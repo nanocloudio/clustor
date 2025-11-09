@@ -1,0 +1,439 @@
+{
+  "schema_version": 1,
+  "generated_at_ms": 1762873885579,
+  "sections": [
+    {
+      "identifier": "Appendix Cross-Index",
+      "heading": "Appendix Cross-Index",
+      "sha256": "67bb8438de0f741b87a3d1f513da11686c640dcf923f5b4eb848973b32adb1fa"
+    },
+    {
+      "identifier": "0",
+      "heading": "0  Consensus Core & Wire Freeze (v0.1)",
+      "sha256": "3b9e058d5180b38c6e5926d70cf87d33f6d13935e6cfd1941bf3cf8313b083f4"
+    },
+    {
+      "identifier": "0.1",
+      "heading": "0.1 Consensus Core (invariants)",
+      "sha256": "5614d134b02b33a1dae25c3df4b85f1f7969106edf5a18bf54926ba1bfa726ec"
+    },
+    {
+      "identifier": "0.2",
+      "heading": "0.2 Defaults and Clause Classification",
+      "sha256": "b1427b56e48c31bdb95535daa7cea6cb2805ffc0aa8667336ca1792d61a58560"
+    },
+    {
+      "identifier": "0.3",
+      "heading": "0.3 Wire/API Freeze (v0.1)",
+      "sha256": "5ace837a4f4ade297e1dbd653575cff64d6d580b73a77a600f19e344f0d6ccb7"
+    },
+    {
+      "identifier": "0.4",
+      "heading": "0.4 Negative Space (out of scope in v0.1)",
+      "sha256": "a51b951f84fae09dfec3abe157cbbf51616fce89bf6541428b74d081288fabe3"
+    },
+    {
+      "identifier": "0.5",
+      "heading": "0.5 Strict Fallback Gate (normative table)",
+      "sha256": "e29374bbb7c9d7ff3b77588f4fbf67317163482afba086a700397228949af65f"
+    },
+    {
+      "identifier": "1",
+      "heading": "1  Architecture & Crash Model",
+      "sha256": "86d772fd7b9b688f23616745bbb1fcd50b425cc4aece26e058b3d26503690ac7"
+    },
+    {
+      "identifier": "1.1",
+      "heading": "1.1 Integration Targets & Use Cases",
+      "sha256": "67ae37e57e2aad39bf4030ae2a7535dab9e2f6bb7ef323847e474d70bb188b8f"
+    },
+    {
+      "identifier": "1.2",
+      "heading": "1.2 Architectural Guarantees",
+      "sha256": "fa7b2bbc81bd98188028d24146de51f7f7477695a4d03b37cbe168ffb41742fa"
+    },
+    {
+      "identifier": "1.2.1",
+      "heading": "1.2.1 Crash Model & Visibility Policy",
+      "sha256": "c14c04b69e3af5d444b3a45782302b24093383fc520f250bd530defe14ee1073"
+    },
+    {
+      "identifier": "2",
+      "heading": "2  Definitions & Vocabulary",
+      "sha256": "ee740ed5e27494fe59bc77b349ff1f79e5b379ff72238ca0f9cb75ce088035c4"
+    },
+    {
+      "identifier": "2.1",
+      "heading": "2.1 Definitions & Conventions",
+      "sha256": "62fb5e9890b819cb0546259cadfb97f1b5198ed2f271bda90530f7046d62f341"
+    },
+    {
+      "identifier": "2.2",
+      "heading": "2.2 Terminology Normalization",
+      "sha256": "8ad9557cf6139d5306f4f7e27a793f77e508870904e4fa181475683a1df87bcd"
+    },
+    {
+      "identifier": "3",
+      "heading": "3  Replication & Consistency Semantics",
+      "sha256": "4ffa33ff0fbf0e961fcb8d8731d01aa2a9fa13236f9bf6f7716365e5b4ef6fee"
+    },
+    {
+      "identifier": "3.1",
+      "heading": "3.1 Term/Index Invariants",
+      "sha256": "a3bec8cbd282cc7db090802f5bdd1e018ac42d93bddb8a36153a2bad942bc45c"
+    },
+    {
+      "identifier": "3.1.1",
+      "heading": "3.1.1 Strict Fallback Gate Checklist",
+      "sha256": "7c3f1a08a07db6c00858812a8923f0135f8fee68411355d656af49aaea08b459"
+    },
+    {
+      "identifier": "3.2",
+      "heading": "3.2 Elections & Leader Stickiness",
+      "sha256": "be91ef075b6a6f0387b29b58abd48f41bb5a8bed70cbaf8ee05f1d6bc4fded47"
+    },
+    {
+      "identifier": "3.3",
+      "heading": "3.3 Read Paths",
+      "sha256": "48303b670674a8a0eedbfcdfc7f12161b53aa9638c691527ef6f00bcf2d99259"
+    },
+    {
+      "identifier": "3.3.1",
+      "heading": "3.3.1 Read Gate and Strict-Fallback Interplay (Normative)",
+      "sha256": "96a8eacafb710f534b680551d27a04a3228793c742c036202782c3a82d0118f3"
+    },
+    {
+      "identifier": "3.4",
+      "heading": "3.4 ACK Contract (Normative)",
+      "sha256": "52ad3b89f661898a3d24251ed089dcb734ed93143ce81a28ae135d85eb0d64a0"
+    },
+    {
+      "identifier": "4",
+      "heading": "4  Partitioning & Topology",
+      "sha256": "6806629baac4321144d64f5bb37f8fe94b79d3b73800c88490c1208bd29ba10f"
+    },
+    {
+      "identifier": "4.1",
+      "heading": "4.1 Membership & Resizing (Normative)",
+      "sha256": "fd9af0cb412529679fb2e911ba5092e262bba44fab42a68ac3a52a0906e02d57"
+    },
+    {
+      "identifier": "4.2",
+      "heading": "4.2 Survivability Precheck",
+      "sha256": "aa1c717ce34ce00ad002d7e9c0e69a6e113e16da401235bce62ef0149a64d133"
+    },
+    {
+      "identifier": "5",
+      "heading": "5  Log Entry Interfaces",
+      "sha256": "c3e2b83cec0223ad7d5eaa1a4e1111ae1f759abae09fb969b7836bbdcd7cd288"
+    },
+    {
+      "identifier": "5.1",
+      "heading": "5.1 Segment Integrity MAC (Mandatory)",
+      "sha256": "fe0da462fc27d0139a075197a195645aed74d659add574633d62238e78934211"
+    },
+    {
+      "identifier": "6",
+      "heading": "6  Durability & Write-Ahead Log",
+      "sha256": "6455301fef3f4cf54e96f031235cdbb40d6a0a6ac5ffe1f102e7aa7e287b4859"
+    },
+    {
+      "identifier": "6.1",
+      "heading": "6.1 Fsync Semantics",
+      "sha256": "d70c1e5fe6d8abfdf0aa10fc42fdd2ab3bc485b7c7ab9c88c1b17e956b8682c3"
+    },
+    {
+      "identifier": "6.2",
+      "heading": "6.2 Group-Fsync Guardrails",
+      "sha256": "dfe40c66c808832282200e1a0c8260baaf8969a8d2bd2c541d3ce935788ee9f7"
+    },
+    {
+      "identifier": "6.3",
+      "heading": "6.3 Startup Scrub & Repair",
+      "sha256": "50cef93c0a2bff0461af14e40e3ed754ad2f2f00f4f493707912e393cde78b76"
+    },
+    {
+      "identifier": "6.4",
+      "heading": "6.4 Background Scrubbing & Quarantine",
+      "sha256": "4243bcea2185030d9aaf3b29117ec409265fa4e049e9b2cda55998fdcec5b787"
+    },
+    {
+      "identifier": "6.5",
+      "heading": "6.5 Durability Ledger Ordering (Proof Obligation)",
+      "sha256": "d4dba10b82621550f0534bc88ad51399b76a2f6bbd9bfa88d227ad5395b15344"
+    },
+    {
+      "identifier": "6.6",
+      "heading": "6.6 Quarantine Lifecycle",
+      "sha256": "3e59f06be4a04fbb9fe4cfcee1ee8fbc557e70e177a694c3b96eaaa488811873"
+    },
+    {
+      "identifier": "7",
+      "heading": "7  Apply Pipeline & State Machine Hooks",
+      "sha256": "960283cb23b39afece5597496eced513ed6c4434d3cdafaf86af030e2d195c8f"
+    },
+    {
+      "identifier": "7.1",
+      "heading": "7.1 Apply Budget SLA",
+      "sha256": "7ed033129a9f1c1ffc3fe013ab15d1ed6bf3256601f36f11d195e94d136d68a0"
+    },
+    {
+      "identifier": "7.2",
+      "heading": "7.2 Idempotency & Replay",
+      "sha256": "818430ee6533a900f0d36aacc97fcbad01e1adc621ad93bfb5339ab1e5218614"
+    },
+    {
+      "identifier": "7.3",
+      "heading": "7.3 AckHandle Lifecycle",
+      "sha256": "f14695f8797b01124bc18e23d4294c4c9921aa962498af8f601cedbd6418c9d4"
+    },
+    {
+      "identifier": "7.4",
+      "heading": "7.4 Aggregator Allowance Profile",
+      "sha256": "15341a8d605937a2e0767de7fc98de5ee1f7e40b051ac11aa7ffb73fe6a23fc7"
+    },
+    {
+      "identifier": "8",
+      "heading": "8  Snapshots & State Transfer",
+      "sha256": "aaaccd2fe2744761249462b45d598131a03e8078012404316707112624205f53"
+    },
+    {
+      "identifier": "8.1",
+      "heading": "8.1 Snapshot Manifest Format",
+      "sha256": "5fd1d7a8d5a9188e97cc12c74f4c57dc50462fa84f4c0b4ca06c063ad0727f48"
+    },
+    {
+      "identifier": "8.2",
+      "heading": "8.2 Snapshot Import Flow",
+      "sha256": "9f9c10efb1a2062ec5197cb90b158ca5fb099bcb0d62c0ef2a6491c1ba8d0745"
+    },
+    {
+      "identifier": "8.3",
+      "heading": "8.3 Snapshot I/O Budgeting",
+      "sha256": "a0d2018393250c608755fc1c05ec5823d76ccf9f364343fde619b600433385c5"
+    },
+    {
+      "identifier": "8.4",
+      "heading": "8.4 Incremental Snapshot Cadence & Restore Guarantees",
+      "sha256": "a98d6c504d443711661e2ef8c85d765ec10a58487e3e1d7b45f2f1d318f228e2"
+    },
+    {
+      "identifier": "9",
+      "heading": "9  Storage Layout, Encryption & Recovery",
+      "sha256": "e39e1e332e73164134d162cff46385561ac577520776e49e036e0f31321b7ed0"
+    },
+    {
+      "identifier": "9.1",
+      "heading": "9.1 Compaction Safety Gates",
+      "sha256": "59b5f850ca1f02bc5d7281e0309b036f76baa94b83b800406b99b7bbbf234b77"
+    },
+    {
+      "identifier": "9.2",
+      "heading": "9.2 Encryption & Key Epoching",
+      "sha256": "747ba23278295d81f466dadb57566dcb5ce12b37285b47c9dc4346c8e7cc5c0f"
+    },
+    {
+      "identifier": "9.3",
+      "heading": "9.3 Compatibility Contracts",
+      "sha256": "7a99a8a614df76981629d4dbfaea7bc3582373bc776a475768e2748082f8e869"
+    },
+    {
+      "identifier": "10",
+      "heading": "10  Flow Control & Backpressure",
+      "sha256": "7824ec7b41e8441bd154c1ffcd94dedfb906e5fe5a3d0adb64567f497fee6f51"
+    },
+    {
+      "identifier": "10.1",
+      "heading": "10.1 Credit Controller Model",
+      "sha256": "1004ad0e21a3e485629c926902112a2beaa8af569c54a8e7076329312b908fff"
+    },
+    {
+      "identifier": "10.2",
+      "heading": "10.2 Lag Classification & Mitigation",
+      "sha256": "5428c9a29970b303d1b9b1288d449fae22f035b208a109e70526ec0f8af54236"
+    },
+    {
+      "identifier": "10.3",
+      "heading": "10.3 Client-Facing Throttling",
+      "sha256": "51c7b9e529cf1281a69b3f4234d8550328406e0ee8f60831a2a0772193673b3b"
+    },
+    {
+      "identifier": "11",
+      "heading": "11  Control Plane – CP-Raft",
+      "sha256": "3a268bd0800da863855168e8e1ab9916f72dc8d80b1defd7e53c756fb16ce0bc"
+    },
+    {
+      "identifier": "11.1",
+      "heading": "11.1 Durable Objects & Feature Gates",
+      "sha256": "823fe80e5edf509e0d2cfe05c635487610516e3f44811ae70ef7d07a1abe5cfe"
+    },
+    {
+      "identifier": "11.2",
+      "heading": "11.2 DR Fencing Enforcement",
+      "sha256": "d73a06b64adf5811d7c93472382f7c491400a43e6a5be3266a950f3e232d79a3"
+    },
+    {
+      "identifier": "11.3",
+      "heading": "11.3 Key Material Epochs",
+      "sha256": "00a3c6fbc8b20e50f605013902c779294c438d7fc6278aec0a101e76f3983f14"
+    },
+    {
+      "identifier": "11.4",
+      "heading": "11.4 System Log Entry Catalog",
+      "sha256": "5c34d048b8b541c677c6bf19e7546301cb2f28ab6851dced3f113aaa37dbd55c"
+    },
+    {
+      "identifier": "11.5",
+      "heading": "11.5 Definition Bundles, Activation Barriers & Readiness Telemetry",
+      "sha256": "04b1d8aaaf01c21197cd4051e76ae60b12ac2dfb2c1c1a6a22c65cae3d806e6d"
+    },
+    {
+      "identifier": "12",
+      "heading": "12  Security & Isolation",
+      "sha256": "a9fc071eb1bb910900c58175e30eb360100cb7bd9fcebf8ee7d466a5fce34505"
+    },
+    {
+      "identifier": "12.1",
+      "heading": "12.1 mTLS & SPIFFE Rotation",
+      "sha256": "b3247222c873f7758513a049408f6bdd1ca062bb2ca0466ee1a72fb485b4f3a0"
+    },
+    {
+      "identifier": "12.2",
+      "heading": "12.2 AEAD Usage & Re-Encryption",
+      "sha256": "df644aaa18901e93bbac86aa84dbda2d06db3883c21e220980117c219d89ed4c"
+    },
+    {
+      "identifier": "12.3",
+      "heading": "12.3 RBAC & Break-Glass Controls",
+      "sha256": "18ed1997451375506fa789a7ddf58689ced5cd85fd4b3ace27a58903e81967f2"
+    },
+    {
+      "identifier": "12.4",
+      "heading": "12.4 Key Purpose Registry",
+      "sha256": "4cba771826b36076aff8709a49086e58c0c52a49a0cbf9c5c402a9c21ecc3bcc"
+    },
+    {
+      "identifier": "13",
+      "heading": "13  Admin & Lifecycle APIs",
+      "sha256": "c7ff33e4716cb33d5b2d10f60f43a1c28f68121efdae1a95d99f886f9dbe2e74"
+    },
+    {
+      "identifier": "13.1",
+      "heading": "13.1 CP Outage Behavior (Runbook Tile)",
+      "sha256": "950b1058178d02bfbd68d659659c4a6edcac3ccb93832a6cdc071cbbf3901afb"
+    },
+    {
+      "identifier": "14",
+      "heading": "14  Telemetry & Observability",
+      "sha256": "ee11c3b01e65b881799d3d6245abf2acbb57bd61cd0ea22e7840a53137a695e3"
+    },
+    {
+      "identifier": "14.1",
+      "heading": "14.1 Golden Signals & Incident Logging",
+      "sha256": "920ffa25f01ff4aa418a9d2e1f111cbf14be48a04418d688a6398b6f685ebf16"
+    },
+    {
+      "identifier": "14.2",
+      "heading": "14.2 Startup Spec Self-Tests",
+      "sha256": "aade727401c40da23f631e591b069b46eff1aa05dd898dfb6aa1f2a6a76b04ef"
+    },
+    {
+      "identifier": "15",
+      "heading": "15  Deployment & Bootstrap",
+      "sha256": "3cfbcd0267e4b92ff108c4e391c84261c3e5332d850e870a06b1a4b7a4855f30"
+    },
+    {
+      "identifier": "15.1",
+      "heading": "15.1 Bootstrap & Disk Hygiene",
+      "sha256": "889309f917772775229798ec176f3d78dacabfea2224f66d7837456db676bdbd"
+    },
+    {
+      "identifier": "15.2",
+      "heading": "15.2 Graceful Shutdown",
+      "sha256": "c56944337d5ab16ad803be8a934db9583dd9cd7e6d3a7e3839604916abcfde87"
+    },
+    {
+      "identifier": "15.3",
+      "heading": "15.3 Kubernetes & Host Guidance",
+      "sha256": "05f21e44fd9a5be72cbe8a2e38d2b0f763b377dd1a998aa247e98aa00b331135"
+    },
+    {
+      "identifier": "15.4",
+      "heading": "15.4 Configuration Profiles",
+      "sha256": "ab695127798a2cb03cb84e9ab430ff545a6a71e7b3c70b270ec3f840f8147ff9"
+    },
+    {
+      "identifier": "15.5",
+      "heading": "15.5 Repair-Mode Bootstrap",
+      "sha256": "260d5c18e4e6e80b379bb773da95c4ee8cee92d94d6bd1963a439cef825d037b"
+    },
+    {
+      "identifier": "16",
+      "heading": "16  Summary of Guarantees",
+      "sha256": "5f435e72ae45900048291429232cf6fa6afa892c3c5e7142fd56fa9b6f1c7e99"
+    },
+    {
+      "identifier": "Appendix A",
+      "heading": "Appendix A App.A – SLOs & Alerts",
+      "sha256": "decc49c03ded9ddae567f07da2e778b8be32fc7b128682fefec31416ff756c89"
+    },
+    {
+      "identifier": "Appendix B",
+      "heading": "Appendix B App.B – Operational Profiles (Highlights)",
+      "sha256": "f187702ad01875e7db09306b6bace96c805ca1972a185eb19312bff9547b3bb1"
+    },
+    {
+      "identifier": "Appendix B.1",
+      "heading": "Appendix B.1 Profile Capability Matrix",
+      "sha256": "d6b8660cd08fca8da82f4605af9ec6e53fa2054d8331dd76fd209930d012ad43"
+    },
+    {
+      "identifier": "Appendix C",
+      "heading": "Appendix C App.C – Test Matrix (Representative)",
+      "sha256": "9bbb4d97831e8ec95ce92df135cfd87b48e17722e1fab9c7cab5b3fb03da57ea"
+    },
+    {
+      "identifier": "Appendix D",
+      "heading": "Appendix D App.D – Wire Envelopes (Shared Schema)",
+      "sha256": "16e843e9227926a861e9393251c3af64043001c884275c8fd93e6e7efca605e4"
+    },
+    {
+      "identifier": "Appendix E",
+      "heading": "Appendix E App.E – ChunkedList Specification",
+      "sha256": "9a298d02c5eafc28736271b8a5d0ff6836a8e3364e61bdd16e115d00432607ed"
+    }
+  ],
+  "bundles": [
+    {
+      "name": "wire_catalog",
+      "path": "artifacts/wire_catalog.json",
+      "sha256": "f3b298bb4210adb5f2d9fb01b71e2dfd28fc44f1c669af6236380a64edccec20"
+    },
+    {
+      "name": "chunked_list_schema",
+      "path": "artifacts/chunked_list_schema.json",
+      "sha256": "8e46378fa5d2879430de175e62204b55da50b4267a8d9b3d9707a19603cc60e1"
+    },
+    {
+      "name": "system_log_catalog",
+      "path": "artifacts/system_log_catalog.json",
+      "sha256": "1b0a41c814565477c068974d41b1a2f742500a32ac26f7f7b1b092e77926c3a2"
+    },
+    {
+      "name": "metrics_buckets",
+      "path": "artifacts/metrics_buckets.json",
+      "sha256": "b19d51f762766e4e3f0d1dcd4b7cd41e55711c10c729666c06565803ca234a6b"
+    }
+  ],
+  "catalog": {
+    "major": 0,
+    "minor": 1,
+    "forward_parse_max_minor": 1
+  },
+  "proof_bundle": {
+    "schema_version": 1,
+    "bundle_sha256": "fded133661ee9bffaf29b5c22ae05cd6ea153e59c79dcccb7c4fc14fb6bf3a84",
+    "bundle_signature": "383a4ce3a884389a11042e2fd3d248ef22f562587b520644ef61478ae64664720eb4e8c7fb8f73f98eac8ed2bcbc8231c1caefe871e1358369e0383b9753b107"
+  },
+  "feature_manifest_sha256": "695d45cddd07bc338d64ec2aa608d0e0b1cca1abe017f7dd446d0afa6d46ab0e"
+}

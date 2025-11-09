@@ -1,0 +1,24 @@
+trust_domain: nanocloud.io
+ca_cert: certs/ca.pem
+
+nodes:
+  - id: node-a
+    raft_bind: 127.0.0.1:7101
+    http_bind: 127.0.0.1:7201
+    cert: certs/node-a-cert.pem
+    key: certs/node-a-key.pem
+    peers: ["node-b", "node-c"]
+
+  - id: node-b
+    raft_bind: 127.0.0.1:7102
+    http_bind: 127.0.0.1:7202
+    cert: certs/node-b-cert.pem
+    key: certs/node-b-key.pem
+    peers: ["node-a", "node-c"]
+
+  - id: node-c
+    raft_bind: 127.0.0.1:7103
+    http_bind: 127.0.0.1:7203
+    cert: certs/node-c-cert.pem
+    key: certs/node-c-key.pem
+    peers: ["node-a", "node-b"]

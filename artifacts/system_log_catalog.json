@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "clause_coverage_hash": "1ba843275e5702b7077ca8f3aecf3c61c4f934813f4a5bbbfbe56a1c063397da",
+  "entries": [
+    {
+      "name": "MembershipChange",
+      "wire_id": "0x01",
+      "fields": [
+        "old_members",
+        "new_members",
+        "routing_epoch"
+      ]
+    },
+    {
+      "name": "MembershipRollback",
+      "wire_id": "0x02",
+      "fields": [
+        "reason",
+        "failing_nodes",
+        "override_ref"
+      ]
+    },
+    {
+      "name": "DurabilityTransition",
+      "wire_id": "0x03",
+      "fields": [
+        "from_mode",
+        "to_mode",
+        "effective_index",
+        "durability_mode_epoch"
+      ]
+    },
+    {
+      "name": "FenceCommit",
+      "wire_id": "0x04",
+      "fields": [
+        "fence_epoch",
+        "manifest_id",
+        "dr_cluster_id"
+      ]
+    },
+    {
+      "name": "DefineActivate",
+      "wire_id": "0x05",
+      "fields": [
+        "bundle_id",
+        "barrier_id",
+        "partitions",
+        "readiness_digest"
+      ]
+    }
+  ]
+}

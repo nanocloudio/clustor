@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "generated_at_ms": 1762873885572,
+  "features": [
+    {
+      "gate": "leader_leases",
+      "cp_object": "LeaseEnable",
+      "predicate_digest": "d972e4192ba00e19456a56e76ce65b39a42a776c9b9174fb9cfbb3485e9ee353",
+      "gate_state": "Disabled"
+    },
+    {
+      "gate": "pid_auto_tune",
+      "cp_object": "FlowPidAutoTune",
+      "predicate_digest": "18da16ae05ebf1656bf745e7a7307a28cb73c7683121e7de9b9aa25e03c0be5a",
+      "gate_state": "Disabled"
+    },
+    {
+      "gate": "snapshot_delta",
+      "cp_object": "SnapshotDeltaEnable",
+      "predicate_digest": "1b29fb93aee487486396c0ffebb402a6025fbf82b2fe0d35f6e6a8d966270b7e",
+      "gate_state": "Disabled"
+    },
+    {
+      "gate": "blake3_merkle",
+      "cp_object": "IntegrityHashSuite",
+      "predicate_digest": "74e30232b86e2d7663c71b4bc20de04e4dc76aa4acb90b16477fe9315f45ee8b",
+      "gate_state": "Disabled"
+    }
+  ],
+  "signature": "f6173ea27f37e8062a77cce32787ac59099b69d9212dfecdaeebd100a4257df05f32d9630723bd1c2c5f74c73eb5cfe98c5e43e2ac39fe8f70fa59eca71e6603"
+}

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "messages": [
+    "MembershipChange",
+    "MembershipRollback",
+    "DurabilityTransition",
+    "FenceCommit",
+    "DurabilityAck",
+    "PreVoteResponse",
+    "RoutingEpochMismatch",
+    "ModeConflict",
+    "ThrottleEnvelope",
+    "WhyNotLeader",
+    "WhyDiskBlocked",
+    "WhySnapshotBlocked",
+    "WhyCreditZero",
+    "OverrideLedgerEntry"
+  ],
+  "clause_coverage_hash": "1ba843275e5702b7077ca8f3aecf3c61c4f934813f4a5bbbfbe56a1c063397da"
+}

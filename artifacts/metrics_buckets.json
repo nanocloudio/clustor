@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "clause_coverage_hash": "1ba843275e5702b7077ca8f3aecf3c61c4f934813f4a5bbbfbe56a1c063397da",
+  "buckets": [
+    {
+      "metric": "clustor.wal.fsync_latency_ms",
+      "unit": "ms",
+      "bounds": [
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        4.0,
+        6.0,
+        8.0,
+        10.0,
+        15.0,
+        20.0,
+        30.0,
+        40.0,
+        60.0,
+        80.0,
+        100.0
+      ],
+      "notes": "WAL fsync latency buckets for strict durability guardrails."
+    },
+    {
+      "metric": "clustor.raft.commit_latency_ms",
+      "unit": "ms",
+      "bounds": [
+        0.5,
+        1.0,
+        2.0,
+        4.0,
+        6.0,
+        8.0,
+        10.0,
+        15.0,
+        20.0,
+        30.0,
+        40.0,
+        60.0,
+        80.0,
+        100.0
+      ],
+      "notes": "Per-partition Raft commit latency histogram."
+    },
+    {
+      "metric": "clustor.snapshot.transfer_seconds",
+      "unit": "s",
+      "bounds": [
+        1.0,
+        2.0,
+        4.0,
+        8.0,
+        16.0,
+        32.0,
+        64.0,
+        128.0,
+        256.0
+      ],
+      "notes": "Snapshot transfer duration buckets."
+    },
+    {
+      "metric": "flow.apply_batch_latency_ms",
+      "unit": "ms",
+      "bounds": [
+        0.25,
+        0.5,
+        1.0,
+        2.0,
+        4.0,
+        6.0,
+        8.0,
+        10.0
+      ],
+      "notes": "Apply pipeline batch latency buckets."
+    }
+  ]
+}

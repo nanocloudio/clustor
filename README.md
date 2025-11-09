@@ -6,7 +6,7 @@ Clustor is a safety-first, Rust-based Raft substrate that ships as a reusable li
 
 ## Why Clustor?
 
-- **Normative safety kernel** – §0 of the spec defines the invariants (log matching, durability, linearizable reads) that every release must satisfy; spec-lint regenerates the machine-readable wire catalog and fails builds on drift.
+- **Normative consensus core** – §0 of the spec defines the invariants (log matching, durability, linearizable reads) that every release must satisfy; spec-lint regenerates the machine-readable wire catalog and fails builds on drift.
 - **Deterministic durability** – WAL ordering, Group-Fsync guardrails, and a quorum durability ledger (`wal/durability.log`) keep acknowledged writes crash-proof and auditable.
 - **Explainable operations** – PID-based flow control, structured throttle envelopes, and Why*/CpUnavailable schemas make it easy to diagnose availability or credit issues.
 - **Snap-ready storage** – Signed, AEAD-protected snapshots with manifest authorization handshakes allow safe compaction and state transfer.
