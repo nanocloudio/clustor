@@ -1,4 +1,8 @@
+use crate::bootstrap::boot_record::{BootRecordError, BootRecordStore, DiskPolicyRecord};
+use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::time::SystemTime;
+use thiserror::Error;
 
 /// Describes the filesystem that backs the WAL + durability ledger.
 #[derive(Debug, Clone)]
@@ -16,7 +20,7 @@ pub enum FilesystemDescriptor {
     Unknown { name: String },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StackAttestation {
     Documented,
     Unknown,
@@ -28,7 +32,7 @@ impl StackAttestation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ext4Options {
     pub data_mode: Ext4DataMode,
     pub barriers_enabled: bool,
@@ -37,7 +41,7 @@ pub struct Ext4Options {
     pub journal_checksum: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ext4DataMode {
     Ordered,
     Writeback,
@@ -54,19 +58,19 @@ impl fmt::Display for Ext4DataMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct XfsOptions {
     pub log_block_size_kib: u32,
     pub barriers_disabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZfsOptions {
     pub sync_policy: ZfsSyncPolicy,
     pub log_bias: ZfsLogBias,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ZfsSyncPolicy {
     Standard,
     Always,
@@ -83,7 +87,7 @@ impl fmt::Display for ZfsSyncPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ZfsLogBias {
     Throughput,
     Latency,
@@ -98,7 +102,7 @@ impl fmt::Display for ZfsLogBias {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceCapabilities {
     pub sys_path: String,
     pub serial: String,
@@ -113,21 +117,21 @@ impl DeviceCapabilities {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WriteCachePolicy {
     WriteThrough,
     WriteBack,
     Unsafe,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OrderedFilesystemProfile {
     Ext4Strict,
     XfsStrict,
     ZfsStrict,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilesystemEvaluation {
     pub profile: Option<OrderedFilesystemProfile>,
     pub rejections: Vec<RejectionReason>,
@@ -139,7 +143,7 @@ impl FilesystemEvaluation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectionReason {
     UnsupportedFilesystem {
         detected: String,
@@ -307,9 +311,51 @@ impl FilesystemDetector {
     }
 }
 
+pub fn verify_disk_policy(
+    stack: &FilesystemStack,
+    store: &BootRecordStore,
+    now: SystemTime,
+) -> Result<DiskPolicyRecord, DiskPolicyError> {
+    let evaluation = FilesystemDetector::evaluate(stack);
+    let rejections = evaluation.rejections.clone();
+    let record = DiskPolicyRecord {
+        profile: evaluation.profile,
+        rejections: rejections.clone(),
+        evaluated_at_ms: system_time_to_ms(now),
+    };
+    let mut boot = store.load_or_default()?;
+    boot.disk_policy = Some(record.clone());
+    store.persist(&boot)?;
+    if evaluation.is_supported() {
+        Ok(record)
+    } else {
+        Err(DiskPolicyError::Rejected {
+            reasons: rejections,
+        })
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum DiskPolicyError {
+    #[error(transparent)]
+    BootRecord(#[from] BootRecordError),
+    #[error("disk policy rejected: {reasons:?}")]
+    Rejected { reasons: Vec<RejectionReason> },
+}
+
+fn system_time_to_ms(time: SystemTime) -> u64 {
+    time.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bootstrap::boot_record::BootRecordStore;
+    use std::time::SystemTime;
+    use tempfile::tempdir;
 
     fn ext4_stack(data_mode: Ext4DataMode) -> FilesystemStack {
         FilesystemStack {
@@ -401,5 +447,35 @@ mod tests {
             .rejections
             .iter()
             .any(|reason| matches!(reason, RejectionReason::ZfsDeviceMissingFua { .. })));
+    }
+
+    #[test]
+    fn verify_disk_policy_records_success() {
+        let stack = ext4_stack(Ext4DataMode::Ordered);
+        let dir = tempdir().expect("temp dir");
+        let store = BootRecordStore::new(dir.path().join("boot.json"));
+        let now = SystemTime::now();
+        let record = verify_disk_policy(&stack, &store, now).expect("supported stack should pass");
+        assert_eq!(record.profile, Some(OrderedFilesystemProfile::Ext4Strict));
+        let persisted = store.load_or_default().expect("boot record load");
+        assert_eq!(persisted.disk_policy, Some(record));
+    }
+
+    #[test]
+    fn verify_disk_policy_propagates_rejections() {
+        let stack = ext4_stack(Ext4DataMode::Writeback);
+        let dir = tempdir().expect("temp dir");
+        let store = BootRecordStore::new(dir.path().join("boot.json"));
+        let now = SystemTime::now();
+        let err = verify_disk_policy(&stack, &store, now).expect_err("unsupported stack rejected");
+        assert!(matches!(err, DiskPolicyError::Rejected { .. }));
+        let persisted = store.load_or_default().expect("boot record load");
+        let policy = persisted
+            .disk_policy
+            .expect("disk policy stored despite rejection");
+        assert!(policy
+            .rejections
+            .iter()
+            .any(|reason| matches!(reason, RejectionReason::Ext4DataModeNotOrdered { .. })));
     }
 }

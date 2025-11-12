@@ -1,7 +1,9 @@
 use clustor::{
-    DualCreditPidController, FlowProfile, FlowSloMonitor, FlowThrottleReason, FlowThrottleState,
-    IncidentCorrelator, TenantFlowController, TenantQuota,
+    CreditHint, DualCreditPidController, FlowIncidentKind, FlowProfile, FlowSloMonitor,
+    FlowThrottleEnvelope, FlowThrottleReason, FlowThrottleState, IncidentCorrelator,
+    IngestStatusCode, TenantFlowController, TenantQuota,
 };
+use serde_json::json;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -96,10 +98,15 @@ fn flow_checkpoint_slo_monitor_tracks_alerts() {
         slo_gap: 49_000.0,
     };
     assert!(monitor
-        .record(FlowProfile::Latency, telemetry, now)
+        .record_ingest_slo(FlowProfile::Latency, telemetry, now)
         .is_some());
     let event = monitor.last_event().expect("event recorded");
-    assert_eq!(event.floor_ops_per_sec, 40_000.0);
+    match &event.kind {
+        FlowIncidentKind::IngestFloorBreach {
+            floor_ops_per_sec, ..
+        } => assert_eq!(*floor_ops_per_sec, 40_000.0),
+        other => panic!("unexpected incident {:?}", other),
+    }
     assert_eq!(event.profile, FlowProfile::Latency);
 
     let mut controller = TenantFlowController::new(
@@ -148,4 +155,17 @@ fn flow_checkpoint_stress_test_records_incidents() {
         .slo_monitor()
         .and_then(|monitor| monitor.last_event());
     assert!(incident.is_some());
+}
+
+#[test]
+fn flow_checkpoint_throttle_envelope_schema_snapshot() {
+    let envelope = FlowThrottleEnvelope::new(
+        FlowThrottleState::Throttled(FlowThrottleReason::EntryCreditsDepleted),
+        CreditHint::Hold,
+        IngestStatusCode::TransientBackpressure,
+    );
+    let value = serde_json::to_value(&envelope).expect("json");
+    assert_eq!(value["credit_hint"], json!("Hold"));
+    assert_eq!(value["ingest_status"], json!("TransientBackpressure"));
+    assert_eq!(value["state"]["Throttled"], json!("EntryCreditsDepleted"));
 }

@@ -2,6 +2,7 @@ use crate::durability::AckHandle;
 #[cfg(test)]
 use crate::profile::ProfileCapability;
 use crate::profile::{PartitionProfile, ProfileCapabilityError, ProfileCapabilityRegistry};
+use crate::telemetry::MetricsRegistry;
 use crate::terminology::TERM_STRICT;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
@@ -313,6 +314,67 @@ impl ApplyMetrics for InMemoryApplyMetrics {
     }
 }
 
+#[derive(Clone)]
+pub struct TelemetryApplyMetrics {
+    registry: Arc<Mutex<MetricsRegistry>>,
+    aggregator: bool,
+}
+
+impl TelemetryApplyMetrics {
+    pub fn new(registry: Arc<Mutex<MetricsRegistry>>, aggregator: bool) -> Self {
+        Self {
+            registry,
+            aggregator,
+        }
+    }
+
+    pub fn for_profile(registry: Arc<Mutex<MetricsRegistry>>, profile: &ApplyProfile) -> Self {
+        Self::new(registry, profile.aggregator)
+    }
+
+    fn registry(&self) -> std::sync::MutexGuard<'_, MetricsRegistry> {
+        self.registry.lock().unwrap()
+    }
+}
+
+impl ApplyMetrics for TelemetryApplyMetrics {
+    fn record_queue_depth(&self, depth: usize, capacity: usize) {
+        let mut registry = self.registry();
+        registry.set_gauge("apply.queue_depth", depth as u64);
+        registry.set_gauge("apply.queue_capacity", capacity as u64);
+    }
+
+    fn record_budget_sample(&self, p99_ns: u64, threshold_ns: u64, breaches: u32) {
+        let mut registry = self.registry();
+        registry.set_gauge("apply.batch_p99_ns", p99_ns);
+        registry.set_gauge("apply.batch_budget_threshold_ns", threshold_ns);
+        registry.set_gauge("apply.budget_breach_streak", breaches as u64);
+        if self.aggregator {
+            registry.inc_counter("apply.aggregator_samples_total", 1);
+        }
+    }
+
+    fn record_queue_alert(&self) {
+        let mut registry = self.registry();
+        registry.inc_counter("apply.queue_alert_total", 1);
+    }
+
+    fn record_guardrail_violation(&self) {
+        let mut registry = self.registry();
+        registry.inc_counter("apply.guardrail_violation_total", 1);
+    }
+
+    fn record_aggregator_budget_breach(&self) {
+        let mut registry = self.registry();
+        registry.inc_counter("apply.aggregator_budget_breach_total", 1);
+    }
+
+    fn record_aggregator_guardrail_violation(&self) {
+        let mut registry = self.registry();
+        registry.inc_counter("apply.aggregator_guardrail_violation_total", 1);
+    }
+}
+
 pub struct ApplyScheduler<M: ApplyMetrics = InMemoryApplyMetrics> {
     profile: ApplyProfile,
     queue: VecDeque<ApplyBatch>,
@@ -447,6 +509,72 @@ impl<M: ApplyMetrics> ApplyScheduler<M> {
             guardrail_threshold: self.profile.budget_breach_threshold,
             spec_clause: APPLY_SPEC_CLAUSE.into(),
         }
+    }
+}
+
+pub struct ApplyRuntime<
+    M: ApplyMetrics = InMemoryApplyMetrics,
+    A: AckHandleMetrics = InMemoryAckHandleMetrics,
+> {
+    scheduler: ApplyScheduler<M>,
+    ack_supervisor: AckHandleSupervisor<A>,
+    ack_policy: AckHandlePolicy,
+}
+
+impl<M: ApplyMetrics, A: AckHandleMetrics> ApplyRuntime<M, A> {
+    pub fn new(
+        profile: ApplyProfile,
+        apply_metrics: M,
+        ack_metrics: A,
+    ) -> Result<Self, ApplyProfileError> {
+        let ack_policy = AckHandlePolicy::for_profile(&profile);
+        let scheduler = ApplyScheduler::new(profile, apply_metrics)?;
+        let ack_supervisor = AckHandleSupervisor::new(ack_policy.clone(), ack_metrics);
+        Ok(Self {
+            scheduler,
+            ack_supervisor,
+            ack_policy,
+        })
+    }
+
+    pub fn enqueue_batch(&mut self, batch: ApplyBatch) -> Result<(), ApplySchedulerError> {
+        self.scheduler.enqueue(batch)
+    }
+
+    pub fn dequeue_batch(&mut self) -> Option<ApplyBatch> {
+        self.scheduler.dequeue()
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.scheduler.queue_len()
+    }
+
+    pub fn record_batch_duration(
+        &mut self,
+        duration: Duration,
+        now: Instant,
+    ) -> ApplyBudgetDecision {
+        self.scheduler.record_duration(duration, now)
+    }
+
+    pub fn register_ack_handle(&self, ack: AckHandle, now: Instant) -> ManagedAckHandle<A> {
+        self.ack_supervisor.register(ack, now)
+    }
+
+    pub fn tick_ack_deadlines(&self, now: Instant) -> Vec<AckTimeoutInfo> {
+        self.ack_supervisor.tick(now)
+    }
+
+    pub fn report(&self) -> ApplyProfileReport {
+        self.scheduler.report()
+    }
+
+    pub fn why_apply(&self, decision_trace_id: impl Into<String>) -> WhyApply {
+        self.scheduler.why_apply(decision_trace_id)
+    }
+
+    pub fn ack_policy(&self) -> &AckHandlePolicy {
+        &self.ack_policy
     }
 }
 
@@ -711,6 +839,19 @@ impl AckHandlePolicy {
             aggregator: true,
         }
     }
+
+    pub fn for_profile(profile: &ApplyProfile) -> Self {
+        if profile.aggregator {
+            Self::aggregator()
+        } else {
+            Self {
+                max_defer_ms: profile.ack_max_defer_ms,
+                drop_window_ms: 1_000,
+                max_consecutive_drops: 3,
+                aggregator: false,
+            }
+        }
+    }
 }
 
 pub trait AckHandleMetrics: Send + Sync {
@@ -768,6 +909,61 @@ impl AckHandleMetrics for InMemoryAckHandleMetrics {
     fn record_defer_guardrail_violation(&self) {
         let mut guard = self.inner.lock().unwrap();
         guard.defer_guardrail_violations += 1;
+    }
+}
+
+#[derive(Clone)]
+pub struct TelemetryAckHandleMetrics {
+    registry: Arc<Mutex<MetricsRegistry>>,
+}
+
+impl TelemetryAckHandleMetrics {
+    pub fn new(registry: Arc<Mutex<MetricsRegistry>>) -> Self {
+        Self { registry }
+    }
+
+    fn registry(&self) -> std::sync::MutexGuard<'_, MetricsRegistry> {
+        self.registry.lock().unwrap()
+    }
+
+    fn failure_code(reason: &AckHandleFailureReason) -> u64 {
+        match reason {
+            AckHandleFailureReason::AckTimeout => 1,
+            AckHandleFailureReason::Application(_) => 2,
+            AckHandleFailureReason::Dropped => 3,
+        }
+    }
+}
+
+impl AckHandleMetrics for TelemetryAckHandleMetrics {
+    fn record_completion(&self, id: u64) {
+        let mut registry = self.registry();
+        registry.inc_counter("ack_handle.completed_total", 1);
+        registry.set_gauge("ack_handle.last_completed_id", id);
+    }
+
+    fn record_failure(&self, _id: u64, reason: &AckHandleFailureReason) {
+        let mut registry = self.registry();
+        registry.inc_counter("ack_handle.failed_total", 1);
+        registry.set_gauge("ack_handle.last_failure_code", Self::failure_code(reason));
+    }
+
+    fn record_timeout(&self, info: &AckTimeoutInfo) {
+        let mut registry = self.registry();
+        registry.inc_counter("ack_handle.timeouts_total", 1);
+        registry.set_gauge("ack_handle.last_timeout.handle_id", info.handle_id);
+        registry.set_gauge("ack_handle.last_timeout.term", info.term);
+        registry.set_gauge("ack_handle.last_timeout.index", info.index);
+    }
+
+    fn record_drop_alert(&self) {
+        let mut registry = self.registry();
+        registry.inc_counter("ack_handle.drop_alert_total", 1);
+    }
+
+    fn record_defer_guardrail_violation(&self) {
+        let mut registry = self.registry();
+        registry.inc_counter("ack_handle.defer_guardrail_violation_total", 1);
     }
 }
 
@@ -949,6 +1145,8 @@ pub enum AckHandleError {
 mod tests {
     use super::*;
     use crate::profile::ProfileCapabilities;
+    use crate::telemetry::MetricsRegistry;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn enqueue_enforces_limits() {
@@ -1130,5 +1328,79 @@ mod tests {
         supervisor.tick(Instant::now() + Duration::from_millis(800));
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.defer_guardrail_violations, 1);
+    }
+
+    #[test]
+    fn telemetry_apply_metrics_records_counters() {
+        let registry = Arc::new(Mutex::new(MetricsRegistry::new("clustor")));
+        let metrics = TelemetryApplyMetrics::new(registry.clone(), true);
+        metrics.record_queue_depth(7, 64);
+        metrics.record_budget_sample(2_000, 3_000, 2);
+        metrics.record_queue_alert();
+        metrics.record_guardrail_violation();
+        metrics.record_aggregator_budget_breach();
+        metrics.record_aggregator_guardrail_violation();
+        let snapshot = registry.lock().unwrap().snapshot();
+        assert_eq!(snapshot.gauges.get("clustor.apply.queue_depth"), Some(&7));
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("clustor.apply.batch_budget_threshold_ns"),
+            Some(&3_000)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("clustor.apply.guardrail_violation_total"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("clustor.apply.aggregator_budget_breach_total"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("clustor.apply.aggregator_samples_total"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn telemetry_ack_handle_metrics_records_counters() {
+        let registry = Arc::new(Mutex::new(MetricsRegistry::new("clustor")));
+        let metrics = TelemetryAckHandleMetrics::new(registry.clone());
+        metrics.record_completion(11);
+        metrics.record_failure(12, &AckHandleFailureReason::Dropped);
+        metrics.record_timeout(&AckTimeoutInfo {
+            handle_id: 99,
+            term: 5,
+            index: 8,
+        });
+        metrics.record_drop_alert();
+        metrics.record_defer_guardrail_violation();
+        let snapshot = registry.lock().unwrap().snapshot();
+        assert_eq!(
+            snapshot.counters.get("clustor.ack_handle.completed_total"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot.counters.get("clustor.ack_handle.drop_alert_total"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("clustor.ack_handle.defer_guardrail_violation_total"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("clustor.ack_handle.last_timeout.handle_id"),
+            Some(&99)
+        );
     }
 }

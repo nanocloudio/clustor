@@ -15,7 +15,7 @@ fn telemetry_checkpoint_registry_and_correlator() {
     registry.inc_counter("cp.cache_hits", 5);
     registry.register_histogram("latency_ns", 1_000);
     registry
-        .observe_histogram("latency_ns", 250)
+        .observe_histogram("latency_ns", 250.0)
         .expect("hist registered");
     let snapshot = registry.snapshot();
     assert!(snapshot.counters.contains_key("clustor.cp.cache_hits"));
@@ -132,4 +132,31 @@ fn recovery_status_emits_truncation_metric() {
     status.record_metrics(&mut registry);
     let snapshot = registry.snapshot();
     assert_eq!(snapshot.gauges["clustor.wal.recovery_truncated_bytes"], 256);
+}
+
+#[test]
+fn telemetry_checkpoint_metric_snapshot_serializes_counts() {
+    let mut registry = MetricsRegistry::new("clustor");
+    registry.register_golden_histograms();
+    registry.inc_counter("cp.cache_hits", 9);
+    registry.set_gauge("flow.ready_partitions", 4);
+    registry
+        .observe_histogram("clustor.wal.fsync_latency_ms", 3.0)
+        .expect("histogram registered");
+    let snapshot = registry.snapshot();
+    let json = serde_json::to_value(&snapshot).expect("snapshot serializes");
+    assert_eq!(
+        json["gauges"]["clustor.flow.ready_partitions"],
+        serde_json::json!(4)
+    );
+    assert_eq!(
+        json["counters"]["clustor.cp.cache_hits"],
+        serde_json::json!(9)
+    );
+    let histogram = json["histograms"]["clustor.wal.fsync_latency_ms"]
+        .as_array()
+        .expect("histogram counts");
+    assert!(histogram
+        .iter()
+        .any(|bucket| bucket.as_u64().unwrap_or(0) > 0));
 }

@@ -7,12 +7,14 @@ pub mod entry;
 pub mod guard;
 pub mod layout;
 pub mod replay;
+pub mod scrub;
 pub mod segment;
+pub mod wal;
 
 pub use compaction::{
-    CompactionBlockReason, CompactionDecision, CompactionGate, CompactionPlanRequest,
-    CompactionState, ManifestAuthorizationLog, ManifestGate, ManifestLogError, SegmentHealth,
-    SegmentSkipReason, SnapshotAuthorizationRecord,
+    authorization_chain_hash, CompactionBlockReason, CompactionDecision, CompactionGate,
+    CompactionPlanRequest, CompactionState, ManifestAuthorizationLog, ManifestGate,
+    ManifestLogError, SegmentHealth, SegmentSkipReason, SnapshotAuthorizationRecord,
 };
 pub use crypto::{
     CryptoError, DataEncryptionKey, KeyEpoch, KeyEpochError, KeyEpochTracker, NonceLedgerConfig,
@@ -28,4 +30,6 @@ pub use layout::{
     StorageState,
 };
 pub use replay::{WalReplayError, WalReplayResult, WalReplayScanner, WalTruncation};
+pub use scrub::{ScrubTelemetry, StartupScrubEngine, StartupScrubReport};
 pub use segment::{SegmentHandle, SegmentManager, SegmentPosition};
+pub use wal::{WalAppendResult, WalReservation, WalWriter, WalWriterError};

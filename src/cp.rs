@@ -1,11 +1,13 @@
 pub mod client;
 
 use crate::consensus::{
-    ConsensusCore, ConsensusCoreStatus, DurabilityProof, GateOperation,
-    StrictFallbackBlockingReason, StrictFallbackState, StrictFallbackWhy,
+    ConsensusCore, ConsensusCoreStateSnapshot, ConsensusCoreStatus, DurabilityProof, GateOperation,
+    GateViolation, StrictFallbackBlockingReason, StrictFallbackMetricsPublisher,
+    StrictFallbackState, StrictFallbackWhy,
 };
 use crate::durability::recovery::RecoveryStatus;
 use crate::profile::PartitionProfile;
+use crate::read_index::{ReadGateClause, ReadGateEvaluator, ReadGateInputs, ReadGateTelemetry};
 use crate::telemetry::MetricsRegistry;
 use log::{info, warn};
 use serde::Serialize;
@@ -16,14 +18,18 @@ const CP_CACHE_SPEC: &str = "§11.ControlPlaneCache";
 const READ_INDEX_SPEC: &str = "§3.3.ReadIndex";
 const ADMIN_GUARD_SPEC: &str = "§13.AdminAPI";
 const SNAPSHOT_IMPORT_SPEC: &str = "§8.SnapshotImport";
+const STRICT_GATE_SPEC_CP: &str = "§0.5.StrictFallbackGate";
 
 pub struct CpProofCoordinator {
     kernel: ConsensusCore,
     retry_after_ms: u64,
     cache_state: CpCacheState,
+    cache_warning_ms_remaining: Option<u64>,
     cache_policy: CpCachePolicy,
     last_publish_at: Option<Instant>,
     last_snapshot_import: Option<StrictFallbackSnapshotImportRecord>,
+    strict_metrics: StrictFallbackMetricsPublisher,
+    read_gate_status: ReadGateTelemetry,
 }
 
 impl CpProofCoordinator {
@@ -32,9 +38,12 @@ impl CpProofCoordinator {
             kernel,
             retry_after_ms: 250,
             cache_state: CpCacheState::Fresh,
+            cache_warning_ms_remaining: None,
             cache_policy: CpCachePolicy::default(),
             last_publish_at: None,
             last_snapshot_import: None,
+            strict_metrics: StrictFallbackMetricsPublisher::new(),
+            read_gate_status: ReadGateTelemetry::blocked(ReadGateClause::StrictFallback),
         }
     }
 
@@ -62,12 +71,16 @@ impl CpProofCoordinator {
         self.kernel.mark_proof_published(proof);
         let previous = self.cache_state;
         self.cache_state = CpCacheState::Fresh;
+        self.cache_warning_ms_remaining = None;
         self.log_cache_transition(previous, "cp_proof_published");
     }
 
     pub fn set_cache_state(&mut self, state: CpCacheState) {
         let previous = self.cache_state;
         self.cache_state = state;
+        self.cache_warning_ms_remaining = state
+            .age_ms()
+            .and_then(|age| self.cache_policy.warning_ms_remaining(age));
         self.log_cache_transition(previous, "manual_override");
     }
 
@@ -77,13 +90,26 @@ impl CpProofCoordinator {
         policy: &CpCachePolicy,
     ) -> CpCacheState {
         let previous = self.cache_state;
-        if cache_age_ms >= policy.ttl_ms() {
-            self.cache_state = CpCacheState::Expired;
+        let half_grace = policy.cache_grace_ms() / 2;
+        let state = if cache_age_ms <= policy.cache_fresh_ms() {
+            CpCacheState::Fresh
+        } else if cache_age_ms <= half_grace {
+            CpCacheState::Cached {
+                age_ms: cache_age_ms,
+            }
+        } else if cache_age_ms < policy.cache_grace_ms() {
+            CpCacheState::Stale {
+                age_ms: cache_age_ms,
+            }
         } else {
-            self.cache_state = CpCacheState::Fresh;
-        }
-        self.log_cache_transition(previous, "ttl_policy");
-        self.cache_state
+            CpCacheState::Expired {
+                age_ms: cache_age_ms,
+            }
+        };
+        self.cache_state = state;
+        self.cache_warning_ms_remaining = policy.warning_ms_remaining(cache_age_ms);
+        self.log_cache_transition(previous, "cache_policy");
+        state
     }
 
     pub fn refresh_cache_state(&mut self, now: Instant) -> CpCacheState {
@@ -97,9 +123,10 @@ impl CpProofCoordinator {
 
     pub fn guard_read_index(&mut self, now: Instant) -> Result<(), ReadIndexError> {
         self.refresh_cache_state(now);
-        if matches!(self.cache_state, CpCacheState::Expired) {
+        if matches!(self.cache_state, CpCacheState::Expired { .. }) {
             self.kernel
                 .record_blocking_reason(StrictFallbackBlockingReason::CacheExpired);
+            self.read_gate_status = ReadGateTelemetry::blocked(ReadGateClause::CacheNotFresh);
             warn!(
                 "event=read_index_guard clause={} outcome=cache_expired retry_after_ms={} cache_state={:?}",
                 READ_INDEX_SPEC,
@@ -114,13 +141,31 @@ impl CpProofCoordinator {
             )));
         }
 
+        if matches!(self.cache_state, CpCacheState::Stale { .. }) {
+            self.kernel
+                .record_blocking_reason(StrictFallbackBlockingReason::NeededForReadIndex);
+            self.read_gate_status = ReadGateTelemetry::blocked(ReadGateClause::CacheNotFresh);
+            warn!(
+                "event=read_index_guard clause={} outcome=cache_not_fresh state={:?}",
+                READ_INDEX_SPEC, self.cache_state
+            );
+            return Err(ReadIndexError::needed_for_read_index(self.build_response(
+                CpUnavailableReason::NeededForReadIndex,
+                None,
+                None,
+                None,
+            )));
+        }
+
         let evaluation = self.kernel.evaluate_gate(GateOperation::ReadIndex);
         if evaluation.allowed {
+            self.read_gate_status = ReadGateTelemetry::allowed();
             return Ok(());
         }
 
         self.kernel.record_gate_block(&evaluation);
         let explanation = self.kernel.explain_gate(&evaluation, now);
+        self.read_gate_status = ReadGateTelemetry::blocked(ReadGateClause::StrictFallback);
         warn!(
             "event=read_index_guard clause={} outcome=strict_fallback_block operation={:?} cache_state={:?}",
             READ_INDEX_SPEC,
@@ -160,12 +205,47 @@ impl CpProofCoordinator {
                 )));
             }
         }
-        Ok(ReadIndexPermit { quorum_index })
+        Ok(ReadIndexPermit {
+            quorum_index,
+            last_published_proof: self.kernel.last_published_proof(),
+            cache_state: self.cache_state,
+        })
+    }
+
+    pub fn evaluate_read_index_permit(
+        &mut self,
+        inputs: ReadGateInputs,
+        now: Instant,
+    ) -> Result<ReadIndexPermit, ReadIndexError> {
+        self.guard_read_index(now)?;
+        let evaluation = ReadGateEvaluator::evaluate(
+            self.kernel.is_strict_fallback(),
+            matches!(self.cache_state, CpCacheState::Fresh),
+            self.kernel.last_local_proof(),
+            self.kernel.last_published_proof(),
+            &inputs,
+        );
+        self.read_gate_status = evaluation.telemetry;
+        if evaluation.allowed {
+            Ok(ReadIndexPermit {
+                quorum_index: inputs.raft_commit_index,
+                last_published_proof: self.kernel.last_published_proof(),
+                cache_state: self.cache_state,
+            })
+        } else {
+            let clause = evaluation
+                .failed_clause
+                .unwrap_or(ReadGateClause::StrictFallback);
+            self.kernel
+                .record_blocking_reason(StrictFallbackBlockingReason::NeededForReadIndex);
+            let response = self.build_read_gate_response(clause, &inputs);
+            Err(ReadIndexError::needed_for_read_index(response))
+        }
     }
 
     pub fn guard_admin(&mut self, now: Instant) -> Result<(), AdminGuardError> {
         self.refresh_cache_state(now);
-        if matches!(self.cache_state, CpCacheState::Expired) {
+        if matches!(self.cache_state, CpCacheState::Expired { .. }) {
             self.kernel
                 .record_blocking_reason(StrictFallbackBlockingReason::CacheExpired);
             warn!(
@@ -179,25 +259,31 @@ impl CpProofCoordinator {
                 None,
             )));
         }
-        if self.kernel.is_strict_fallback() {
-            self.kernel
-                .record_blocking_reason(StrictFallbackBlockingReason::NeededForReadIndex);
-            warn!(
-                "event=admin_guard clause={} outcome=strict_fallback_block cache_state={:?}",
-                ADMIN_GUARD_SPEC, self.cache_state
-            );
-            return Err(AdminGuardError::needed_for_read_index(self.build_response(
-                CpUnavailableReason::NeededForReadIndex,
-                None,
-                None,
-                None,
-            )));
-        }
         Ok(())
+    }
+
+    pub fn guard_durability_transition(&mut self, now: Instant) -> CpGuardResult<()> {
+        self.guard_strict_operation(GateOperation::EnableGroupFsync, now)
+    }
+
+    pub fn guard_lease_enable(&mut self, now: Instant) -> CpGuardResult<()> {
+        self.guard_strict_operation(GateOperation::EnableLeaseReads, now)
+    }
+
+    pub fn guard_follower_capability_grant(&mut self, now: Instant) -> CpGuardResult<()> {
+        self.guard_strict_operation(GateOperation::GrantFollowerReadSnapshotCapability, now)
+    }
+
+    pub fn guard_snapshot_delta_enable(&mut self, now: Instant) -> CpGuardResult<()> {
+        self.guard_strict_operation(GateOperation::EnableSnapshotDelta, now)
     }
 
     pub fn consensus_core_status(&self, now: Instant) -> ConsensusCoreStatus {
         self.kernel.status(now)
+    }
+
+    pub fn consensus_core_state(&self) -> ConsensusCoreStateSnapshot {
+        self.kernel.snapshot_state()
     }
 
     pub fn consensus_core(&self) -> &ConsensusCore {
@@ -211,6 +297,29 @@ impl CpProofCoordinator {
     pub fn publish_cache_metrics(&self, registry: &mut MetricsRegistry, now: Instant) {
         let age = self.cache_age_ms(now).unwrap_or(0);
         registry.set_gauge("cp.cache_age_ms", age);
+    }
+
+    pub fn record_cache_refresh(&mut self, now: Instant) {
+        let previous = self.cache_state;
+        self.last_publish_at = Some(now);
+        self.cache_state = CpCacheState::Fresh;
+        self.cache_warning_ms_remaining = None;
+        self.log_cache_transition(previous, "cache_refresh");
+    }
+
+    pub fn cache_refresh_due(&self, now: Instant) -> bool {
+        self.cache_age_ms(now)
+            .map(|age| age >= self.cache_policy.cache_warn_ms())
+            .unwrap_or(false)
+    }
+
+    pub fn publish_strict_fallback_metrics(
+        &mut self,
+        registry: &mut MetricsRegistry,
+        now: Instant,
+    ) {
+        let telemetry = self.kernel.telemetry(now);
+        self.strict_metrics.publish(registry, &telemetry);
     }
 
     pub fn cache_age_ms(&self, now: Instant) -> Option<u64> {
@@ -242,7 +351,7 @@ impl CpProofCoordinator {
             return Err(StrictFallbackSnapshotImportError::StateNotLocalOnly { state });
         }
         self.refresh_cache_state(now);
-        if matches!(self.cache_state, CpCacheState::Expired) {
+        if matches!(self.cache_state, CpCacheState::Expired { .. }) {
             self.kernel
                 .record_blocking_reason(StrictFallbackBlockingReason::CacheExpired);
             warn!(
@@ -272,6 +381,33 @@ impl CpProofCoordinator {
         self.last_snapshot_import.as_ref()
     }
 
+    pub fn read_gate_status(&self) -> ReadGateTelemetry {
+        self.read_gate_status
+    }
+
+    pub fn publish_read_gate_metrics(&self, metrics: &mut MetricsRegistry) {
+        metrics.set_gauge(
+            "cp.read_gate.can_serve_readindex",
+            if self.read_gate_status.can_serve {
+                1
+            } else {
+                0
+            },
+        );
+        metrics.set_gauge(
+            "cp.read_gate.failed_clause_id",
+            self.read_gate_status.clause_metric(),
+        );
+        metrics.set_gauge(
+            "cp.read_gate.failed_clause_present",
+            if self.read_gate_status.failed_clause.is_some() {
+                1
+            } else {
+                0
+            },
+        );
+    }
+
     fn build_response(
         &self,
         reason: CpUnavailableReason,
@@ -285,13 +421,34 @@ impl CpProofCoordinator {
             strict_state: self.kernel.state(),
             last_local_proof: self.kernel.last_local_proof(),
             pending_entries: self.kernel.pending_entries(),
-            cache_warning_ms_remaining: self.cache_state.warning_ms(),
+            cache_warning_ms_remaining: self.cache_warning_ms_remaining,
             explanation,
             ledger_index,
             required_index,
             decision_epoch: self.kernel.decision_epoch(),
             strict_fallback_blocking_reason: self.kernel.blocking_reason(),
         }
+    }
+
+    fn build_read_gate_response(
+        &self,
+        clause: ReadGateClause,
+        inputs: &ReadGateInputs,
+    ) -> CpUnavailableResponse {
+        let (ledger, required) = if matches!(clause, ReadGateClause::IndexInequality) {
+            (
+                Some(inputs.wal_committed_index),
+                Some(inputs.raft_commit_index),
+            )
+        } else {
+            (None, None)
+        };
+        self.build_response(
+            CpUnavailableReason::NeededForReadIndex,
+            None,
+            ledger,
+            required,
+        )
     }
 
     fn log_cache_transition(&self, previous: CpCacheState, reason: &str) {
@@ -306,46 +463,141 @@ impl CpProofCoordinator {
             );
         }
     }
+
+    fn guard_strict_operation(
+        &mut self,
+        operation: GateOperation,
+        now: Instant,
+    ) -> CpGuardResult<()> {
+        self.refresh_cache_state(now);
+        if matches!(self.cache_state, CpCacheState::Expired { .. }) {
+            self.kernel
+                .record_blocking_reason(StrictFallbackBlockingReason::CacheExpired);
+            warn!(
+                "event=strict_gate clause={} operation={:?} outcome=cache_expired decision_epoch={}",
+                STRICT_GATE_SPEC_CP,
+                operation,
+                self.kernel.decision_epoch()
+            );
+            return Err(Box::new(self.build_response(
+                CpUnavailableReason::CacheExpired,
+                None,
+                None,
+                None,
+            )));
+        }
+
+        let evaluation = self.kernel.evaluate_gate(operation);
+        if evaluation.allowed {
+            return Ok(());
+        }
+
+        self.kernel.record_gate_block(&evaluation);
+        let violation = evaluation
+            .violation
+            .expect("blocked strict-fallback gate must include violation");
+        let reason = match violation {
+            GateViolation::CpUnavailableCacheExpired => CpUnavailableReason::CacheExpired,
+            _ => CpUnavailableReason::NeededForReadIndex,
+        };
+        warn!(
+            "event=strict_gate clause={} operation={:?} violation={:?} reason={:?} decision_epoch={}",
+            STRICT_GATE_SPEC_CP,
+            operation,
+            violation,
+            reason,
+            self.kernel.decision_epoch()
+        );
+        Err(Box::new(self.build_response(
+            reason,
+            self.kernel.explain_gate(&evaluation, now),
+            None,
+            None,
+        )))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum CpCacheState {
     Fresh,
-    Warning { ms_remaining: u64 },
-    Expired,
+    Cached { age_ms: u64 },
+    Stale { age_ms: u64 },
+    Expired { age_ms: u64 },
 }
 
 impl CpCacheState {
-    pub fn warning_ms(&self) -> Option<u64> {
+    fn age_ms(&self) -> Option<u64> {
         match self {
-            CpCacheState::Warning { ms_remaining } => Some(*ms_remaining),
-            _ => None,
+            CpCacheState::Fresh => None,
+            CpCacheState::Cached { age_ms }
+            | CpCacheState::Stale { age_ms }
+            | CpCacheState::Expired { age_ms } => Some(*age_ms),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct CpCachePolicy {
-    ttl_ms: u64,
+    proof_ttl_ms: u64,
+    cache_fresh_ms: u64,
+    cache_warn_ms: u64,
+    cache_grace_ms: u64,
 }
 
 impl CpCachePolicy {
-    pub fn new(ttl_ms: u64) -> Self {
-        Self { ttl_ms }
+    pub fn new(proof_ttl_ms: u64) -> Self {
+        let cache_grace_ms = 300_000u64;
+        let cache_warn_ms =
+            ((3 * cache_grace_ms) / 4).max(cache_grace_ms.saturating_sub(60_000u64));
+        Self {
+            proof_ttl_ms,
+            cache_fresh_ms: 60_000,
+            cache_warn_ms,
+            cache_grace_ms,
+        }
     }
 
     pub fn for_profile(profile: PartitionProfile) -> Self {
         Self::new(profile.config().cp_durability_proof_ttl_ms)
     }
 
-    pub fn ttl_ms(&self) -> u64 {
-        self.ttl_ms
+    pub fn with_cache_windows(mut self, fresh_ms: u64, grace_ms: u64) -> Self {
+        self.cache_fresh_ms = fresh_ms.min(grace_ms);
+        self.cache_grace_ms = grace_ms;
+        self.cache_warn_ms = ((3 * grace_ms) / 4).max(grace_ms.saturating_sub(60_000u64));
+        self
+    }
+
+    pub fn proof_ttl_ms(&self) -> u64 {
+        self.proof_ttl_ms
+    }
+
+    pub fn cache_fresh_ms(&self) -> u64 {
+        self.cache_fresh_ms
+    }
+
+    pub fn cache_warn_ms(&self) -> u64 {
+        self.cache_warn_ms
+    }
+
+    pub fn cache_grace_ms(&self) -> u64 {
+        self.cache_grace_ms
+    }
+
+    pub fn warning_ms_remaining(&self, age_ms: u64) -> Option<u64> {
+        if age_ms >= self.cache_grace_ms {
+            Some(0)
+        } else if age_ms >= self.cache_warn_ms {
+            Some(self.cache_grace_ms.saturating_sub(age_ms))
+        } else {
+            None
+        }
     }
 }
 
 impl Default for CpCachePolicy {
     fn default() -> Self {
-        Self::new(300_000)
+        Self::new(43_200_000)
     }
 }
 
@@ -369,6 +621,8 @@ pub struct CpUnavailableResponse {
     pub decision_epoch: u64,
     pub strict_fallback_blocking_reason: Option<StrictFallbackBlockingReason>,
 }
+
+pub type CpGuardResult<T = ()> = Result<T, Box<CpUnavailableResponse>>;
 
 const MAX_SNAPSHOT_IMPORT_REASON_LEN: usize = 64;
 
@@ -447,12 +701,6 @@ pub struct AdminGuardError {
 }
 
 impl AdminGuardError {
-    fn needed_for_read_index(response: CpUnavailableResponse) -> Self {
-        Self {
-            response: Box::new(response),
-        }
-    }
-
     fn cache_expired(response: CpUnavailableResponse) -> Self {
         Self {
             response: Box::new(response),
@@ -471,6 +719,7 @@ mod tests {
         ConsensusCore, ConsensusCoreConfig, DurabilityProof, StrictFallbackState,
     };
     use crate::telemetry::MetricsRegistry;
+    use crate::CommitVisibility;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -503,12 +752,94 @@ mod tests {
     }
 
     #[test]
+    fn read_index_permit_requires_predicate() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let mut coordinator = CpProofCoordinator::new(kernel);
+        let now = Instant::now();
+        coordinator.load_local_ledger(DurabilityProof::new(2, 20), now);
+        coordinator
+            .publish_cp_proof_at(DurabilityProof::new(2, 20), now + Duration::from_millis(1));
+        let inputs = ReadGateInputs {
+            commit_visibility: CommitVisibility::DurableOnly,
+            wal_committed_index: 20,
+            raft_commit_index: 20,
+        };
+        let permit = coordinator
+            .evaluate_read_index_permit(inputs, now + Duration::from_millis(2))
+            .expect("predicate should pass");
+        assert_eq!(permit.quorum_index, 20);
+        assert!(coordinator.read_gate_status().can_serve);
+    }
+
+    #[test]
+    fn read_gate_reports_failed_clause() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let mut coordinator = CpProofCoordinator::new(kernel);
+        let now = Instant::now();
+        coordinator.load_local_ledger(DurabilityProof::new(3, 30), now);
+        coordinator
+            .publish_cp_proof_at(DurabilityProof::new(3, 30), now + Duration::from_millis(1));
+        let inputs = ReadGateInputs {
+            commit_visibility: CommitVisibility::CommitAllowsPreDurable,
+            wal_committed_index: 30,
+            raft_commit_index: 30,
+        };
+        let err = coordinator
+            .evaluate_read_index_permit(inputs, now + Duration::from_millis(2))
+            .expect_err("predicate should reject");
+        assert_eq!(err.response.reason, CpUnavailableReason::NeededForReadIndex);
+        assert_eq!(
+            coordinator.read_gate_status().failed_clause,
+            Some(ReadGateClause::CommitVisibility)
+        );
+    }
+
+    #[test]
+    fn read_gate_surfaces_index_gap() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let mut coordinator = CpProofCoordinator::new(kernel);
+        let now = Instant::now();
+        coordinator.load_local_ledger(DurabilityProof::new(4, 40), now);
+        coordinator
+            .publish_cp_proof_at(DurabilityProof::new(4, 40), now + Duration::from_millis(1));
+        let inputs = ReadGateInputs {
+            commit_visibility: CommitVisibility::DurableOnly,
+            wal_committed_index: 39,
+            raft_commit_index: 40,
+        };
+        let err = coordinator
+            .evaluate_read_index_permit(inputs, now + Duration::from_millis(2))
+            .expect_err("index gap should block");
+        assert_eq!(err.response.ledger_index, Some(39));
+        assert_eq!(err.response.required_index, Some(40));
+        assert_eq!(
+            coordinator.read_gate_status().failed_clause,
+            Some(ReadGateClause::IndexInequality)
+        );
+    }
+
+    #[test]
+    fn read_gate_metrics_publish_status() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let coordinator = CpProofCoordinator::new(kernel);
+        let mut registry = MetricsRegistry::new("clustor");
+        coordinator.publish_read_gate_metrics(&mut registry);
+        let snapshot = registry.snapshot();
+        assert_eq!(
+            snapshot
+                .gauges
+                .get("clustor.cp.read_gate.failed_clause_present"),
+            Some(&1)
+        );
+    }
+
+    #[test]
     fn cache_expiry_forces_cp_unavailable() {
         let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
         let mut coordinator = CpProofCoordinator::new(kernel);
         let now = Instant::now();
         coordinator.load_local_ledger(DurabilityProof::new(1, 5), now);
-        coordinator.set_cache_state(CpCacheState::Expired);
+        coordinator.set_cache_state(CpCacheState::Expired { age_ms: 400_000 });
 
         let err = coordinator
             .guard_read_index(now)
@@ -521,9 +852,7 @@ mod tests {
         );
         assert_eq!(err.response.decision_epoch, 1);
 
-        coordinator.set_cache_state(CpCacheState::Warning {
-            ms_remaining: 30_000,
-        });
+        coordinator.set_cache_state(CpCacheState::Stale { age_ms: 270_000 });
         coordinator.load_local_ledger(DurabilityProof::new(2, 20), now);
         let err = coordinator
             .guard_read_index(now)
@@ -568,16 +897,109 @@ mod tests {
     #[test]
     fn proof_ttl_enforces_cache_expiry_and_metrics() {
         let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
-        let mut coordinator =
-            CpProofCoordinator::new(kernel).with_cache_policy(CpCachePolicy::new(1_000));
+        let policy = CpCachePolicy::new(1_000).with_cache_windows(100, 500);
+        let mut coordinator = CpProofCoordinator::new(kernel).with_cache_policy(policy);
         let now = Instant::now();
         coordinator.publish_cp_proof_at(DurabilityProof::new(5, 50), now);
         let mut registry = MetricsRegistry::new("clustor");
         coordinator.publish_cache_metrics(&mut registry, now + Duration::from_millis(600));
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.gauges["clustor.cp.cache_age_ms"], 600);
-        let state = coordinator.refresh_cache_state(now + Duration::from_millis(2_000));
-        assert!(matches!(state, CpCacheState::Expired));
+        let state = coordinator.refresh_cache_state(now + Duration::from_millis(600));
+        assert!(matches!(state, CpCacheState::Expired { .. }));
+    }
+
+    #[test]
+    fn strict_fallback_metrics_publish_through_coordinator() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let mut coordinator = CpProofCoordinator::new(kernel);
+        let mut registry = MetricsRegistry::new("clustor");
+        let now = Instant::now();
+        coordinator.load_local_ledger(DurabilityProof::new(8, 80), now);
+        coordinator.consensus_core_mut().register_strict_write();
+        coordinator.publish_strict_fallback_metrics(&mut registry, now + Duration::from_millis(1));
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.gauges["clustor.strict_fallback_state"], 1);
+        assert_eq!(
+            snapshot.gauges["clustor.strict_fallback_pending_entries"],
+            1
+        );
+        assert_eq!(snapshot.gauges["clustor.strict_fallback_decision_epoch"], 1);
+        assert_eq!(
+            snapshot.gauges["clustor.strict_fallback_blocking_reason.None"],
+            1
+        );
+    }
+
+    #[test]
+    fn cache_refresh_due_follows_warning_window() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let policy = CpCachePolicy::new(1_000).with_cache_windows(100, 800);
+        let mut coordinator = CpProofCoordinator::new(kernel).with_cache_policy(policy);
+        let now = Instant::now();
+        coordinator.publish_cp_proof_at(DurabilityProof::new(9, 90), now);
+        assert!(
+            !coordinator.cache_refresh_due(now + Duration::from_millis(200)),
+            "warn threshold should not trigger early"
+        );
+        let warn_time = now + Duration::from_millis(650);
+        assert!(
+            coordinator.cache_refresh_due(warn_time),
+            "warning should fire after cache_warn_ms"
+        );
+        coordinator.record_cache_refresh(warn_time);
+        assert!(
+            !coordinator.cache_refresh_due(warn_time + Duration::from_millis(10)),
+            "manual refresh resets warning window"
+        );
+    }
+
+    #[test]
+    fn read_index_permit_exposes_proof_and_cache_state() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let mut coordinator = CpProofCoordinator::new(kernel);
+        let now = Instant::now();
+        coordinator.load_local_ledger(DurabilityProof::new(12, 120), now);
+        coordinator.publish_cp_proof_at(DurabilityProof::new(12, 120), now);
+        let permit = coordinator
+            .guard_read_index_with_quorum(120, now + Duration::from_millis(1))
+            .expect("permit should be granted");
+        assert_eq!(permit.quorum_index, 120);
+        assert_eq!(
+            permit.last_published_proof,
+            Some(DurabilityProof::new(12, 120))
+        );
+        assert!(matches!(permit.cache_state, CpCacheState::Fresh));
+    }
+
+    #[test]
+    fn read_gate_errors_track_cache_transitions() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let policy = CpCachePolicy::new(1_000).with_cache_windows(100, 500);
+        let mut coordinator = CpProofCoordinator::new(kernel).with_cache_policy(policy);
+        let now = Instant::now();
+        coordinator.load_local_ledger(DurabilityProof::new(4, 40), now);
+
+        let err = coordinator
+            .guard_read_index(now + Duration::from_millis(1))
+            .expect_err("LocalOnly blocks read index");
+        assert_eq!(err.response.reason, CpUnavailableReason::NeededForReadIndex);
+
+        coordinator.publish_cp_proof_at(DurabilityProof::new(4, 40), now);
+        assert!(coordinator
+            .guard_read_index(now + Duration::from_millis(2))
+            .is_ok());
+
+        let expired_at = now + Duration::from_millis(600);
+        let err = coordinator
+            .guard_read_index(expired_at)
+            .expect_err("expired cache blocks read index");
+        assert_eq!(err.response.reason, CpUnavailableReason::CacheExpired);
+
+        coordinator.record_cache_refresh(expired_at);
+        assert!(coordinator
+            .guard_read_index(expired_at + Duration::from_millis(1))
+            .is_ok());
     }
 
     #[test]
@@ -623,7 +1045,7 @@ mod tests {
         let mut coordinator = CpProofCoordinator::new(kernel);
         let now = Instant::now();
         coordinator.load_local_ledger(DurabilityProof::new(1, 1), now);
-        coordinator.set_cache_state(CpCacheState::Expired);
+        coordinator.set_cache_state(CpCacheState::Expired { age_ms: 400_000 });
 
         let err = coordinator
             .authorize_snapshot_import(
@@ -657,9 +1079,100 @@ mod tests {
             coordinator.cache_age_ms(now + Duration::from_millis(5))
         );
     }
+
+    #[test]
+    fn durability_transition_guard_tracks_strict_state() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let mut coordinator = CpProofCoordinator::new(kernel);
+        let now = Instant::now();
+        coordinator.load_local_ledger(DurabilityProof::new(5, 50), now);
+
+        let err = coordinator
+            .guard_durability_transition(now + Duration::from_millis(1))
+            .expect_err("group fsync should be gated");
+        assert_eq!(err.reason, CpUnavailableReason::NeededForReadIndex);
+        assert_eq!(err.strict_state, StrictFallbackState::LocalOnly);
+        assert!(err.explanation.is_some());
+
+        coordinator
+            .publish_cp_proof_at(DurabilityProof::new(5, 50), now + Duration::from_millis(2));
+        assert!(coordinator
+            .guard_durability_transition(now + Duration::from_millis(3))
+            .is_ok());
+    }
+
+    #[test]
+    fn lease_enable_guard_respects_cache_and_strict_states() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let policy = CpCachePolicy::new(1_000).with_cache_windows(100, 1_000);
+        let mut coordinator = CpProofCoordinator::new(kernel).with_cache_policy(policy);
+        let now = Instant::now();
+        coordinator.load_local_ledger(DurabilityProof::new(7, 70), now);
+
+        let err = coordinator
+            .guard_lease_enable(now + Duration::from_millis(1))
+            .expect_err("leases blocked while LocalOnly");
+        assert_eq!(err.reason, CpUnavailableReason::NeededForReadIndex);
+
+        coordinator
+            .publish_cp_proof_at(DurabilityProof::new(7, 70), now + Duration::from_millis(2));
+        let expired_state = coordinator.refresh_cache_state(now + Duration::from_millis(1_200));
+        assert!(matches!(expired_state, CpCacheState::Expired { .. }));
+        let err = coordinator
+            .guard_lease_enable(now + Duration::from_millis(1_200))
+            .expect_err("expired cache blocks leases");
+        assert_eq!(err.reason, CpUnavailableReason::CacheExpired);
+    }
+
+    #[test]
+    fn strict_fallback_scenario_matches_gate_table() {
+        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let mut coordinator = CpProofCoordinator::new(kernel);
+        let now = Instant::now();
+        coordinator.load_local_ledger(DurabilityProof::new(11, 110), now);
+
+        let group = coordinator
+            .guard_durability_transition(now + Duration::from_millis(1))
+            .expect_err("group fsync blocked while LocalOnly");
+        assert_eq!(group.reason, CpUnavailableReason::NeededForReadIndex);
+
+        let lease = coordinator
+            .guard_lease_enable(now + Duration::from_millis(1))
+            .expect_err("leases blocked while LocalOnly");
+        assert_eq!(lease.reason, CpUnavailableReason::NeededForReadIndex);
+
+        let follower = coordinator
+            .guard_follower_capability_grant(now + Duration::from_millis(1))
+            .expect_err("follower capability blocked while LocalOnly");
+        assert_eq!(follower.reason, CpUnavailableReason::NeededForReadIndex);
+
+        let delta = coordinator
+            .guard_snapshot_delta_enable(now + Duration::from_millis(1))
+            .expect_err("snapshot delta blocked while LocalOnly");
+        assert_eq!(delta.reason, CpUnavailableReason::CacheExpired);
+
+        coordinator.publish_cp_proof_at(
+            DurabilityProof::new(11, 110),
+            now + Duration::from_millis(2),
+        );
+
+        type StrictGuardFn = fn(&mut CpProofCoordinator, Instant) -> CpGuardResult<()>;
+        let mut validators: [StrictGuardFn; 4] = [
+            CpProofCoordinator::guard_durability_transition,
+            CpProofCoordinator::guard_lease_enable,
+            CpProofCoordinator::guard_follower_capability_grant,
+            CpProofCoordinator::guard_snapshot_delta_enable,
+        ];
+        for guard in validators.iter_mut() {
+            (guard)(&mut coordinator, now + Duration::from_millis(3))
+                .expect("gate should clear after proof published");
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReadIndexPermit {
     pub quorum_index: u64,
+    pub last_published_proof: Option<DurabilityProof>,
+    pub cache_state: CpCacheState,
 }

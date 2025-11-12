@@ -3,8 +3,22 @@ use crate::raft::rpc::{AppendEntriesRequest, AppendEntriesResponse};
 use log::warn;
 
 /// Applies AppendEntries RPCs to a `RaftLogStore`, enforcing log matching and truncation rules.
+#[derive(Debug)]
 pub struct AppendEntriesProcessor<'a> {
     log: &'a mut RaftLogStore,
+}
+
+#[derive(Debug)]
+pub struct AppendEntriesCoordinator<'a> {
+    processor: AppendEntriesProcessor<'a>,
+    wal_cursor: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppendEntriesReport {
+    pub outcome: AppendEntriesOutcome,
+    pub previous_wal_index: u64,
+    pub current_wal_index: u64,
 }
 
 const RAFT_SPEC_CLAUSE: &str = "§3.1.LogMatching";
@@ -75,6 +89,56 @@ impl<'a> AppendEntriesProcessor<'a> {
             .map(|entry| entry.index)
             .unwrap_or(request.prev_log_index);
         Ok(AppendEntriesOutcome::success(match_index))
+    }
+}
+
+impl<'a> AppendEntriesCoordinator<'a> {
+    pub fn new(log: &'a mut RaftLogStore) -> Self {
+        let cursor = log.last_index();
+        Self {
+            processor: AppendEntriesProcessor::new(log),
+            wal_cursor: cursor,
+        }
+    }
+
+    pub fn apply(
+        &mut self,
+        request: &AppendEntriesRequest,
+    ) -> Result<AppendEntriesReport, RaftLogError> {
+        let outcome = self.processor.apply(request)?;
+        let previous = self.wal_cursor;
+        if outcome.success {
+            self.wal_cursor = outcome.match_index;
+        }
+        Ok(AppendEntriesReport {
+            outcome,
+            previous_wal_index: previous,
+            current_wal_index: self.wal_cursor,
+        })
+    }
+
+    pub fn wal_cursor(&self) -> u64 {
+        self.wal_cursor
+    }
+}
+
+impl AppendEntriesReport {
+    pub fn conflict(&self) -> Option<(u64, Option<u64>)> {
+        if self.outcome.success {
+            None
+        } else {
+            self.outcome
+                .conflict_index
+                .map(|idx| (idx, self.outcome.conflict_term))
+        }
+    }
+
+    pub fn success(&self) -> bool {
+        self.outcome.success
+    }
+
+    pub fn advanced(&self) -> bool {
+        self.success() && self.current_wal_index > self.previous_wal_index
     }
 }
 
@@ -234,5 +298,50 @@ mod tests {
             .unwrap();
         assert_eq!(flushed.len(), 2);
         assert!(batcher.flush().is_empty());
+    }
+
+    #[test]
+    fn coordinator_advances_cursor_on_success() {
+        let (_tmp, mut log) = store();
+        log.append(RaftLogEntry::new(1, 1, b"a".to_vec())).unwrap();
+        let mut coordinator = AppendEntriesCoordinator::new(&mut log);
+        assert_eq!(coordinator.wal_cursor(), 1);
+        let request = AppendEntriesRequest {
+            term: 2,
+            leader_id: "l".into(),
+            prev_log_index: 1,
+            prev_log_term: 1,
+            leader_commit: 1,
+            entries: vec![
+                RaftLogEntry::new(2, 2, b"b".to_vec()),
+                RaftLogEntry::new(2, 3, b"c".to_vec()),
+            ],
+        };
+        let report = coordinator.apply(&request).unwrap();
+        assert!(report.success());
+        assert!(report.advanced());
+        assert_eq!(report.previous_wal_index, 1);
+        assert_eq!(report.current_wal_index, 3);
+    }
+
+    #[test]
+    fn coordinator_preserves_cursor_on_conflict() {
+        let (_tmp, mut log) = store();
+        log.append(RaftLogEntry::new(1, 1, b"a".to_vec())).unwrap();
+        log.append(RaftLogEntry::new(2, 2, b"b".to_vec())).unwrap();
+        let mut coordinator = AppendEntriesCoordinator::new(&mut log);
+        let request = AppendEntriesRequest {
+            term: 3,
+            leader_id: "l".into(),
+            prev_log_index: 2,
+            prev_log_term: 1,
+            leader_commit: 2,
+            entries: vec![RaftLogEntry::new(3, 3, b"c".to_vec())],
+        };
+        let report = coordinator.apply(&request).unwrap();
+        assert!(!report.success());
+        assert_eq!(report.previous_wal_index, report.current_wal_index);
+        let conflict = report.conflict().expect("conflict expected");
+        assert_eq!(conflict.0, 2);
     }
 }

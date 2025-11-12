@@ -1,3 +1,4 @@
+use crate::durability::IoMode;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -62,6 +63,49 @@ pub struct StickinessTelemetry {
     pub consecutive_low: u32,
     pub leader_uptime_ms: u64,
     pub min_leader_term_ms: u64,
+}
+
+/// Helper that wires §3.2's stickiness predicate into the durability gate from §6.1 by forcing
+/// Strict mode whenever device latency overruns are observed.
+pub struct LeaderStickinessGate {
+    controller: LeaderStickinessController,
+    degraded: bool,
+}
+
+impl LeaderStickinessGate {
+    pub fn new(config: LeaderStickinessConfig, leader_since: Instant) -> Self {
+        Self {
+            controller: LeaderStickinessController::new(config, leader_since),
+            degraded: false,
+        }
+    }
+
+    pub fn reset_leader(&mut self, now: Instant) {
+        self.controller.reset_leader(now);
+        self.degraded = false;
+    }
+
+    pub fn record_fsync_sample(&mut self, sample: Duration, now: Instant) -> StickinessDecision {
+        let decision = self.controller.record_fsync_sample(sample, now);
+        self.degraded = self.controller.telemetry(now).degraded;
+        decision
+    }
+
+    pub fn degraded(&self) -> bool {
+        self.degraded
+    }
+
+    pub fn enforce_mode(&self, desired: IoMode) -> IoMode {
+        if self.degraded {
+            IoMode::Strict
+        } else {
+            desired
+        }
+    }
+
+    pub fn telemetry(&self, now: Instant) -> StickinessTelemetry {
+        self.controller.telemetry(now)
+    }
 }
 
 pub struct LeaderStickinessController {
@@ -168,6 +212,10 @@ impl LeaderStickinessController {
         }
     }
 
+    pub fn last_reason(&self) -> Option<LatencyGuardReason> {
+        self.last_reason
+    }
+
     fn moving_average(&self) -> Duration {
         if self.samples.is_empty() {
             return Duration::ZERO;
@@ -241,5 +289,45 @@ mod tests {
                 assert!(matches!(decision, StickinessDecision::Maintain));
             }
         }
+    }
+
+    #[test]
+    fn gate_forces_strict_mode_when_degraded() {
+        let now = Instant::now();
+        let mut gate = LeaderStickinessGate::new(LeaderStickinessConfig::default(), now);
+        for offset in 0..3 {
+            gate.record_fsync_sample(
+                Duration::from_millis(30),
+                now + Duration::from_millis(offset),
+            );
+        }
+        assert!(gate.degraded());
+        assert!(matches!(
+            gate.record_fsync_sample(Duration::from_millis(30), now + Duration::from_millis(10)),
+            StickinessDecision::PendingStepDown { .. }
+        ));
+        assert!(matches!(gate.enforce_mode(IoMode::Group), IoMode::Strict));
+    }
+
+    #[test]
+    fn gate_releases_strict_mode_after_recovery() {
+        let now = Instant::now();
+        let mut gate = LeaderStickinessGate::new(LeaderStickinessConfig::default(), now);
+        for offset in 0..3 {
+            gate.record_fsync_sample(
+                Duration::from_millis(30),
+                now + Duration::from_millis(offset),
+            );
+        }
+        assert!(gate.degraded());
+        gate.record_fsync_sample(Duration::from_millis(5), now + Duration::from_millis(100));
+        for offset in 0..5 {
+            gate.record_fsync_sample(
+                Duration::from_millis(5),
+                now + Duration::from_millis(150 + offset),
+            );
+        }
+        assert!(!gate.degraded());
+        assert!(matches!(gate.enforce_mode(IoMode::Group), IoMode::Group));
     }
 }

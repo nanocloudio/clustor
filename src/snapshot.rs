@@ -1,6 +1,7 @@
 use crate::consensus::StrictFallbackState;
 use crate::storage::{
-    DataEncryptionKey, ManifestAuthorizationLog, ManifestLogError, SnapshotAuthorizationRecord,
+    authorization_chain_hash, DataEncryptionKey, ManifestAuthorizationLog, ManifestLogError,
+    SnapshotAuthorizationRecord,
 };
 #[allow(deprecated)]
 use aes_gcm::aead::generic_array::GenericArray;
@@ -8,6 +9,7 @@ use aes_gcm::aead::{AeadCore, AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Key};
 use hmac::{Hmac, Mac};
 use log::{info, warn};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -16,6 +18,7 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -226,6 +229,130 @@ pub struct SnapshotExportTelemetry {
     pub backlog_bytes: u64,
 }
 
+const SNAPSHOT_LOG_BYTES_TARGET: u64 = 512 * 1024 * 1024;
+const SNAPSHOT_MAX_INTERVAL_MS: u64 = 15 * 60 * 1000;
+const SNAPSHOT_CATCHUP_THRESHOLD_BYTES: u64 = 64 * 1024 * 1024;
+const SNAPSHOT_IMPORT_NODE_FLOOR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum SnapshotTriggerReason {
+    LogBytes,
+    Interval,
+    FollowerLag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SnapshotTriggerDecision {
+    pub should_trigger: bool,
+    pub reason: Option<SnapshotTriggerReason>,
+    pub log_bytes: u64,
+    pub follower_lag_bytes: u64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SnapshotCadenceTelemetry {
+    pub log_bytes_target: u64,
+    pub catchup_threshold_bytes: u64,
+    pub last_snapshot_ms: u64,
+    pub idle_duration_ms: u64,
+    pub pending_reason: Option<SnapshotTriggerReason>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotTriggerConfig {
+    pub log_bytes_target: u64,
+    pub max_interval_ms: u64,
+    pub catchup_threshold_bytes: u64,
+}
+
+impl Default for SnapshotTriggerConfig {
+    fn default() -> Self {
+        Self {
+            log_bytes_target: SNAPSHOT_LOG_BYTES_TARGET,
+            max_interval_ms: SNAPSHOT_MAX_INTERVAL_MS,
+            catchup_threshold_bytes: SNAPSHOT_CATCHUP_THRESHOLD_BYTES,
+        }
+    }
+}
+
+impl SnapshotTriggerConfig {
+    pub fn new(log_bytes_target: u64, max_interval_ms: u64, catchup_threshold_bytes: u64) -> Self {
+        Self {
+            log_bytes_target,
+            max_interval_ms,
+            catchup_threshold_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SnapshotTrigger {
+    config: SnapshotTriggerConfig,
+    last_snapshot_ms: Option<u64>,
+    pending_reason: Option<SnapshotTriggerReason>,
+}
+
+impl SnapshotTrigger {
+    pub fn new(config: SnapshotTriggerConfig) -> Self {
+        Self {
+            config,
+            last_snapshot_ms: None,
+            pending_reason: None,
+        }
+    }
+
+    pub fn record_snapshot(&mut self, now_ms: u64) {
+        self.last_snapshot_ms = Some(now_ms);
+        self.pending_reason = None;
+    }
+
+    pub fn evaluate(
+        &mut self,
+        log_bytes: u64,
+        follower_lag_bytes: u64,
+        now_ms: u64,
+    ) -> SnapshotTriggerDecision {
+        let elapsed = self
+            .last_snapshot_ms
+            .map(|last| now_ms.saturating_sub(last))
+            .unwrap_or(0);
+        let reason = if log_bytes >= self.config.log_bytes_target {
+            Some(SnapshotTriggerReason::LogBytes)
+        } else if elapsed >= self.config.max_interval_ms {
+            Some(SnapshotTriggerReason::Interval)
+        } else if follower_lag_bytes >= self.config.catchup_threshold_bytes {
+            Some(SnapshotTriggerReason::FollowerLag)
+        } else {
+            None
+        };
+        if reason.is_some() {
+            self.pending_reason = reason;
+        }
+        SnapshotTriggerDecision {
+            should_trigger: reason.is_some(),
+            reason,
+            log_bytes,
+            follower_lag_bytes,
+            elapsed_ms: elapsed,
+        }
+    }
+
+    pub fn telemetry(&self, now_ms: u64) -> SnapshotCadenceTelemetry {
+        let idle = self
+            .last_snapshot_ms
+            .map(|last| now_ms.saturating_sub(last))
+            .unwrap_or(0);
+        SnapshotCadenceTelemetry {
+            log_bytes_target: self.config.log_bytes_target,
+            catchup_threshold_bytes: self.config.catchup_threshold_bytes,
+            last_snapshot_ms: self.last_snapshot_ms.unwrap_or(0),
+            idle_duration_ms: idle,
+            pending_reason: self.pending_reason,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SnapshotExportController {
     max_inflight_bytes: usize,
@@ -237,18 +364,88 @@ pub struct SnapshotExportController {
     last_state: SnapshotThrottleState,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SnapshotImportRetryPolicy {
+    pub max_retries: u32,
+    pub base_delay: Duration,
+    pub max_delay: Duration,
+    pub time_budget: Duration,
+    pub jitter_fraction: f64,
+}
+
+impl Default for SnapshotImportRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_retries: 3,
+            base_delay: Duration::from_millis(1_000),
+            max_delay: Duration::from_millis(10_000),
+            time_budget: Duration::from_secs(60),
+            jitter_fraction: 0.25,
+        }
+    }
+}
+
+impl SnapshotImportRetryPolicy {
+    fn jittered_delay(&self, attempt: u32) -> Duration {
+        let base = self.delay_for_retry(attempt);
+        if base.is_zero() {
+            return base;
+        }
+        if self.jitter_fraction <= 0.0 {
+            return base;
+        }
+        let jitter = self.jitter_fraction.min(1.0);
+        let min = (1.0 - jitter).max(0.0);
+        let max = 1.0 + jitter;
+        let mut rng = rand::thread_rng();
+        let factor = rng.gen_range(min..=max);
+        let millis = base.as_millis() as f64;
+        let jittered = (millis * factor).round().max(1.0);
+        Duration::from_millis(jittered.min(u64::MAX as f64) as u64)
+    }
+
+    fn delay_for_retry(&self, attempt: u32) -> Duration {
+        if self.base_delay.is_zero() {
+            return Duration::ZERO;
+        }
+        let shift = attempt.min(31);
+        let multiplier = 1u128 << shift;
+        let base_ms = self.base_delay.as_millis();
+        let raw = base_ms.saturating_mul(multiplier);
+        let capped = raw.min(self.max_delay.as_millis());
+        Duration::from_millis(capped.min(u128::from(u64::MAX)) as u64)
+    }
+
+    fn sleep(&self, delay: Duration) {
+        if delay.is_zero() {
+            return;
+        }
+        std::thread::sleep(delay);
+    }
+}
+
 pub struct SnapshotChunkImporter {
     cipher: Aes256Gcm,
     dek_epoch: u32,
     iv_salt: String,
+    retry: SnapshotImportRetryPolicy,
 }
 
 impl SnapshotChunkImporter {
     pub fn new(key: &DataEncryptionKey, iv_salt: impl Into<String>) -> Self {
+        Self::with_retry_policy(key, iv_salt, SnapshotImportRetryPolicy::default())
+    }
+
+    pub fn with_retry_policy(
+        key: &DataEncryptionKey,
+        iv_salt: impl Into<String>,
+        retry: SnapshotImportRetryPolicy,
+    ) -> Self {
         Self {
             cipher: Aes256Gcm::new(key_ref(&key.bytes)),
             dek_epoch: key.epoch,
             iv_salt: iv_salt.into(),
+            retry,
         }
     }
 
@@ -257,39 +454,84 @@ impl SnapshotChunkImporter {
         manifest_id: &str,
         payload: &SnapshotChunkPayload,
     ) -> Result<Vec<u8>, SnapshotImportError> {
-        if compute_hash(&payload.ciphertext) != payload.chunk.digest {
-            return Err(SnapshotImportError::DigestMismatch {
-                chunk_id: payload.chunk.chunk_id.clone(),
-            });
-        }
-        let chunk_index = chunk_index_from_id(&payload.chunk.chunk_id).ok_or_else(|| {
-            SnapshotImportError::Decrypt {
-                chunk_id: payload.chunk.chunk_id.clone(),
+        self.import_chunk_with_retry(manifest_id, payload, Instant::now())
+    }
+
+    fn import_chunk_with_retry(
+        &self,
+        manifest_id: &str,
+        payload: &SnapshotChunkPayload,
+        start: Instant,
+    ) -> Result<Vec<u8>, SnapshotImportError> {
+        let mut retries = 0;
+        let deadline = start
+            .checked_add(self.retry.time_budget)
+            .unwrap_or_else(|| start + self.retry.time_budget);
+        loop {
+            match self.decrypt_once(manifest_id, payload) {
+                Ok(bytes) => return Ok(bytes),
+                Err(err @ SnapshotImportError::UnknownChunk { .. }) => return Err(err),
+                Err(err) => {
+                    if retries >= self.retry.max_retries {
+                        return Err(err);
+                    }
+                    if self.retry.time_budget != Duration::ZERO && Instant::now() >= deadline {
+                        return Err(err);
+                    }
+                    let delay = self.retry.jittered_delay(retries);
+                    retries += 1;
+                    if delay.is_zero() {
+                        continue;
+                    }
+                    if self.retry.time_budget != Duration::ZERO {
+                        let now = Instant::now();
+                        if let Some(next) = now.checked_add(delay) {
+                            if next > deadline {
+                                return Err(err);
+                            }
+                        } else {
+                            return Err(err);
+                        }
+                    }
+                    self.retry.sleep(delay);
+                }
             }
-        })?;
+        }
+    }
+
+    fn decrypt_once(
+        &self,
+        manifest_id: &str,
+        payload: &SnapshotChunkPayload,
+    ) -> Result<Vec<u8>, SnapshotImportError> {
+        let chunk_id = payload.chunk.chunk_id.clone();
+        let chunk_index =
+            chunk_index_from_id(&chunk_id).ok_or_else(|| SnapshotImportError::Decrypt {
+                chunk_id: chunk_id.clone(),
+            })?;
         let mut ciphertext = payload.ciphertext.clone();
         if ciphertext.len() < 16 {
             return Err(SnapshotImportError::Decrypt {
-                chunk_id: payload.chunk.chunk_id.clone(),
+                chunk_id: chunk_id.clone(),
             });
         }
         let tag_split = ciphertext.len() - 16;
         let (body, tag) = ciphertext.split_at_mut(tag_split);
         let mut plaintext = body.to_vec();
-        self.cipher
-            .decrypt_in_place_detached(
-                nonce_ref(&derive_chunk_nonce(
-                    self.dek_epoch,
-                    &self.iv_salt,
-                    chunk_index,
-                )),
-                &build_chunk_aad(manifest_id, chunk_index, payload.chunk.len),
-                &mut plaintext,
-                tag_ref(tag),
-            )
-            .map_err(|_| SnapshotImportError::Decrypt {
-                chunk_id: payload.chunk.chunk_id.clone(),
-            })?;
+        let aad = build_chunk_aad(manifest_id, chunk_index, payload.chunk.len);
+        let nonce = derive_chunk_nonce(self.dek_epoch, &self.iv_salt, chunk_index);
+        if self
+            .cipher
+            .decrypt_in_place_detached(nonce_ref(&nonce), &aad, &mut plaintext, tag_ref(tag))
+            .is_err()
+        {
+            plaintext.zeroize();
+            return Err(SnapshotImportError::Decrypt { chunk_id });
+        }
+        if compute_hash(&plaintext) != payload.chunk.digest {
+            plaintext.zeroize();
+            return Err(SnapshotImportError::DigestMismatch { chunk_id });
+        }
         Ok(plaintext)
     }
 }
@@ -1061,6 +1303,7 @@ impl SnapshotChunkExporter {
                 return Err(SnapshotExportError::TotalBytesExceeded);
             }
             let plaintext = &buffer[..read];
+            let digest = compute_hash(plaintext);
             let ciphertext = self
                 .encrypt_chunk(manifest_id, chunk_index, plaintext)
                 .map_err(|err| {
@@ -1073,7 +1316,6 @@ impl SnapshotChunkExporter {
                     );
                     SnapshotExportError::Encrypt
                 })?;
-            let digest = compute_hash(&ciphertext);
             let chunk = SnapshotChunk {
                 chunk_id: format!("{manifest_id}-{chunk_index:04}"),
                 offset,
@@ -1154,6 +1396,16 @@ pub struct SignedSnapshotManifest {
     pub signature: ManifestSignature,
 }
 
+impl SignedSnapshotManifest {
+    pub fn canonical_json(&self) -> Result<Vec<u8>, ManifestError> {
+        let mut value = serde_json::to_value(&self.manifest)?;
+        if let serde_json::Value::Object(ref mut obj) = value {
+            obj.insert("signature".into(), serde_json::to_value(&self.signature)?);
+        }
+        canonicalize_value(&value)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ManifestVerification {
     pub manifest_id: String,
@@ -1232,7 +1484,7 @@ pub enum ManifestVerificationError {
     Manifest(#[from] ManifestError),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestSignature {
     pub algorithm: String,
     pub value: String,
@@ -1406,6 +1658,8 @@ impl SnapshotAuthorizer {
         if signed.manifest.content_hash.is_none() {
             return Err(SnapshotAuthorizationError::MissingHash);
         }
+        let manifest_hash = signed.manifest.content_hash.clone().unwrap();
+        let previous = self.log.latest()?;
         let metadata = fs::metadata(manifest_path)?;
         if !metadata.is_file() {
             return Err(SnapshotAuthorizationError::NotAFile);
@@ -1413,12 +1667,19 @@ impl SnapshotAuthorizer {
         let file = fs::OpenOptions::new().read(true).open(manifest_path)?;
         file.sync_all()?;
         drop(file);
+        let prev_chain = previous.as_ref().map(|record| record.chain_hash.as_str());
         let record = SnapshotAuthorizationRecord {
             manifest_id: signed.manifest.manifest_id.clone(),
             base_index: signed.manifest.base_index,
             auth_seq,
-            manifest_hash: signed.manifest.content_hash.clone().unwrap(),
+            manifest_hash: manifest_hash.clone(),
             recorded_at_ms,
+            chain_hash: authorization_chain_hash(
+                prev_chain,
+                &signed.manifest.manifest_id,
+                auth_seq,
+                &manifest_hash,
+            ),
         };
         self.log.append(&record)?;
         Ok(record)
@@ -1480,13 +1741,15 @@ impl SnapshotTrustCache {
 pub struct AppendEntriesBatch {
     pub chunk_id: String,
     pub bytes: usize,
+    pub entries: usize,
 }
 
 impl AppendEntriesBatch {
-    pub fn new(chunk_id: impl Into<String>, bytes: usize) -> Self {
+    pub fn new(chunk_id: impl Into<String>, bytes: usize, entries: usize) -> Self {
         Self {
             chunk_id: chunk_id.into(),
             bytes,
+            entries,
         }
     }
 }
@@ -1499,8 +1762,20 @@ pub enum SnapshotThrottleState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotThrottleReason {
-    InFlightBytes { buffered: usize, limit: usize },
-    RateLimit { observed_bps: u64, limit_bps: u64 },
+    InFlightBytes {
+        buffered: usize,
+        limit: usize,
+    },
+    RateLimit {
+        observed_bps: u64,
+        limit_bps: u64,
+    },
+    SnapshotImport {
+        buffered_entries: usize,
+        entry_limit: usize,
+        buffered_bytes: usize,
+        byte_limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1514,6 +1789,7 @@ pub struct SnapshotImportConfig {
     pub max_inflight_bytes: usize,
     pub resume_ratio: f32,
     pub max_bytes_per_second: u64,
+    pub max_inflight_entries: usize,
 }
 
 impl SnapshotImportConfig {
@@ -1522,6 +1798,7 @@ impl SnapshotImportConfig {
             max_inflight_bytes,
             resume_ratio: 0.6,
             max_bytes_per_second: 0,
+            max_inflight_entries: 8_192,
         }
     }
 
@@ -1532,6 +1809,11 @@ impl SnapshotImportConfig {
 
     pub fn with_bandwidth(mut self, max_bytes_per_second: u64) -> Self {
         self.max_bytes_per_second = max_bytes_per_second;
+        self
+    }
+
+    pub fn with_entry_limit(mut self, max_entries: usize) -> Self {
+        self.max_inflight_entries = max_entries;
         self
     }
 }
@@ -1587,10 +1869,81 @@ pub struct SnapshotImportTelemetrySnapshot {
     pub last_reason: Option<SnapshotThrottleReason>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotImportNodeTelemetrySnapshot {
+    pub usage_bytes: u64,
+    pub peak_usage_bytes: u64,
+    pub limit_bytes: u64,
+}
+
+#[derive(Debug)]
+pub struct SnapshotImportNodeBudget {
+    node_ram_bytes: u64,
+    ram_fraction: f64,
+    hard_cap_bytes: u64,
+    usage_bytes: u64,
+    peak_usage_bytes: u64,
+}
+
+impl SnapshotImportNodeBudget {
+    pub fn new(node_ram_bytes: u64, ram_fraction: f64, hard_cap_bytes: u64) -> Self {
+        Self {
+            node_ram_bytes,
+            ram_fraction,
+            hard_cap_bytes,
+            usage_bytes: 0,
+            peak_usage_bytes: 0,
+        }
+    }
+
+    pub fn limit_bytes(&self) -> u64 {
+        let fraction = self.ram_fraction.clamp(0.05, 0.25);
+        let fraction_cap = ((self.node_ram_bytes as f64) * fraction).floor() as u64;
+        let floor = SNAPSHOT_IMPORT_NODE_FLOOR_BYTES;
+        let bounded = fraction_cap.max(floor);
+        bounded.min(self.hard_cap_bytes)
+    }
+
+    pub fn try_reserve(&mut self, bytes: u64) -> Result<(), SnapshotImportError> {
+        let limit = self.limit_bytes();
+        if bytes > limit {
+            return Err(SnapshotImportError::NodePressure {
+                usage_bytes: self.usage_bytes,
+                limit_bytes: limit,
+            });
+        }
+        let new_usage = self.usage_bytes.saturating_add(bytes);
+        if new_usage > limit {
+            return Err(SnapshotImportError::NodePressure {
+                usage_bytes: self.usage_bytes,
+                limit_bytes: limit,
+            });
+        }
+        self.usage_bytes = new_usage;
+        if new_usage > self.peak_usage_bytes {
+            self.peak_usage_bytes = new_usage;
+        }
+        Ok(())
+    }
+
+    pub fn release(&mut self, bytes: u64) {
+        self.usage_bytes = self.usage_bytes.saturating_sub(bytes);
+    }
+
+    pub fn telemetry(&self) -> SnapshotImportNodeTelemetrySnapshot {
+        SnapshotImportNodeTelemetrySnapshot {
+            usage_bytes: self.usage_bytes,
+            peak_usage_bytes: self.peak_usage_bytes,
+            limit_bytes: self.limit_bytes(),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SnapshotAppendEntriesCoordinator {
     config: SnapshotImportConfig,
     buffered_bytes: usize,
+    buffered_entries: usize,
     inflight: VecDeque<AppendEntriesBatch>,
     telemetry: SnapshotImportTelemetry,
     last_state: SnapshotThrottleState,
@@ -1607,6 +1960,7 @@ impl SnapshotAppendEntriesCoordinator {
         Self {
             config,
             buffered_bytes: 0,
+            buffered_entries: 0,
             inflight: VecDeque::new(),
             telemetry: SnapshotImportTelemetry::default(),
             last_state: SnapshotThrottleState::Open,
@@ -1625,6 +1979,7 @@ impl SnapshotAppendEntriesCoordinator {
         now: Instant,
     ) -> SnapshotThrottleEnvelope {
         self.buffered_bytes += batch.bytes;
+        self.buffered_entries += batch.entries;
         let bytes = batch.bytes;
         self.inflight.push_back(batch);
         self.record_transfer(bytes_to_u64(bytes), now);
@@ -1652,12 +2007,17 @@ impl SnapshotAppendEntriesCoordinator {
             })?;
         let batch = self.inflight.remove(pos).expect("position valid");
         self.buffered_bytes = self.buffered_bytes.saturating_sub(batch.bytes);
+        self.buffered_entries = self.buffered_entries.saturating_sub(batch.entries);
         self.refresh_rate_window(now);
         Ok(self.envelope_at(now))
     }
 
     pub fn buffered_bytes(&self) -> usize {
         self.buffered_bytes
+    }
+
+    pub fn buffered_entries(&self) -> usize {
+        self.buffered_entries
     }
 
     pub fn telemetry(&self) -> SnapshotImportTelemetrySnapshot {
@@ -1671,11 +2031,8 @@ impl SnapshotAppendEntriesCoordinator {
     fn envelope_at(&mut self, now: Instant) -> SnapshotThrottleEnvelope {
         self.refresh_rate_window(now);
         let mut reason = None;
-        if self.should_throttle_buffer() {
-            reason = Some(SnapshotThrottleReason::InFlightBytes {
-                buffered: self.buffered_bytes,
-                limit: self.config.max_inflight_bytes,
-            });
+        if let Some(buffer_reason) = self.import_limit_reason() {
+            reason = Some(buffer_reason);
         } else if let Some(rate_reason) = self.rate_limit_reason() {
             reason = Some(rate_reason);
         }
@@ -1693,20 +2050,43 @@ impl SnapshotAppendEntriesCoordinator {
         }
     }
 
-    fn should_throttle_buffer(&self) -> bool {
-        let at_cap = self.buffered_bytes >= self.config.max_inflight_bytes;
-        let above_resume = self.buffered_bytes > self.resume_threshold();
-        match self.last_state {
-            SnapshotThrottleState::Throttled(SnapshotThrottleReason::InFlightBytes { .. }) => {
-                above_resume
+    fn import_limit_reason(&self) -> Option<SnapshotThrottleReason> {
+        let entry_cap = self.config.max_inflight_entries;
+        let byte_cap = self.config.max_inflight_bytes;
+        let entries_over_limit = self.buffered_entries >= entry_cap;
+        let bytes_over_limit = self.buffered_bytes >= byte_cap;
+        let throttled_due_to_import = matches!(
+            self.last_state,
+            SnapshotThrottleState::Throttled(SnapshotThrottleReason::SnapshotImport { .. })
+        );
+        if throttled_due_to_import {
+            let entries_above_resume = self.buffered_entries > self.resume_entry_threshold();
+            let bytes_above_resume = self.buffered_bytes > self.resume_byte_threshold();
+            if !entries_above_resume && !bytes_above_resume {
+                return None;
             }
-            _ => at_cap,
+        } else if !entries_over_limit && !bytes_over_limit {
+            return None;
         }
+        if entries_over_limit || bytes_over_limit {
+            return Some(SnapshotThrottleReason::SnapshotImport {
+                buffered_entries: self.buffered_entries,
+                entry_limit: entry_cap,
+                buffered_bytes: self.buffered_bytes,
+                byte_limit: byte_cap,
+            });
+        }
+        None
     }
 
-    fn resume_threshold(&self) -> usize {
+    fn resume_byte_threshold(&self) -> usize {
         let ratio = self.config.resume_ratio.clamp(0.0, 1.0);
         ((self.config.max_inflight_bytes as f32) * ratio).ceil() as usize
+    }
+
+    fn resume_entry_threshold(&self) -> usize {
+        let ratio = self.config.resume_ratio.clamp(0.0, 1.0);
+        ((self.config.max_inflight_entries as f32) * ratio).ceil() as usize
     }
 
     fn record_transfer(&mut self, bytes: u64, now: Instant) {
@@ -1747,6 +2127,8 @@ pub enum SnapshotImportError {
     DigestMismatch { chunk_id: String },
     #[error("failed to decrypt chunk {chunk_id}")]
     Decrypt { chunk_id: String },
+    #[error("snapshot import node buffer exhausted (usage={usage_bytes} limit={limit_bytes})")]
+    NodePressure { usage_bytes: u64, limit_bytes: u64 },
 }
 
 #[cfg(test)]
@@ -1756,6 +2138,16 @@ mod tests {
     use std::io::Cursor;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    fn fast_retry_policy() -> SnapshotImportRetryPolicy {
+        SnapshotImportRetryPolicy {
+            max_retries: 0,
+            base_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            time_budget: Duration::ZERO,
+            jitter_fraction: 0.0,
+        }
+    }
 
     #[test]
     fn manifest_builder_generates_stable_hash() {
@@ -1937,14 +2329,14 @@ mod tests {
     #[test]
     fn append_entries_coordinator_throttles_on_capacity() {
         let mut coordinator = SnapshotAppendEntriesCoordinator::new(256);
-        let envelope = coordinator.enqueue(AppendEntriesBatch::new("c1", 128));
+        let envelope = coordinator.enqueue(AppendEntriesBatch::new("c1", 128, 1));
         assert_eq!(envelope.buffered_bytes, 128);
         assert!(matches!(envelope.state, SnapshotThrottleState::Open));
 
-        let envelope = coordinator.enqueue(AppendEntriesBatch::new("c2", 160));
+        let envelope = coordinator.enqueue(AppendEntriesBatch::new("c2", 160, 1));
         assert!(matches!(
             envelope.state,
-            SnapshotThrottleState::Throttled(SnapshotThrottleReason::InFlightBytes { .. })
+            SnapshotThrottleState::Throttled(SnapshotThrottleReason::SnapshotImport { .. })
         ));
         assert_eq!(coordinator.buffered_bytes(), 288);
 
@@ -1956,7 +2348,7 @@ mod tests {
     #[test]
     fn append_entries_coordinator_errors_on_unknown_chunk() {
         let mut coordinator = SnapshotAppendEntriesCoordinator::new(128);
-        coordinator.enqueue(AppendEntriesBatch::new("c1", 64));
+        coordinator.enqueue(AppendEntriesBatch::new("c1", 64, 1));
         let err = coordinator.complete("missing").unwrap_err();
         assert!(matches!(err, SnapshotImportError::UnknownChunk { .. }));
     }
@@ -1967,11 +2359,11 @@ mod tests {
             SnapshotImportConfig::new(200).with_resume_ratio(0.5),
         );
         let now = Instant::now();
-        coordinator.enqueue_at(AppendEntriesBatch::new("c1", 150), now);
-        let throttled = coordinator.enqueue_at(AppendEntriesBatch::new("c2", 80), now);
+        coordinator.enqueue_at(AppendEntriesBatch::new("c1", 150, 1), now);
+        let throttled = coordinator.enqueue_at(AppendEntriesBatch::new("c2", 80, 1), now);
         assert!(matches!(
             throttled.state,
-            SnapshotThrottleState::Throttled(SnapshotThrottleReason::InFlightBytes { .. })
+            SnapshotThrottleState::Throttled(SnapshotThrottleReason::SnapshotImport { .. })
         ));
 
         // Removing 150 bytes drops buffered to 80 which is below resume threshold.
@@ -1986,17 +2378,54 @@ mod tests {
     }
 
     #[test]
+    fn append_entries_enforces_entry_limit() {
+        let mut coordinator = SnapshotAppendEntriesCoordinator::with_config(
+            SnapshotImportConfig::new(1_024).with_entry_limit(3),
+        );
+        coordinator.enqueue(AppendEntriesBatch::new("c1", 64, 1));
+        coordinator.enqueue(AppendEntriesBatch::new("c2", 64, 1));
+        let throttled = coordinator.enqueue(AppendEntriesBatch::new("c3", 64, 1));
+        assert!(matches!(
+            throttled.state,
+            SnapshotThrottleState::Throttled(SnapshotThrottleReason::SnapshotImport { .. })
+        ));
+        assert_eq!(coordinator.buffered_entries(), 3);
+
+        coordinator.complete("c1").unwrap();
+        let resumed = coordinator.complete("c2").unwrap();
+        assert!(matches!(resumed.state, SnapshotThrottleState::Open));
+    }
+
+    #[test]
     fn append_entries_rate_limit_throttle() {
         let mut coordinator = SnapshotAppendEntriesCoordinator::with_config(
             SnapshotImportConfig::new(1024).with_bandwidth(256),
         );
         let now = Instant::now();
-        coordinator.enqueue_at(AppendEntriesBatch::new("c1", 128), now);
-        let envelope = coordinator.enqueue_at(AppendEntriesBatch::new("c2", 200), now);
+        coordinator.enqueue_at(AppendEntriesBatch::new("c1", 128, 1), now);
+        let envelope = coordinator.enqueue_at(AppendEntriesBatch::new("c2", 200, 1), now);
         assert!(matches!(
             envelope.state,
             SnapshotThrottleState::Throttled(SnapshotThrottleReason::RateLimit { .. })
         ));
+    }
+
+    #[test]
+    fn snapshot_import_node_budget_limits_usage() {
+        let gib = 1024_u64 * 1024 * 1024;
+        let mut budget = SnapshotImportNodeBudget::new(64 * gib, 0.1, 32 * gib);
+        let limit = budget.limit_bytes();
+        assert_eq!(limit, SNAPSHOT_IMPORT_NODE_FLOOR_BYTES.min(32 * gib));
+        budget.try_reserve(4 * gib).expect("reservation fits");
+        let err = budget
+            .try_reserve(5 * gib)
+            .expect_err("node budget exhausted");
+        assert!(matches!(err, SnapshotImportError::NodePressure { .. }));
+        budget.release(2 * gib);
+        let telemetry = budget.telemetry();
+        assert_eq!(telemetry.usage_bytes, 2 * gib);
+        assert_eq!(telemetry.peak_usage_bytes, 4 * gib);
+        assert_eq!(telemetry.limit_bytes, limit);
     }
 
     #[test]
@@ -2007,7 +2436,7 @@ mod tests {
         let chunks = exporter
             .export_reader("fixture", Cursor::new(plaintext.clone()), 64)
             .expect("chunks");
-        let importer = SnapshotChunkImporter::new(&key, "salt");
+        let importer = SnapshotChunkImporter::with_retry_policy(&key, "salt", fast_retry_policy());
         let mut store = SnapshotStagingStore::new();
         for chunk in &chunks {
             let staged = importer
@@ -2028,11 +2457,27 @@ mod tests {
             .expect("chunks");
         let mut tampered = chunks[0].clone();
         tampered.chunk.digest = "0xdeadbeef".into();
-        let importer = SnapshotChunkImporter::new(&key, "salt");
+        let importer = SnapshotChunkImporter::with_retry_policy(&key, "salt", fast_retry_policy());
         let err = importer
             .import_chunk("fixture", &tampered)
             .expect_err("digest mismatch");
         assert!(matches!(err, SnapshotImportError::DigestMismatch { .. }));
+    }
+
+    #[test]
+    fn snapshot_chunk_importer_rejects_truncated_payload() {
+        let key = DataEncryptionKey::new(14, [11u8; 32]);
+        let exporter = SnapshotChunkExporter::new(SnapshotExportProfile::Latency, &key, "salt");
+        let chunks = exporter
+            .export_reader("fixture", Cursor::new(vec![0xCDu8; 64]), 32)
+            .expect("chunks");
+        let mut truncated = chunks[0].clone();
+        truncated.ciphertext.truncate(8);
+        let importer = SnapshotChunkImporter::with_retry_policy(&key, "salt", fast_retry_policy());
+        let err = importer
+            .import_chunk("fixture", &truncated)
+            .expect_err("reject truncated chunk");
+        assert!(matches!(err, SnapshotImportError::Decrypt { .. }));
     }
 
     fn readiness() -> SnapshotReadiness {
@@ -2184,6 +2629,43 @@ mod tests {
         assert!(response.headers.snapshot_only);
         assert_eq!(response.headers.snapshot_manifest_id, "m1");
         assert_eq!(response.headers.cp_cache_age_ms, 42);
+    }
+
+    #[test]
+    fn snapshot_trigger_honors_thresholds() {
+        let mut trigger = SnapshotTrigger::new(SnapshotTriggerConfig::default());
+        let under = trigger.evaluate(SNAPSHOT_LOG_BYTES_TARGET - 1, 0, 1_000);
+        assert!(!under.should_trigger);
+
+        let log_trigger = trigger.evaluate(SNAPSHOT_LOG_BYTES_TARGET, 0, 2_000);
+        assert!(matches!(
+            log_trigger.reason,
+            Some(SnapshotTriggerReason::LogBytes)
+        ));
+        trigger.record_snapshot(2_000);
+
+        let interval_trigger = trigger.evaluate(0, 0, 2_000 + SNAPSHOT_MAX_INTERVAL_MS);
+        assert!(matches!(
+            interval_trigger.reason,
+            Some(SnapshotTriggerReason::Interval)
+        ));
+        trigger.record_snapshot(3_000);
+
+        let lag_trigger = trigger.evaluate(
+            0,
+            SNAPSHOT_CATCHUP_THRESHOLD_BYTES,
+            3_000 + SNAPSHOT_MAX_INTERVAL_MS / 2,
+        );
+        assert!(matches!(
+            lag_trigger.reason,
+            Some(SnapshotTriggerReason::FollowerLag)
+        ));
+        let telemetry = trigger.telemetry(3_500);
+        assert_eq!(
+            telemetry.pending_reason,
+            Some(SnapshotTriggerReason::FollowerLag)
+        );
+        assert_eq!(telemetry.last_snapshot_ms, 3_000);
     }
 
     #[test]
@@ -2362,7 +2844,7 @@ mod tests {
             "salt",
         );
 
-        let importer = SnapshotChunkImporter::new(&key, "salt");
+        let importer = SnapshotChunkImporter::with_retry_policy(&key, "salt", fast_retry_policy());
         let mut staging = SnapshotStagingStore::new();
         for chunk in &chunks {
             let bytes = importer
@@ -2421,7 +2903,7 @@ mod tests {
             "salt",
         );
 
-        let importer = SnapshotChunkImporter::new(&key, "salt");
+        let importer = SnapshotChunkImporter::with_retry_policy(&key, "salt", fast_retry_policy());
         let mut tampered = chunks[0].clone();
         tampered.chunk.digest = "0xdeadbeef".into();
         let err = importer

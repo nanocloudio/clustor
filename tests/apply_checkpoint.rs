@@ -1,6 +1,7 @@
 use clustor::apply::{
     AckHandlePolicy, AckHandleSupervisor, ApplyBatch, ApplyBudgetDecision, ApplyEntry,
-    ApplyProfile, ApplyScheduler, DedupeCache, DedupeConfig, DedupeToken, InMemoryAckHandleMetrics,
+    ApplyProfile, ApplyRuntime, ApplyScheduler, DedupeCache, DedupeConfig, DedupeToken,
+    InMemoryAckHandleMetrics, InMemoryApplyMetrics,
 };
 use clustor::durability::AckHandle;
 use clustor::profile::{PartitionProfile, ProfileCapabilityRegistry};
@@ -42,6 +43,27 @@ fn apply_checkpoint_ack_handle_timeouts_surface_retryable() {
     assert_eq!(timeouts.len(), 1);
     drop(handle);
     assert_eq!(metrics.snapshot().timeouts, 1);
+}
+
+#[test]
+fn apply_runtime_ack_deadlines_enforced() {
+    let profile = ApplyProfile {
+        ack_max_defer_ms: 1,
+        ..ApplyProfile::default()
+    };
+    let ack_metrics = InMemoryAckHandleMetrics::default();
+    let runtime = ApplyRuntime::new(
+        profile,
+        InMemoryApplyMetrics::default(),
+        ack_metrics.clone(),
+    )
+    .unwrap();
+    let handle = runtime.register_ack_handle(AckHandle::new(1, 1, 2), Instant::now());
+    let expired = runtime.tick_ack_deadlines(Instant::now() + Duration::from_millis(5));
+    assert_eq!(expired.len(), 1);
+    drop(handle);
+    assert_eq!(ack_metrics.snapshot().timeouts, 1);
+    assert_eq!(runtime.ack_policy().max_defer_ms, 1);
 }
 
 #[test]

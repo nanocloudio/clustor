@@ -1,11 +1,12 @@
 use clustor::bootstrap::probe::GroupFsyncGuardConfig;
 use clustor::storage::{
-    CompactionAuthAck, CompactionBlockReason, CompactionDecision, CompactionGate,
-    CompactionPlanRequest, CompactionState, DataEncryptionKey, EntryFrameBuilder, GroupFsyncPolicy,
-    ManifestGate, NonceLedgerConfig, NonceReservationLedger, SegmentHeader, SegmentHeaderError,
-    SegmentHealth, SegmentManager, SegmentSkipReason, SnapshotAuthorizationRecord, WalAead,
-    WAL_CRYPTO_BLOCK_BYTES,
+    authorization_chain_hash, CompactionAuthAck, CompactionBlockReason, CompactionDecision,
+    CompactionGate, CompactionPlanRequest, CompactionState, DataEncryptionKey, EntryFrameBuilder,
+    GroupFsyncPolicy, ManifestAuthorizationLog, ManifestGate, ManifestLogError, NonceLedgerConfig,
+    NonceReservationLedger, SegmentHeader, SegmentHeaderError, SegmentHealth, SegmentManager,
+    SegmentSkipReason, SnapshotAuthorizationRecord, WalAead, WAL_CRYPTO_BLOCK_BYTES,
 };
+use tempfile::TempDir;
 
 #[test]
 fn wal_segment_flush_order_preserved() {
@@ -42,12 +43,14 @@ fn group_fsync_policy_switches_modes() {
 
 #[test]
 fn compaction_blocks_without_manifest_ack() {
+    let chain = authorization_chain_hash(None, "m-1", 7, "abc123");
     let record = SnapshotAuthorizationRecord {
         manifest_id: "m-1".into(),
         base_index: 90,
         auth_seq: 7,
         manifest_hash: "abc123".into(),
         recorded_at_ms: 0,
+        chain_hash: chain,
     };
     let state = compaction_state(record.clone(), None);
     let decision = CompactionGate::plan(CompactionPlanRequest {
@@ -66,18 +69,16 @@ fn compaction_blocks_without_manifest_ack() {
 
 #[test]
 fn compaction_skips_segments_with_pending_nonce_until_abandon() {
+    let chain = authorization_chain_hash(None, "m-2", 8, "def456");
     let record = SnapshotAuthorizationRecord {
         manifest_id: "m-2".into(),
         base_index: 120,
         auth_seq: 8,
         manifest_hash: "def456".into(),
         recorded_at_ms: 0,
+        chain_hash: chain.clone(),
     };
-    let ack = CompactionAuthAck {
-        manifest_id: "m-2".into(),
-        auth_seq: 8,
-        acked_at_ms: 1,
-    };
+    let ack = CompactionAuthAck::from_record(&record, None, 1);
     let mut state = compaction_state(record.clone(), Some(ack));
     state.quorum_applied_index = 140;
     let mut ledger = NonceReservationLedger::new(4);
@@ -161,6 +162,55 @@ fn nonce_reservations_emit_gap_telemetry() {
     let telemetry = ledger.telemetry();
     assert_eq!(telemetry.committed_blocks, 0);
     assert!(telemetry.gap_bytes >= 4 * WAL_CRYPTO_BLOCK_BYTES as u64);
+}
+
+#[test]
+fn manifest_authorization_log_detects_chain_tampering() {
+    let tmp = TempDir::new().unwrap();
+    let log = ManifestAuthorizationLog::new(tmp.path().join("manifests.log"));
+    let first = SnapshotAuthorizationRecord {
+        manifest_id: "chain-1".into(),
+        base_index: 10,
+        auth_seq: 1,
+        manifest_hash: "0xabc".into(),
+        recorded_at_ms: 0,
+        chain_hash: authorization_chain_hash(None, "chain-1", 1, "0xabc"),
+    };
+    log.append(&first).expect("initial record");
+    let bad = SnapshotAuthorizationRecord {
+        manifest_id: "chain-2".into(),
+        base_index: 20,
+        auth_seq: 2,
+        manifest_hash: "0xdef".into(),
+        recorded_at_ms: 1,
+        chain_hash: "0xdeadbeef".into(),
+    };
+    let err = log.append(&bad).expect_err("chain mismatch detected");
+    assert!(matches!(err, ManifestLogError::ChainMismatch { .. }));
+}
+
+#[test]
+fn compaction_ack_chain_tracks_prior_entries() {
+    let first = SnapshotAuthorizationRecord {
+        manifest_id: "ack-1".into(),
+        base_index: 10,
+        auth_seq: 1,
+        manifest_hash: "0xaaa".into(),
+        recorded_at_ms: 0,
+        chain_hash: authorization_chain_hash(None, "ack-1", 1, "0xaaa"),
+    };
+    let ack1 = CompactionAuthAck::from_record(&first, None, 2);
+    let second = SnapshotAuthorizationRecord {
+        manifest_id: "ack-2".into(),
+        base_index: 20,
+        auth_seq: 2,
+        manifest_hash: "0xbbb".into(),
+        recorded_at_ms: 1,
+        chain_hash: authorization_chain_hash(Some(first.chain_hash.as_str()), "ack-2", 2, "0xbbb"),
+    };
+    let ack2 = CompactionAuthAck::from_record(&second, Some(ack1.chain_hash.as_str()), 3);
+    assert_ne!(ack1.chain_hash, ack2.chain_hash);
+    assert_eq!(ack2.manifest_id, "ack-2");
 }
 
 fn compaction_state(

@@ -20,6 +20,16 @@ pub enum StrictFallbackState {
     ProofPublished,
 }
 
+impl StrictFallbackState {
+    pub fn as_metric(self) -> u64 {
+        match self {
+            StrictFallbackState::Healthy => 0,
+            StrictFallbackState::LocalOnly => 1,
+            StrictFallbackState::ProofPublished => 2,
+        }
+    }
+}
+
 /// Configuration knobs lifted directly from the specification.
 #[derive(Debug, Clone)]
 pub struct ConsensusCoreConfig {
@@ -258,6 +268,17 @@ pub struct ConsensusCoreTelemetry {
     pub alert_active: bool,
     pub demotion: DemotionStatus,
     pub gate_blocks: GateBlockMetrics,
+    pub decision_epoch: u64,
+    pub blocking_reason: Option<StrictFallbackBlockingReason>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConsensusCoreStateSnapshot {
+    pub state: StrictFallbackState,
+    pub strict_fallback: bool,
+    pub pending_entries: u64,
+    pub last_local_proof: Option<DurabilityProof>,
+    pub last_published_proof: Option<DurabilityProof>,
     pub decision_epoch: u64,
     pub blocking_reason: Option<StrictFallbackBlockingReason>,
 }
@@ -527,6 +548,18 @@ impl ConsensusCore {
         }
     }
 
+    pub fn snapshot_state(&self) -> ConsensusCoreStateSnapshot {
+        ConsensusCoreStateSnapshot {
+            state: self.state,
+            strict_fallback: self.strict_fallback,
+            pending_entries: self.pending_entries,
+            last_local_proof: self.last_local_proof,
+            last_published_proof: self.last_published_proof,
+            decision_epoch: self.decision_epoch,
+            blocking_reason: self.blocking_reason,
+        }
+    }
+
     pub fn explain_gate(
         &self,
         evaluation: &GateEvaluation,
@@ -587,6 +620,7 @@ impl StrictFallbackMetricsPublisher {
             "strict_fallback_blocking_read_index",
             telemetry.blocking_read_index as u64,
         );
+        registry.set_gauge("strict_fallback_state", telemetry.state.as_metric());
         registry.set_gauge("strict_fallback_pending_entries", telemetry.pending_entries);
         registry.set_gauge("strict_fallback_decision_epoch", telemetry.decision_epoch);
 
@@ -930,6 +964,7 @@ mod tests {
         );
 
         let snapshot = registry.snapshot();
+        assert_eq!(snapshot.gauges["clustor.strict_fallback_state"], 1);
         assert_eq!(
             snapshot.gauges["clustor.strict_fallback_pending_entries"],
             2
@@ -1007,6 +1042,41 @@ mod tests {
 
         kernel.mark_healthy();
         assert_eq!(kernel.decision_epoch(), 5);
+    }
+
+    #[test]
+    fn state_snapshot_reflects_gate_state() {
+        let mut kernel = ConsensusCore::new(ConsensusCoreConfig::default());
+        let now = Instant::now();
+        kernel.enter_strict_fallback(DurabilityProof::new(2, 20), now);
+        kernel.register_strict_write();
+
+        let eval = kernel.evaluate_gate(GateOperation::EnableGroupFsync);
+        kernel.record_gate_block(&eval);
+
+        let snapshot = kernel.snapshot_state();
+        assert_eq!(snapshot.state, StrictFallbackState::LocalOnly);
+        assert!(snapshot.strict_fallback);
+        assert_eq!(snapshot.pending_entries, 1);
+        assert_eq!(snapshot.last_local_proof, Some(DurabilityProof::new(2, 20)));
+        assert_eq!(snapshot.last_published_proof, None);
+        assert_eq!(
+            snapshot.blocking_reason,
+            Some(StrictFallbackBlockingReason::ModeConflictStrictFallback)
+        );
+        assert_eq!(snapshot.decision_epoch, kernel.decision_epoch());
+
+        kernel.mark_proof_published(DurabilityProof::new(3, 30));
+        let cleared = kernel.snapshot_state();
+        assert_eq!(cleared.state, StrictFallbackState::ProofPublished);
+        assert!(!cleared.strict_fallback);
+        assert_eq!(cleared.pending_entries, 0);
+        assert_eq!(
+            cleared.last_published_proof,
+            Some(DurabilityProof::new(3, 30))
+        );
+        assert!(cleared.blocking_reason.is_none());
+        assert!(cleared.decision_epoch > snapshot.decision_epoch);
     }
 
     fn all_operations() -> &'static [GateOperation] {

@@ -26,9 +26,7 @@ fn cp_outage_forces_strict_backpressure() {
     coordinator
         .consensus_core_mut()
         .enter_strict_fallback(clustor::DurabilityProof::new(1, 10), now);
-    coordinator.set_cache_state(CpCacheState::Warning {
-        ms_remaining: 30_000,
-    });
+    coordinator.set_cache_state(CpCacheState::Stale { age_ms: 270_000 });
 
     let err = placements
         .validate_routing_epoch("p1", 5, now + Duration::from_secs(10))
@@ -46,8 +44,8 @@ fn cp_outage_forces_strict_backpressure() {
 #[test]
 fn cp_cache_expiry_recovers_after_republish() {
     let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
-    let mut coordinator =
-        CpProofCoordinator::new(kernel).with_cache_policy(clustor::CpCachePolicy::new(1_000));
+    let policy = clustor::CpCachePolicy::new(1_000).with_cache_windows(100, 1_000);
+    let mut coordinator = CpProofCoordinator::new(kernel).with_cache_policy(policy);
     let now = Instant::now();
     coordinator.publish_cp_proof_at(clustor::DurabilityProof::new(2, 20), now);
     assert!(coordinator

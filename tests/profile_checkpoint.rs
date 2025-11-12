@@ -37,18 +37,26 @@ fn profile_checkpoint_consensus_core_uses_profile_windows() {
 }
 
 #[test]
-fn profile_checkpoint_cache_policy_expires_at_ttl() {
+fn profile_checkpoint_cache_policy_tracks_window_states() {
     let mut coordinator =
         CpProofCoordinator::new(ConsensusCore::new(ConsensusCoreConfig::default()));
     let policy = CpCachePolicy::for_profile(PartitionProfile::Throughput);
-    assert_eq!(
-        coordinator.apply_cache_policy(policy.ttl_ms() - 1, &policy),
+    assert!(matches!(
+        coordinator.apply_cache_policy(10, &policy),
         CpCacheState::Fresh
-    );
-    assert_eq!(
-        coordinator.apply_cache_policy(policy.ttl_ms(), &policy),
-        CpCacheState::Expired
-    );
+    ));
+    assert!(matches!(
+        coordinator.apply_cache_policy(policy.cache_fresh_ms() + 1, &policy),
+        CpCacheState::Cached { .. }
+    ));
+    assert!(matches!(
+        coordinator.apply_cache_policy(policy.cache_grace_ms() - 1, &policy),
+        CpCacheState::Stale { .. }
+    ));
+    assert!(matches!(
+        coordinator.apply_cache_policy(policy.cache_grace_ms(), &policy),
+        CpCacheState::Expired { .. }
+    ));
 }
 
 #[test]

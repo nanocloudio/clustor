@@ -44,8 +44,11 @@ fn appendix_c_manifest_matches_fixture() {
     }
     let signer = HmacManifestSigner::new(b"appendix-c-key");
     let signed = builder.finalize(&signer).unwrap();
-    let canonical = serde_json::to_string_pretty(&signed.manifest).unwrap();
+    let canonical =
+        String::from_utf8(signed.canonical_json().expect("canonical manifest bytes")).unwrap();
     assert_eq!(canonical.trim(), FIXTURE.trim());
+    assert_eq!(signed.signature.algorithm, "HMAC-SHA256");
+    assert!(!signed.signature.value.is_empty());
 }
 
 #[test]
@@ -84,7 +87,7 @@ fn snapshot_checkpoint_large_import_enforces_throttle() {
     let mut throttled_events = 0;
     for (idx, chunk) in chunks.iter().enumerate() {
         let now = base + Duration::from_millis((idx as u64) * 5);
-        let batch = AppendEntriesBatch::new(&chunk.chunk.chunk_id, chunk.ciphertext.len());
+        let batch = AppendEntriesBatch::new(&chunk.chunk.chunk_id, chunk.ciphertext.len(), 1);
         let envelope = coordinator.enqueue_at(batch, now);
         if matches!(envelope.state, SnapshotThrottleState::Throttled(_)) {
             throttled_events += 1;

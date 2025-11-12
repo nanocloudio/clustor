@@ -4,7 +4,7 @@ use crate::transport::{CatalogNegotiationConfig, CatalogNegotiationReport};
 use crate::wire::NegotiationError;
 use hex;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -223,6 +223,22 @@ pub struct ShutdownManager {
     draining: bool,
     repair_mode: bool,
     last_action: Option<Instant>,
+    pending_actions: VecDeque<ShutdownAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShutdownAction {
+    TransferLeader { partition_id: String },
+    FlushWal,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ShutdownError {
+    #[error("unexpected shutdown action: expected {expected:?}, observed {observed:?}")]
+    UnexpectedAction {
+        expected: ShutdownAction,
+        observed: ShutdownAction,
+    },
 }
 
 impl Default for ShutdownManager {
@@ -237,17 +253,55 @@ impl ShutdownManager {
             draining: false,
             repair_mode: false,
             last_action: None,
+            pending_actions: VecDeque::new(),
         }
     }
 
-    pub fn begin_shutdown(&mut self, now: Instant) {
+    pub fn begin_shutdown(&mut self, partition_id: impl Into<String>, now: Instant) {
         self.draining = true;
+        self.pending_actions.clear();
+        self.pending_actions
+            .push_back(ShutdownAction::TransferLeader {
+                partition_id: partition_id.into(),
+            });
+        self.pending_actions.push_back(ShutdownAction::FlushWal);
         self.last_action = Some(now);
     }
 
     pub fn enter_repair_mode(&mut self, now: Instant) {
         self.repair_mode = true;
+        self.pending_actions.clear();
         self.last_action = Some(now);
+    }
+
+    pub fn next_action(&self) -> Option<&ShutdownAction> {
+        self.pending_actions.front()
+    }
+
+    pub fn record_action_complete(
+        &mut self,
+        action: &ShutdownAction,
+        now: Instant,
+    ) -> Result<(), ShutdownError> {
+        match self.pending_actions.front() {
+            Some(expected) if expected == action => {
+                self.pending_actions.pop_front();
+                self.last_action = Some(now);
+                Ok(())
+            }
+            Some(expected) => Err(ShutdownError::UnexpectedAction {
+                expected: expected.clone(),
+                observed: action.clone(),
+            }),
+            None => Err(ShutdownError::UnexpectedAction {
+                expected: ShutdownAction::FlushWal,
+                observed: action.clone(),
+            }),
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.pending_actions.is_empty()
     }
 
     pub fn status(&self) -> ShutdownStatus {
@@ -255,15 +309,17 @@ impl ShutdownManager {
             draining: self.draining,
             repair_mode: self.repair_mode,
             last_action: self.last_action,
+            pending_actions: self.pending_actions.iter().cloned().collect(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ShutdownStatus {
     pub draining: bool,
     pub repair_mode: bool,
     pub last_action: Option<Instant>,
+    pub pending_actions: Vec<ShutdownAction>,
 }
 
 #[derive(Debug, Clone)]

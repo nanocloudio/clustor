@@ -18,10 +18,11 @@ pub use quorum::{
 };
 
 pub use rpc::{
-    AppendEntriesFrameError, AppendEntriesRequest, AppendEntriesResponse, RequestVoteFrameError,
-    RequestVoteRejectReason, RequestVoteRequest, RequestVoteResponse,
+    AppendEntriesFrameError, AppendEntriesRequest, AppendEntriesResponse, PreVoteResponse,
+    PreVoteResponseFrameError, RequestVoteFrameError, RequestVoteRejectReason, RequestVoteRequest,
+    RequestVoteResponse,
 };
 pub use stickiness::{
     DeviceLatencyConfig, LatencyGuardReason, LeaderStickinessConfig, LeaderStickinessController,
-    StickinessDecision, StickinessTelemetry,
+    LeaderStickinessGate, StickinessDecision, StickinessTelemetry,
 };

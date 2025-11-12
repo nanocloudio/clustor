@@ -1,3 +1,5 @@
+use crate::profile::PartitionProfile;
+use crate::raft::rpc::PreVoteResponse;
 use crate::raft::{PartitionQuorum, ReplicaId};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha20Rng;
@@ -13,6 +15,16 @@ pub enum ElectionProfile {
     Throughput,
     ControlPlane,
     Wan,
+}
+
+impl From<PartitionProfile> for ElectionProfile {
+    fn from(profile: PartitionProfile) -> Self {
+        match profile {
+            PartitionProfile::Wan => ElectionProfile::Wan,
+            PartitionProfile::Throughput => ElectionProfile::Throughput,
+            PartitionProfile::Latency | PartitionProfile::Zfs => ElectionProfile::Latency,
+        }
+    }
 }
 
 impl ElectionProfile {
@@ -74,6 +86,10 @@ impl LatencyState {
             false
         }
     }
+
+    fn force_wan_override(&mut self) {
+        self.wan_override_next = true;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +100,10 @@ pub struct ElectionController {
 }
 
 impl ElectionController {
+    pub fn for_partition_profile(profile: PartitionProfile, seed: u64) -> Self {
+        Self::new(profile.into(), seed)
+    }
+
     pub fn new(profile: ElectionProfile, seed: u64) -> Self {
         Self {
             profile,
@@ -127,6 +147,19 @@ impl ElectionController {
             PreVoteDecision::Granted
         } else {
             PreVoteDecision::Rejected(PreVoteRejectReason::LogBehind)
+        }
+    }
+
+    pub fn apply_pre_vote_response(
+        &mut self,
+        replica: impl Into<ReplicaId>,
+        response: &PreVoteResponse,
+    ) {
+        if response.high_rtt.unwrap_or(false) {
+            self.latency
+                .entry(replica.into())
+                .or_default()
+                .force_wan_override();
         }
     }
 
@@ -275,7 +308,10 @@ impl CandidateState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raft::{PartitionQuorum, PartitionQuorumConfig};
+    use crate::raft::{
+        LeaderStickinessConfig, LeaderStickinessGate, PartitionQuorum, PartitionQuorumConfig,
+        StickinessDecision,
+    };
 
     #[test]
     fn election_timeout_respects_profile_range() {
@@ -336,5 +372,75 @@ mod tests {
                 <= Duration::from_millis(150)
         );
         assert!(candidate.timer().expired(now + Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn partition_profiles_map_to_election_profiles() {
+        let mut wan = ElectionController::for_partition_profile(PartitionProfile::Wan, 5);
+        for _ in 0..3 {
+            let timeout = wan.next_election_timeout("wan");
+            assert!(
+                timeout >= Duration::from_millis(300) && timeout <= Duration::from_millis(600),
+                "WAN timeout {timeout:?} outside expected window"
+            );
+        }
+        let mut zfs = ElectionController::for_partition_profile(PartitionProfile::Zfs, 7);
+        for _ in 0..3 {
+            let timeout = zfs.next_election_timeout("zfs");
+            assert!(
+                timeout >= Duration::from_millis(150) && timeout <= Duration::from_millis(300),
+                "ZFS timeout {timeout:?} outside latency window"
+            );
+        }
+    }
+
+    #[test]
+    fn prevote_high_rtt_forces_wan_window_once() {
+        let mut controller = ElectionController::new(ElectionProfile::Latency, 3);
+        let response = PreVoteResponse {
+            term: 10,
+            vote_granted: true,
+            high_rtt: Some(true),
+        };
+        controller.apply_pre_vote_response("peer-1", &response);
+        let widened = controller.next_election_timeout("peer-1");
+        assert!(
+            widened >= Duration::from_millis(300),
+            "expected WAN window, got {widened:?}"
+        );
+        let reset = controller.next_election_timeout("peer-1");
+        assert!(
+            reset < Duration::from_millis(300),
+            "WAN override should last one timeout"
+        );
+    }
+
+    #[test]
+    fn high_rtt_and_stickiness_checkpoint() {
+        let mut controller = ElectionController::new(ElectionProfile::Latency, 17);
+        for _ in 0..HIGH_RTT_CONFIRMATIONS {
+            controller.record_heartbeat_rtt("follower-a", 250);
+        }
+        let widened = controller.next_election_timeout("follower-a");
+        assert!(widened >= Duration::from_millis(300));
+        let base = Instant::now();
+        let mut gate = LeaderStickinessGate::new(LeaderStickinessConfig::default(), base);
+        let mut decision = StickinessDecision::Maintain;
+        for offset in 0..3 {
+            decision = gate.record_fsync_sample(
+                Duration::from_millis(32),
+                base + Duration::from_millis(offset),
+            );
+        }
+        assert!(matches!(
+            decision,
+            StickinessDecision::PendingStepDown { .. }
+        ));
+        let later = base + Duration::from_millis(1000);
+        decision = gate.record_fsync_sample(Duration::from_millis(30), later);
+        assert!(matches!(
+            decision,
+            StickinessDecision::StepDownRequired { .. }
+        ));
     }
 }

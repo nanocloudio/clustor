@@ -1,8 +1,11 @@
 use crate::apply::WhyApply;
 use crate::cp::{CpProofCoordinator, CpUnavailableResponse};
 use crate::cp_raft::{CpPlacementClient, PlacementRecord};
-use crate::flow::{FlowThrottleEnvelope, FlowThrottleReason, FlowThrottleState};
-use crate::security::{BreakGlassToken, RbacManifestCache, SecurityError};
+use crate::flow::{
+    CreditHint, FlowThrottleEnvelope, FlowThrottleReason, FlowThrottleState, IngestStatusCode,
+};
+use crate::security::{BreakGlassToken, RbacManifestCache, SecurityError, SpiffeId};
+use crate::system_log::SystemLogEntry;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,17 +48,34 @@ pub enum DurabilityMode {
     Relaxed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateDurabilityModeRequest {
-    pub idempotency_key: String,
-    pub partition_id: String,
-    pub target_mode: DurabilityMode,
+#[derive(Debug, Clone)]
+struct DurabilityState {
+    mode: DurabilityMode,
+    epoch: u64,
+}
+
+impl DurabilityState {
+    fn new() -> Self {
+        Self {
+            mode: DurabilityMode::Strict,
+            epoch: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateDurabilityModeResponse {
+pub struct SetDurabilityModeRequest {
+    pub idempotency_key: String,
+    pub partition_id: String,
+    pub target_mode: DurabilityMode,
+    pub expected_mode: DurabilityMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetDurabilityModeResponse {
     pub partition_id: String,
     pub applied_mode: DurabilityMode,
+    pub durability_mode_epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +91,41 @@ pub struct SnapshotThrottleResponse {
     pub throttle_state: FlowThrottleEnvelope,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransferLeaderRequest {
+    pub idempotency_key: String,
+    pub partition_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_replica_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferLeaderResponse {
+    pub partition_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_replica_id: Option<String>,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotTriggerRequest {
+    pub idempotency_key: String,
+    pub partition_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotTriggerResponse {
+    pub partition_id: String,
+    pub accepted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ThrottleExplainResponse {
     pub partition_id: String,
@@ -81,18 +136,18 @@ pub struct ThrottleExplainResponse {
 }
 
 #[derive(Debug, Clone)]
-pub struct IdempotencyLedger {
-    entries: HashMap<String, LedgerRecord>,
+pub struct IdempotencyLedger<T: Clone> {
+    entries: HashMap<String, LedgerRecord<T>>,
     retention: Duration,
 }
 
 #[derive(Debug, Clone)]
-struct LedgerRecord {
-    response: CreatePartitionResponse,
+struct LedgerRecord<T: Clone> {
+    response: T,
     stored_at: Instant,
 }
 
-impl IdempotencyLedger {
+impl<T: Clone> IdempotencyLedger<T> {
     pub fn new(retention: Duration) -> Self {
         Self {
             entries: HashMap::new(),
@@ -100,7 +155,7 @@ impl IdempotencyLedger {
         }
     }
 
-    pub fn record(&mut self, key: String, response: CreatePartitionResponse, now: Instant) {
+    pub fn record(&mut self, key: String, response: T, now: Instant) {
         self.entries.insert(
             key,
             LedgerRecord {
@@ -111,7 +166,7 @@ impl IdempotencyLedger {
         self.evict(now);
     }
 
-    pub fn get(&mut self, key: &str, now: Instant) -> Option<CreatePartitionResponse> {
+    pub fn get(&mut self, key: &str, now: Instant) -> Option<T> {
         self.evict(now);
         self.entries.get(key).map(|record| record.response.clone())
     }
@@ -120,32 +175,45 @@ impl IdempotencyLedger {
         self.entries
             .retain(|_, record| now.saturating_duration_since(record.stored_at) < self.retention);
     }
+
+    pub fn retention(&self) -> Duration {
+        self.retention
+    }
 }
 
 pub struct AdminHandler {
     cp_guard: CpProofCoordinator,
     placements: CpPlacementClient,
-    ledger: IdempotencyLedger,
-    durability_modes: HashMap<String, DurabilityMode>,
+    create_partition_ledger: IdempotencyLedger<CreatePartitionResponse>,
+    durability_ledger: IdempotencyLedger<SetDurabilityModeResponse>,
+    transfer_ledger: IdempotencyLedger<TransferLeaderResponse>,
+    snapshot_trigger_ledger: IdempotencyLedger<SnapshotTriggerResponse>,
+    durability_modes: HashMap<String, DurabilityState>,
     throttle_state: HashMap<String, FlowThrottleEnvelope>,
     audit_log: Vec<AdminAuditRecord>,
     apply_reports: HashMap<String, WhyApply>,
+    durability_log: Vec<SystemLogEntry>,
 }
 
 impl AdminHandler {
     pub fn new(
         cp_guard: CpProofCoordinator,
         placements: CpPlacementClient,
-        ledger: IdempotencyLedger,
+        ledger: IdempotencyLedger<CreatePartitionResponse>,
     ) -> Self {
+        let retention = ledger.retention();
         Self {
             cp_guard,
             placements,
-            ledger,
+            create_partition_ledger: ledger,
+            durability_ledger: IdempotencyLedger::new(retention),
+            transfer_ledger: IdempotencyLedger::new(retention),
+            snapshot_trigger_ledger: IdempotencyLedger::new(retention),
             durability_modes: HashMap::new(),
             throttle_state: HashMap::new(),
             audit_log: Vec::new(),
             apply_reports: HashMap::new(),
+            durability_log: Vec::new(),
         }
     }
 
@@ -155,7 +223,10 @@ impl AdminHandler {
         now: Instant,
     ) -> Result<CreatePartitionResponse, AdminError> {
         self.guard_cp(now)?;
-        if let Some(response) = self.ledger.get(&request.idempotency_key, now) {
+        if let Some(response) = self
+            .create_partition_ledger
+            .get(&request.idempotency_key, now)
+        {
             return Ok(response);
         }
         let record = PlacementRecord {
@@ -175,7 +246,7 @@ impl AdminHandler {
         };
         let replica_count = request.replicas.len();
         let idempotency_key = request.idempotency_key.clone();
-        self.ledger
+        self.create_partition_ledger
             .record(request.idempotency_key, response.clone(), now);
         info!(
             "event=admin_create_partition clause={} partition_id={} routing_epoch={} replicas={} ledger_entries={} idempotency_key={}",
@@ -183,37 +254,69 @@ impl AdminHandler {
             response.partition_id,
             response.routing_epoch,
             replica_count,
-            self.ledger.entries.len(),
+            self.create_partition_ledger.entries.len(),
             idempotency_key
         );
         Ok(response)
     }
 
-    pub fn handle_update_durability_mode(
+    pub fn handle_set_durability_mode(
         &mut self,
-        request: UpdateDurabilityModeRequest,
+        request: SetDurabilityModeRequest,
         now: Instant,
-    ) -> Result<UpdateDurabilityModeResponse, AdminError> {
+    ) -> Result<SetDurabilityModeResponse, AdminError> {
         self.guard_cp(now)?;
+        if let Some(cached) = self.durability_ledger.get(&request.idempotency_key, now) {
+            return Ok(cached);
+        }
         let partition_id = request.partition_id.clone();
         let target_mode = request.target_mode.clone();
-        self.durability_modes
-            .insert(partition_id.clone(), target_mode.clone());
+        let state = self
+            .durability_modes
+            .entry(partition_id.clone())
+            .or_insert_with(DurabilityState::new);
+        if state.mode != request.expected_mode {
+            return Err(AdminError::ModeConflict {
+                current: state.mode.clone(),
+                requested: target_mode,
+            });
+        }
+        if state.mode != target_mode && matches!(target_mode, DurabilityMode::Relaxed) {
+            self.cp_guard
+                .guard_durability_transition(now)
+                .map_err(AdminError::CpUnavailable)?;
+        }
+        if state.mode != target_mode {
+            let previous = state.mode.clone();
+            state.epoch = state.epoch.saturating_add(1);
+            state.mode = target_mode.clone();
+            self.durability_log
+                .push(SystemLogEntry::DurabilityTransition {
+                    from_mode: format!("{previous:?}"),
+                    to_mode: format!("{target_mode:?}"),
+                    effective_index: state.epoch,
+                    durability_mode_epoch: state.epoch,
+                });
+        }
         self.audit_log.push(AdminAuditRecord {
-            action: "UpdateDurabilityMode".into(),
+            action: "SetDurabilityMode".into(),
             partition_id: partition_id.clone(),
             reason: None,
             recorded_at: now,
             spec_clause: ADMIN_AUDIT_SPEC_CLAUSE.into(),
         });
-        info!(
-            "event=admin_update_durability clause={} partition_id={} target_mode={:?}",
-            ADMIN_API_SPEC, partition_id, target_mode
-        );
-        Ok(UpdateDurabilityModeResponse {
+        let response = SetDurabilityModeResponse {
             partition_id,
-            applied_mode: target_mode,
-        })
+            applied_mode: state.mode.clone(),
+            durability_mode_epoch: state.epoch,
+        };
+        self.durability_ledger
+            .record(request.idempotency_key, response.clone(), now);
+        info!(
+            "event=admin_set_durability clause={} partition_id={} target_mode={:?} epoch={}",
+            ADMIN_API_SPEC, response.partition_id, target_mode, state.epoch
+        );
+        Ok(response)
     }
 
     pub fn handle_snapshot_throttle(
@@ -224,15 +327,17 @@ impl AdminHandler {
         self.guard_cp(now)?;
         let partition_id = request.partition_id.clone();
         let envelope = if request.enable {
-            FlowThrottleEnvelope {
-                state: FlowThrottleState::Open,
-            }
+            FlowThrottleEnvelope::new(
+                FlowThrottleState::Open,
+                CreditHint::Recover,
+                IngestStatusCode::Healthy,
+            )
         } else {
-            FlowThrottleEnvelope {
-                state: FlowThrottleState::Throttled(FlowThrottleReason::ByteCreditDebt {
-                    byte_credit: 0,
-                }),
-            }
+            FlowThrottleEnvelope::new(
+                FlowThrottleState::Throttled(FlowThrottleReason::ByteCreditDebt { byte_credit: 0 }),
+                CreditHint::Shed,
+                IngestStatusCode::TransientBackpressure,
+            )
         };
         self.throttle_state
             .insert(partition_id.clone(), envelope.clone());
@@ -251,6 +356,89 @@ impl AdminHandler {
             partition_id,
             throttle_state: envelope,
         })
+    }
+
+    pub fn handle_transfer_leader(
+        &mut self,
+        request: TransferLeaderRequest,
+        now: Instant,
+    ) -> Result<TransferLeaderResponse, AdminError> {
+        self.guard_cp(now)?;
+        if let Some(cached) = self.transfer_ledger.get(&request.idempotency_key, now) {
+            return Ok(cached);
+        }
+        let partition_id = request.partition_id.clone();
+        let placement = self
+            .placements
+            .placement_snapshot(&partition_id)
+            .ok_or(AdminError::UnknownPartition)?;
+        if let Some(target) = &request.target_replica_id {
+            if !placement
+                .record
+                .members
+                .iter()
+                .any(|member| member == target)
+            {
+                return Err(AdminError::UnknownPartition);
+            }
+        }
+        let response = TransferLeaderResponse {
+            partition_id: partition_id.clone(),
+            target_replica_id: request.target_replica_id.clone(),
+            accepted: true,
+            message: Some("transfer scheduled".into()),
+        };
+        self.audit_log.push(AdminAuditRecord {
+            action: "TransferLeader".into(),
+            partition_id,
+            reason: request.reason.clone(),
+            recorded_at: now,
+            spec_clause: ADMIN_AUDIT_SPEC_CLAUSE.into(),
+        });
+        info!(
+            "event=admin_transfer_leader clause={} partition_id={} target_replica={:?}",
+            ADMIN_API_SPEC, response.partition_id, response.target_replica_id
+        );
+        self.transfer_ledger
+            .record(request.idempotency_key, response.clone(), now);
+        Ok(response)
+    }
+
+    pub fn handle_snapshot_trigger(
+        &mut self,
+        request: SnapshotTriggerRequest,
+        now: Instant,
+    ) -> Result<SnapshotTriggerResponse, AdminError> {
+        self.guard_cp(now)?;
+        if let Some(cached) = self
+            .snapshot_trigger_ledger
+            .get(&request.idempotency_key, now)
+        {
+            return Ok(cached);
+        }
+        let partition_id = request.partition_id.clone();
+        if self.placements.placement_snapshot(&partition_id).is_none() {
+            return Err(AdminError::UnknownPartition);
+        }
+        let response = SnapshotTriggerResponse {
+            partition_id: partition_id.clone(),
+            accepted: true,
+            message: Some(format!("snapshot trigger accepted: {}", request.reason)),
+        };
+        self.audit_log.push(AdminAuditRecord {
+            action: "SnapshotTrigger".into(),
+            partition_id,
+            reason: Some(request.reason.clone()),
+            recorded_at: now,
+            spec_clause: ADMIN_AUDIT_SPEC_CLAUSE.into(),
+        });
+        info!(
+            "event=admin_snapshot_trigger clause={} partition_id={} reason={}",
+            ADMIN_API_SPEC, response.partition_id, request.reason
+        );
+        self.snapshot_trigger_ledger
+            .record(request.idempotency_key, response.clone(), now);
+        Ok(response)
     }
 
     fn guard_cp(&mut self, now: Instant) -> Result<(), AdminError> {
@@ -273,9 +461,11 @@ impl AdminHandler {
             self.throttle_state
                 .get(partition_id)
                 .cloned()
-                .unwrap_or(FlowThrottleEnvelope {
-                    state: FlowThrottleState::Open,
-                });
+                .unwrap_or(FlowThrottleEnvelope::new(
+                    FlowThrottleState::Open,
+                    CreditHint::Recover,
+                    IngestStatusCode::Healthy,
+                ));
         Ok(ThrottleExplainResponse {
             partition_id: partition_id.to_string(),
             envelope,
@@ -291,6 +481,10 @@ impl AdminHandler {
 
     pub fn audit_log(&self) -> &[AdminAuditRecord] {
         &self.audit_log
+    }
+
+    pub fn durability_log(&self) -> &[SystemLogEntry] {
+        &self.durability_log
     }
 
     pub fn record_apply_profile_report(
@@ -320,6 +514,11 @@ pub enum AdminError {
     UnknownPartition,
     #[error("control plane unavailable: {0:?}")]
     CpUnavailable(Box<CpUnavailableResponse>),
+    #[error("mode conflict: requested {requested:?} while current is {current:?}")]
+    ModeConflict {
+        current: DurabilityMode,
+        requested: DurabilityMode,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -333,14 +532,14 @@ pub struct AdminAuditRecord {
 
 #[derive(Debug, Clone)]
 pub struct AdminRequestContext {
-    pub role: String,
+    pub principal: SpiffeId,
     pub breakglass_token: Option<BreakGlassToken>,
 }
 
 impl AdminRequestContext {
-    pub fn new(role: impl Into<String>) -> Self {
+    pub fn new(principal: SpiffeId) -> Self {
         Self {
-            role: role.into(),
+            principal,
             breakglass_token: None,
         }
     }
@@ -354,16 +553,20 @@ impl AdminRequestContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdminCapability {
     CreatePartition,
-    UpdateDurabilityMode,
+    SetDurabilityMode,
     SnapshotThrottle,
+    TransferLeader,
+    TriggerSnapshot,
 }
 
 impl AdminCapability {
     fn as_str(&self) -> &'static str {
         match self {
             Self::CreatePartition => "CreatePartition",
-            Self::UpdateDurabilityMode => "UpdateDurabilityMode",
+            Self::SetDurabilityMode => "SetDurabilityMode",
             Self::SnapshotThrottle => "SnapshotThrottle",
+            Self::TransferLeader => "TransferLeader",
+            Self::TriggerSnapshot => "TriggerSnapshot",
         }
     }
 }
@@ -391,16 +594,16 @@ impl AdminService {
             .map_err(AdminServiceError::from)
     }
 
-    pub fn update_durability_mode(
+    pub fn set_durability_mode(
         &mut self,
         ctx: &AdminRequestContext,
-        request: UpdateDurabilityModeRequest,
+        request: SetDurabilityModeRequest,
         now: Instant,
-    ) -> Result<UpdateDurabilityModeResponse, AdminServiceError> {
-        self.authorize(ctx, AdminCapability::UpdateDurabilityMode, now)?;
-        validate_update_durability_mode(&request)?;
+    ) -> Result<SetDurabilityModeResponse, AdminServiceError> {
+        self.authorize(ctx, AdminCapability::SetDurabilityMode, now)?;
+        validate_set_durability_mode(&request)?;
         self.handler
-            .handle_update_durability_mode(request, now)
+            .handle_set_durability_mode(request, now)
             .map_err(AdminServiceError::from)
     }
 
@@ -414,6 +617,32 @@ impl AdminService {
         validate_snapshot_throttle(&request)?;
         self.handler
             .handle_snapshot_throttle(request, now)
+            .map_err(AdminServiceError::from)
+    }
+
+    pub fn transfer_leader(
+        &mut self,
+        ctx: &AdminRequestContext,
+        request: TransferLeaderRequest,
+        now: Instant,
+    ) -> Result<TransferLeaderResponse, AdminServiceError> {
+        self.authorize(ctx, AdminCapability::TransferLeader, now)?;
+        validate_transfer_leader(&request)?;
+        self.handler
+            .handle_transfer_leader(request, now)
+            .map_err(AdminServiceError::from)
+    }
+
+    pub fn trigger_snapshot(
+        &mut self,
+        ctx: &AdminRequestContext,
+        request: SnapshotTriggerRequest,
+        now: Instant,
+    ) -> Result<SnapshotTriggerResponse, AdminServiceError> {
+        self.authorize(ctx, AdminCapability::TriggerSnapshot, now)?;
+        validate_snapshot_trigger(&request)?;
+        self.handler
+            .handle_snapshot_trigger(request, now)
             .map_err(AdminServiceError::from)
     }
 
@@ -443,46 +672,74 @@ impl AdminService {
         capability: AdminCapability,
         now: Instant,
     ) -> Result<(), AdminServiceError> {
-        match self.rbac.authorize(&ctx.role, capability.as_str(), now) {
-            Ok(_) => Ok(()),
+        let principal = ctx.principal.canonical();
+        let resolved_role = match self.rbac.role_for(&ctx.principal, now) {
+            Ok(role) => Some(role),
             Err(SecurityError::Unauthorized) => {
                 warn!(
-                    "event=admin_authorize clause={} capability={} role={} outcome=unauthorized",
+                    "event=admin_authorize clause={} capability={} principal={} outcome=principal_unmapped",
                     ADMIN_API_SPEC,
                     capability.as_str(),
-                    ctx.role.as_str(),
+                    principal
                 );
-                if let Some(token) = ctx.breakglass_token.clone() {
-                    match self
-                        .rbac
-                        .apply_breakglass(token.clone(), capability.as_str(), now)
-                    {
-                        Ok(_) => {
-                            info!(
-                                "event=admin_breakglass clause={} capability={} role={} token_id={}",
-                                ADMIN_API_SPEC,
-                                capability.as_str(),
-                                ctx.role,
-                                token.token_id
-                            );
-                            Ok(())
-                        }
-                        Err(err) => {
-                            warn!(
-                                "event=admin_breakglass_failed clause={} capability={} role={} error={:?}",
-                                ADMIN_API_SPEC,
-                                capability.as_str(),
-                                ctx.role,
-                                err
-                            );
-                            Err(AdminServiceError::from(err))
-                        }
-                    }
-                } else {
-                    Err(AdminServiceError::Security(SecurityError::Unauthorized))
+                None
+            }
+            Err(err) => {
+                warn!(
+                    "event=admin_authorize clause={} capability={} principal={} error={:?}",
+                    ADMIN_API_SPEC,
+                    capability.as_str(),
+                    principal,
+                    err
+                );
+                return Err(AdminServiceError::Security(err));
+            }
+        };
+
+        if let Some(role_name) = resolved_role.as_deref() {
+            match self.rbac.authorize(role_name, capability.as_str(), now) {
+                Ok(_) => return Ok(()),
+                Err(SecurityError::Unauthorized) => {
+                    warn!(
+                        "event=admin_authorize clause={} capability={} principal={} role={} outcome=unauthorized",
+                        ADMIN_API_SPEC,
+                        capability.as_str(),
+                        principal,
+                        role_name
+                    );
+                }
+                Err(err) => return Err(AdminServiceError::Security(err)),
+            }
+        }
+
+        if let Some(token) = ctx.breakglass_token.clone() {
+            match self
+                .rbac
+                .apply_breakglass(token.clone(), capability.as_str(), now)
+            {
+                Ok(_) => {
+                    info!(
+                        "event=admin_breakglass clause={} capability={} principal={} token_id={}",
+                        ADMIN_API_SPEC,
+                        capability.as_str(),
+                        principal,
+                        token.token_id
+                    );
+                    Ok(())
+                }
+                Err(err) => {
+                    warn!(
+                        "event=admin_breakglass_failed clause={} capability={} principal={} error={:?}",
+                        ADMIN_API_SPEC,
+                        capability.as_str(),
+                        principal,
+                        err
+                    );
+                    Err(AdminServiceError::from(err))
                 }
             }
-            Err(err) => Err(AdminServiceError::Security(err)),
+        } else {
+            Err(AdminServiceError::Security(SecurityError::Unauthorized))
         }
     }
 
@@ -516,8 +773,8 @@ fn validate_create_partition(request: &CreatePartitionRequest) -> Result<(), Adm
     Ok(())
 }
 
-fn validate_update_durability_mode(
-    request: &UpdateDurabilityModeRequest,
+fn validate_set_durability_mode(
+    request: &SetDurabilityModeRequest,
 ) -> Result<(), AdminServiceError> {
     validate_idempotency_key(&request.idempotency_key)?;
     validate_identifier(&request.partition_id, "partition_id", 64)?;
@@ -529,6 +786,33 @@ fn validate_snapshot_throttle(request: &SnapshotThrottleRequest) -> Result<(), A
     if request.reason.trim().is_empty() {
         return Err(AdminServiceError::InvalidRequest(
             "reason is required for snapshot throttle".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transfer_leader(request: &TransferLeaderRequest) -> Result<(), AdminServiceError> {
+    validate_idempotency_key(&request.idempotency_key)?;
+    validate_identifier(&request.partition_id, "partition_id", 64)?;
+    if let Some(replica) = &request.target_replica_id {
+        validate_identifier(replica, "target_replica_id", 64)?;
+    }
+    if let Some(reason) = &request.reason {
+        if reason.trim().is_empty() {
+            return Err(AdminServiceError::InvalidRequest(
+                "reason must not be empty when provided".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_snapshot_trigger(request: &SnapshotTriggerRequest) -> Result<(), AdminServiceError> {
+    validate_idempotency_key(&request.idempotency_key)?;
+    validate_identifier(&request.partition_id, "partition_id", 64)?;
+    if request.reason.trim().is_empty() {
+        return Err(AdminServiceError::InvalidRequest(
+            "reason is required for snapshot trigger".into(),
         ));
     }
     Ok(())
@@ -573,9 +857,15 @@ fn validate_identifier(value: &str, field: &str, max_len: usize) -> Result<(), A
 mod tests {
     use super::*;
     use crate::apply::ApplyProfileReport;
-    use crate::consensus::{ConsensusCore, ConsensusCoreConfig, DurabilityProof};
+    use crate::consensus::{
+        ConsensusCore, ConsensusCoreConfig, DurabilityProof, StrictFallbackState,
+    };
     use crate::cp::{CpProofCoordinator, CpUnavailableReason};
-    use crate::security::{BreakGlassToken, RbacManifestCache, SpiffeId};
+    use crate::security::{
+        BreakGlassToken, RbacManifest, RbacManifestCache, RbacPrincipal, RbacRole, SpiffeId,
+    };
+    use crate::system_log::SystemLogEntry;
+    use std::time::SystemTime;
 
     #[test]
     fn handler_preserves_idempotency() {
@@ -623,16 +913,19 @@ mod tests {
             },
             now,
         );
-        handler
-            .handle_update_durability_mode(
-                UpdateDurabilityModeRequest {
+        let response = handler
+            .handle_set_durability_mode(
+                SetDurabilityModeRequest {
                     idempotency_key: "dur1".into(),
                     partition_id: "p1".into(),
                     target_mode: DurabilityMode::Relaxed,
+                    expected_mode: DurabilityMode::Strict,
                 },
                 now,
             )
             .unwrap();
+        assert_eq!(response.applied_mode, DurabilityMode::Relaxed);
+        assert_eq!(response.durability_mode_epoch, 1);
         let throttle = handler
             .handle_snapshot_throttle(
                 SnapshotThrottleRequest {
@@ -655,6 +948,21 @@ mod tests {
             .audit_log()
             .iter()
             .all(|record| record.spec_clause == ADMIN_AUDIT_SPEC_CLAUSE));
+        let log = handler.durability_log();
+        assert_eq!(log.len(), 1);
+        match &log[0] {
+            SystemLogEntry::DurabilityTransition {
+                from_mode,
+                to_mode,
+                durability_mode_epoch,
+                ..
+            } => {
+                assert_eq!(from_mode, "Strict");
+                assert_eq!(to_mode, "Relaxed");
+                assert_eq!(*durability_mode_epoch, 1);
+            }
+            other => panic!("unexpected durability log entry: {other:?}"),
+        }
     }
 
     #[test]
@@ -720,8 +1028,14 @@ mod tests {
     fn admin_service_enforces_rbac_and_supports_breakglass() {
         let now = Instant::now();
         let (mut service, ctx) = build_service(now, vec!["SnapshotThrottle"]);
+        let request = SetDurabilityModeRequest {
+            idempotency_key: "durability-breakglass".into(),
+            partition_id: "p1".into(),
+            target_mode: DurabilityMode::Relaxed,
+            expected_mode: DurabilityMode::Strict,
+        };
         let err = service
-            .create_partition(&ctx, create_partition_request(), now)
+            .set_durability_mode(&ctx, request.clone(), now)
             .expect_err("missing capability rejected");
         assert!(matches!(
             err,
@@ -730,15 +1044,50 @@ mod tests {
 
         let token = BreakGlassToken {
             token_id: "bg-1".into(),
-            spiffe_id: SpiffeId::parse("spiffe://example.org/operator").unwrap(),
-            scope: "CreatePartition".into(),
+            spiffe_id: SpiffeId::parse(
+                "spiffe://example.org/breakglass/DurabilityOverride/operator",
+            )
+            .unwrap(),
+            scope: "DurabilityOverride".into(),
             ticket_url: "https://ticket/1".into(),
             expires_at: now + Duration::from_secs(60),
+            issued_at: SystemTime::now(),
         };
-        let ctx = AdminRequestContext::new("operator").with_breakglass(token);
+        let ctx =
+            AdminRequestContext::new(SpiffeId::parse("spiffe://example.org/operator").unwrap())
+                .with_breakglass(token);
         service
-            .create_partition(&ctx, create_partition_request(), now)
+            .set_durability_mode(&ctx, request, now)
             .expect("breakglass allows execution");
+    }
+
+    #[test]
+    fn admin_service_rejects_unmapped_principals() {
+        let now = Instant::now();
+        let (mut service, _) = build_service(now, vec!["CreatePartition"]);
+        let ctx =
+            AdminRequestContext::new(SpiffeId::parse("spiffe://example.org/observer").unwrap());
+        let err = service
+            .create_partition(&ctx, create_partition_request(), now)
+            .expect_err("unmapped principal rejected");
+        assert!(matches!(
+            err,
+            AdminServiceError::Security(SecurityError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn admin_service_blocks_when_rbac_cache_stale() {
+        let now = Instant::now();
+        let (mut service, ctx) = build_service(now, vec!["CreatePartition"]);
+        let future = now + Duration::from_secs(3_601);
+        let err = service
+            .create_partition(&ctx, create_partition_request(), future)
+            .expect_err("stale cache blocks admin APIs");
+        assert!(matches!(
+            err,
+            AdminServiceError::Security(SecurityError::RbacStale)
+        ));
     }
 
     #[test]
@@ -757,18 +1106,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn durability_transition_guard_blocks_during_strict_fallback() {
+        let now = Instant::now();
+        let mut handler = build_handler(now);
+        handler
+            .cp_guard
+            .load_local_ledger(DurabilityProof::new(9, 90), now);
+        let request = SetDurabilityModeRequest {
+            idempotency_key: "durability-1".into(),
+            partition_id: "p1".into(),
+            target_mode: DurabilityMode::Relaxed,
+            expected_mode: DurabilityMode::Strict,
+        };
+        let err = handler
+            .handle_set_durability_mode(request.clone(), now)
+            .expect_err("strict fallback must block group fsync");
+        match err {
+            AdminError::CpUnavailable(response) => {
+                assert_eq!(response.reason, CpUnavailableReason::NeededForReadIndex);
+                assert_eq!(response.strict_state, StrictFallbackState::LocalOnly);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        handler
+            .cp_guard
+            .publish_cp_proof_at(DurabilityProof::new(9, 90), now + Duration::from_millis(1));
+        handler
+            .handle_set_durability_mode(request, now + Duration::from_millis(2))
+            .expect("guard clears once proof published");
+    }
+
+    #[test]
+    fn set_durability_mode_detects_mode_conflicts() {
+        let now = Instant::now();
+        let mut handler = build_handler(now);
+        handler
+            .handle_set_durability_mode(
+                SetDurabilityModeRequest {
+                    idempotency_key: "durability-1".into(),
+                    partition_id: "p1".into(),
+                    target_mode: DurabilityMode::Relaxed,
+                    expected_mode: DurabilityMode::Strict,
+                },
+                now,
+            )
+            .unwrap();
+        let err = handler
+            .handle_set_durability_mode(
+                SetDurabilityModeRequest {
+                    idempotency_key: "durability-stale".into(),
+                    partition_id: "p1".into(),
+                    target_mode: DurabilityMode::Relaxed,
+                    expected_mode: DurabilityMode::Strict,
+                },
+                now + Duration::from_millis(1),
+            )
+            .expect_err("stale caller receives ModeConflict");
+        assert!(matches!(err, AdminError::ModeConflict { .. }));
+    }
+
     fn build_service(now: Instant, capabilities: Vec<&str>) -> (AdminService, AdminRequestContext) {
         let handler = build_handler(now);
         let mut rbac = RbacManifestCache::new(Duration::from_secs(3_600));
-        let mut roles = HashMap::new();
-        roles.insert(
-            "operator".into(),
-            capabilities.into_iter().map(|c| c.to_string()).collect(),
-        );
-        rbac.load_manifest(roles, now);
+        let manifest = RbacManifest {
+            roles: vec![RbacRole {
+                name: "operator".into(),
+                capabilities: capabilities.into_iter().map(|c| c.to_string()).collect(),
+            }],
+            principals: vec![RbacPrincipal {
+                spiffe_id: "spiffe://example.org/operator".into(),
+                role: "operator".into(),
+            }],
+        };
+        rbac.load_manifest(manifest, now).unwrap();
         (
             AdminService::new(handler, rbac),
-            AdminRequestContext::new("operator"),
+            AdminRequestContext::new(SpiffeId::parse("spiffe://example.org/operator").unwrap()),
         )
     }
 

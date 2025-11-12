@@ -53,6 +53,10 @@ pub struct WhyNotLeader {
     pub pending_entries: u64,
     pub runtime_terms: Vec<RuntimeTerm>,
     pub strict_fallback_why: Option<StrictFallbackWhy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_ids_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
 }
 
 impl WhyNotLeader {
@@ -75,7 +79,21 @@ impl WhyNotLeader {
             pending_entries: consensus.pending_entries,
             runtime_terms: vec![TERM_STRICT],
             strict_fallback_why,
+            truncated_ids_count: None,
+            continuation_token: None,
         }
+    }
+
+    pub fn with_truncation(
+        mut self,
+        truncated_ids_count: u32,
+        continuation_token: Option<impl Into<String>>,
+    ) -> Self {
+        if truncated_ids_count > 0 {
+            self.truncated_ids_count = Some(truncated_ids_count);
+            self.continuation_token = continuation_token.map(|token| token.into());
+        }
+        self
     }
 }
 
@@ -87,6 +105,10 @@ pub struct WhySnapshotBlocked {
     pub delta_chain: Option<SnapshotDeltaChainTelemetry>,
     pub error: SnapshotReadError,
     pub runtime_terms: Vec<RuntimeTerm>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated_ids_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continuation_token: Option<String>,
 }
 
 impl WhySnapshotBlocked {
@@ -108,7 +130,21 @@ impl WhySnapshotBlocked {
             delta_chain,
             error,
             runtime_terms,
+            truncated_ids_count: None,
+            continuation_token: None,
         }
+    }
+
+    pub fn with_truncation(
+        mut self,
+        truncated_ids_count: u32,
+        continuation_token: Option<impl Into<String>>,
+    ) -> Self {
+        if truncated_ids_count > 0 {
+            self.truncated_ids_count = Some(truncated_ids_count);
+            self.continuation_token = continuation_token.map(|token| token.into());
+        }
+        self
     }
 }
 
@@ -195,6 +231,50 @@ mod tests {
         assert_eq!(header.partition_id, "p7");
         assert_eq!(header.routing_epoch, 4);
         assert_eq!(header.durability_mode_epoch, 2);
+    }
+
+    #[test]
+    fn why_not_leader_truncation_metadata_applies() {
+        let header = WhySchemaHeader::new("p9", 2, 1, 999);
+        let quorum = PartitionQuorumStatus {
+            committed_index: 10,
+            committed_term: 2,
+            quorum_size: 3,
+        };
+        let why = WhyNotLeader::from_status(
+            header,
+            None,
+            LocalRole::Follower,
+            CpCacheState::Stale { age_ms: 5_000 },
+            consensus_status(StrictFallbackState::LocalOnly),
+            quorum,
+            None,
+        )
+        .with_truncation(5, Some("token-1"));
+        assert_eq!(why.truncated_ids_count, Some(5));
+        assert_eq!(why.continuation_token.as_deref(), Some("token-1"));
+    }
+
+    #[test]
+    fn why_snapshot_blocked_applies_truncation_metadata() {
+        let header = WhySchemaHeader::new("p10", 3, 2, 123);
+        let telemetry = SnapshotFallbackTelemetry {
+            partition_ready_ratio_snapshot: 0.5,
+            snapshot_manifest_age_ms: 1_000,
+            snapshot_only_ready_state: SnapshotOnlyReadyState::Healthy,
+            snapshot_only_min_ready_ratio: 0.8,
+            snapshot_only_slo_breach_total: 1,
+        };
+        let why = WhySnapshotBlocked::new(
+            header,
+            "manifest-trunc",
+            telemetry,
+            None,
+            SnapshotReadError::SnapshotOnlyUnavailable,
+        )
+        .with_truncation(3, None::<String>);
+        assert_eq!(why.truncated_ids_count, Some(3));
+        assert!(why.continuation_token.is_none());
     }
 
     use crate::snapshot::SnapshotDeltaChainState;

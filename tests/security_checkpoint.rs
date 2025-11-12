@@ -1,10 +1,9 @@
 use clustor::storage::crypto::KeyEpoch;
 use clustor::{
-    BreakGlassToken, KeyEpochWatcher, MetricsRegistry, MtlsIdentityManager, RbacManifestCache,
-    SecurityError, SerialNumber, SpiffeId,
+    BreakGlassToken, KeyEpochWatcher, MetricsRegistry, MtlsIdentityManager, RbacManifest,
+    RbacManifestCache, RbacPrincipal, RbacRole, SecurityError, SerialNumber, SpiffeId,
 };
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 fn sample_cert(now: Instant, serial: u64) -> clustor::security::Certificate {
     clustor::security::Certificate {
@@ -111,20 +110,34 @@ fn security_checkpoint_rotates_and_revokes() {
         .expect("override allows lagging partition");
 
     let mut cache = RbacManifestCache::new(Duration::from_secs(30));
-    let mut roles = HashMap::new();
-    roles.insert("operator".into(), vec!["CreatePartition".into()]);
-    cache.load_manifest(roles, now);
+    cache
+        .load_manifest(
+            RbacManifest {
+                roles: vec![RbacRole {
+                    name: "operator".into(),
+                    capabilities: vec!["CreatePartition".into()],
+                }],
+                principals: vec![RbacPrincipal {
+                    spiffe_id: "spiffe://example.org/operator".into(),
+                    role: "operator".into(),
+                }],
+            },
+            now,
+        )
+        .expect("manifest loads");
     cache
         .authorize("operator", "CreatePartition", now)
         .expect("authorized");
     let token = BreakGlassToken {
         token_id: "token-checkpoint".into(),
-        spiffe_id: SpiffeId::parse("spiffe://example.org/operator").unwrap(),
-        scope: "ThrottleOverride".into(),
+        spiffe_id: SpiffeId::parse("spiffe://example.org/breakglass/DurabilityOverride/operator")
+            .unwrap(),
+        scope: "DurabilityOverride".into(),
         ticket_url: "https://ticket".into(),
         expires_at: now + Duration::from_secs(60),
+        issued_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
     };
     cache
-        .apply_breakglass(token, "ThrottleOverride", now)
+        .apply_breakglass(token, "SetDurabilityMode", now)
         .expect("token accepted");
 }

@@ -1,4 +1,6 @@
 use crate::bootstrap::boot_record::{BootRecord, BootRecordError, BootRecordStore};
+use crate::consensus::RaftMetadataStore;
+use crate::storage::compaction::{authorization_chain_hash, SnapshotAuthorizationRecord};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::fs;
@@ -30,6 +32,7 @@ impl StorageLayout {
             snapshot_dir: self.root.join("snapshot"),
             definitions_dir: self.root.join("definitions"),
             metadata_file: self.root.join("metadata.json"),
+            raft_metadata_file: self.root.join("raft_metadata.json"),
             boot_record_file: self.root.join("boot_record.json"),
             manifest_authorizations: self.root.join("snapshot/manifest_authorizations.log"),
             durability_log: self.root.join("wal/durability.log"),
@@ -42,6 +45,9 @@ impl StorageLayout {
         fs::create_dir_all(&paths.snapshot_dir)?;
         fs::create_dir_all(&paths.definitions_dir)?;
         if let Some(parent) = paths.metadata_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if let Some(parent) = paths.raft_metadata_file.parent() {
             fs::create_dir_all(parent)?;
         }
         if let Some(parent) = paths.boot_record_file.parent() {
@@ -61,6 +67,10 @@ impl StorageLayout {
 
     pub fn boot_record_store(&self) -> BootRecordStore {
         BootRecordStore::new(self.paths().boot_record_file)
+    }
+
+    pub fn raft_metadata_store(&self) -> RaftMetadataStore {
+        RaftMetadataStore::new(self.paths().raft_metadata_file.clone())
     }
 
     pub fn load_state(&self) -> Result<StorageState, StorageLayoutError> {
@@ -88,6 +98,7 @@ pub struct StoragePaths {
     pub snapshot_dir: PathBuf,
     pub definitions_dir: PathBuf,
     pub metadata_file: PathBuf,
+    pub raft_metadata_file: PathBuf,
     pub boot_record_file: PathBuf,
     pub manifest_authorizations: PathBuf,
     pub durability_log: PathBuf,
@@ -131,7 +142,30 @@ pub struct CompactionMetadata {
 pub struct CompactionAuthAck {
     pub manifest_id: String,
     pub auth_seq: u64,
+    pub manifest_hash: String,
     pub acked_at_ms: u64,
+    pub chain_hash: String,
+}
+
+impl CompactionAuthAck {
+    pub fn from_record(
+        record: &SnapshotAuthorizationRecord,
+        previous_chain: Option<&str>,
+        acked_at_ms: u64,
+    ) -> Self {
+        Self {
+            manifest_id: record.manifest_id.clone(),
+            auth_seq: record.auth_seq,
+            manifest_hash: record.manifest_hash.clone(),
+            acked_at_ms,
+            chain_hash: authorization_chain_hash(
+                previous_chain,
+                &record.manifest_id,
+                record.auth_seq,
+                &record.manifest_hash,
+            ),
+        }
+    }
 }
 
 impl CompactionMetadata {
@@ -328,6 +362,17 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn raft_metadata_store_aligns_with_layout() {
+        let tmp = TempDir::new().unwrap();
+        let layout = StorageLayout::new(tmp.path());
+        let store = layout.raft_metadata_store();
+        assert_eq!(
+            store.path().strip_prefix(tmp.path()).unwrap(),
+            Path::new("raft_metadata.json")
+        );
+    }
+
+    #[test]
     fn ensures_tree_and_loads_defaults() {
         let tmp = TempDir::new().unwrap();
         let layout = StorageLayout::new(tmp.path());
@@ -360,7 +405,10 @@ mod tests {
         };
         layout.metadata_store().persist(&metadata).unwrap();
 
-        let boot = BootRecord { fsync_probe: None };
+        let boot = BootRecord {
+            fsync_probe: None,
+            disk_policy: None,
+        };
         let store = layout.boot_record_store();
         store.persist(&boot).unwrap();
 

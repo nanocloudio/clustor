@@ -8,7 +8,7 @@ use super::NetError;
 use crate::raft::{
     AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
 };
-use crate::security::MtlsIdentityManager;
+use crate::security::{MtlsIdentityManager, RevocationSource};
 use crate::transport::raft::{RaftRpcHandler, RaftRpcServer};
 use log::{debug, info, warn};
 use rustls::client::{
@@ -121,6 +121,7 @@ pub struct RaftNetworkClient {
     tls_config: Arc<ClientConfig>,
     server_name: ServerName,
     mtls: MtlsIdentityManager,
+    session: Option<ClientSession>,
 }
 
 impl RaftNetworkClient {
@@ -138,7 +139,15 @@ impl RaftNetworkClient {
             server_name: server_name(&config.host)?,
             tls_config,
             mtls: config.mtls,
+            session: None,
         })
+    }
+
+    pub fn refresh_revocation(&mut self, now: Instant) {
+        self.mtls
+            .record_revocation_refresh(RevocationSource::Ocsp, now);
+        self.mtls
+            .record_revocation_refresh(RevocationSource::Crl, now);
     }
 
     pub fn request_vote(
@@ -166,28 +175,28 @@ impl RaftNetworkClient {
     }
 
     fn send(&mut self, opcode: u8, payload: &[u8], now: Instant) -> Result<Vec<u8>, NetError> {
-        let mut stream = self.connect()?;
-        let mut conn = ClientConnection::new(self.tls_config.clone(), self.server_name.clone())?;
-        complete_client_handshake(&mut conn, &mut stream)?;
-        match stream.peer_addr() {
-            Ok(addr) => info!("event=raft_client_tls_session peer={addr}"),
-            Err(_) => debug!("event=raft_client_tls_session peer=unknown"),
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            match self.ensure_session(now) {
+                Ok(session) => match session.send(opcode, payload) {
+                    Ok(response) => return Ok(response),
+                    Err(err) => {
+                        self.session.take();
+                        if attempts >= 2 {
+                            return Err(err);
+                        }
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    if attempts >= 2 {
+                        return Err(err);
+                    }
+                    continue;
+                }
+            }
         }
-        let peer_chain = conn
-            .peer_certificates()
-            .ok_or_else(|| NetError::Certificate("peer presented no certificate".into()))?;
-        let peer_certificate = decode_peer_certificate(peer_chain, Instant::now())?;
-        self.mtls
-            .verify_peer(&peer_certificate, now)
-            .map_err(|err| NetError::Protocol(format!("mTLS verification failed: {err}")))?;
-        let mut tls = Stream::new(&mut conn, &mut stream);
-        write_frame(&mut tls, opcode, payload)?;
-        let response = read_response(&mut tls)?;
-        match stream.peer_addr() {
-            Ok(addr) => info!("event=raft_client_disconnect peer={addr}"),
-            Err(_) => debug!("event=raft_client_disconnect peer=unknown"),
-        }
-        Ok(response)
     }
 
     fn connect(&self) -> Result<TcpStream, NetError> {
@@ -201,7 +210,7 @@ impl RaftNetworkClient {
                     return Ok(stream);
                 }
                 Err(err) => {
-                    warn!("event=raft_client_tcp_error peer={} error={}", addr, err);
+                    debug!("event=raft_client_tcp_error peer={} error={}", addr, err);
                     last_err = Some(err);
                 }
             }
@@ -209,6 +218,64 @@ impl RaftNetworkClient {
         Err(NetError::Io(last_err.unwrap_or_else(|| {
             std::io::Error::other("unable to connect to Raft peer")
         })))
+    }
+
+    fn ensure_session(&mut self, now: Instant) -> Result<&mut ClientSession, NetError> {
+        if self.session.is_none() {
+            let session = ClientSession::connect(
+                self.connect()?,
+                self.tls_config.clone(),
+                self.server_name.clone(),
+                &mut self.mtls,
+                now,
+            )?;
+            self.session = Some(session);
+        }
+        Ok(self.session.as_mut().expect("session set"))
+    }
+}
+
+struct ClientSession {
+    stream: TcpStream,
+    conn: ClientConnection,
+}
+
+impl ClientSession {
+    fn connect(
+        mut stream: TcpStream,
+        tls_config: Arc<ClientConfig>,
+        server_name: ServerName,
+        mtls: &mut MtlsIdentityManager,
+        now: Instant,
+    ) -> Result<Self, NetError> {
+        let mut conn = ClientConnection::new(tls_config, server_name)?;
+        complete_client_handshake(&mut conn, &mut stream)?;
+        match stream.peer_addr() {
+            Ok(addr) => info!("event=raft_client_tls_session peer={addr}"),
+            Err(_) => debug!("event=raft_client_tls_session peer=unknown"),
+        }
+        let peer_chain = conn
+            .peer_certificates()
+            .ok_or_else(|| NetError::Certificate("peer presented no certificate".into()))?;
+        let peer_certificate = decode_peer_certificate(peer_chain, Instant::now())?;
+        mtls.verify_peer(&peer_certificate, now)
+            .map_err(|err| NetError::Protocol(format!("mTLS verification failed: {err}")))?;
+        Ok(Self { stream, conn })
+    }
+
+    fn send(&mut self, opcode: u8, payload: &[u8]) -> Result<Vec<u8>, NetError> {
+        let mut tls = Stream::new(&mut self.conn, &mut self.stream);
+        write_frame(&mut tls, opcode, payload)?;
+        read_response(&mut tls)
+    }
+}
+
+impl Drop for ClientSession {
+    fn drop(&mut self) {
+        match self.stream.peer_addr() {
+            Ok(addr) => info!("event=raft_client_disconnect peer={addr}"),
+            Err(_) => debug!("event=raft_client_disconnect peer=unknown"),
+        }
     }
 }
 

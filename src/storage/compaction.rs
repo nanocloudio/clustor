@@ -1,5 +1,7 @@
 use crate::storage::layout::{CompactionAuthAck, StorageMetadata};
+use hex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -46,7 +48,9 @@ impl ManifestGate {
         }
         match &self.acknowledgement {
             Some(ack)
-                if ack.manifest_id == record.manifest_id && ack.auth_seq == record.auth_seq =>
+                if ack.manifest_id == record.manifest_id
+                    && ack.auth_seq == record.auth_seq
+                    && ack.manifest_hash == record.manifest_hash =>
             {
                 Ok(())
             }
@@ -214,12 +218,10 @@ pub fn compute_compaction_floor(
     snapshot_base_index: u64,
     quorum_sm_durable_index: u64,
 ) -> u64 {
-    if quorum_sm_durable_index < snapshot_base_index {
-        return snapshot_base_index;
-    }
     let learner_floor = learner_slack_floor.unwrap_or(0);
     let quorum_floor = quorum_applied_index.min(snapshot_base_index);
-    learner_floor.max(quorum_floor)
+    let floor = learner_floor.max(quorum_floor);
+    floor.min(quorum_sm_durable_index)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -229,6 +231,36 @@ pub struct SnapshotAuthorizationRecord {
     pub auth_seq: u64,
     pub manifest_hash: String,
     pub recorded_at_ms: u64,
+    pub chain_hash: String,
+}
+
+const ZERO_CHAIN: [u8; 32] = [0u8; 32];
+
+pub fn authorization_chain_hash(
+    previous_chain: Option<&str>,
+    manifest_id: &str,
+    auth_seq: u64,
+    manifest_hash: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    if let Some(prev) = previous_chain {
+        let trimmed = prev.strip_prefix("0x").unwrap_or(prev);
+        if let Ok(bytes) = hex::decode(trimmed) {
+            if bytes.len() == ZERO_CHAIN.len() {
+                hasher.update(bytes);
+            } else {
+                hasher.update(ZERO_CHAIN);
+            }
+        } else {
+            hasher.update(ZERO_CHAIN);
+        }
+    } else {
+        hasher.update(ZERO_CHAIN);
+    }
+    hasher.update(manifest_id.as_bytes());
+    hasher.update(auth_seq.to_be_bytes());
+    hasher.update(manifest_hash.as_bytes());
+    format!("0x{}", hex::encode(hasher.finalize()))
 }
 
 pub struct ManifestAuthorizationLog {
@@ -241,13 +273,26 @@ impl ManifestAuthorizationLog {
     }
 
     pub fn append(&self, record: &SnapshotAuthorizationRecord) -> Result<(), ManifestLogError> {
-        if let Some(latest) = self.latest()? {
-            if record.auth_seq <= latest.auth_seq {
+        let latest = self.latest()?;
+        if let Some(latest_record) = &latest {
+            if record.auth_seq <= latest_record.auth_seq {
                 return Err(ManifestLogError::OutOfOrderSeq {
-                    expected: latest.auth_seq + 1,
+                    expected: latest_record.auth_seq + 1,
                     observed: record.auth_seq,
                 });
             }
+        }
+        let expected_chain = authorization_chain_hash(
+            latest.as_ref().map(|entry| entry.chain_hash.as_str()),
+            &record.manifest_id,
+            record.auth_seq,
+            &record.manifest_hash,
+        );
+        if record.chain_hash != expected_chain {
+            return Err(ManifestLogError::ChainMismatch {
+                expected: expected_chain,
+                observed: record.chain_hash.clone(),
+            });
         }
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
@@ -300,6 +345,8 @@ pub enum ManifestLogError {
     Serialization(#[from] serde_json::Error),
     #[error("authorization sequence out of order: expected {expected}, observed {observed}")]
     OutOfOrderSeq { expected: u64, observed: u64 },
+    #[error("authorization chain mismatch: expected {expected}, observed {observed}")]
+    ChainMismatch { expected: String, observed: String },
 }
 
 pub fn manifest_gate_from_metadata(
@@ -332,6 +379,18 @@ mod tests {
     }
 
     #[test]
+    fn floor_clamped_by_quorum_sm_durable() {
+        let floor = compute_compaction_floor(Some(900), 1_500, 1_200, 950);
+        assert_eq!(floor, 950);
+    }
+
+    #[test]
+    fn floor_uses_quorum_and_base_when_durable_allows() {
+        let floor = compute_compaction_floor(None, 1_800, 1_200, 2_000);
+        assert_eq!(floor, 1_200);
+    }
+
+    #[test]
     fn blocks_when_manifest_missing() {
         let state = CompactionState {
             learner_slack_floor: None,
@@ -360,19 +419,58 @@ mod tests {
     }
 
     #[test]
+    fn blocks_when_snapshot_base_not_durable() {
+        let chain = authorization_chain_hash(None, "m1", 5, "abc");
+        let record = SnapshotAuthorizationRecord {
+            manifest_id: "m1".into(),
+            base_index: 90,
+            auth_seq: 5,
+            manifest_hash: "abc".into(),
+            recorded_at_ms: 0,
+            chain_hash: chain.clone(),
+        };
+        let ack = CompactionAuthAck::from_record(&record, None, 0);
+        let state = CompactionState {
+            learner_slack_floor: None,
+            quorum_applied_index: 100,
+            snapshot_base_index: 90,
+            quorum_sm_durable_index: 80,
+            guard_bytes_satisfied: true,
+            learner_retirement_pending: false,
+            manifest_gate: ManifestGate {
+                relisted: true,
+                signature_valid: true,
+                authorization: Some(record),
+                acknowledgement: Some(ack),
+            },
+        };
+        let request = CompactionPlanRequest {
+            state,
+            segments: Vec::new(),
+        };
+        match CompactionGate::plan(request) {
+            CompactionDecision::Blocked(reasons) => {
+                assert!(reasons.iter().any(|reason| matches!(
+                    reason,
+                    CompactionBlockReason::SnapshotBaseNotDurable { .. }
+                )));
+            }
+            _ => panic!("expected blocked"),
+        }
+    }
+
+    #[test]
     fn ready_plan_skips_nonce_and_rewrite_segments() {
+        let chain = authorization_chain_hash(None, "m1", 7, "abc");
         let record = SnapshotAuthorizationRecord {
             manifest_id: "m1".into(),
             base_index: 90,
             auth_seq: 7,
             manifest_hash: "abc".into(),
             recorded_at_ms: 0,
+            chain_hash: chain.clone(),
         };
-        let ack = CompactionAuthAck {
-            manifest_id: "m1".into(),
-            auth_seq: 7,
-            acked_at_ms: 0,
-        };
+        let ack = CompactionAuthAck::from_record(&record, None, 0);
         let state = CompactionState {
             learner_slack_floor: None,
             quorum_applied_index: 100,
@@ -426,16 +524,75 @@ mod tests {
     }
 
     #[test]
+    fn ready_plan_allows_nonce_abandon_segments() {
+        let chain = authorization_chain_hash(None, "m1", 7, "abc");
+        let record = SnapshotAuthorizationRecord {
+            manifest_id: "m1".into(),
+            base_index: 90,
+            auth_seq: 7,
+            manifest_hash: "abc".into(),
+            recorded_at_ms: 0,
+            chain_hash: chain.clone(),
+        };
+        let ack = CompactionAuthAck::from_record(&record, None, 0);
+        let state = CompactionState {
+            learner_slack_floor: None,
+            quorum_applied_index: 100,
+            snapshot_base_index: 90,
+            quorum_sm_durable_index: 120,
+            guard_bytes_satisfied: true,
+            learner_retirement_pending: false,
+            manifest_gate: ManifestGate {
+                relisted: true,
+                signature_valid: true,
+                authorization: Some(record),
+                acknowledgement: Some(ack),
+            },
+        };
+        let segments = vec![
+            SegmentHealth {
+                segment_seq: 1,
+                max_index_in_segment: 80,
+                has_pending_nonce_reservation: false,
+                abandon_record_present: false,
+                rewrite_inflight: false,
+            },
+            SegmentHealth {
+                segment_seq: 2,
+                max_index_in_segment: 75,
+                has_pending_nonce_reservation: true,
+                abandon_record_present: true,
+                rewrite_inflight: false,
+            },
+        ];
+        let decision = CompactionGate::plan(CompactionPlanRequest { state, segments });
+        match decision {
+            CompactionDecision::Ready {
+                floor_effective,
+                deletable_segments,
+                skipped_segments,
+            } => {
+                assert_eq!(floor_effective, 90);
+                assert_eq!(deletable_segments, vec![1, 2]);
+                assert!(skipped_segments.is_empty());
+            }
+            _ => panic!("expected ready"),
+        }
+    }
+
+    #[test]
     fn manifest_log_appends_and_reads() {
         let tmp = TempDir::new().unwrap();
         let log_path = tmp.path().join("manifest.log");
         let log = ManifestAuthorizationLog::new(&log_path);
+        let chain = authorization_chain_hash(None, "m2", 1, "deadbeef");
         let record = SnapshotAuthorizationRecord {
             manifest_id: "m2".into(),
             base_index: 42,
             auth_seq: 1,
             manifest_hash: "deadbeef".into(),
             recorded_at_ms: 123,
+            chain_hash: chain.clone(),
         };
         log.append(&record).unwrap();
         let read_back = log.latest().unwrap().unwrap();
@@ -446,6 +603,7 @@ mod tests {
             auth_seq: 2,
             manifest_hash: "cafe".into(),
             recorded_at_ms: 124,
+            chain_hash: authorization_chain_hash(Some(chain.as_str()), "m3", 2, "cafe"),
         };
         log.append(&second).unwrap();
         let records = log.load().unwrap();

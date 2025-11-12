@@ -4,15 +4,21 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+/// `(term,index)` reference to the latest known log tail.
+pub type LogTailRef = TermIndexSnapshot;
+
 /// Persistent Raft metadata tracking the node's `current_term` and vote state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct RaftMetadata {
     pub current_term: u64,
     pub voted_for: Option<String>,
+    #[serde(default)]
     pub last_applied: u64,
-    pub last_log_term: u64,
-    pub last_log_index: u64,
+    #[serde(default)]
+    pub log_tail: Option<LogTailRef>,
+    #[serde(default)]
     pub wal_block_size: u32,
+    #[serde(default)]
     pub wal_next_block: u64,
 }
 
@@ -33,10 +39,23 @@ impl RaftMetadata {
     }
 
     pub fn note_append(&mut self, term: u64, index: u64) {
-        if term > self.last_log_term || index > self.last_log_index {
-            self.last_log_term = term;
-            self.last_log_index = index;
+        self.record_log_tail(term, index);
+    }
+
+    pub fn record_log_tail(&mut self, term: u64, index: u64) {
+        if let Some(existing) = self.log_tail {
+            if existing.term > term {
+                return;
+            }
+            if existing.term == term && existing.index >= index {
+                return;
+            }
         }
+        self.log_tail = Some(LogTailRef { term, index });
+    }
+
+    pub fn log_tail(&self) -> Option<LogTailRef> {
+        self.log_tail
     }
 }
 
@@ -104,7 +123,7 @@ impl RaftLogEntry {
 }
 
 /// Compact `(term,index)` snapshots written alongside the log for fast reloads.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TermIndexSnapshot {
     pub term: u64,
     pub index: u64,
@@ -115,8 +134,10 @@ pub struct TermIndexSnapshot {
 pub struct RaftLogStore {
     log_path: PathBuf,
     index_path: PathBuf,
+    snapshot_hint_path: PathBuf,
     entries: Vec<RaftLogEntry>,
     index: Vec<TermIndexSnapshot>,
+    snapshot_hint: Option<TermIndexSnapshot>,
 }
 
 impl RaftLogStore {
@@ -127,6 +148,8 @@ impl RaftLogStore {
         }
         let mut index_path = log_path.clone();
         index_path.set_extension("idx");
+        let mut snapshot_hint_path = log_path.clone();
+        snapshot_hint_path.set_extension("snap");
 
         let entries = Self::load_entries(&log_path)?;
         let index = if index_path.exists() {
@@ -134,13 +157,22 @@ impl RaftLogStore {
         } else {
             Self::rebuild_snapshot(&entries)
         };
+        let hint = Self::load_snapshot_hint(&snapshot_hint_path)?;
 
-        Ok(Self {
+        let mut store = Self {
             log_path,
             index_path,
+            snapshot_hint_path,
             entries,
             index,
-        })
+            snapshot_hint: hint,
+        };
+
+        if let Some(snapshot) = hint {
+            store.apply_snapshot_hint(snapshot)?;
+        }
+
+        Ok(store)
     }
 
     pub fn len(&self) -> usize {
@@ -244,6 +276,36 @@ impl RaftLogStore {
         Ok(())
     }
 
+    pub fn discard_through(&mut self, index: u64) -> Result<(), RaftLogError> {
+        let original_len = self.entries.len();
+        self.entries.retain(|entry| entry.index > index);
+        self.index.retain(|snapshot| snapshot.index > index);
+        if self.entries.len() == original_len {
+            return Ok(());
+        }
+        self.rewrite_files()?;
+        Ok(())
+    }
+
+    pub fn snapshot_hint(&self) -> Option<TermIndexSnapshot> {
+        self.snapshot_hint
+    }
+
+    pub fn persist_snapshot_hint(&mut self, hint: TermIndexSnapshot) -> Result<(), RaftLogError> {
+        if self
+            .snapshot_hint
+            .map(|existing| existing.index >= hint.index)
+            == Some(true)
+        {
+            // No-op when the existing hint already covers this range.
+            return Ok(());
+        }
+        self.apply_snapshot_hint(hint)?;
+        self.snapshot_hint = Some(hint);
+        self.write_snapshot_hint()?;
+        Ok(())
+    }
+
     fn rewrite_files(&self) -> Result<(), RaftLogError> {
         Self::rewrite_json_lines(&self.log_path, &self.entries)?;
         Self::rewrite_json_lines(&self.index_path, &self.index)?;
@@ -320,6 +382,40 @@ impl RaftLogStore {
             })
             .collect()
     }
+
+    fn apply_snapshot_hint(&mut self, hint: TermIndexSnapshot) -> Result<(), RaftLogError> {
+        self.discard_through(hint.index)?;
+        Ok(())
+    }
+
+    fn load_snapshot_hint(path: &Path) -> Result<Option<TermIndexSnapshot>, RaftLogError> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(path)?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+
+    fn write_snapshot_hint(&self) -> Result<(), RaftLogError> {
+        if let Some(hint) = self.snapshot_hint {
+            if let Some(parent) = self.snapshot_hint_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let tmp = self.snapshot_hint_path.with_extension("snap.tmp");
+            let mut file = File::create(&tmp)?;
+            let payload = serde_json::to_vec(&hint)?;
+            file.write_all(&payload)?;
+            file.write_all(b"\n")?;
+            file.sync_all()?;
+            fs::rename(tmp, &self.snapshot_hint_path)?;
+        } else if self.snapshot_hint_path.exists() {
+            fs::remove_file(&self.snapshot_hint_path)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
@@ -387,9 +483,33 @@ mod tests {
             ..Default::default()
         };
         meta.record_vote("node-a");
+        meta.record_log_tail(5, 42);
         store.persist(&meta).unwrap();
         let loaded = store.load_or_default().unwrap();
         assert_eq!(loaded.current_term, 5);
         assert_eq!(loaded.voted_for.as_deref(), Some("node-a"));
+        assert_eq!(loaded.log_tail.unwrap().index, 42);
+    }
+
+    #[test]
+    fn snapshot_hint_discards_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let log_path = tmp.path().join("raft.log");
+        {
+            let mut store = RaftLogStore::open(&log_path).unwrap();
+            for i in 1..=5 {
+                store
+                    .append(RaftLogEntry::new(1, i, vec![i as u8]))
+                    .unwrap();
+            }
+            store
+                .persist_snapshot_hint(TermIndexSnapshot { term: 1, index: 3 })
+                .unwrap();
+            assert_eq!(store.snapshot_hint().unwrap().index, 3);
+            assert_eq!(store.first_index(), 4);
+        }
+        let reopened = RaftLogStore::open(&log_path).unwrap();
+        assert_eq!(reopened.snapshot_hint().unwrap().index, 3);
+        assert_eq!(reopened.first_index(), 4);
     }
 }

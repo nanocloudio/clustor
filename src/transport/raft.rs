@@ -6,6 +6,7 @@ use crate::raft::{
 };
 use crate::security::{Certificate, MtlsIdentityManager, SecurityError};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use thiserror::Error;
 
@@ -17,18 +18,26 @@ pub trait RaftRpcHandler {
 
 /// Minimal authenticated RPC endpoint for Raft leadership traffic.
 pub struct RaftRpcServer<H> {
-    identity: MtlsIdentityManager,
+    identity: Arc<Mutex<MtlsIdentityManager>>,
     handler: H,
     catalog: Option<CatalogNegotiationReport>,
 }
 
 impl<H: RaftRpcHandler> RaftRpcServer<H> {
     pub fn new(identity: MtlsIdentityManager, handler: H) -> Self {
+        Self::with_identity(Arc::new(Mutex::new(identity)), handler)
+    }
+
+    pub fn with_identity(identity: Arc<Mutex<MtlsIdentityManager>>, handler: H) -> Self {
         Self {
             identity,
             handler,
             catalog: None,
         }
+    }
+
+    pub fn identity_handle(&self) -> Arc<Mutex<MtlsIdentityManager>> {
+        self.identity.clone()
     }
 
     /// Performs catalog negotiation and persists the resulting transcript for §0.3 auditors.
@@ -49,9 +58,12 @@ impl<H: RaftRpcHandler> RaftRpcServer<H> {
         frame: &[u8],
         now: Instant,
     ) -> Result<Vec<u8>, RaftTransportError> {
-        self.identity
-            .verify_peer(peer, now)
-            .map_err(RaftTransportError::Security)?;
+        {
+            let mut identity = self.identity.lock().expect("MtlsIdentityManager poisoned");
+            identity
+                .verify_peer(peer, now)
+                .map_err(RaftTransportError::Security)?;
+        }
         let request = match RequestVoteRequest::decode(frame) {
             Ok(req) => req,
             Err(err) => {
@@ -73,9 +85,12 @@ impl<H: RaftRpcHandler> RaftRpcServer<H> {
         frame: &[u8],
         now: Instant,
     ) -> Result<Vec<u8>, RaftTransportError> {
-        self.identity
-            .verify_peer(peer, now)
-            .map_err(RaftTransportError::Security)?;
+        {
+            let mut identity = self.identity.lock().expect("MtlsIdentityManager poisoned");
+            identity
+                .verify_peer(peer, now)
+                .map_err(RaftTransportError::Security)?;
+        }
         let request = match AppendEntriesRequest::decode(frame) {
             Ok(req) => req,
             Err(err) => {

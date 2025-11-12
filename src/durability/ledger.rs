@@ -2,6 +2,7 @@ use crate::consensus::DurabilityProof;
 use crate::raft::{
     PartitionQuorum, PartitionQuorumConfig, PartitionQuorumStatus, QuorumError, ReplicaId,
 };
+use crate::telemetry::MetricsRegistry;
 use crate::terminology::{RuntimeTerm, TERM_GROUP_FSYNC, TERM_STRICT};
 use log::info;
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,7 @@ pub struct AckRecord {
     pub io_mode: IoMode,
 }
 
+#[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IoMode {
     Strict,
@@ -76,8 +78,29 @@ impl DurabilityLedger {
         })
     }
 
+    pub fn ingest_ack(&mut self, ack: DurabilityAckMessage) -> Result<LedgerUpdate, LedgerError> {
+        let record = AckRecord {
+            replica: ack.replica,
+            term: ack.term,
+            index: ack.last_fsynced_index,
+            segment_seq: ack.segment_seq,
+            io_mode: ack.io_mode,
+        };
+        self.record_ack(record)
+    }
+
     pub fn status(&self) -> PartitionQuorumStatus {
         self.quorum.status()
+    }
+
+    pub fn pending_entries(&self) -> u64 {
+        match (
+            self.last_record.as_ref(),
+            self.quorum.status().committed_index,
+        ) {
+            (Some(last), committed) => last.index.saturating_sub(committed),
+            _ => 0,
+        }
     }
 
     pub fn latest_proof(&self) -> Option<DurabilityProof> {
@@ -105,6 +128,34 @@ impl DurabilityLedger {
 pub struct LedgerUpdate {
     pub record: AckRecord,
     pub quorum_index: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DurabilityAckMessage {
+    pub replica: ReplicaId,
+    pub term: u64,
+    pub last_fsynced_index: u64,
+    pub segment_seq: u64,
+    pub io_mode: IoMode,
+}
+
+#[derive(Debug, Default)]
+pub struct DurabilityMetricsPublisher;
+
+impl DurabilityMetricsPublisher {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn publish(&mut self, registry: &mut MetricsRegistry, ledger: &DurabilityLedger) {
+        let status = ledger.status();
+        registry.set_gauge(
+            "durability.last_quorum_fsynced_index",
+            status.committed_index,
+        );
+        registry.set_gauge("durability.last_quorum_fsynced_term", status.committed_term);
+        registry.set_gauge("durability.pending_entries", ledger.pending_entries());
+    }
 }
 
 #[derive(Debug)]
@@ -159,6 +210,7 @@ pub enum LedgerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::MetricsRegistry;
 
     #[test]
     fn ack_handle_waits_for_quorum() {
@@ -185,5 +237,79 @@ mod tests {
         assert!(handle.is_satisfied());
         let proof = ledger.latest_proof().unwrap();
         assert_eq!(proof.index, 20);
+    }
+
+    #[test]
+    fn ack_handle_ignores_lower_indices() {
+        let mut ledger = DurabilityLedger::new(PartitionQuorumConfig::new(3));
+        for id in ["leader", "f1", "f2"] {
+            ledger.register_replica(id);
+        }
+        let mut handle = ledger.ack_handle(5, 50);
+        let low = AckRecord {
+            replica: ReplicaId::new("leader"),
+            term: 5,
+            index: 40,
+            segment_seq: 1,
+            io_mode: IoMode::Strict,
+        };
+        assert!(!handle.observe(&low));
+        let leader_high = AckRecord {
+            index: 55,
+            ..low.clone()
+        };
+        assert!(!handle.observe(&leader_high));
+        let follower_high = AckRecord {
+            replica: ReplicaId::new("f1"),
+            index: 55,
+            ..low.clone()
+        };
+        assert!(handle.observe(&follower_high));
+    }
+
+    #[test]
+    fn ingest_ack_computes_quorum_index() {
+        let mut ledger = DurabilityLedger::new(PartitionQuorumConfig::new(3));
+        for id in ["leader", "f1", "f2"] {
+            ledger.register_replica(id);
+        }
+
+        let ack = |replica: &str| DurabilityAckMessage {
+            replica: ReplicaId::new(replica.to_string()),
+            term: 3,
+            last_fsynced_index: 30,
+            segment_seq: 11,
+            io_mode: IoMode::Strict,
+        };
+
+        let update = ledger.ingest_ack(ack("leader")).unwrap();
+        assert_eq!(update.quorum_index, 0);
+        let update = ledger.ingest_ack(ack("f1")).unwrap();
+        assert_eq!(update.quorum_index, 30);
+    }
+
+    #[test]
+    fn metrics_publisher_exports_quorum_stats() {
+        let mut ledger = DurabilityLedger::new(PartitionQuorumConfig::new(3));
+        for id in ["leader", "f1", "f2"] {
+            ledger.register_replica(id);
+        }
+        let ack = DurabilityAckMessage {
+            replica: ReplicaId::new("leader"),
+            term: 4,
+            last_fsynced_index: 12,
+            segment_seq: 5,
+            io_mode: IoMode::Strict,
+        };
+        ledger.ingest_ack(ack).unwrap();
+
+        let mut registry = MetricsRegistry::new("clustor");
+        let mut publisher = DurabilityMetricsPublisher::new();
+        publisher.publish(&mut registry, &ledger);
+        let snapshot = registry.snapshot();
+        assert_eq!(
+            snapshot.gauges["clustor.durability.last_quorum_fsynced_index"],
+            ledger.status().committed_index
+        );
     }
 }

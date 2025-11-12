@@ -29,13 +29,7 @@ fn corrupt_wal_forces_local_only_and_telemetry() {
     let wal = WalReplayScanner::scan(&segments).unwrap();
     assert!(wal.truncation.is_some());
 
-    let entries = vec![DurabilityLogEntry {
-        term: 1,
-        index: 1,
-        segment_seq: 1,
-        io_mode: IoMode::Strict,
-        timestamp_ms: 0,
-    }];
+    let entries = vec![DurabilityLogEntry::new(1, 1, 1, IoMode::Strict, 0)];
     let status = RecoveryStatus::new(&wal, &entries);
     let mut registry = MetricsRegistry::new("clustor");
     status.record_metrics(&mut registry);

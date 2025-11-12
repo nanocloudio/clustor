@@ -4,18 +4,18 @@ use super::http::{read_request, write_json_response, SimpleHttpRequest};
 use super::tls::{complete_server_handshake, decode_peer_certificate, TlsIdentity, TlsTrustStore};
 use super::NetError;
 use crate::admin::{
-    AdminRequestContext, AdminService, CreatePartitionRequest, SnapshotThrottleRequest,
-    UpdateDurabilityModeRequest,
+    AdminRequestContext, AdminService, CreatePartitionRequest, SetDurabilityModeRequest,
+    SnapshotThrottleRequest, SnapshotTriggerRequest, TransferLeaderRequest,
 };
-use crate::security::{Certificate, SecurityError};
+use crate::security::{BreakGlassToken, Certificate, SecurityError, SpiffeId};
 use log::{error, info, warn};
 use rustls::{ServerConfig, ServerConnection, Stream};
-use serde::de::DeserializeOwned;
+use serde::{de::DeserializeOwned, Deserialize};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 use url::form_urlencoded;
 
 pub struct AdminHttpServerConfig {
@@ -113,9 +113,16 @@ fn handle_connection(
             return Ok(());
         }
     };
-    let ctx = build_context(&request, &peer_certificate);
+    let now = Instant::now();
+    let ctx = match build_context(&request, &peer_certificate, now) {
+        Ok(ctx) => ctx,
+        Err(err) => {
+            write_json_response(&mut tls, err.status, &err.body)?;
+            return Ok(());
+        }
+    };
     let mut guard = service.lock().expect("admin service poisoned");
-    match dispatch_request(&mut guard, ctx, request) {
+    match dispatch_request(&mut guard, ctx, request, now) {
         Ok(response) => write_json_response(&mut tls, 200, &response)?,
         Err(err) => {
             write_json_response(&mut tls, err.status, &err.body)?;
@@ -128,8 +135,8 @@ fn dispatch_request(
     service: &mut AdminService,
     ctx: AdminRequestContext,
     request: SimpleHttpRequest,
+    now: Instant,
 ) -> Result<serde_json::Value, HttpAdminError> {
-    let now = Instant::now();
     match (request.method.as_str(), request.path.as_str()) {
         ("POST", "/admin/create-partition") => {
             let payload: CreatePartitionRequest = parse_body(&request)?;
@@ -138,12 +145,12 @@ fn dispatch_request(
                 .map_err(HttpAdminError::from)?;
             Ok(serde_json::to_value(response).expect("serialize create_partition"))
         }
-        ("POST", "/admin/update-durability-mode") => {
-            let payload: UpdateDurabilityModeRequest = parse_body(&request)?;
+        ("POST", "/admin/set-durability-mode") => {
+            let payload: SetDurabilityModeRequest = parse_body(&request)?;
             let response = service
-                .update_durability_mode(&ctx, payload, now)
+                .set_durability_mode(&ctx, payload, now)
                 .map_err(HttpAdminError::from)?;
-            Ok(serde_json::to_value(response).expect("serialize update_durability_mode"))
+            Ok(serde_json::to_value(response).expect("serialize set_durability_mode"))
         }
         ("POST", "/admin/snapshot-throttle") => {
             let payload: SnapshotThrottleRequest = parse_body(&request)?;
@@ -151,6 +158,20 @@ fn dispatch_request(
                 .snapshot_throttle(&ctx, payload, now)
                 .map_err(HttpAdminError::from)?;
             Ok(serde_json::to_value(response).expect("serialize snapshot_throttle"))
+        }
+        ("POST", "/admin/transfer-leader") => {
+            let payload: TransferLeaderRequest = parse_body(&request)?;
+            let response = service
+                .transfer_leader(&ctx, payload, now)
+                .map_err(HttpAdminError::from)?;
+            Ok(serde_json::to_value(response).expect("serialize transfer_leader"))
+        }
+        ("POST", "/admin/snapshot-trigger") => {
+            let payload: SnapshotTriggerRequest = parse_body(&request)?;
+            let response = service
+                .trigger_snapshot(&ctx, payload, now)
+                .map_err(HttpAdminError::from)?;
+            Ok(serde_json::to_value(response).expect("serialize snapshot_trigger"))
         }
         ("GET", "/admin/throttle") => {
             let partition = require_query(&request, "partition_id")?;
@@ -178,13 +199,48 @@ fn dispatch_request(
     }
 }
 
-fn build_context(request: &SimpleHttpRequest, cert: &Certificate) -> AdminRequestContext {
-    let role = request
-        .header("x-admin-role")
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| cert.spiffe_id.path.trim_start_matches('/').to_string());
-    AdminRequestContext::new(role)
+fn build_context(
+    request: &SimpleHttpRequest,
+    cert: &Certificate,
+    now: Instant,
+) -> Result<AdminRequestContext, HttpAdminError> {
+    let mut ctx = AdminRequestContext::new(cert.spiffe_id.clone());
+    if let Some(raw_token) = request.header("x-breakglass-token") {
+        if !raw_token.trim().is_empty() {
+            let token = parse_breakglass_token(raw_token, now)?;
+            ctx = ctx.with_breakglass(token);
+        }
+    }
+    Ok(ctx)
+}
+
+fn parse_breakglass_token(
+    header_value: &str,
+    now: Instant,
+) -> Result<BreakGlassToken, HttpAdminError> {
+    #[derive(Deserialize)]
+    struct BreakGlassHeader {
+        token_id: String,
+        scope: String,
+        ticket_url: String,
+        spiffe_id: String,
+        expires_in_ms: u64,
+    }
+    let payload: BreakGlassHeader = serde_json::from_str(header_value).map_err(|err| {
+        HttpAdminError::status_message(400, format!("invalid breakglass token header: {err}"))
+    })?;
+    let ttl = Duration::from_millis(payload.expires_in_ms);
+    let spiffe = SpiffeId::parse(&payload.spiffe_id).map_err(|err| {
+        HttpAdminError::status_message(400, format!("invalid breakglass SPIFFE ID: {err}"))
+    })?;
+    Ok(BreakGlassToken {
+        token_id: payload.token_id,
+        spiffe_id: spiffe,
+        scope: payload.scope,
+        ticket_url: payload.ticket_url,
+        expires_at: now + ttl,
+        issued_at: SystemTime::now(),
+    })
 }
 
 fn parse_body<T: DeserializeOwned>(request: &SimpleHttpRequest) -> Result<T, HttpAdminError> {
@@ -247,6 +303,15 @@ impl From<crate::admin::AdminServiceError> for HttpAdminError {
                 crate::admin::AdminError::UnknownPartition => {
                     HttpAdminError::status_message(404, "partition not registered")
                 }
+                crate::admin::AdminError::ModeConflict { current, requested } => HttpAdminError {
+                    status: 409,
+                    body: serde_json::json!({
+                        "error": "ModeConflict",
+                        "status": 409,
+                        "current_mode": current,
+                        "requested_mode": requested,
+                    }),
+                },
                 crate::admin::AdminError::CpUnavailable(response) => HttpAdminError {
                     status: 503,
                     body: serde_json::json!({

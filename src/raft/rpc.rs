@@ -139,6 +139,80 @@ pub enum RequestVoteRejectReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreVoteResponse {
+    pub term: u64,
+    pub vote_granted: bool,
+    pub high_rtt: Option<bool>,
+}
+
+impl PreVoteResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(11);
+        buf.extend_from_slice(&self.term.to_le_bytes());
+        buf.push(if self.vote_granted { 1 } else { 0 });
+        match self.high_rtt {
+            Some(value) => {
+                buf.push(1);
+                buf.push(if value { 1 } else { 0 });
+            }
+            None => buf.push(0),
+        }
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, PreVoteResponseFrameError> {
+        if bytes.len() < 9 {
+            return Err(PreVoteResponseFrameError::Truncated);
+        }
+        let term = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let vote_granted = bytes[8] != 0;
+        if bytes.len() == 9 {
+            return Ok(Self {
+                term,
+                vote_granted,
+                high_rtt: None,
+            });
+        }
+        let has_high_rtt = bytes[9];
+        match has_high_rtt {
+            0 => Ok(Self {
+                term,
+                vote_granted,
+                high_rtt: None,
+            }),
+            1 => {
+                if bytes.len() < 11 {
+                    return Err(PreVoteResponseFrameError::Truncated);
+                }
+                let high_rtt = match bytes[10] {
+                    0 => false,
+                    1 => true,
+                    other => {
+                        return Err(PreVoteResponseFrameError::InvalidHighRtt { value: other })
+                    }
+                };
+                Ok(Self {
+                    term,
+                    vote_granted,
+                    high_rtt: Some(high_rtt),
+                })
+            }
+            other => Err(PreVoteResponseFrameError::InvalidHasHighRtt { value: other }),
+        }
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum PreVoteResponseFrameError {
+    #[error("frame truncated")]
+    Truncated,
+    #[error("invalid has_high_rtt flag {value}")]
+    InvalidHasHighRtt { value: u8 },
+    #[error("invalid high_rtt value {value}")]
+    InvalidHighRtt { value: u8 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendEntriesRequest {
     pub term: u64,
     pub leader_id: String,
@@ -402,5 +476,30 @@ mod tests {
         let decoded = AppendEntriesResponse::decode(&encoded).unwrap();
         assert!(decoded.success);
         assert_eq!(decoded.match_index, 42);
+    }
+
+    #[test]
+    fn prevote_response_matches_spec_vector() {
+        let response = PreVoteResponse {
+            term: 42,
+            vote_granted: true,
+            high_rtt: Some(true),
+        };
+        let encoded = response.encode();
+        assert_eq!(
+            encoded,
+            vec![0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01]
+        );
+        let decoded = PreVoteResponse::decode(&encoded).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn prevote_response_legacy_frame_decodes_without_high_rtt() {
+        let legacy = vec![0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let decoded = PreVoteResponse::decode(&legacy).unwrap();
+        assert_eq!(decoded.term, 42);
+        assert!(!decoded.vote_granted);
+        assert!(decoded.high_rtt.is_none());
     }
 }

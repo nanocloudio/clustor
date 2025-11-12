@@ -18,25 +18,31 @@ impl FlowProfile {
     fn params(&self) -> PidParams {
         match self {
             FlowProfile::Latency => PidParams {
-                kp: 0.8,
-                ki: 0.2,
-                kd: 0.05,
-                entry_credit_max: 2_048,
-                byte_credit_max: 32 * 1024 * 1024,
-            },
-            FlowProfile::Throughput => PidParams {
-                kp: 1.2,
-                ki: 0.15,
-                kd: 0.1,
+                kp: 0.60,
+                ki: 0.20,
+                kd: 0.10,
+                derivative_tau_ms: 300.0,
                 entry_credit_max: 4_096,
                 byte_credit_max: 64 * 1024 * 1024,
+                integral_clamp: 2_048.0,
+            },
+            FlowProfile::Throughput => PidParams {
+                kp: 0.50,
+                ki: 0.15,
+                kd: 0.08,
+                derivative_tau_ms: 300.0,
+                entry_credit_max: 4_096,
+                byte_credit_max: 64 * 1024 * 1024,
+                integral_clamp: 2_048.0,
             },
             FlowProfile::Wan => PidParams {
-                kp: 0.6,
-                ki: 0.1,
-                kd: 0.02,
-                entry_credit_max: 1_024,
-                byte_credit_max: 16 * 1024 * 1024,
+                kp: 0.40,
+                ki: 0.10,
+                kd: 0.05,
+                derivative_tau_ms: 450.0,
+                entry_credit_max: 4_096,
+                byte_credit_max: 64 * 1024 * 1024,
+                integral_clamp: 2_048.0,
             },
         }
     }
@@ -77,18 +83,20 @@ struct PidParams {
     kp: f64,
     ki: f64,
     kd: f64,
+    derivative_tau_ms: f64,
     entry_credit_max: i64,
     byte_credit_max: i64,
+    integral_clamp: f64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CreditHint {
     Recover,
     Hold,
     Shed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IngestStatusCode {
     Healthy,
     TransientBackpressure,
@@ -108,6 +116,7 @@ pub struct DualCreditPidController {
     params: PidParams,
     integral: f64,
     last_error: f64,
+    derivative_state: f64,
     last_sample: Option<Instant>,
     entry_credits: i64,
     byte_credits: i64,
@@ -122,6 +131,7 @@ impl DualCreditPidController {
             params,
             integral: 0.0,
             last_error: 0.0,
+            derivative_state: 0.0,
             last_sample: None,
             entry_credits: params.entry_credit_max / 2,
             byte_credits: 0,
@@ -143,18 +153,19 @@ impl DualCreditPidController {
             .unwrap_or(1.0);
         let error = setpoint - observed;
         self.integral += error * dt;
-        let derivative = if self.last_sample.is_some() {
-            (error - self.last_error) / dt
-        } else {
-            0.0
-        };
+        self.integral = self
+            .integral
+            .clamp(-self.params.integral_clamp, self.params.integral_clamp);
+        let derivative = self.ema_derivative(error, dt);
         let raw_output =
             self.params.kp * error + self.params.ki * self.integral + self.params.kd * derivative;
         self.last_error = error;
         self.last_sample = Some(now);
         self.apply_output(raw_output);
-        let throttle = self.throttle_envelope();
-        let ingest_status = self.ingest_status(&throttle);
+        let credit_hint = self.credit_hint();
+        let throttle_state = self.throttle_state();
+        let ingest_status = self.ingest_status(&throttle_state);
+        let throttle = FlowThrottleEnvelope::new(throttle_state, credit_hint, ingest_status);
         FlowDecision {
             entry_credits: self.entry_credits,
             entry_credit_max: self.params.entry_credit_max,
@@ -162,10 +173,22 @@ impl DualCreditPidController {
             byte_credit_max: self.params.byte_credit_max,
             applied_output: raw_output,
             throttle,
-            credit_hint: self.credit_hint(),
+            credit_hint,
             ingest_status,
             pid_auto_tune_state: self.auto_tune_state,
         }
+    }
+
+    fn ema_derivative(&mut self, error: f64, dt: f64) -> f64 {
+        if dt <= 0.0 || self.last_sample.is_none() {
+            self.derivative_state = 0.0;
+            return 0.0;
+        }
+        let raw = (error - self.last_error) / dt;
+        let tau = (self.params.derivative_tau_ms / 1_000.0).max(f64::EPSILON);
+        let alpha = dt / (tau + dt);
+        self.derivative_state += alpha * (raw - self.derivative_state);
+        self.derivative_state
     }
 
     fn apply_output(&mut self, output: f64) {
@@ -200,28 +223,22 @@ impl DualCreditPidController {
         }
     }
 
-    fn ingest_status(&self, throttle: &FlowThrottleEnvelope) -> IngestStatusCode {
-        match throttle.state {
+    fn ingest_status(&self, state: &FlowThrottleState) -> IngestStatusCode {
+        match state {
             FlowThrottleState::Open => IngestStatusCode::Healthy,
             FlowThrottleState::Throttled(_) => IngestStatusCode::TransientBackpressure,
         }
     }
 
-    fn throttle_envelope(&self) -> FlowThrottleEnvelope {
+    fn throttle_state(&self) -> FlowThrottleState {
         if self.byte_credits > 0 {
-            FlowThrottleEnvelope {
-                state: FlowThrottleState::Throttled(FlowThrottleReason::ByteCreditDebt {
-                    byte_credit: self.byte_credits,
-                }),
-            }
+            FlowThrottleState::Throttled(FlowThrottleReason::ByteCreditDebt {
+                byte_credit: self.byte_credits,
+            })
         } else if self.entry_credits == 0 {
-            FlowThrottleEnvelope {
-                state: FlowThrottleState::Throttled(FlowThrottleReason::EntryCreditsDepleted),
-            }
+            FlowThrottleState::Throttled(FlowThrottleReason::EntryCreditsDepleted)
         } else {
-            FlowThrottleEnvelope {
-                state: FlowThrottleState::Open,
-            }
+            FlowThrottleState::Open
         }
     }
 }
@@ -280,10 +297,22 @@ pub trait FlowMetrics: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
+pub enum FlowIncidentKind {
+    IngestFloorBreach {
+        ops_per_sec: f64,
+        floor_ops_per_sec: f64,
+    },
+    StructuralLag {
+        lag_bytes: u64,
+        lag_duration_ms: u64,
+    },
+    DeviceDowngrade,
+}
+
+#[derive(Debug, Clone)]
 pub struct FlowSloIncidentRecord {
     pub profile: FlowProfile,
-    pub ops_per_sec: f64,
-    pub floor_ops_per_sec: f64,
+    pub kind: FlowIncidentKind,
     pub decision: IncidentDecision,
     pub recorded_at: Instant,
 }
@@ -314,7 +343,7 @@ impl FlowSloMonitor {
         }
     }
 
-    pub fn record(
+    pub fn record_ingest_slo(
         &mut self,
         profile: FlowProfile,
         telemetry: FlowIngestTelemetry,
@@ -332,12 +361,55 @@ impl FlowSloMonitor {
             .record(format!("flow.ingest_slo.{}", profile.metric_label()), now);
         self.last_event = Some(FlowSloIncidentRecord {
             profile,
-            ops_per_sec: telemetry.ops_per_sec,
-            floor_ops_per_sec: floor,
+            kind: FlowIncidentKind::IngestFloorBreach {
+                ops_per_sec: telemetry.ops_per_sec,
+                floor_ops_per_sec: floor,
+            },
             decision,
             recorded_at: now,
         });
         Some(decision)
+    }
+
+    pub fn record_structural_lag(
+        &mut self,
+        profile: FlowProfile,
+        lag_bytes: u64,
+        lag_duration_ms: u64,
+        now: Instant,
+    ) -> IncidentDecision {
+        let decision = self.correlator.record(
+            format!("flow.structural_lag.{}", profile.metric_label()),
+            now,
+        );
+        self.last_event = Some(FlowSloIncidentRecord {
+            profile,
+            kind: FlowIncidentKind::StructuralLag {
+                lag_bytes,
+                lag_duration_ms,
+            },
+            decision,
+            recorded_at: now,
+        });
+        decision
+    }
+
+    pub fn record_device_downgrade(
+        &mut self,
+        profile: FlowProfile,
+        now: Instant,
+    ) -> IncidentDecision {
+        let decision = self.correlator.record(
+            format!("flow.device_downgrade.{}", profile.metric_label()),
+            now,
+        );
+        self.last_event = Some(FlowSloIncidentRecord {
+            profile,
+            kind: FlowIncidentKind::DeviceDowngrade,
+            decision,
+            recorded_at: now,
+        });
+        decision
     }
 
     pub fn last_event(&self) -> Option<&FlowSloIncidentRecord> {
@@ -346,6 +418,55 @@ impl FlowSloMonitor {
 
     pub fn floor_for(&self, profile: FlowProfile) -> Option<f64> {
         self.floors.get(&profile).copied()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowLagClass {
+    Healthy,
+    Transient,
+    Structural,
+}
+
+#[derive(Debug, Clone)]
+struct StructuralLagTracker {
+    state: FlowLagClass,
+    last_sample: Option<Instant>,
+}
+
+impl StructuralLagTracker {
+    fn new() -> Self {
+        Self {
+            state: FlowLagClass::Healthy,
+            last_sample: None,
+        }
+    }
+
+    fn record(&mut self, lag_bytes: u64, lag_duration_ms: u64, now: Instant) -> FlowLagClass {
+        let next = Self::classify(lag_bytes, lag_duration_ms);
+        self.state = next;
+        self.last_sample = Some(now);
+        next
+    }
+
+    fn state(&self) -> FlowLagClass {
+        self.state
+    }
+
+    fn classify(lag_bytes: u64, lag_duration_ms: u64) -> FlowLagClass {
+        const TRANSIENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+        const STRUCTURAL_HARD_BYTES: u64 = 256 * 1024 * 1024;
+        const TRANSIENT_MAX_DURATION_MS: u64 = 30_000;
+        if lag_bytes == 0 && lag_duration_ms == 0 {
+            FlowLagClass::Healthy
+        } else if lag_bytes >= STRUCTURAL_HARD_BYTES
+            || lag_bytes > TRANSIENT_MAX_BYTES
+            || lag_duration_ms >= TRANSIENT_MAX_DURATION_MS
+        {
+            FlowLagClass::Structural
+        } else {
+            FlowLagClass::Transient
+        }
     }
 }
 
@@ -454,6 +575,8 @@ pub struct TenantFlowController<M: FlowMetrics = InMemoryFlowMetrics> {
     slo_monitor: Option<FlowSloMonitor>,
     last_flow_decision: Option<FlowDecision>,
     last_tenant_decision: Option<TenantFlowDecision>,
+    lag_tracker: StructuralLagTracker,
+    device_degraded: bool,
 }
 
 impl TenantFlowController<InMemoryFlowMetrics> {
@@ -472,6 +595,8 @@ impl<M: FlowMetrics> TenantFlowController<M> {
             slo_monitor: None,
             last_flow_decision: None,
             last_tenant_decision: None,
+            lag_tracker: StructuralLagTracker::new(),
+            device_degraded: false,
         }
     }
 
@@ -487,6 +612,75 @@ impl<M: FlowMetrics> TenantFlowController<M> {
         self.slo_monitor.as_ref()
     }
 
+    pub fn record_structural_lag(
+        &mut self,
+        lag_bytes: u64,
+        lag_duration_ms: u64,
+        now: Instant,
+    ) -> FlowLagClass {
+        let class = self.lag_tracker.record(lag_bytes, lag_duration_ms, now);
+        if matches!(class, FlowLagClass::Structural) {
+            if let Some(monitor) = self.slo_monitor.as_mut() {
+                monitor.record_structural_lag(
+                    self.controller.profile(),
+                    lag_bytes,
+                    lag_duration_ms,
+                    now,
+                );
+            }
+        }
+        class
+    }
+
+    pub fn lag_class(&self) -> FlowLagClass {
+        self.lag_tracker.state()
+    }
+
+    pub fn record_device_downgrade(&mut self, degraded: bool, now: Instant) {
+        if self.device_degraded != degraded {
+            self.device_degraded = degraded;
+            if degraded {
+                if let Some(monitor) = self.slo_monitor.as_mut() {
+                    monitor.record_device_downgrade(self.controller.profile(), now);
+                }
+            }
+        }
+    }
+
+    pub fn device_degraded(&self) -> bool {
+        self.device_degraded
+    }
+
+    fn apply_structural_policies(&self, flow: &mut FlowDecision) {
+        match self.lag_tracker.state() {
+            FlowLagClass::Healthy => {}
+            FlowLagClass::Transient => {
+                let cap = (self.controller.params.entry_credit_max / 2).max(1);
+                flow.entry_credits = flow.entry_credits.min(cap);
+                if matches!(flow.credit_hint, CreditHint::Recover) {
+                    flow.credit_hint = CreditHint::Hold;
+                }
+            }
+            FlowLagClass::Structural => {
+                let cap = (self.controller.params.entry_credit_max / 4).max(1);
+                flow.entry_credits = flow.entry_credits.min(cap);
+                flow.credit_hint = CreditHint::Shed;
+                flow.ingest_status = IngestStatusCode::PermanentDurability;
+            }
+        }
+
+        if self.device_degraded {
+            flow.credit_hint = CreditHint::Shed;
+            flow.ingest_status = IngestStatusCode::PermanentDurability;
+        }
+
+        flow.throttle = FlowThrottleEnvelope::new(
+            flow.throttle.state.clone(),
+            flow.credit_hint,
+            flow.ingest_status,
+        );
+    }
+
     pub fn evaluate(
         &mut self,
         tenant: &str,
@@ -494,7 +688,8 @@ impl<M: FlowMetrics> TenantFlowController<M> {
         observed: f64,
         now: Instant,
     ) -> TenantFlowDecision {
-        let flow = self.controller.record_sample(setpoint, observed, now);
+        let mut flow = self.controller.record_sample(setpoint, observed, now);
+        self.apply_structural_policies(&mut flow);
         let ops = flow.entry_credits.max(0) as f64;
         let telemetry = FlowIngestTelemetry {
             ops_per_sec: ops,
@@ -504,7 +699,7 @@ impl<M: FlowMetrics> TenantFlowController<M> {
         self.ingest_telemetry = Some(telemetry);
         self.metrics.record_ingest_ops(telemetry);
         if let Some(monitor) = self.slo_monitor.as_mut() {
-            monitor.record(self.controller.profile(), telemetry, now);
+            monitor.record_ingest_slo(self.controller.profile(), telemetry, now);
         }
         let (quota, override_active) = self.quotas.resolve(tenant, now);
         let mut throttle = flow.throttle.clone();
@@ -512,11 +707,13 @@ impl<M: FlowMetrics> TenantFlowController<M> {
             && ((flow.entry_credits as u64) > quota.ingest_limit
                 || (flow.byte_credits as u64) > quota.backlog_limit)
         {
-            throttle = FlowThrottleEnvelope {
-                state: FlowThrottleState::Throttled(FlowThrottleReason::QuotaExceeded {
+            throttle = FlowThrottleEnvelope::new(
+                FlowThrottleState::Throttled(FlowThrottleReason::QuotaExceeded {
                     tenant: tenant.to_string(),
                 }),
-            };
+                flow.credit_hint,
+                flow.ingest_status,
+            );
         }
         let decision = TenantFlowDecision {
             flow,
@@ -603,9 +800,23 @@ pub enum FlowThrottleReason {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FlowThrottleEnvelope {
     pub state: FlowThrottleState,
+    pub credit_hint: CreditHint,
+    pub ingest_status: IngestStatusCode,
 }
 
 impl FlowThrottleEnvelope {
+    pub fn new(
+        state: FlowThrottleState,
+        credit_hint: CreditHint,
+        ingest_status: IngestStatusCode,
+    ) -> Self {
+        Self {
+            state,
+            credit_hint,
+            ingest_status,
+        }
+    }
+
     pub fn explain(&self) -> String {
         match &self.state {
             FlowThrottleState::Open => "flow controller open".to_string(),
@@ -653,6 +864,29 @@ mod tests {
         let later = controller.record_sample(100.0, 160.0, start + Duration::from_millis(5));
         assert!(later.byte_credits >= decision.byte_credits);
         assert!(controller.entry_credits <= decision.entry_credits);
+    }
+
+    #[test]
+    fn pid_simulation_converges_and_clamps_integral() {
+        let mut controller = DualCreditPidController::new(FlowProfile::Throughput);
+        let start = Instant::now();
+        for step in 0..200 {
+            let observed = if step < 50 { 100.0 } else { 1_000.0 };
+            controller.record_sample(
+                1_000.0,
+                observed,
+                start + Duration::from_millis((step * 10) as u64),
+            );
+        }
+        assert!(
+            controller.integral.abs() <= controller.params.integral_clamp + f64::EPSILON,
+            "integral {} exceeded clamp {}",
+            controller.integral,
+            controller.params.integral_clamp
+        );
+        assert!(controller.entry_credits <= controller.params.entry_credit_max);
+        let steady = controller.record_sample(1_000.0, 1_000.0, start + Duration::from_secs(5));
+        assert!(matches!(steady.throttle.state, FlowThrottleState::Open));
     }
 
     #[test]
@@ -741,5 +975,71 @@ mod tests {
         assert_eq!(why.tenant, "tenant-x");
         assert!(why.runtime_terms.contains(&TERM_STRICT));
         assert!(why.telemetry.target_ops_per_sec > 0.0);
+    }
+
+    #[test]
+    fn structural_lag_sheds_credits_and_records_incident() {
+        let mut controller =
+            TenantFlowController::new(FlowProfile::Throughput, TenantQuota::unlimited());
+        controller.install_slo_monitor(FlowSloMonitor::new(IncidentCorrelator::new(
+            Duration::from_secs(1),
+        )));
+        let now = Instant::now();
+        controller.record_structural_lag(300 * 1024 * 1024, 60_000, now);
+        assert!(matches!(controller.lag_class(), FlowLagClass::Structural));
+        let event = controller
+            .slo_monitor
+            .as_ref()
+            .and_then(|monitor| monitor.last_event())
+            .expect("structural incident");
+        match &event.kind {
+            FlowIncidentKind::StructuralLag { lag_bytes, .. } => {
+                assert!(*lag_bytes >= 300 * 1024 * 1024)
+            }
+            other => panic!("unexpected incident {:?}", other),
+        }
+        let decision = controller.evaluate("tenant", 1_000.0, 1_200.0, now);
+        assert_eq!(
+            decision.flow.ingest_status,
+            IngestStatusCode::PermanentDurability
+        );
+        assert!(matches!(decision.flow.credit_hint, CreditHint::Shed));
+    }
+
+    #[test]
+    fn transient_lag_caps_entry_credits() {
+        let mut controller =
+            TenantFlowController::new(FlowProfile::Throughput, TenantQuota::unlimited());
+        let now = Instant::now();
+        controller.record_structural_lag(10 * 1024 * 1024, 5_000, now);
+        let decision = controller.evaluate("tenant", 2_000.0, 500.0, now);
+        assert!(matches!(controller.lag_class(), FlowLagClass::Transient));
+        assert!(decision.flow.entry_credits <= controller.controller.params.entry_credit_max / 2);
+        assert_eq!(decision.flow.ingest_status, IngestStatusCode::Healthy);
+    }
+
+    #[test]
+    fn device_downgrade_forces_shed_hint() {
+        let mut controller =
+            TenantFlowController::new(FlowProfile::Latency, TenantQuota::unlimited());
+        let now = Instant::now();
+        controller.install_slo_monitor(FlowSloMonitor::new(IncidentCorrelator::new(
+            Duration::from_secs(1),
+        )));
+        controller.record_device_downgrade(true, now);
+        let event = controller
+            .slo_monitor
+            .as_ref()
+            .and_then(|monitor| monitor.last_event());
+        if let Some(record) = event {
+            assert!(matches!(record.kind, FlowIncidentKind::DeviceDowngrade));
+        }
+        let decision = controller.evaluate("tenant", 200.0, 50.0, now);
+        assert!(controller.device_degraded());
+        assert_eq!(
+            decision.flow.ingest_status,
+            IngestStatusCode::PermanentDurability
+        );
+        assert!(matches!(decision.flow.credit_hint, CreditHint::Shed));
     }
 }

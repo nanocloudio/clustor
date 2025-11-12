@@ -1,6 +1,10 @@
 use clustor::bootstrap::{
     BootstrapConfig, BootstrapError, BootstrapPipeline, BootstrapRequest, CatalogNegotiationConfig,
-    ManifestValidationConfig, ProfileLoader, ShutdownManager,
+    ManifestValidationConfig, ProfileLoader, ShutdownAction, ShutdownManager,
+};
+use clustor::storage::{
+    NonceLedgerConfig, NonceReservationLedger, StartupScrubEngine, MAX_RESERVATION_BLOCKS,
+    WAL_CRYPTO_BLOCK_BYTES,
 };
 use clustor::{
     BundleNegotiationEntry, CatalogVersion, ConsensusCoreManifestBuilder, ProofBundleRef,
@@ -10,7 +14,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tempfile::tempdir;
 
 fn read_negotiation_entries(path: &PathBuf) -> Vec<BundleNegotiationEntry> {
@@ -110,11 +114,48 @@ fn bootstrap_pipeline_runs_steps_and_reports() {
 fn shutdown_manager_tracks_repair_mode() {
     let mut manager = ShutdownManager::new();
     let now = Instant::now();
-    manager.begin_shutdown(now);
+    manager.begin_shutdown("p1", now);
     manager.enter_repair_mode(now + Duration::from_secs(1));
     let status = manager.status();
     assert!(status.draining && status.repair_mode);
     assert!(status.last_action.is_some());
+}
+
+#[test]
+fn shutdown_manager_enforces_action_order() {
+    let mut manager = ShutdownManager::new();
+    let now = Instant::now();
+    manager.begin_shutdown("p2", now);
+    let first = manager.next_action().cloned().expect("transfer scheduled");
+    match first {
+        ShutdownAction::TransferLeader { ref partition_id } => {
+            assert_eq!(partition_id, "p2");
+        }
+        other => panic!("unexpected first action: {:?}", other),
+    }
+    manager
+        .record_action_complete(&first, now + Duration::from_millis(1))
+        .expect("transfer completes");
+    let second = manager.next_action().cloned().expect("flush pending");
+    assert_eq!(second, ShutdownAction::FlushWal);
+    manager
+        .record_action_complete(&second, now + Duration::from_millis(2))
+        .expect("flush completes");
+    assert!(manager.is_complete());
+}
+
+#[test]
+fn shutdown_manager_rejects_out_of_order_actions() {
+    let mut manager = ShutdownManager::new();
+    let now = Instant::now();
+    manager.begin_shutdown("p3", now);
+    let err = manager
+        .record_action_complete(&ShutdownAction::FlushWal, now)
+        .expect_err("flush cannot run before transfer");
+    assert!(matches!(
+        err,
+        clustor::bootstrap::ShutdownError::UnexpectedAction { .. }
+    ));
 }
 
 #[test]
@@ -147,7 +188,7 @@ fn bootstrap_checkpoint_covers_shutdown_flow() {
     assert!(!report.events.is_empty());
 
     let mut manager = ShutdownManager::new();
-    manager.begin_shutdown(now + Duration::from_secs(5));
+    manager.begin_shutdown("partition-x", now + Duration::from_secs(5));
     let status = manager.status();
     assert!(status.draining);
 }
@@ -175,6 +216,38 @@ fn bootstrap_pipeline_rejects_mutated_manifest() {
         )
         .expect_err("tampered manifest should fail");
     assert!(matches!(err, BootstrapError::Manifest(_)));
+}
+
+#[test]
+fn startup_scrub_failures_force_repair_mode() {
+    let mut ledger = NonceReservationLedger::with_config(
+        99,
+        NonceLedgerConfig {
+            warn_gap_bytes: WAL_CRYPTO_BLOCK_BYTES as u64,
+            abandon_gap_bytes: 2 * WAL_CRYPTO_BLOCK_BYTES as u64,
+        },
+    );
+    // Simulate a ledger that must be scrubbed.
+    ledger.reserve(MAX_RESERVATION_BLOCKS, 0).unwrap();
+    ledger.reserve(MAX_RESERVATION_BLOCKS, 0).unwrap();
+    assert!(ledger.needs_scrub());
+    let first = StartupScrubEngine::run(&mut ledger, SystemTime::now());
+    assert!(first.scrubbed);
+    assert!(!ledger.needs_scrub());
+
+    // Reintroduce gaps to emulate a scrub failure on next boot.
+    ledger.reserve(MAX_RESERVATION_BLOCKS, 0).unwrap();
+    ledger.reserve(MAX_RESERVATION_BLOCKS, 0).unwrap();
+    assert!(ledger.needs_scrub());
+    let mut manager = ShutdownManager::new();
+    manager.begin_shutdown("repair-partition", Instant::now());
+    manager.enter_repair_mode(Instant::now() + Duration::from_secs(1));
+    let status = manager.status();
+    assert!(status.repair_mode);
+    assert!(
+        status.pending_actions.is_empty(),
+        "repair mode halts graceful shutdown sequence"
+    );
 }
 
 #[test]

@@ -5,10 +5,10 @@ pub mod log_store;
 pub mod manifest;
 
 pub use kernel::{
-    ConsensusCore, ConsensusCoreConfig, ConsensusCoreStatus, ConsensusCoreTelemetry,
-    DemotionReason, DemotionStatus, DurabilityProof, GateBlockMetrics, GateEvaluation,
-    GateOperation, GateViolation, StrictFallbackBlockingReason, StrictFallbackMetricsPublisher,
-    StrictFallbackState, StrictFallbackWhy,
+    ConsensusCore, ConsensusCoreConfig, ConsensusCoreStateSnapshot, ConsensusCoreStatus,
+    ConsensusCoreTelemetry, DemotionReason, DemotionStatus, DurabilityProof, GateBlockMetrics,
+    GateEvaluation, GateOperation, GateViolation, StrictFallbackBlockingReason,
+    StrictFallbackMetricsPublisher, StrictFallbackState, StrictFallbackWhy,
 };
 pub use log_store::{
     RaftLogEntry, RaftLogError, RaftLogStore, RaftMetadata, RaftMetadataError, RaftMetadataStore,

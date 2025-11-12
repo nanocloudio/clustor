@@ -1,4 +1,6 @@
-use crate::activation::{readiness_digest, ShadowApplyState, WarmupReadinessRecord};
+use crate::activation::{
+    readiness_digest, ShadowApplyState, WarmupReadinessRecord, WarmupReadinessSnapshot,
+};
 use crate::feature_guard::{FeatureCapabilityMatrix, FeatureGateState};
 use crate::overrides::{DiskOverrideDocument, OverrideError};
 use crate::snapshot::{SnapshotDeltaChainTelemetry, SnapshotExportTelemetry};
@@ -270,20 +272,52 @@ pub fn map_partition_ratios(
     readiness: &[WarmupReadinessRecord],
     ratios: &HashMap<String, f64>,
 ) -> Vec<ReadyStateProbe> {
+    let empty = HashMap::new();
+    map_partition_ratios_with_barriers(readiness, ratios, &empty)
+}
+
+pub fn map_partition_ratios_with_barriers(
+    readiness: &[WarmupReadinessRecord],
+    ratios: &HashMap<String, f64>,
+    barriers: &HashMap<String, String>,
+) -> Vec<ReadyStateProbe> {
     readiness
         .iter()
         .map(|record| ReadyStateProbe {
             readiness: record.clone(),
-            activation_barrier_id: None,
-            partition_ready_ratio: *ratios.get(&record.partition_id).unwrap_or(&0.0),
+            activation_barrier_id: barriers.get(&record.partition_id).cloned(),
+            partition_ready_ratio: ratios.get(&record.partition_id).copied().unwrap_or(0.0),
         })
         .collect()
+}
+
+pub fn readyz_from_warmup_snapshot(
+    snapshot: &WarmupReadinessSnapshot,
+    partition_ratios: &HashMap<String, f64>,
+    barrier_assignments: &HashMap<String, String>,
+    capability_matrix: &FeatureCapabilityMatrix,
+    feature_manifest_digest: impl Into<String>,
+    overrides: Vec<OverrideStatus>,
+) -> ReadyzSnapshot {
+    let probes = map_partition_ratios_with_barriers(
+        &snapshot.records,
+        partition_ratios,
+        barrier_assignments,
+    );
+    ReadyzSnapshot::new(
+        probes,
+        snapshot.publish_period_ms,
+        snapshot.skipped_publications_total,
+        capability_matrix,
+        feature_manifest_digest,
+        overrides,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activation::{ShadowApplyState, WarmupReadinessRecord};
+    use crate::activation::{ShadowApplyState, WarmupReadinessRecord, WarmupReadinessSnapshot};
     use crate::feature_guard::FeatureManifestBuilder;
     use crate::overrides::{DiskOverrideDevice, DiskWriteCacheMode, QueueFlags};
     use crate::snapshot::SnapshotDeltaChainState;
@@ -334,7 +368,6 @@ mod tests {
 
         let record = readiness_record("p1", 0.9);
         let ratios = HashMap::from([("p1".into(), 0.8)]);
-        let probes = map_partition_ratios(std::slice::from_ref(&record), &ratios);
         let doc = disk_override("999999");
         let override_status =
             OverrideStatus::from_disk_override(&doc, 0).expect("override converts");
@@ -345,10 +378,16 @@ mod tests {
             last_full_snapshot_ms: Some(1_000),
             last_snapshot_ms: Some(2_000),
         };
-        let snapshot = ReadyzSnapshot::new(
-            probes,
-            1_000,
-            0,
+        let warmup_snapshot = WarmupReadinessSnapshot {
+            records: vec![record.clone()],
+            publish_period_ms: 1_000,
+            skipped_publications_total: 0,
+        };
+        let barrier_map = HashMap::from([("p1".into(), "barrier-1".into())]);
+        let snapshot = readyz_from_warmup_snapshot(
+            &warmup_snapshot,
+            &ratios,
+            &barrier_map,
             &matrix,
             manifest_digest.clone(),
             vec![override_status.clone()],
@@ -364,6 +403,7 @@ mod tests {
         let why = snapshot.why_not_ready("p1").expect("partition captured");
         assert_eq!(why.health, ReadyStateHealth::WarmupPending);
         assert_eq!(why.readiness_digest, snapshot.readiness_digest());
+        assert_eq!(why.activation_barrier_id.as_deref(), Some("barrier-1"));
         assert_eq!(snapshot.publish_period_ms(), 1_000);
         assert_eq!(snapshot.skipped_publications_total(), 0);
         assert_eq!(snapshot.feature_manifest_digest(), manifest_digest);

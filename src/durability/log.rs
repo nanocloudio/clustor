@@ -1,5 +1,6 @@
 use crate::consensus::DurabilityProof;
 use crate::durability::ledger::IoMode;
+use crc32fast::Hasher;
 use log::error;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
@@ -16,6 +17,48 @@ pub struct DurabilityLogEntry {
     pub segment_seq: u64,
     pub io_mode: IoMode,
     pub timestamp_ms: u64,
+    pub record_crc32c: u32,
+}
+
+impl DurabilityLogEntry {
+    pub fn new(
+        term: u64,
+        index: u64,
+        segment_seq: u64,
+        io_mode: IoMode,
+        timestamp_ms: u64,
+    ) -> Self {
+        let mut entry = Self {
+            term,
+            index,
+            segment_seq,
+            io_mode,
+            timestamp_ms,
+            record_crc32c: 0,
+        };
+        entry.record_crc32c = entry.compute_crc();
+        entry
+    }
+
+    pub fn validate_crc(&self) -> bool {
+        self.record_crc32c == self.compute_crc()
+    }
+
+    pub fn normalized(&self) -> Self {
+        let mut clone = self.clone();
+        clone.record_crc32c = clone.compute_crc();
+        clone
+    }
+
+    fn compute_crc(&self) -> u32 {
+        let mut hasher = Hasher::new();
+        hasher.update(&self.term.to_le_bytes());
+        hasher.update(&self.index.to_le_bytes());
+        hasher.update(&self.segment_seq.to_le_bytes());
+        hasher.update(&[self.io_mode as u8]);
+        hasher.update(&self.timestamp_ms.to_le_bytes());
+        hasher.finalize()
+    }
 }
 
 #[derive(Debug)]
@@ -48,7 +91,8 @@ impl DurabilityLogWriter {
     }
 
     pub fn append(&mut self, entry: &DurabilityLogEntry) -> Result<(), DurabilityLogError> {
-        let mut payload = serde_json::to_vec(entry)?;
+        let entry = entry.normalized();
+        let mut payload = serde_json::to_vec(&entry)?;
         payload.push(b'\n');
         self.write_payload(&payload)?;
         self.next_offset = self.next_offset.saturating_add(payload.len() as u64);
@@ -145,6 +189,8 @@ pub enum DurabilityLogError {
     Io(#[from] io::Error),
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("durability log CRC mismatch at index {index}")]
+    CorruptRecord { index: u64 },
 }
 
 fn parse_entries<R: BufRead>(reader: R) -> Result<Vec<DurabilityLogEntry>, DurabilityLogError> {
@@ -154,7 +200,11 @@ fn parse_entries<R: BufRead>(reader: R) -> Result<Vec<DurabilityLogEntry>, Durab
         if line.trim().is_empty() {
             continue;
         }
-        entries.push(serde_json::from_str(&line)?);
+        let entry: DurabilityLogEntry = serde_json::from_str(&line)?;
+        if !entry.validate_crc() {
+            return Err(DurabilityLogError::CorruptRecord { index: entry.index });
+        }
+        entries.push(entry);
     }
     Ok(entries)
 }
@@ -167,20 +217,8 @@ mod tests {
     #[test]
     fn detects_corruption() {
         let entries = vec![
-            DurabilityLogEntry {
-                term: 1,
-                index: 10,
-                segment_seq: 1,
-                io_mode: IoMode::Strict,
-                timestamp_ms: 0,
-            },
-            DurabilityLogEntry {
-                term: 1,
-                index: 5,
-                segment_seq: 2,
-                io_mode: IoMode::Strict,
-                timestamp_ms: 0,
-            },
+            DurabilityLogEntry::new(1, 10, 1, IoMode::Strict, 0),
+            DurabilityLogEntry::new(1, 5, 2, IoMode::Strict, 0),
         ];
         let outcome = DurabilityLogReplay::replay(&entries);
         assert_eq!(outcome.entries.len(), 1);
@@ -190,20 +228,8 @@ mod tests {
     #[test]
     fn clean_log_replays_without_error() {
         let entries = vec![
-            DurabilityLogEntry {
-                term: 1,
-                index: 1,
-                segment_seq: 1,
-                io_mode: IoMode::Strict,
-                timestamp_ms: 0,
-            },
-            DurabilityLogEntry {
-                term: 1,
-                index: 2,
-                segment_seq: 2,
-                io_mode: IoMode::Strict,
-                timestamp_ms: 0,
-            },
+            DurabilityLogEntry::new(1, 1, 1, IoMode::Strict, 0),
+            DurabilityLogEntry::new(1, 2, 2, IoMode::Strict, 0),
         ];
         let outcome = DurabilityLogReplay::replay(&entries);
         assert_eq!(outcome.entries.len(), 2);
@@ -215,17 +241,36 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join("wal").join("durability.log");
         let mut writer = DurabilityLogWriter::open(&path).unwrap();
-        let entry = DurabilityLogEntry {
-            term: 7,
-            index: 42,
-            segment_seq: 9,
-            io_mode: IoMode::Strict,
-            timestamp_ms: 1234,
-        };
+        let entry = DurabilityLogEntry::new(7, 42, 9, IoMode::Strict, 1234);
         writer.append(&entry).unwrap();
         let mut writer = DurabilityLogWriter::open(&path).unwrap();
         let entries = writer.read_all().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].index, 42);
+    }
+
+    #[test]
+    fn read_all_rejects_crc_mismatch() {
+        use std::fs;
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("wal").join("durability.log");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut writer = DurabilityLogWriter::open(&path).unwrap();
+        let entry = DurabilityLogEntry::new(3, 9, 2, IoMode::Strict, 0);
+        writer.append(&entry).unwrap();
+
+        // Corrupt the CRC by rewriting the on-disk record.
+        let content = fs::read_to_string(&path).unwrap();
+        let mut json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        json["record_crc32c"] = serde_json::json!(0);
+        let mut payload = serde_json::to_vec(&json).unwrap();
+        payload.push(b'\n');
+        fs::write(&path, payload).unwrap();
+
+        let mut reader = DurabilityLogWriter::open(&path).unwrap();
+        let err = reader.read_all().unwrap_err();
+        assert!(matches!(err, DurabilityLogError::CorruptRecord { .. }));
     }
 }

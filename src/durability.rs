@@ -4,7 +4,10 @@ pub mod ledger;
 pub mod log;
 pub mod recovery;
 
-pub use ledger::{AckHandle, AckRecord, DurabilityLedger, IoMode, LedgerError, LedgerUpdate};
+pub use ledger::{
+    AckHandle, AckRecord, DurabilityAckMessage, DurabilityLedger, DurabilityMetricsPublisher,
+    IoMode, LedgerError, LedgerUpdate,
+};
 pub use log::{
     DurabilityLogEntry, DurabilityLogError, DurabilityLogReplay, DurabilityLogWriter, ReplayError,
 };

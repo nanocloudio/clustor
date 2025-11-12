@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clustor::durability::ledger::IoMode;
 use clustor::durability::{DurabilityLogEntry, DurabilityLogWriter};
-use clustor::{RaftLogEntry, RaftLogStore, RaftMetadata, RaftMetadataStore};
+use clustor::{RaftLogEntry, RaftLogStore, RaftMetadata, RaftMetadataStore, WalWriter};
 use parking_lot::Mutex;
 
 const DEFAULT_CRYPTO_BLOCK_BYTES: u64 = 4096;
@@ -22,7 +22,7 @@ pub struct PersistentState {
     metadata_store: RaftMetadataStore,
     metadata: Arc<Mutex<RaftMetadata>>,
     durability_log: Arc<Mutex<DurabilityLogWriter>>,
-    wal_tracker: Arc<Mutex<WalReservationTracker>>,
+    wal_writer: Arc<Mutex<WalWriter>>,
 }
 
 impl PersistentState {
@@ -41,15 +41,23 @@ impl PersistentState {
         if metadata.wal_block_size == 0 {
             metadata.wal_block_size = DEFAULT_CRYPTO_BLOCK_BYTES as u32;
         }
-        metadata.last_log_index = log_store.last_index();
-        metadata.last_log_term = log_store.last_term_index().map(|s| s.term).unwrap_or(0);
-        metadata.wal_next_block = metadata
-            .wal_next_block
-            .max(calculate_block_cursor(&log_path, metadata.wal_block_size as u64));
+        if let Some(tail) = log_store.last_term_index() {
+            metadata.record_log_tail(tail.term, tail.index);
+        }
+        let wal_path = state_dir.join("wal.bin");
+        let block_size = if metadata.wal_block_size == 0 {
+            DEFAULT_CRYPTO_BLOCK_BYTES
+        } else {
+            metadata.wal_block_size as u64
+        };
+        metadata.wal_block_size = block_size as u32;
+        let mut wal_writer = WalWriter::open(&wal_path, block_size)
+            .with_context(|| format!("open wal {}", wal_path.display()))?;
+        wal_writer.align_next_block(metadata.wal_next_block);
+        metadata.wal_next_block = wal_writer.next_block();
         metadata_store
             .persist(&metadata)
             .context("persist metadata after recovery")?;
-        let wal_tracker = WalReservationTracker::from_metadata(&metadata);
         let durability_path = state_dir.join("wal_durability.log");
         let durability_log = DurabilityLogWriter::open(&durability_path)
             .with_context(|| format!("open durability log {}", durability_path.display()))?;
@@ -58,12 +66,31 @@ impl PersistentState {
             metadata_store,
             metadata: Arc::new(Mutex::new(metadata)),
             durability_log: Arc::new(Mutex::new(durability_log)),
-            wal_tracker: Arc::new(Mutex::new(wal_tracker)),
+            wal_writer: Arc::new(Mutex::new(wal_writer)),
         })
     }
 
     pub fn log_handle(&self) -> Arc<Mutex<RaftLogStore>> {
         self.log.clone()
+    }
+
+    pub fn current_term(&self) -> u64 {
+        self.metadata.lock().current_term
+    }
+
+    pub fn voted_for(&self) -> Option<String> {
+        self.metadata.lock().voted_for.clone()
+    }
+
+    pub fn set_current_term(&self, term: u64) -> Result<(), String> {
+        self.with_metadata(|metadata| metadata.update_term(term))
+    }
+
+    pub fn record_vote(&self, candidate: Option<&str>) -> Result<(), String> {
+        self.with_metadata(|metadata| match candidate {
+            Some(id) => metadata.record_vote(id),
+            None => metadata.reset_vote(),
+        })
     }
 
     pub fn entries_from(&self, index: u64) -> Vec<RaftLogEntry> {
@@ -83,21 +110,26 @@ impl PersistentState {
         log.append(entry.clone())?;
         drop(log);
 
-        let mut tracker = self.wal_tracker.lock();
-        let reservation = tracker.reserve(serialized_entry.len() + 1);
+        let mut wal_writer = self.wal_writer.lock();
+        let wal_result = wal_writer
+            .append_frame(&serialized_entry)
+            .context("append wal frame")?;
         let mut metadata = self.metadata.lock();
-        metadata.last_log_index = entry.index;
-        metadata.last_log_term = entry.term;
-        metadata.wal_next_block = tracker.next_block();
-        metadata.wal_block_size = tracker.block_size() as u32;
+        metadata.record_log_tail(entry.term, entry.index);
+        metadata.wal_next_block = wal_writer.next_block();
+        metadata.wal_block_size = wal_writer.block_size() as u32;
         self.metadata_store.persist(&metadata)?;
         drop(metadata);
-        drop(tracker);
+        drop(wal_writer);
 
-        self.append_durability_record(entry.term, entry.index, reservation.start_block)?;
+        self.append_durability_record(
+            entry.term,
+            entry.index,
+            wal_result.reservation.start_block,
+        )?;
         Ok(AppendedEntry {
             entry,
-            segment_seq: reservation.start_block,
+            segment_seq: wal_result.reservation.start_block,
         })
     }
 
@@ -108,22 +140,29 @@ impl PersistentState {
         segment_seq: u64,
     ) -> Result<()> {
         let mut log = self.durability_log.lock();
-        let entry = DurabilityLogEntry {
+        let entry = DurabilityLogEntry::new(
             term,
             index,
             segment_seq,
-            io_mode: IoMode::Strict,
-            timestamp_ms: current_time_ms(),
-        };
+            IoMode::Strict,
+            current_time_ms(),
+        );
         log.append(&entry)?;
         Ok(())
     }
 }
 
-fn calculate_block_cursor(path: &Path, block: u64) -> u64 {
-    match std::fs::metadata(path) {
-        Ok(meta) => ((meta.len() + block - 1) / block) as u64,
-        Err(_) => 0,
+impl PersistentState {
+    fn with_metadata<F>(&self, mutator: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut RaftMetadata),
+    {
+        let mut metadata = self.metadata.lock();
+        mutator(&mut metadata);
+        self.metadata_store
+            .persist(&metadata)
+            .map_err(|err| format!("persist metadata failed: {err}"))?;
+        Ok(())
     }
 }
 
@@ -132,58 +171,6 @@ fn current_time_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-#[derive(Debug, Clone)]
-struct WalReservationTracker {
-    block_size: u64,
-    next_block: u64,
-}
-
-impl WalReservationTracker {
-    fn from_metadata(meta: &RaftMetadata) -> Self {
-        let block_size = if meta.wal_block_size == 0 {
-            DEFAULT_CRYPTO_BLOCK_BYTES
-        } else {
-            meta.wal_block_size as u64
-        };
-        Self {
-            block_size,
-            next_block: meta.wal_next_block,
-        }
-    }
-
-    fn reserve(&mut self, bytes: usize) -> WalReservation {
-        let blocks = divide_round_up(bytes as u64, self.block_size).max(1);
-        let start = self.next_block;
-        self.next_block += blocks;
-        WalReservation {
-            start_block: start,
-            blocks,
-        }
-    }
-
-    fn next_block(&self) -> u64 {
-        self.next_block
-    }
-
-    fn block_size(&self) -> u64 {
-        self.block_size
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-struct WalReservation {
-    start_block: u64,
-    blocks: u64,
-}
-
-fn divide_round_up(value: u64, divisor: u64) -> u64 {
-    if divisor == 0 {
-        return 0;
-    }
-    (value + divisor - 1) / divisor
 }
 
 #[cfg(test)]
@@ -202,11 +189,27 @@ mod tests {
         {
             let state = PersistentState::open(dir.path()).unwrap();
             let metadata = state.metadata_snapshot();
-            assert_eq!(metadata.last_log_index, 2);
-            assert_eq!(metadata.last_log_term, 1);
-            assert!(metadata.wal_next_block >= 2);
+            let tail = metadata.log_tail().unwrap();
+            assert_eq!(tail.index, 2);
+            assert_eq!(tail.term, 1);
+            assert!(metadata.wal_next_block >= 1);
             let entries = state.entries_from(1);
             assert_eq!(entries.len(), 2);
         }
+    }
+
+    #[test]
+    fn wal_cursor_recovers_after_restart() {
+        let dir = tempdir().unwrap();
+        let next_block = {
+            let state = PersistentState::open(dir.path()).unwrap();
+            state.append_payload(1, b"alpha".to_vec()).unwrap();
+            state.metadata_snapshot().wal_next_block
+        };
+        let state = PersistentState::open(dir.path()).unwrap();
+        state.append_payload(1, b"beta".to_vec()).unwrap();
+        let metadata = state.metadata_snapshot();
+        assert!(metadata.wal_next_block >= next_block);
+        assert_eq!(metadata.log_tail().unwrap().index, 2);
     }
 }

@@ -1,3 +1,4 @@
+use crate::bootstrap::filesystem::{OrderedFilesystemProfile, RejectionReason};
 use crate::bootstrap::probe::FsyncProbeResult;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -9,6 +10,15 @@ use thiserror::Error;
 pub struct BootRecord {
     #[serde(default)]
     pub fsync_probe: Option<FsyncProbeResult>,
+    #[serde(default)]
+    pub disk_policy: Option<DiskPolicyRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskPolicyRecord {
+    pub profile: Option<OrderedFilesystemProfile>,
+    pub rejections: Vec<RejectionReason>,
+    pub evaluated_at_ms: u64,
 }
 
 #[derive(Debug)]

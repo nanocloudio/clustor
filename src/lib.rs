@@ -20,6 +20,7 @@ pub mod net;
 pub mod overrides;
 pub mod profile;
 pub mod raft;
+pub mod read_index;
 pub mod readyz;
 pub mod security;
 pub mod snapshot;
@@ -42,16 +43,17 @@ pub use activation::{
 pub use apply::{
     AckHandleError, AckHandleFailureReason, AckHandleMetrics, AckHandlePolicy, AckHandleStatus,
     AckHandleSupervisor, AckTimeoutInfo, ApplyBatch, ApplyBudgetDecision, ApplyEntry, ApplyMetrics,
-    ApplyProfile, ApplyProfileError, ApplyProfileReport, ApplyScheduler, ApplySchedulerError,
-    DedupeCache, DedupeConfig, DedupeSnapshot, DedupeToken, InMemoryAckHandleMetrics,
-    InMemoryApplyMetrics, ManagedAckHandle, ReplayGuard,
+    ApplyProfile, ApplyProfileError, ApplyProfileReport, ApplyRuntime, ApplyScheduler,
+    ApplySchedulerError, DedupeCache, DedupeConfig, DedupeSnapshot, DedupeToken,
+    InMemoryAckHandleMetrics, InMemoryApplyMetrics, ManagedAckHandle, ReplayGuard,
+    TelemetryAckHandleMetrics, TelemetryApplyMetrics,
 };
 pub use consensus::{
     BundleDigest, CatalogVersion, ConsensusCore, ConsensusCoreConfig, ConsensusCoreManifest,
-    ConsensusCoreManifestBuilder, ConsensusCoreManifestError, ConsensusCoreStatus,
-    ConsensusCoreTelemetry, DemotionReason, DemotionStatus, DurabilityProof, GateBlockMetrics,
-    GateEvaluation, GateOperation, GateViolation, ProofBundleRef, RaftLogEntry, RaftLogError,
-    RaftLogStore, RaftMetadata, RaftMetadataError, RaftMetadataStore, SectionHash,
+    ConsensusCoreManifestBuilder, ConsensusCoreManifestError, ConsensusCoreStateSnapshot,
+    ConsensusCoreStatus, ConsensusCoreTelemetry, DemotionReason, DemotionStatus, DurabilityProof,
+    GateBlockMetrics, GateEvaluation, GateOperation, GateViolation, ProofBundleRef, RaftLogEntry,
+    RaftLogError, RaftLogStore, RaftMetadata, RaftMetadataError, RaftMetadataStore, SectionHash,
     StrictFallbackBlockingReason, StrictFallbackMetricsPublisher, StrictFallbackState,
     StrictFallbackWhy, TermIndexSnapshot,
 };
@@ -68,23 +70,31 @@ pub use profile::{
     CapabilityGateViolation, PartitionProfile, ProfileCapabilities, ProfileCapability,
     ProfileCapabilityError, ProfileCapabilityRegistry,
 };
+pub use read_index::{
+    CommitVisibility, ReadGateClause, ReadGateEvaluator, ReadGateInputs, ReadGateTelemetry,
+};
 pub use system_log::{SystemLogEntry, SystemLogError};
 
 pub use raft::{
     AppendEntriesFrameError, AppendEntriesOutcome, AppendEntriesProcessor, AppendEntriesRequest,
     AppendEntriesResponse, CandidateState, DeviceLatencyConfig, ElectionController,
     ElectionProfile, ElectionTimer, HeartbeatBatcher, HighRttState, LatencyGuardReason,
-    LeaderStickinessConfig, LeaderStickinessController, PartitionQuorum, PartitionQuorumConfig,
-    PartitionQuorumStatus, PreVoteDecision, PreVoteRejectReason, QuorumError, ReplicaId,
-    ReplicaProgress, RequestVoteFrameError, RequestVoteRejectReason, RequestVoteRequest,
-    RequestVoteResponse, StickinessDecision, StickinessTelemetry,
+    LeaderStickinessConfig, LeaderStickinessController, LeaderStickinessGate, PartitionQuorum,
+    PartitionQuorumConfig, PartitionQuorumStatus, PreVoteDecision, PreVoteRejectReason,
+    PreVoteResponse, PreVoteResponseFrameError, QuorumError, ReplicaId, ReplicaProgress,
+    RequestVoteFrameError, RequestVoteRejectReason, RequestVoteRequest, RequestVoteResponse,
+    StickinessDecision, StickinessTelemetry,
 };
 
-pub use durability::{AckHandle, AckRecord, DurabilityLedger, IoMode, LedgerError, LedgerUpdate};
+pub use durability::{
+    AckHandle, AckRecord, DurabilityAckMessage, DurabilityLedger, DurabilityMetricsPublisher,
+    IoMode, LedgerError, LedgerUpdate,
+};
 pub use flow::{
-    DualCreditPidController, FlowDecision, FlowProfile, FlowSloIncidentRecord, FlowSloMonitor,
-    FlowThrottleEnvelope, FlowThrottleReason, FlowThrottleState, QuotaOverrideRecord,
-    TenantFlowController, TenantFlowDecision, TenantQuota, TenantQuotaManager,
+    CreditHint, DualCreditPidController, FlowDecision, FlowIncidentKind, FlowLagClass, FlowProfile,
+    FlowSloIncidentRecord, FlowSloMonitor, FlowThrottleEnvelope, FlowThrottleReason,
+    FlowThrottleState, IngestStatusCode, QuotaOverrideRecord, TenantFlowController,
+    TenantFlowDecision, TenantQuota, TenantQuotaManager,
 };
 pub use follower::{FollowerCapabilityGate, FollowerReadError};
 pub use membership::{
@@ -93,16 +103,18 @@ pub use membership::{
 };
 pub use overrides::{DiskOverrideDevice, DiskOverrideDocument, DiskWriteCacheMode, OverrideError};
 pub use readyz::{
-    map_partition_ratios, OverrideStatus, OverrideType, ReadyExplain, ReadyStateHealth,
-    ReadyStateProbe, ReadyzCapabilityRecord, ReadyzRecord, ReadyzSnapshot,
+    map_partition_ratios, map_partition_ratios_with_barriers, readyz_from_warmup_snapshot,
+    OverrideStatus, OverrideType, ReadyExplain, ReadyStateHealth, ReadyStateProbe,
+    ReadyzCapabilityRecord, ReadyzRecord, ReadyzSnapshot,
 };
 
 pub use admin::{
     AdminCapability, AdminError, AdminHandler, AdminRequestContext, AdminService,
     AdminServiceError, CreatePartitionRequest, CreatePartitionResponse, DurabilityMode,
-    IdempotencyLedger, PartitionSpec, ReplicaSpec, SnapshotThrottleRequest,
-    SnapshotThrottleResponse, ThrottleExplainResponse, UpdateDurabilityModeRequest,
-    UpdateDurabilityModeResponse,
+    IdempotencyLedger, PartitionSpec, ReplicaSpec, SetDurabilityModeRequest,
+    SetDurabilityModeResponse, SnapshotThrottleRequest, SnapshotThrottleResponse,
+    SnapshotTriggerRequest, SnapshotTriggerResponse, ThrottleExplainResponse,
+    TransferLeaderRequest, TransferLeaderResponse,
 };
 pub use feature_guard::{
     future_gates, FeatureCapabilityMatrix, FeatureCapabilityState, FeatureGateState,
@@ -119,23 +131,26 @@ pub use net::{
     TlsTrustStore, WhyHttpServer, WhyHttpServerConfig, WhyHttpServerHandle, WhyPublisher,
 };
 pub use security::{
-    BreakGlassAudit, BreakGlassToken, Certificate, KeyEpochWatcher, MtlsIdentityManager,
-    RbacManifestCache, SecurityError, SerialNumber, SpiffeId,
+    BreakGlassAudit, BreakGlassAuditLog, BreakGlassToken, Certificate, KeyEpochWatcher,
+    MtlsIdentityManager, RbacManifest, RbacManifestCache, RbacPrincipal, RbacRole, SecurityError,
+    SerialNumber, SpiffeId,
 };
 pub use snapshot::{
     AppendEntriesBatch, CommitEpochEntry, DedupShardDigest, HmacManifestSigner, ManifestEncryption,
     ManifestError, ManifestSignature, ManifestSigner, ManifestVerification,
     ManifestVerificationError, SignedSnapshotManifest, SnapshotAppendEntriesCoordinator,
-    SnapshotAuthorizationError, SnapshotAuthorizer, SnapshotChunk, SnapshotChunkExporter,
-    SnapshotChunkPayload, SnapshotDeltaChainState, SnapshotDeltaChainTelemetry,
-    SnapshotDeltaPolicy, SnapshotDeltaPolicyError, SnapshotExportCaps, SnapshotExportController,
-    SnapshotExportError, SnapshotExportProfile, SnapshotExportTelemetry,
+    SnapshotAuthorizationError, SnapshotAuthorizer, SnapshotCadenceTelemetry, SnapshotChunk,
+    SnapshotChunkExporter, SnapshotChunkPayload, SnapshotDeltaChainState,
+    SnapshotDeltaChainTelemetry, SnapshotDeltaPolicy, SnapshotDeltaPolicyError, SnapshotExportCaps,
+    SnapshotExportController, SnapshotExportError, SnapshotExportProfile, SnapshotExportTelemetry,
     SnapshotFallbackController, SnapshotFallbackTelemetry, SnapshotImportConfig,
-    SnapshotImportError, SnapshotImportTelemetrySnapshot, SnapshotImportValidationError,
+    SnapshotImportError, SnapshotImportNodeBudget, SnapshotImportNodeTelemetrySnapshot,
+    SnapshotImportRetryPolicy, SnapshotImportTelemetrySnapshot, SnapshotImportValidationError,
     SnapshotImportValidator, SnapshotKind, SnapshotManifest, SnapshotManifestBuilder,
     SnapshotManifestVerifier, SnapshotOnlyReadyState, SnapshotReadError, SnapshotReadHeaders,
     SnapshotReadRequest, SnapshotReadResponse, SnapshotReadiness, SnapshotThrottleEnvelope,
-    SnapshotThrottleReason, SnapshotThrottleState,
+    SnapshotThrottleReason, SnapshotThrottleState, SnapshotTrigger, SnapshotTriggerConfig,
+    SnapshotTriggerDecision, SnapshotTriggerReason,
 };
 pub use spec_fixtures::{
     FixtureBundle, FixtureBundleGenerator, FixtureEntry, FixtureError, SpecLint,
@@ -154,8 +169,9 @@ pub use storage::{
     NonceReservationTelemetry, SegmentHandle, SegmentHeader, SegmentHeaderError, SegmentHealth,
     SegmentManager, SegmentPosition, SegmentSkipReason, SnapshotAuthorizationRecord, StorageLayout,
     StorageLayoutError, StorageMetadata, StorageMetadataError, StorageMetadataStore, StoragePaths,
-    StorageState, WalAead, WalReplayError, WalReplayResult, WalReplayScanner, WalTruncation,
-    MAX_RESERVATION_BLOCKS, WAL_CRYPTO_BLOCK_BYTES,
+    StorageState, WalAead, WalAppendResult, WalReplayError, WalReplayResult, WalReplayScanner,
+    WalReservation, WalTruncation, WalWriter, WalWriterError, MAX_RESERVATION_BLOCKS,
+    WAL_CRYPTO_BLOCK_BYTES,
 };
 pub use telemetry::{
     CpDegradationMetrics, IncidentCorrelator, IncidentDecision, MetricsRegistry, MetricsSnapshot,
