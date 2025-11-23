@@ -4,6 +4,8 @@ pub mod append;
 pub mod election;
 pub mod quorum;
 pub mod rpc;
+#[cfg(feature = "async-net")]
+pub mod runtime_scaffold;
 pub mod stickiness;
 
 pub use append::{AppendEntriesOutcome, AppendEntriesProcessor, HeartbeatBatcher};

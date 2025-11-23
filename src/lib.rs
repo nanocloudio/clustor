@@ -1,18 +1,25 @@
 //! Core library entrypoint for the Clustor consensus core.
 //! Currently exposes the strict-fallback state machine described in
 //! `docs/specification.md` §0.5 and §2.1.1.
+#![deny(unreachable_pub)]
+#![deny(unused_must_use)]
+#![cfg_attr(docsrs, warn(missing_docs))]
 
 pub mod activation;
+#[cfg(feature = "admin-http")]
 pub mod admin;
 pub mod apply;
 pub mod bootstrap;
+pub mod config_utils;
 pub mod consensus;
 pub mod cp;
 pub mod cp_raft;
 pub mod dr;
 pub mod durability;
+pub mod error;
 pub mod feature_guard;
 pub mod flow;
+#[cfg(feature = "snapshot-crypto")]
 pub mod follower;
 pub mod membership;
 #[cfg(feature = "net")]
@@ -22,7 +29,9 @@ pub mod profile;
 pub mod raft;
 pub mod read_index;
 pub mod readyz;
+pub mod retry;
 pub mod security;
+#[cfg(feature = "snapshot-crypto")]
 pub mod snapshot;
 pub mod spec_fixtures;
 pub mod spec_matrix;
@@ -37,8 +46,8 @@ pub mod wire;
 
 pub use activation::{
     readiness_digest, ActivationBarrier, ActivationBarrierDecision, ActivationBarrierEvaluator,
-    ActivationBarrierState, ShadowApplyState, WarmupReadinessPublisher, WarmupReadinessRecord,
-    WarmupReadinessSnapshot,
+    ActivationBarrierState, ActivationDigestError, ShadowApplyState, WarmupReadinessPublisher,
+    WarmupReadinessRecord, WarmupReadinessSnapshot,
 };
 pub use apply::{
     AckHandleError, AckHandleFailureReason, AckHandleMetrics, AckHandlePolicy, AckHandleStatus,
@@ -60,12 +69,17 @@ pub use consensus::{
 
 pub use cp::{
     client::{CpApiTransport, CpClientError, CpControlPlaneClient, TransportResponse},
-    CpCachePolicy, CpCacheState, CpProofCoordinator, CpUnavailableReason, CpUnavailableResponse,
-    ReadIndexError, ReadIndexPermit, StrictFallbackSnapshotImportError,
-    StrictFallbackSnapshotImportReason, StrictFallbackSnapshotImportRecord,
+    CpCachePolicy, CpCacheState, CpGuardError, CpProofCoordinator, CpUnavailableReason,
+    CpUnavailableResponse, ReadIndexPermit,
+};
+#[cfg(feature = "snapshot-crypto")]
+pub use cp::{
+    StrictFallbackSnapshotImportError, StrictFallbackSnapshotImportReason,
+    StrictFallbackSnapshotImportRecord,
 };
 pub use cp_raft::{CpPlacementClient, PlacementRecord, PlacementSnapshot, RoutingEpochError};
 pub use dr::{DrFenceError, DrFenceManager, FenceState};
+pub use error::{ClustorError, GuardError, SerializationError};
 pub use profile::{
     CapabilityGateViolation, PartitionProfile, ProfileCapabilities, ProfileCapability,
     ProfileCapabilityError, ProfileCapabilityRegistry,
@@ -75,6 +89,8 @@ pub use read_index::{
 };
 pub use system_log::{SystemLogEntry, SystemLogError};
 
+#[cfg(feature = "async-net")]
+pub use raft::runtime_scaffold::{RaftNodeCallbacks, RaftNodeHandle, RaftNodeScaffold};
 pub use raft::{
     AppendEntriesFrameError, AppendEntriesOutcome, AppendEntriesProcessor, AppendEntriesRequest,
     AppendEntriesResponse, CandidateState, DeviceLatencyConfig, ElectionController,
@@ -96,6 +112,7 @@ pub use flow::{
     FlowThrottleState, IngestStatusCode, QuotaOverrideRecord, TenantFlowController,
     TenantFlowDecision, TenantQuota, TenantQuotaManager,
 };
+#[cfg(feature = "snapshot-crypto")]
 pub use follower::{FollowerCapabilityGate, FollowerReadError};
 pub use membership::{
     evaluate_survivability, CatchUpDecision, CatchUpReason, LearnerCatchUpConfig,
@@ -108,6 +125,7 @@ pub use readyz::{
     ReadyzCapabilityRecord, ReadyzRecord, ReadyzSnapshot,
 };
 
+#[cfg(feature = "admin-http")]
 pub use admin::{
     AdminCapability, AdminError, AdminHandler, AdminRequestContext, AdminService,
     AdminServiceError, CreatePartitionRequest, CreatePartitionResponse, DurabilityMode,
@@ -124,17 +142,27 @@ pub use feature_guard::{
 };
 #[cfg(feature = "net")]
 pub use net::{
-    load_identity_from_pem, load_trust_store_from_pem, AdminHttpServer, AdminHttpServerConfig,
-    AdminHttpServerHandle, HttpCpTransport, HttpCpTransportBuilder, RaftNetworkClient,
-    RaftNetworkClientConfig, RaftNetworkServer, RaftNetworkServerConfig, RaftNetworkServerHandle,
-    ReadyzHttpServer, ReadyzHttpServerConfig, ReadyzHttpServerHandle, ReadyzPublisher, TlsIdentity,
-    TlsTrustStore, WhyHttpServer, WhyHttpServerConfig, WhyHttpServerHandle, WhyPublisher,
+    load_identity_from_pem, load_trust_store_from_pem, HttpCpTransport, HttpCpTransportBuilder,
+    RaftNetworkClient, RaftNetworkClientConfig, RaftNetworkClientOptions, RaftNetworkServer,
+    RaftNetworkServerConfig, RaftNetworkServerHandle, ReadyzHttpServer, ReadyzHttpServerConfig,
+    ReadyzHttpServerHandle, ReadyzPublisher, TlsIdentity, TlsTrustStore, WhyHttpServer,
+    WhyHttpServerConfig, WhyHttpServerHandle, WhyPublisher,
+};
+#[cfg(all(feature = "net", feature = "admin-http"))]
+pub use net::{AdminHttpServer, AdminHttpServerConfig, AdminHttpServerHandle};
+#[cfg(all(feature = "management", feature = "async-net"))]
+pub use net::{AsyncManagementHttpServer, AsyncManagementHttpServerHandle};
+#[cfg(feature = "management")]
+pub use net::{ManagementHttpServer, ManagementHttpServerConfig, ManagementHttpServerHandle};
+#[cfg(feature = "admin-http")]
+pub use security::{
+    BreakGlassAudit, BreakGlassAuditLog, BreakGlassToken, RbacManifest, RbacManifestCache,
+    RbacPrincipal, RbacRole,
 };
 pub use security::{
-    BreakGlassAudit, BreakGlassAuditLog, BreakGlassToken, Certificate, KeyEpochWatcher,
-    MtlsIdentityManager, RbacManifest, RbacManifestCache, RbacPrincipal, RbacRole, SecurityError,
-    SerialNumber, SpiffeId,
+    Certificate, KeyEpochWatcher, MtlsIdentityManager, SecurityError, SerialNumber, SpiffeId,
 };
+#[cfg(feature = "snapshot-crypto")]
 pub use snapshot::{
     AppendEntriesBatch, CommitEpochEntry, DedupShardDigest, HmacManifestSigner, ManifestEncryption,
     ManifestError, ManifestSignature, ManifestSigner, ManifestVerification,
@@ -175,7 +203,7 @@ pub use storage::{
 };
 pub use telemetry::{
     CpDegradationMetrics, IncidentCorrelator, IncidentDecision, MetricsRegistry, MetricsSnapshot,
-    TelemetryError,
+    SharedMetricsRegistry, TelemetryError,
 };
 pub use terminology::{
     runtime_terms, RuntimeTerm, TERM_DURABILITY_RECORD, TERM_FOLLOWER_READ_SNAPSHOT,
@@ -186,7 +214,9 @@ pub use transport::{
     raft::{RaftRpcHandler, RaftRpcServer, RaftTransportError},
     CatalogNegotiationConfig, CatalogNegotiationReport, ForwardCompatTracker,
 };
-pub use why::{LocalRole, WhyNotLeader, WhySchemaHeader, WhySnapshotBlocked};
+#[cfg(feature = "snapshot-crypto")]
+pub use why::WhySnapshotBlocked;
+pub use why::{LocalRole, WhyNotLeader, WhySchemaHeader};
 pub use wire::{
     BundleNegotiationEntry, BundleNegotiationLog, NegotiationError, WireCatalogNegotiator,
 };

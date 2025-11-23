@@ -2,18 +2,31 @@ use crate::durability::AckHandle;
 #[cfg(test)]
 use crate::profile::ProfileCapability;
 use crate::profile::{PartitionProfile, ProfileCapabilityError, ProfileCapabilityRegistry};
-use crate::telemetry::MetricsRegistry;
+use crate::telemetry::{SharedMetricsRegistry, TelemetryError};
 use crate::terminology::TERM_STRICT;
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const DEFAULT_P99_WINDOW: usize = 10_000;
 const QUEUE_ALERT_THRESHOLD: f32 = 0.9;
 const APPLY_SPEC_CLAUSE: &str = "§6.4";
+
+fn log_metric_error<T>(context: &str, result: Result<T, TelemetryError>) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(err) => {
+            warn!(
+                "event=telemetry_metric_error context={} error={}",
+                context, err
+            );
+            None
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ApplyProfile {
@@ -275,103 +288,140 @@ pub struct InMemoryApplyMetricsSnapshot {
 
 impl InMemoryApplyMetrics {
     pub fn snapshot(&self) -> InMemoryApplyMetricsSnapshot {
-        self.inner.lock().unwrap().clone()
+        self.lock_inner().clone()
+    }
+
+    fn lock_inner(&self) -> MutexGuard<'_, InMemoryApplyMetricsSnapshot> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("event=in_memory_apply_metrics_poisoned; recovering state");
+                poisoned.into_inner()
+            }
+        }
     }
 }
 
 impl ApplyMetrics for InMemoryApplyMetrics {
     fn record_queue_depth(&self, depth: usize, capacity: usize) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.queue_depth = depth;
         guard.queue_capacity = capacity;
     }
 
     fn record_budget_sample(&self, p99_ns: u64, threshold_ns: u64, breaches: u32) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.last_p99_ns = p99_ns;
         guard.last_threshold_ns = threshold_ns;
         guard.consecutive_breaches = breaches;
     }
 
     fn record_queue_alert(&self) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.queue_alerts += 1;
     }
 
     fn record_guardrail_violation(&self) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.guardrail_violations += 1;
     }
 
     fn record_aggregator_budget_breach(&self) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.aggregator_budget_breaches += 1;
     }
 
     fn record_aggregator_guardrail_violation(&self) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.aggregator_guardrail_violations += 1;
     }
 }
 
 #[derive(Clone)]
 pub struct TelemetryApplyMetrics {
-    registry: Arc<Mutex<MetricsRegistry>>,
+    registry: SharedMetricsRegistry,
     aggregator: bool,
 }
 
 impl TelemetryApplyMetrics {
-    pub fn new(registry: Arc<Mutex<MetricsRegistry>>, aggregator: bool) -> Self {
+    pub fn new(registry: SharedMetricsRegistry, aggregator: bool) -> Self {
         Self {
             registry,
             aggregator,
         }
     }
 
-    pub fn for_profile(registry: Arc<Mutex<MetricsRegistry>>, profile: &ApplyProfile) -> Self {
+    pub fn for_profile(registry: SharedMetricsRegistry, profile: &ApplyProfile) -> Self {
         Self::new(registry, profile.aggregator)
-    }
-
-    fn registry(&self) -> std::sync::MutexGuard<'_, MetricsRegistry> {
-        self.registry.lock().unwrap()
     }
 }
 
 impl ApplyMetrics for TelemetryApplyMetrics {
     fn record_queue_depth(&self, depth: usize, capacity: usize) {
-        let mut registry = self.registry();
-        registry.set_gauge("apply.queue_depth", depth as u64);
-        registry.set_gauge("apply.queue_capacity", capacity as u64);
+        log_metric_error(
+            "apply.queue_depth",
+            self.registry.set_gauge("apply.queue_depth", depth as u64),
+        );
+        log_metric_error(
+            "apply.queue_capacity",
+            self.registry
+                .set_gauge("apply.queue_capacity", capacity as u64),
+        );
     }
 
     fn record_budget_sample(&self, p99_ns: u64, threshold_ns: u64, breaches: u32) {
-        let mut registry = self.registry();
-        registry.set_gauge("apply.batch_p99_ns", p99_ns);
-        registry.set_gauge("apply.batch_budget_threshold_ns", threshold_ns);
-        registry.set_gauge("apply.budget_breach_streak", breaches as u64);
+        log_metric_error(
+            "apply.batch_p99_ns",
+            self.registry.set_gauge("apply.batch_p99_ns", p99_ns),
+        );
+        log_metric_error(
+            "apply.batch_budget_threshold_ns",
+            self.registry
+                .set_gauge("apply.batch_budget_threshold_ns", threshold_ns),
+        );
+        log_metric_error(
+            "apply.budget_breach_streak",
+            self.registry
+                .set_gauge("apply.budget_breach_streak", breaches as u64),
+        );
         if self.aggregator {
-            registry.inc_counter("apply.aggregator_samples_total", 1);
+            log_metric_error(
+                "apply.aggregator_samples_total",
+                self.registry
+                    .inc_counter("apply.aggregator_samples_total", 1),
+            );
         }
     }
 
     fn record_queue_alert(&self) {
-        let mut registry = self.registry();
-        registry.inc_counter("apply.queue_alert_total", 1);
+        log_metric_error(
+            "apply.queue_alert_total",
+            self.registry.inc_counter("apply.queue_alert_total", 1),
+        );
     }
 
     fn record_guardrail_violation(&self) {
-        let mut registry = self.registry();
-        registry.inc_counter("apply.guardrail_violation_total", 1);
+        log_metric_error(
+            "apply.guardrail_violation_total",
+            self.registry
+                .inc_counter("apply.guardrail_violation_total", 1),
+        );
     }
 
     fn record_aggregator_budget_breach(&self) {
-        let mut registry = self.registry();
-        registry.inc_counter("apply.aggregator_budget_breach_total", 1);
+        log_metric_error(
+            "apply.aggregator_budget_breach_total",
+            self.registry
+                .inc_counter("apply.aggregator_budget_breach_total", 1),
+        );
     }
 
     fn record_aggregator_guardrail_violation(&self) {
-        let mut registry = self.registry();
-        registry.inc_counter("apply.aggregator_guardrail_violation_total", 1);
+        log_metric_error(
+            "apply.aggregator_guardrail_violation_total",
+            self.registry
+                .inc_counter("apply.aggregator_guardrail_violation_total", 1),
+        );
     }
 }
 
@@ -879,51 +929,57 @@ pub struct AckHandleMetricsSnapshot {
 
 impl InMemoryAckHandleMetrics {
     pub fn snapshot(&self) -> AckHandleMetricsSnapshot {
-        self.inner.lock().unwrap().clone()
+        self.lock_inner().clone()
+    }
+
+    fn lock_inner(&self) -> MutexGuard<'_, AckHandleMetricsSnapshot> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn!("event=in_memory_ack_metrics_poisoned; recovering state");
+                poisoned.into_inner()
+            }
+        }
     }
 }
 
 impl AckHandleMetrics for InMemoryAckHandleMetrics {
     fn record_completion(&self, _id: u64) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.completed += 1;
     }
 
     fn record_failure(&self, _id: u64, reason: &AckHandleFailureReason) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.failed += 1;
         guard.last_failure = Some(reason.clone());
     }
 
     fn record_timeout(&self, _info: &AckTimeoutInfo) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.timeouts += 1;
         guard.last_failure = Some(AckHandleFailureReason::AckTimeout);
     }
 
     fn record_drop_alert(&self) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.drop_alerts += 1;
     }
 
     fn record_defer_guardrail_violation(&self) {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.lock_inner();
         guard.defer_guardrail_violations += 1;
     }
 }
 
 #[derive(Clone)]
 pub struct TelemetryAckHandleMetrics {
-    registry: Arc<Mutex<MetricsRegistry>>,
+    registry: SharedMetricsRegistry,
 }
 
 impl TelemetryAckHandleMetrics {
-    pub fn new(registry: Arc<Mutex<MetricsRegistry>>) -> Self {
+    pub fn new(registry: SharedMetricsRegistry) -> Self {
         Self { registry }
-    }
-
-    fn registry(&self) -> std::sync::MutexGuard<'_, MetricsRegistry> {
-        self.registry.lock().unwrap()
     }
 
     fn failure_code(reason: &AckHandleFailureReason) -> u64 {
@@ -937,33 +993,63 @@ impl TelemetryAckHandleMetrics {
 
 impl AckHandleMetrics for TelemetryAckHandleMetrics {
     fn record_completion(&self, id: u64) {
-        let mut registry = self.registry();
-        registry.inc_counter("ack_handle.completed_total", 1);
-        registry.set_gauge("ack_handle.last_completed_id", id);
+        log_metric_error(
+            "ack_handle.completed_total",
+            self.registry.inc_counter("ack_handle.completed_total", 1),
+        );
+        log_metric_error(
+            "ack_handle.last_completed_id",
+            self.registry.set_gauge("ack_handle.last_completed_id", id),
+        );
     }
 
     fn record_failure(&self, _id: u64, reason: &AckHandleFailureReason) {
-        let mut registry = self.registry();
-        registry.inc_counter("ack_handle.failed_total", 1);
-        registry.set_gauge("ack_handle.last_failure_code", Self::failure_code(reason));
+        log_metric_error(
+            "ack_handle.failed_total",
+            self.registry.inc_counter("ack_handle.failed_total", 1),
+        );
+        log_metric_error(
+            "ack_handle.last_failure_code",
+            self.registry
+                .set_gauge("ack_handle.last_failure_code", Self::failure_code(reason)),
+        );
     }
 
     fn record_timeout(&self, info: &AckTimeoutInfo) {
-        let mut registry = self.registry();
-        registry.inc_counter("ack_handle.timeouts_total", 1);
-        registry.set_gauge("ack_handle.last_timeout.handle_id", info.handle_id);
-        registry.set_gauge("ack_handle.last_timeout.term", info.term);
-        registry.set_gauge("ack_handle.last_timeout.index", info.index);
+        log_metric_error(
+            "ack_handle.timeouts_total",
+            self.registry.inc_counter("ack_handle.timeouts_total", 1),
+        );
+        log_metric_error(
+            "ack_handle.last_timeout.handle_id",
+            self.registry
+                .set_gauge("ack_handle.last_timeout.handle_id", info.handle_id),
+        );
+        log_metric_error(
+            "ack_handle.last_timeout.term",
+            self.registry
+                .set_gauge("ack_handle.last_timeout.term", info.term),
+        );
+        log_metric_error(
+            "ack_handle.last_timeout.index",
+            self.registry
+                .set_gauge("ack_handle.last_timeout.index", info.index),
+        );
     }
 
     fn record_drop_alert(&self) {
-        let mut registry = self.registry();
-        registry.inc_counter("ack_handle.drop_alert_total", 1);
+        log_metric_error(
+            "ack_handle.drop_alert_total",
+            self.registry.inc_counter("ack_handle.drop_alert_total", 1),
+        );
     }
 
     fn record_defer_guardrail_violation(&self) {
-        let mut registry = self.registry();
-        registry.inc_counter("ack_handle.defer_guardrail_violation_total", 1);
+        log_metric_error(
+            "ack_handle.defer_guardrail_violation_total",
+            self.registry
+                .inc_counter("ack_handle.defer_guardrail_violation_total", 1),
+        );
     }
 }
 
@@ -973,7 +1059,7 @@ pub struct AckHandleSupervisor<M: AckHandleMetrics = InMemoryAckHandleMetrics> {
 
 struct AckHandleSupervisorState<M: AckHandleMetrics> {
     policy: AckHandlePolicy,
-    metrics: M,
+    metrics: Arc<M>,
     next_id: u64,
     handles: HashMap<u64, HandleRecord>,
     drop_events: VecDeque<Instant>,
@@ -986,6 +1072,7 @@ struct HandleRecord {
 
 impl<M: AckHandleMetrics> AckHandleSupervisor<M> {
     pub fn new(policy: AckHandlePolicy, metrics: M) -> Self {
+        let metrics = Arc::new(metrics);
         Self {
             inner: Arc::new(Mutex::new(AckHandleSupervisorState {
                 policy,
@@ -998,7 +1085,7 @@ impl<M: AckHandleMetrics> AckHandleSupervisor<M> {
     }
 
     pub fn register(&self, ack: AckHandle, now: Instant) -> ManagedAckHandle<M> {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = lock_supervisor_state(&self.inner);
         let id = guard.next_id;
         guard.next_id += 1;
         let deadline = now + Duration::from_millis(guard.policy.max_defer_ms);
@@ -1012,49 +1099,73 @@ impl<M: AckHandleMetrics> AckHandleSupervisor<M> {
     }
 
     pub fn tick(&self, now: Instant) -> Vec<AckTimeoutInfo> {
-        let mut guard = self.inner.lock().unwrap();
-        let mut timed_out = Vec::new();
-        let mut expired = Vec::new();
-        for (id, record) in guard.handles.iter() {
-            if record.deadline <= now {
-                let (term, index) = record.ack.target();
-                let info = AckTimeoutInfo {
-                    handle_id: *id,
-                    term,
-                    index,
-                };
-                guard.metrics.record_timeout(&info);
-                if guard.policy.aggregator {
-                    guard.metrics.record_defer_guardrail_violation();
+        let (timed_out, metrics, aggregator) = {
+            let mut guard = lock_supervisor_state(&self.inner);
+            let mut timed_out = Vec::new();
+            let mut expired = Vec::new();
+            for (id, record) in guard.handles.iter() {
+                if record.deadline <= now {
+                    let (term, index) = record.ack.target();
+                    let info = AckTimeoutInfo {
+                        handle_id: *id,
+                        term,
+                        index,
+                    };
+                    timed_out.push(info);
+                    expired.push(*id);
                 }
-                timed_out.push(info);
-                expired.push(*id);
             }
-        }
-        for id in expired {
-            guard.handles.remove(&id);
+            for id in expired {
+                guard.handles.remove(&id);
+            }
+            (timed_out, guard.metrics.clone(), guard.policy.aggregator)
+        };
+        for info in &timed_out {
+            metrics.record_timeout(info);
+            if aggregator {
+                metrics.record_defer_guardrail_violation();
+            }
         }
         timed_out
     }
 
     fn note_drop(&self, id: u64, now: Instant) {
-        let mut guard = self.inner.lock().unwrap();
-        if guard.handles.remove(&id).is_some() {
-            guard
-                .metrics
-                .record_failure(id, &AckHandleFailureReason::Dropped);
-            guard.drop_events.push_back(now);
-            let window = Duration::from_millis(guard.policy.drop_window_ms);
-            while let Some(front) = guard.drop_events.front() {
-                if now.duration_since(*front) > window {
-                    guard.drop_events.pop_front();
-                } else {
-                    break;
+        let action = {
+            let mut guard = lock_supervisor_state(&self.inner);
+            if guard.handles.remove(&id).is_some() {
+                guard.drop_events.push_back(now);
+                let window = Duration::from_millis(guard.policy.drop_window_ms);
+                while let Some(front) = guard.drop_events.front() {
+                    if now.duration_since(*front) > window {
+                        guard.drop_events.pop_front();
+                    } else {
+                        break;
+                    }
                 }
+                let should_alert =
+                    guard.drop_events.len() as u32 >= guard.policy.max_consecutive_drops;
+                Some((guard.metrics.clone(), should_alert))
+            } else {
+                None
             }
-            if guard.drop_events.len() as u32 >= guard.policy.max_consecutive_drops {
-                guard.metrics.record_drop_alert();
+        };
+        if let Some((metrics, should_alert)) = action {
+            metrics.record_failure(id, &AckHandleFailureReason::Dropped);
+            if should_alert {
+                metrics.record_drop_alert();
             }
+        }
+    }
+}
+
+fn lock_supervisor_state<'a, M: AckHandleMetrics>(
+    inner: &'a Arc<Mutex<AckHandleSupervisorState<M>>>,
+) -> MutexGuard<'a, AckHandleSupervisorState<M>> {
+    match inner.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            warn!("event=ack_handle_supervisor_poisoned; recovering state");
+            poisoned.into_inner()
         }
     }
 }
@@ -1084,14 +1195,18 @@ impl<M: AckHandleMetrics> ManagedAckHandle<M> {
         if self.finished {
             return Err(AckHandleError::AlreadyFinished);
         }
-        let mut guard = self.inner.lock().unwrap();
-        match guard.handles.remove(&self.id) {
-            Some(_) => {
+        let metrics = {
+            let mut guard = lock_supervisor_state(&self.inner);
+            guard
+                .handles
+                .remove(&self.id)
+                .map(|_| guard.metrics.clone())
+        };
+        match metrics {
+            Some(metrics) => {
                 match &status {
-                    AckHandleStatus::Completed => guard.metrics.record_completion(self.id),
-                    AckHandleStatus::Failed(reason) => {
-                        guard.metrics.record_failure(self.id, reason)
-                    }
+                    AckHandleStatus::Completed => metrics.record_completion(self.id),
+                    AckHandleStatus::Failed(reason) => metrics.record_failure(self.id, reason),
                 }
                 self.finished = true;
                 Ok(())
@@ -1145,8 +1260,7 @@ pub enum AckHandleError {
 mod tests {
     use super::*;
     use crate::profile::ProfileCapabilities;
-    use crate::telemetry::MetricsRegistry;
-    use std::sync::{Arc, Mutex};
+    use crate::telemetry::SharedMetricsRegistry;
 
     #[test]
     fn enqueue_enforces_limits() {
@@ -1332,7 +1446,7 @@ mod tests {
 
     #[test]
     fn telemetry_apply_metrics_records_counters() {
-        let registry = Arc::new(Mutex::new(MetricsRegistry::new("clustor")));
+        let registry = SharedMetricsRegistry::new("clustor");
         let metrics = TelemetryApplyMetrics::new(registry.clone(), true);
         metrics.record_queue_depth(7, 64);
         metrics.record_budget_sample(2_000, 3_000, 2);
@@ -1340,7 +1454,7 @@ mod tests {
         metrics.record_guardrail_violation();
         metrics.record_aggregator_budget_breach();
         metrics.record_aggregator_guardrail_violation();
-        let snapshot = registry.lock().unwrap().snapshot();
+        let snapshot = registry.snapshot().expect("apply metrics snapshot");
         assert_eq!(snapshot.gauges.get("clustor.apply.queue_depth"), Some(&7));
         assert_eq!(
             snapshot
@@ -1370,7 +1484,7 @@ mod tests {
 
     #[test]
     fn telemetry_ack_handle_metrics_records_counters() {
-        let registry = Arc::new(Mutex::new(MetricsRegistry::new("clustor")));
+        let registry = SharedMetricsRegistry::new("clustor");
         let metrics = TelemetryAckHandleMetrics::new(registry.clone());
         metrics.record_completion(11);
         metrics.record_failure(12, &AckHandleFailureReason::Dropped);
@@ -1381,7 +1495,7 @@ mod tests {
         });
         metrics.record_drop_alert();
         metrics.record_defer_guardrail_violation();
-        let snapshot = registry.lock().unwrap().snapshot();
+        let snapshot = registry.snapshot().expect("ack metrics snapshot");
         assert_eq!(
             snapshot.counters.get("clustor.ack_handle.completed_total"),
             Some(&1)

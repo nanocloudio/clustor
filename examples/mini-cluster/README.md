@@ -59,6 +59,7 @@ Each node exposes:
 
 - A Raft TLS listener (see `cluster.yaml` for the port)
 - An HTTPS API on the corresponding `http_bind` address
+- A consolidated management endpoint on `management_bind` (mTLS) serving `/readyz`, `/readyz/why/<id>`, `/why/not-leader/<id>`, and `/admin/*`
 
 By default every node keeps its Raft log under `./state/<node-id>/raft.log`, resolved
 relative to the configuration file. You can choose a different location with
@@ -99,6 +100,11 @@ curl -k --cacert certs/ca.pem \
 
 # Query any node to see the replicated log
 curl -k --cacert certs/ca.pem https://127.0.0.1:7202/events | jq
+
+# Query the management API (mTLS)
+curl -k --cacert certs/ca.pem \
+     --cert certs/node-a-cert.pem --key certs/node-a-key.pem \
+     https://127.0.0.1:7301/readyz | jq
 ```
 
 You should see each node report both events even though you only posted to two of them.

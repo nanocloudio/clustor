@@ -137,7 +137,9 @@ fn recovery_status_emits_truncation_metric() {
 #[test]
 fn telemetry_checkpoint_metric_snapshot_serializes_counts() {
     let mut registry = MetricsRegistry::new("clustor");
-    registry.register_golden_histograms();
+    registry
+        .register_golden_histograms()
+        .expect("register golden histograms");
     registry.inc_counter("cp.cache_hits", 9);
     registry.set_gauge("flow.ready_partitions", 4);
     registry

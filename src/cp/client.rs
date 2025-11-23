@@ -1,5 +1,7 @@
 use crate::cp_raft::{CpPlacementClient, PlacementRecord};
 use crate::feature_guard::FeatureManifest;
+#[cfg(feature = "net")]
+use crate::net::NetError;
 use crate::security::{Certificate, MtlsIdentityManager, SecurityError};
 use serde::de::DeserializeOwned;
 use std::time::Instant;
@@ -74,11 +76,20 @@ fn decode_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, CpClientError> {
 #[derive(Debug, Error)]
 pub enum CpClientError {
     #[error("transport error: {0}")]
-    Transport(String),
+    Transport(#[from] TransportError),
     #[error("security error: {0}")]
     Security(#[from] SecurityError),
     #[error("decode error: {0}")]
     Decode(#[from] serde_json::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum TransportError {
+    #[error("no route for {path}")]
+    NoRoute { path: String },
+    #[cfg(feature = "net")]
+    #[error(transparent)]
+    Network(#[from] NetError),
 }
 
 #[cfg(test)]
@@ -154,7 +165,6 @@ mod tests {
         MtlsIdentityManager::new(
             cert,
             "cp.internal",
-            std::time::Duration::from_secs(300),
             std::time::Duration::from_secs(600),
             now,
         )
@@ -191,10 +201,12 @@ mod tests {
 
     impl CpApiTransport for MockTransport {
         fn get(&self, path: &str) -> Result<TransportResponse, CpClientError> {
-            self.responses
-                .get(path)
-                .cloned()
-                .ok_or_else(|| CpClientError::Transport(format!("no route for {path}")))
+            self.responses.get(path).cloned().ok_or_else(|| {
+                TransportError::NoRoute {
+                    path: path.to_string(),
+                }
+                .into()
+            })
         }
     }
 }

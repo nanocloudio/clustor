@@ -6,7 +6,7 @@ use crate::raft::{
 };
 use crate::security::{Certificate, MtlsIdentityManager, SecurityError};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use thiserror::Error;
 
@@ -18,17 +18,17 @@ pub trait RaftRpcHandler {
 
 /// Minimal authenticated RPC endpoint for Raft leadership traffic.
 pub struct RaftRpcServer<H> {
-    identity: Arc<Mutex<MtlsIdentityManager>>,
+    identity: Arc<RwLock<MtlsIdentityManager>>,
     handler: H,
     catalog: Option<CatalogNegotiationReport>,
 }
 
 impl<H: RaftRpcHandler> RaftRpcServer<H> {
     pub fn new(identity: MtlsIdentityManager, handler: H) -> Self {
-        Self::with_identity(Arc::new(Mutex::new(identity)), handler)
+        Self::with_identity(Arc::new(RwLock::new(identity)), handler)
     }
 
-    pub fn with_identity(identity: Arc<Mutex<MtlsIdentityManager>>, handler: H) -> Self {
+    pub fn with_identity(identity: Arc<RwLock<MtlsIdentityManager>>, handler: H) -> Self {
         Self {
             identity,
             handler,
@@ -36,7 +36,7 @@ impl<H: RaftRpcHandler> RaftRpcServer<H> {
         }
     }
 
-    pub fn identity_handle(&self) -> Arc<Mutex<MtlsIdentityManager>> {
+    pub fn identity_handle(&self) -> Arc<RwLock<MtlsIdentityManager>> {
         self.identity.clone()
     }
 
@@ -59,7 +59,10 @@ impl<H: RaftRpcHandler> RaftRpcServer<H> {
         now: Instant,
     ) -> Result<Vec<u8>, RaftTransportError> {
         {
-            let mut identity = self.identity.lock().expect("MtlsIdentityManager poisoned");
+            let mut identity = self
+                .identity
+                .write()
+                .map_err(|_| RaftTransportError::IdentityPoisoned)?;
             identity
                 .verify_peer(peer, now)
                 .map_err(RaftTransportError::Security)?;
@@ -86,7 +89,10 @@ impl<H: RaftRpcHandler> RaftRpcServer<H> {
         now: Instant,
     ) -> Result<Vec<u8>, RaftTransportError> {
         {
-            let mut identity = self.identity.lock().expect("MtlsIdentityManager poisoned");
+            let mut identity = self
+                .identity
+                .write()
+                .map_err(|_| RaftTransportError::IdentityPoisoned)?;
             identity
                 .verify_peer(peer, now)
                 .map_err(RaftTransportError::Security)?;
@@ -126,6 +132,8 @@ pub enum RaftTransportError {
     AppendEntriesFrame(#[from] AppendEntriesFrameError),
     #[error(transparent)]
     Negotiation(#[from] NegotiationError),
+    #[error("mTLS identity manager lock poisoned")]
+    IdentityPoisoned,
 }
 
 #[cfg(test)]
@@ -177,7 +185,6 @@ mod tests {
         MtlsIdentityManager::new(
             certificate("spiffe://example.org/servers/leader", 1, now),
             "example.org",
-            Duration::from_secs(300),
             Duration::from_secs(600),
             now,
         )

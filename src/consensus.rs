@@ -1,7 +1,7 @@
 //! Consensus-core components shared across the runtime.
 
 pub mod kernel;
-pub mod log_store;
+pub mod log;
 pub mod manifest;
 
 pub use kernel::{
@@ -10,7 +10,7 @@ pub use kernel::{
     GateEvaluation, GateOperation, GateViolation, StrictFallbackBlockingReason,
     StrictFallbackMetricsPublisher, StrictFallbackState, StrictFallbackWhy,
 };
-pub use log_store::{
+pub use log::{
     RaftLogEntry, RaftLogError, RaftLogStore, RaftMetadata, RaftMetadataError, RaftMetadataStore,
     TermIndexSnapshot,
 };

@@ -1,3 +1,5 @@
+#![cfg(feature = "snapshot-crypto")]
+
 use clustor::{
     SnapshotFallbackController, SnapshotReadError, SnapshotReadRequest, SnapshotReadiness,
     StrictFallbackState,

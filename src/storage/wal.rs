@@ -1,13 +1,17 @@
-use std::fs::{self, File, OpenOptions};
+use crate::retry::RetryPolicy;
+use crate::storage::SharedBufferedWriter;
+use log::warn;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-
-#[cfg(not(unix))]
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::FileExt;
+use std::thread;
+use std::time::Duration;
 
 use thiserror::Error;
+
+const WAL_IO_MAX_ATTEMPTS: usize = 3;
+const WAL_IO_BACKOFF: Duration = Duration::from_millis(20);
+const WAL_FLUSH_THRESHOLD: usize = 64 * 1024;
 
 /// Reservation covering a contiguous range of WAL crypto blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +24,7 @@ pub struct WalReservation {
 #[derive(Debug)]
 pub struct WalWriter {
     path: PathBuf,
-    file: File,
+    buffer: SharedBufferedWriter,
     cursor: u64,
     tracker: WalReservationTracker,
     block_size: u64,
@@ -32,17 +36,20 @@ impl WalWriter {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new()
+        let mut sync_file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
             .open(&path)?;
-        let cursor = file.seek(SeekFrom::End(0))?;
+        let cursor = sync_file.seek(SeekFrom::End(0))?;
+        let writer_file = sync_file.try_clone()?;
+        let buffer =
+            SharedBufferedWriter::with_position(writer_file, 128 * 1024, WAL_FLUSH_THRESHOLD)?;
         let tracker = WalReservationTracker::new(block_size, divide_round_up(cursor, block_size));
         Ok(Self {
             path,
-            file,
+            buffer,
             cursor,
             tracker,
             block_size,
@@ -65,28 +72,24 @@ impl WalWriter {
     pub fn append_frame(&mut self, payload: &[u8]) -> Result<WalAppendResult, WalWriterError> {
         let offset = self.cursor;
         let len = payload.len() as u64;
-        self.write_at(payload, offset)?;
+        let label = format!("wal_write path={}", self.path.display());
+        retry_io(
+            || {
+                self.buffer.write_all(payload)?;
+                Ok(())
+            },
+            &label,
+        )?;
         self.cursor = self.cursor.saturating_add(len);
-        self.file.sync_data()?;
+        retry_io(|| self.buffer.flush(), "wal_flush")?;
+        let sync_label = format!("wal_sync path={}", self.path.display());
+        retry_io(|| self.buffer.sync_data(), &sync_label)?;
         let reservation = self.tracker.reserve(payload.len());
         Ok(WalAppendResult {
             offset,
             len,
             reservation,
         })
-    }
-
-    fn write_at(&mut self, payload: &[u8], offset: u64) -> Result<(), WalWriterError> {
-        #[cfg(unix)]
-        {
-            self.file.write_all_at(payload, offset)?;
-        }
-        #[cfg(not(unix))]
-        {
-            self.file.seek(SeekFrom::Start(offset))?;
-            self.file.write_all(payload)?;
-        }
-        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -147,10 +150,47 @@ fn divide_round_up(value: u64, divisor: u64) -> u64 {
     value.div_ceil(divisor)
 }
 
+fn retry_io<F>(mut op: F, label: &str) -> io::Result<()>
+where
+    F: FnMut() -> io::Result<()>,
+{
+    let policy = RetryPolicy::linear(WAL_IO_MAX_ATTEMPTS, WAL_IO_BACKOFF);
+    let mut retry = policy.handle();
+    loop {
+        match op() {
+            Ok(()) => return Ok(()),
+            Err(err) if should_retry(&err) => {
+                if let Some(delay) = retry.next_delay() {
+                    warn!(
+                        "event=wal_io_retry label={} attempt={} error={}",
+                        label,
+                        retry.attempts(),
+                        err
+                    );
+                    if !delay.is_zero() {
+                        thread::sleep(delay);
+                    }
+                } else {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn should_retry(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::tempdir;
 
     #[test]
@@ -173,5 +213,22 @@ mod tests {
         let mut writer = WalWriter::open(&wal_path, 4096).unwrap();
         writer.align_next_block(10);
         assert_eq!(writer.next_block(), 10);
+    }
+
+    #[test]
+    fn retry_io_retries_interrupts() {
+        let attempts = AtomicUsize::new(0);
+        retry_io(
+            || {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(io::Error::new(io::ErrorKind::Interrupted, "flaky"))
+                } else {
+                    Ok(())
+                }
+            },
+            "wal_retry_test",
+        )
+        .expect("retry succeeds");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 }

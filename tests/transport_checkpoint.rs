@@ -168,7 +168,6 @@ fn identity_manager(now: Instant) -> MtlsIdentityManager {
     MtlsIdentityManager::new(
         certificate("spiffe://example.org/servers/leader", 1, now),
         "example.org",
-        Duration::from_secs(300),
         Duration::from_secs(600),
         now,
     )

@@ -33,7 +33,7 @@ impl<'a> AppendEntriesProcessor<'a> {
         request: &AppendEntriesRequest,
     ) -> Result<AppendEntriesOutcome, RaftLogError> {
         if request.prev_log_index > 0 {
-            match self.log.entry(request.prev_log_index) {
+            match self.log.entry(request.prev_log_index)? {
                 Some(entry) if entry.term == request.prev_log_term => {}
                 Some(entry) => {
                     warn!(
@@ -61,8 +61,9 @@ impl<'a> AppendEntriesProcessor<'a> {
             }
         }
 
-        for entry in &request.entries {
-            if let Some(existing) = self.log.entry(entry.index) {
+        let mut append_from = request.entries.len();
+        for (idx, entry) in request.entries.iter().enumerate() {
+            if let Some(existing) = self.log.entry(entry.index)? {
                 if existing.term != entry.term {
                     warn!(
                         "event=raft_truncate_conflict clause={} reason=term_conflict index={} existing_term={} incoming_term={} leader_term={}",
@@ -73,16 +74,21 @@ impl<'a> AppendEntriesProcessor<'a> {
                         request.term
                     );
                     self.log.truncate_from(entry.index)?;
+                    append_from = idx;
                     break;
                 } else {
+                    append_from = idx + 1;
                     continue;
                 }
             } else {
+                append_from = idx;
                 break;
             }
         }
 
-        self.log.append_batch(&request.entries)?;
+        if append_from < request.entries.len() {
+            self.log.append_batch(&request.entries[append_from..])?;
+        }
         let match_index = request
             .entries
             .last()

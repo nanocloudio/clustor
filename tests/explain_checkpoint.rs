@@ -1,3 +1,5 @@
+#![cfg(feature = "snapshot-crypto")]
+
 use clustor::consensus::{
     ConsensusCoreStatus, DemotionStatus, StrictFallbackBlockingReason, StrictFallbackState,
 };

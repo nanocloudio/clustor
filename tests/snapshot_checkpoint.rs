@@ -1,3 +1,5 @@
+#![cfg(feature = "snapshot-crypto")]
+
 use clustor::DataEncryptionKey;
 use clustor::{
     AppendEntriesBatch, CommitEpochEntry, DedupShardDigest, HmacManifestSigner,
@@ -79,7 +81,7 @@ fn snapshot_checkpoint_large_import_enforces_throttle() {
         .verify(&signed, Instant::now())
         .expect("manifest passes verification");
 
-    let config = SnapshotImportConfig::new(200)
+    let config = SnapshotImportConfig::new(1_200)
         .with_resume_ratio(0.5)
         .with_bandwidth(256);
     let mut coordinator = SnapshotAppendEntriesCoordinator::with_config(config);
@@ -88,7 +90,7 @@ fn snapshot_checkpoint_large_import_enforces_throttle() {
     for (idx, chunk) in chunks.iter().enumerate() {
         let now = base + Duration::from_millis((idx as u64) * 5);
         let batch = AppendEntriesBatch::new(&chunk.chunk.chunk_id, chunk.ciphertext.len(), 1);
-        let envelope = coordinator.enqueue_at(batch, now);
+        let envelope = coordinator.enqueue_at(batch, now).unwrap();
         if matches!(envelope.state, SnapshotThrottleState::Throttled(_)) {
             throttled_events += 1;
         }

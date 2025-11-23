@@ -1,10 +1,11 @@
 use crate::consensus::{ConsensusCoreStatus, StrictFallbackState, StrictFallbackWhy};
 use crate::cp::CpCacheState;
 use crate::raft::PartitionQuorumStatus;
+#[cfg(feature = "snapshot-crypto")]
 use crate::snapshot::{SnapshotDeltaChainTelemetry, SnapshotFallbackTelemetry, SnapshotReadError};
-use crate::terminology::{
-    RuntimeTerm, TERM_FOLLOWER_READ_SNAPSHOT, TERM_SNAPSHOT_DELTA, TERM_STRICT,
-};
+use crate::terminology::{RuntimeTerm, TERM_STRICT};
+#[cfg(feature = "snapshot-crypto")]
+use crate::terminology::{TERM_FOLLOWER_READ_SNAPSHOT, TERM_SNAPSHOT_DELTA};
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,6 +98,7 @@ impl WhyNotLeader {
     }
 }
 
+#[cfg(feature = "snapshot-crypto")]
 #[derive(Debug, Clone, Serialize)]
 pub struct WhySnapshotBlocked {
     pub header: WhySchemaHeader,
@@ -111,6 +113,7 @@ pub struct WhySnapshotBlocked {
     pub continuation_token: Option<String>,
 }
 
+#[cfg(feature = "snapshot-crypto")]
 impl WhySnapshotBlocked {
     pub fn new(
         header: WhySchemaHeader,
@@ -148,7 +151,7 @@ impl WhySnapshotBlocked {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "snapshot-crypto"))]
 mod tests {
     use super::*;
     use crate::consensus::{ConsensusCoreStatus, DemotionStatus, StrictFallbackBlockingReason};

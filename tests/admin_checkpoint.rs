@@ -1,3 +1,5 @@
+#![cfg(feature = "admin-http")]
+
 use clustor::{
     AdminError, AdminHandler, AdminRequestContext, AdminService, AdminServiceError,
     CpPlacementClient, CpProofCoordinator, CpUnavailableReason, CreatePartitionRequest,
@@ -144,7 +146,7 @@ fn admin_api_checkpoint_covers_success_and_strict_fallback() {
         .create_partition(&ctx, failure_request, future)
         .expect_err("strict fallback rejection surfaces");
     match err {
-        AdminServiceError::Admin(AdminError::CpUnavailable(response)) => {
+        AdminServiceError::Admin(AdminError::CpUnavailable { response, .. }) => {
             assert_eq!(response.reason, CpUnavailableReason::CacheExpired);
         }
         other => panic!("expected CpUnavailable, got {other:?}"),

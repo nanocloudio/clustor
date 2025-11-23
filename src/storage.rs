@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod definitions;
 pub mod entry;
 pub mod guard;
+pub mod io;
 pub mod layout;
 pub mod replay;
 pub mod scrub;
@@ -24,6 +25,7 @@ pub use crypto::{
 pub use definitions::{DefinitionBundle, DefinitionBundleError, DefinitionBundleStore};
 pub use entry::{EntryFrame, EntryFrameBuilder, EntryFrameError, FrameHeader, MerkleDigest};
 pub use guard::{FsyncMode, GroupFsyncPolicy, GroupFsyncPolicyTelemetry};
+pub use io::SharedBufferedWriter;
 pub use layout::{
     CompactionAuthAck, CompactionMetadata, NonceReservationAbandon, StorageLayout,
     StorageLayoutError, StorageMetadata, StorageMetadataError, StorageMetadataStore, StoragePaths,

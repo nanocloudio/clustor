@@ -1,3 +1,5 @@
+#![cfg(feature = "admin-http")]
+
 use clustor::storage::crypto::KeyEpoch;
 use clustor::{
     BreakGlassToken, KeyEpochWatcher, MetricsRegistry, MtlsIdentityManager, RbacManifest,
@@ -18,13 +20,8 @@ fn sample_cert(now: Instant, serial: u64) -> clustor::security::Certificate {
 fn security_checkpoint_rotates_and_revokes() {
     let now = Instant::now();
     let active = sample_cert(now, 1);
-    let mut manager = MtlsIdentityManager::new(
-        active.clone(),
-        "example.org",
-        Duration::from_secs(600),
-        Duration::from_secs(120),
-        now,
-    );
+    let mut manager =
+        MtlsIdentityManager::new(active.clone(), "example.org", Duration::from_secs(120), now);
     manager
         .verify_peer(&sample_cert(now, 99), now)
         .expect("peer accepted");

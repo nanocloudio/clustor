@@ -40,7 +40,10 @@ fn strict_fallback_demotion_and_probe_guardrail_checkpoint() {
     let err = coordinator
         .guard_read_index(start + Duration::from_millis(10))
         .expect_err("ReadIndex should be blocked while LocalOnly persists");
-    assert_eq!(err.response.reason, CpUnavailableReason::NeededForReadIndex);
+    assert_eq!(
+        err.response().reason,
+        CpUnavailableReason::NeededForReadIndex
+    );
 }
 
 fn slow_probe(p99_ms: u64) -> FsyncProbeResult {

@@ -41,7 +41,10 @@ fn corrupt_wal_forces_local_only_and_telemetry() {
     let err = coordinator
         .guard_read_index(now)
         .expect_err("recovery should force LocalOnly");
-    assert_eq!(err.response.reason, CpUnavailableReason::NeededForReadIndex);
+    assert_eq!(
+        err.response().reason,
+        CpUnavailableReason::NeededForReadIndex
+    );
 
     let snapshot = registry.snapshot();
     assert!(

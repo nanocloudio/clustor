@@ -1,5 +1,6 @@
 use crate::storage::layout::NonceReservationAbandon;
 use crate::transport::{CatalogNegotiationReport, ForwardCompatTracker};
+// aes-gcm relies on generic-array 0.14, so suppress the upstream deprecation locally.
 #[allow(deprecated)]
 use aes_gcm::aead::generic_array::GenericArray;
 use aes_gcm::aead::{AeadCore, AeadInPlace, KeyInit};
@@ -247,10 +248,26 @@ impl SegmentHeader {
         }
         Ok(Self {
             wal_format_version,
-            segment_seq: u64::from_be_bytes(bytes[1..9].try_into().unwrap()),
-            crypto_block_bytes: u16::from_be_bytes(bytes[9..11].try_into().unwrap()),
-            dek_epoch: u32::from_be_bytes(bytes[11..15].try_into().unwrap()),
-            reserved: u16::from_be_bytes(bytes[15..17].try_into().unwrap()),
+            segment_seq: u64::from_be_bytes(
+                bytes[1..9]
+                    .try_into()
+                    .map_err(|_| SegmentHeaderError::TooShort)?,
+            ),
+            crypto_block_bytes: u16::from_be_bytes(
+                bytes[9..11]
+                    .try_into()
+                    .map_err(|_| SegmentHeaderError::TooShort)?,
+            ),
+            dek_epoch: u32::from_be_bytes(
+                bytes[11..15]
+                    .try_into()
+                    .map_err(|_| SegmentHeaderError::TooShort)?,
+            ),
+            reserved: u16::from_be_bytes(
+                bytes[15..17]
+                    .try_into()
+                    .map_err(|_| SegmentHeaderError::TooShort)?,
+            ),
         })
     }
 

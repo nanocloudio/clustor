@@ -125,6 +125,7 @@ pub enum StrictFallbackBlockingReason {
     CacheExpired,
     NeededForReadIndex,
     ModeConflictStrictFallback,
+    CircuitBreakerOpen,
 }
 
 impl StrictFallbackBlockingReason {
@@ -135,6 +136,7 @@ impl StrictFallbackBlockingReason {
             StrictFallbackBlockingReason::ModeConflictStrictFallback => {
                 "ModeConflictStrictFallback"
             }
+            StrictFallbackBlockingReason::CircuitBreakerOpen => "CircuitBreakerOpen",
         }
     }
 }
@@ -459,18 +461,27 @@ impl ConsensusCore {
             Ok(())
         } else {
             self.record_gate_block(&evaluation);
+            debug_assert!(
+                evaluation.violation.is_some(),
+                "gate evaluation must include violation when rejected"
+            );
             Err(evaluation
                 .violation
-                .expect("gate evaluation must include violation when rejected"))
+                .unwrap_or(GateViolation::ModeConflictStrictFallback))
         }
     }
 
     pub fn record_gate_block(&mut self, evaluation: &GateEvaluation) {
-        if !evaluation.allowed && evaluation.violation.is_some() {
+        if !evaluation.allowed {
+            let Some(violation) = evaluation.violation else {
+                debug_assert!(
+                    false,
+                    "blocked evaluation must include violation (operation={:?})",
+                    evaluation.operation
+                );
+                return;
+            };
             self.gate_blocks.bump(evaluation.operation);
-            let violation = evaluation
-                .violation
-                .expect("blocked evaluation must include violation");
             let reason = Self::blocking_reason_for_violation(violation);
             self.record_blocking_reason(reason);
             warn!(
@@ -643,10 +654,11 @@ impl StrictFallbackMetricsPublisher {
         registry: &mut MetricsRegistry,
         active: Option<StrictFallbackBlockingReason>,
     ) {
-        const REASONS: [StrictFallbackBlockingReason; 3] = [
+        const REASONS: [StrictFallbackBlockingReason; 4] = [
             StrictFallbackBlockingReason::CacheExpired,
             StrictFallbackBlockingReason::NeededForReadIndex,
             StrictFallbackBlockingReason::ModeConflictStrictFallback,
+            StrictFallbackBlockingReason::CircuitBreakerOpen,
         ];
         for reason in REASONS {
             let value = if Some(reason) == active { 1 } else { 0 };

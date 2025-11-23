@@ -7,6 +7,54 @@ const REQUEST_VOTE_VERSION: u8 = 1;
 const REQUEST_VOTE_RESPONSE_VERSION: u8 = 1;
 const APPEND_ENTRIES_VERSION: u8 = 1;
 
+fn read_u64_le<E, F>(bytes: &[u8], cursor: &mut usize, mut truncated: F) -> Result<u64, E>
+where
+    F: FnMut() -> E,
+{
+    if bytes.len() < *cursor + 8 {
+        return Err(truncated());
+    }
+    let value = u64::from_le_bytes(
+        bytes[*cursor..*cursor + 8]
+            .try_into()
+            .map_err(|_| truncated())?,
+    );
+    *cursor += 8;
+    Ok(value)
+}
+
+fn read_u32_le<E, F>(bytes: &[u8], cursor: &mut usize, mut truncated: F) -> Result<u32, E>
+where
+    F: FnMut() -> E,
+{
+    if bytes.len() < *cursor + 4 {
+        return Err(truncated());
+    }
+    let value = u32::from_le_bytes(
+        bytes[*cursor..*cursor + 4]
+            .try_into()
+            .map_err(|_| truncated())?,
+    );
+    *cursor += 4;
+    Ok(value)
+}
+
+fn read_u16_le<E, F>(bytes: &[u8], cursor: &mut usize, mut truncated: F) -> Result<u16, E>
+where
+    F: FnMut() -> E,
+{
+    if bytes.len() < *cursor + 2 {
+        return Err(truncated());
+    }
+    let value = u16::from_le_bytes(
+        bytes[*cursor..*cursor + 2]
+            .try_into()
+            .map_err(|_| truncated())?,
+    );
+    *cursor += 2;
+    Ok(value)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestVoteRequest {
     pub term: u64,
@@ -48,15 +96,11 @@ impl RequestVoteRequest {
         }
         let flags = bytes[1];
         let mut cursor = 2;
-        let term = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        let last_log_index = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        let last_log_term = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
+        let term = read_u64_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)?;
+        let last_log_index = read_u64_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)?;
+        let last_log_term = read_u64_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)?;
         let candidate_len =
-            u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap()) as usize;
-        cursor += 2;
+            read_u16_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)? as usize;
         if bytes.len() < cursor + candidate_len {
             return Err(RequestVoteFrameError::Truncated);
         }
@@ -109,8 +153,9 @@ impl RequestVoteResponse {
             });
         }
         let flags = bytes[1];
-        let term = u64::from_le_bytes(bytes[2..10].try_into().unwrap());
-        let reason = match bytes[10] {
+        let mut cursor = 2;
+        let term = read_u64_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)?;
+        let reason = match bytes[cursor] {
             0 => None,
             1 => Some(RequestVoteRejectReason::LogBehind),
             2 => Some(RequestVoteRejectReason::TermOutOfDate),
@@ -164,16 +209,19 @@ impl PreVoteResponse {
         if bytes.len() < 9 {
             return Err(PreVoteResponseFrameError::Truncated);
         }
-        let term = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        let vote_granted = bytes[8] != 0;
-        if bytes.len() == 9 {
+        let mut cursor = 0;
+        let term = read_u64_le(bytes, &mut cursor, || PreVoteResponseFrameError::Truncated)?;
+        let vote_granted = bytes[cursor] != 0;
+        cursor += 1;
+        if bytes.len() == cursor {
             return Ok(Self {
                 term,
                 vote_granted,
                 high_rtt: None,
             });
         }
-        let has_high_rtt = bytes[9];
+        let has_high_rtt = bytes[cursor];
+        cursor += 1;
         match has_high_rtt {
             0 => Ok(Self {
                 term,
@@ -181,10 +229,10 @@ impl PreVoteResponse {
                 high_rtt: None,
             }),
             1 => {
-                if bytes.len() < 11 {
+                if bytes.len() < cursor + 1 {
                     return Err(PreVoteResponseFrameError::Truncated);
                 }
-                let high_rtt = match bytes[10] {
+                let high_rtt = match bytes[cursor] {
                     0 => false,
                     1 => true,
                     other => {
@@ -281,16 +329,13 @@ impl AppendEntriesRequest {
             });
         }
         let mut cursor = 2;
-        let term = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        let prev_log_index = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        let prev_log_term = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        let leader_commit = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        let leader_len = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap()) as usize;
-        cursor += 2;
+        let term = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
+        let prev_log_index =
+            read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
+        let prev_log_term = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
+        let leader_commit = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
+        let leader_len =
+            read_u16_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)? as usize;
         if bytes.len() < cursor + leader_len + 2 {
             return Err(AppendEntriesFrameError::Truncated);
         }
@@ -299,20 +344,16 @@ impl AppendEntriesRequest {
             .to_string();
         cursor += leader_len;
         let entry_count =
-            u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap()) as usize;
-        cursor += 2;
+            read_u16_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)? as usize;
         let mut entries = Vec::with_capacity(entry_count);
         for _ in 0..entry_count {
             if bytes.len() < cursor + 8 * 2 + 4 {
                 return Err(AppendEntriesFrameError::Truncated);
             }
-            let term = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
-            let index = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-            cursor += 8;
+            let term = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
+            let index = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
             let payload_len =
-                u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
+                read_u32_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)? as usize;
             if bytes.len() < cursor + payload_len {
                 return Err(AppendEntriesFrameError::Truncated);
             }
@@ -364,13 +405,11 @@ impl AppendEntriesResponse {
         }
         let success = bytes[1] & 0x01 == 0x01;
         let mut cursor = 2;
-        let term = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        let match_index = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        let conflict_index = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-        cursor += 8;
-        let conflict_term = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        let term = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
+        let match_index = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
+        let conflict_index =
+            read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
+        let conflict_term = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
         Ok(Self {
             term,
             success,

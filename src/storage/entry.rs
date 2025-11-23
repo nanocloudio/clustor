@@ -42,16 +42,35 @@ impl EntryFrame {
             return Err(EntryFrameError::TooShort);
         }
         let mut cursor = 0;
-        let term = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        let term = u64::from_le_bytes(
+            bytes[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| EntryFrameError::Corrupt)?,
+        );
         cursor += 8;
-        let index = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        let index = u64::from_le_bytes(
+            bytes[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| EntryFrameError::Corrupt)?,
+        );
         cursor += 8;
-        let timestamp_ms = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+        let timestamp_ms = u64::from_le_bytes(
+            bytes[cursor..cursor + 8]
+                .try_into()
+                .map_err(|_| EntryFrameError::Corrupt)?,
+        );
         cursor += 8;
-        let metadata_len = u16::from_le_bytes(bytes[cursor..cursor + 2].try_into().unwrap());
+        let metadata_len = u16::from_le_bytes(
+            bytes[cursor..cursor + 2]
+                .try_into()
+                .map_err(|_| EntryFrameError::Corrupt)?,
+        );
         cursor += 2;
-        let payload_len =
-            u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let payload_len = u32::from_le_bytes(
+            bytes[cursor..cursor + 4]
+                .try_into()
+                .map_err(|_| EntryFrameError::Corrupt)?,
+        ) as usize;
         cursor += 4;
 
         let metadata_end = cursor + metadata_len as usize;
@@ -65,7 +84,11 @@ impl EntryFrame {
         let metadata = bytes[cursor..metadata_end].to_vec();
         let payload = bytes[metadata_end..payload_end].to_vec();
         cursor = payload_end;
-        let crc32 = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
+        let crc32 = u32::from_le_bytes(
+            bytes[cursor..cursor + 4]
+                .try_into()
+                .map_err(|_| EntryFrameError::Corrupt)?,
+        );
         cursor += 4;
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&bytes[cursor..cursor + 32]);

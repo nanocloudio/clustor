@@ -32,6 +32,11 @@ pub enum SystemLogEntry {
         partitions: Vec<String>,
         readiness_digest: String,
     },
+    AdminAuditSpill {
+        action: String,
+        partition_id: String,
+        reason: Option<String>,
+    },
 }
 
 impl SystemLogEntry {
@@ -88,6 +93,15 @@ impl SystemLogEntry {
                 write_string_array(&mut buf, partitions)?;
                 write_string(&mut buf, readiness_digest)?;
             }
+            SystemLogEntry::AdminAuditSpill {
+                action,
+                partition_id,
+                reason,
+            } => {
+                write_string(&mut buf, action)?;
+                write_string(&mut buf, partition_id)?;
+                write_optional_string(&mut buf, reason)?;
+            }
         }
         Ok(buf)
     }
@@ -139,6 +153,11 @@ impl SystemLogEntry {
                 partitions: read_string_array(&mut bytes)?,
                 readiness_digest: read_string(&mut bytes)?,
             },
+            0x06 => SystemLogEntry::AdminAuditSpill {
+                action: read_string(&mut bytes)?,
+                partition_id: read_string(&mut bytes)?,
+                reason: read_optional_string(&mut bytes)?,
+            },
             other => {
                 if let Err(err) =
                     tracker.note_unknown_field(format!("system_log.wire_entry_id=0x{other:02x}"))
@@ -157,6 +176,7 @@ impl SystemLogEntry {
             SystemLogEntry::DurabilityTransition { .. } => 0x03,
             SystemLogEntry::FenceCommit { .. } => 0x04,
             SystemLogEntry::DefineActivate { .. } => 0x05,
+            SystemLogEntry::AdminAuditSpill { .. } => 0x06,
         }
     }
 }

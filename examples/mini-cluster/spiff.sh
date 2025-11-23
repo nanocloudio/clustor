@@ -106,4 +106,3 @@ echo "  Chain : ${CHAIN_FILE}"
 echo ""
 echo "Inspect with:"
 echo "  openssl x509 -in ${CERT_FILE} -noout -text | grep -A3 'Subject Alternative'"
-

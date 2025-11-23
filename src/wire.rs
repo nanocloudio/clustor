@@ -105,7 +105,13 @@ impl WireCatalogNegotiator {
         let entry =
             BundleNegotiationEntry::rejected(&self.partition_id, local, remote, reason.into());
         self.log.append(&entry)?;
-        Err(NegotiationError::WireCatalogMismatch(entry.reason.unwrap()))
+        let reason = entry
+            .reason
+            .clone()
+            .ok_or_else(|| NegotiationError::MissingReason {
+                partition_id: self.partition_id.clone(),
+            })?;
+        Err(NegotiationError::WireCatalogMismatch { reason })
     }
 }
 
@@ -166,8 +172,10 @@ impl BundleNegotiationEntry {
 
 #[derive(Debug, Error)]
 pub enum NegotiationError {
-    #[error("wire catalog mismatch: {0}")]
-    WireCatalogMismatch(String),
+    #[error("wire catalog mismatch: {reason}")]
+    WireCatalogMismatch { reason: String },
+    #[error("missing rejection reason for partition {partition_id}")]
+    MissingReason { partition_id: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -208,7 +216,7 @@ mod tests {
         let local = catalog(0, 1, 1);
         let remote = catalog(0, 3, 3);
         let err = negotiator.negotiate(local, remote).unwrap_err();
-        assert!(matches!(err, NegotiationError::WireCatalogMismatch(_)));
+        assert!(matches!(err, NegotiationError::WireCatalogMismatch { .. }));
         let entries = log.entries().unwrap();
         assert!(!entries[0].accepted);
     }
