@@ -6,6 +6,7 @@ mod fuzz;
 mod handler;
 mod parser;
 mod response;
+#[cfg(feature = "management")]
 mod server;
 
 pub(super) use deadline::RequestDeadline;
@@ -15,4 +16,5 @@ pub(super) use handler::{HttpHandlerError, HttpRequestContext};
 pub(super) use parser::read_request;
 pub(super) use parser::SimpleHttpRequest;
 pub(super) use response::write_json_response;
+#[cfg(feature = "management")]
 pub(super) use server::spawn_tls_http_server;

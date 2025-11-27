@@ -1,4 +1,4 @@
-#![cfg(feature = "net")]
+#![cfg(all(feature = "net", feature = "management"))]
 
 use super::{HttpHandlerError, HttpRequestContext, RequestDeadline, SimpleHttpRequest};
 use crate::net::server::{spawn_listener, ServerHandle};
