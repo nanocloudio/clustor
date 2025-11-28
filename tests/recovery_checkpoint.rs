@@ -1,9 +1,9 @@
-use clustor::consensus::{ConsensusCore, ConsensusCoreConfig};
-use clustor::cp::{CpProofCoordinator, CpUnavailableReason};
+use clustor::control_plane::core::{CpProofCoordinator, CpUnavailableReason};
 use clustor::durability::{DurabilityLogEntry, IoMode, RecoveryStatus};
 use clustor::storage::layout::WalSegmentRef;
 use clustor::storage::{EntryFrameBuilder, WalReplayScanner};
 use clustor::telemetry::MetricsRegistry;
+use clustor::{ConsensusCore, ConsensusCoreConfig};
 use std::fs;
 use std::time::Instant;
 use tempfile::tempdir;

@@ -1,25 +1,30 @@
-use crate::cp::CpGuardError;
+use crate::control_plane::core::CpGuardError;
 use thiserror::Error;
 
-#[cfg(feature = "admin-http")]
-pub mod admin;
-pub mod cp;
+pub mod control_plane;
 mod http;
 #[cfg(feature = "management")]
 pub mod management;
 #[cfg(feature = "net")]
 pub mod peer_supervisor;
-pub mod raft;
 pub mod readyz;
+pub mod replication;
 mod server;
 pub mod tls;
-pub mod why;
 
 #[cfg(feature = "admin-http")]
-pub use admin::{AdminHttpServer, AdminHttpServerConfig, AdminHttpServerHandle};
+pub use control_plane::admin::{AdminHttpServer, AdminHttpServerConfig, AdminHttpServerHandle};
 #[cfg(all(feature = "admin-http", feature = "async-net"))]
-pub use admin::{AsyncAdminHttpServer, AsyncAdminHttpServerHandle};
-pub use cp::{HttpCpTransport, HttpCpTransportBuilder};
+pub use control_plane::admin::{AsyncAdminHttpServer, AsyncAdminHttpServerHandle};
+pub use control_plane::cp::{HttpCpTransport, HttpCpTransportBuilder};
+#[cfg(feature = "snapshot-crypto")]
+pub use control_plane::why::WhySnapshotBlocked;
+#[cfg(feature = "async-net")]
+pub use control_plane::why::{AsyncWhyHttpServer, AsyncWhyHttpServerHandle};
+pub use control_plane::why::{
+    LocalRole, WhyHttpServer, WhyHttpServerConfig, WhyHttpServerHandle, WhyNotLeader, WhyPublisher,
+    WhySchemaHeader,
+};
 #[cfg(all(feature = "management", feature = "async-net"))]
 pub use management::{AsyncManagementHttpServer, AsyncManagementHttpServerHandle};
 #[cfg(feature = "management")]
@@ -31,20 +36,19 @@ pub use peer_supervisor::spawn_revocation_refresher;
 #[cfg(feature = "net")]
 pub use peer_supervisor::{PeerHealth, PeerStatus};
 #[cfg(feature = "async-net")]
-pub use raft::{AsyncRaftNetworkClient, AsyncRaftNetworkServer, AsyncRaftNetworkServerHandle};
-pub use raft::{
-    RaftNetworkClient, RaftNetworkClientConfig, RaftNetworkClientOptions, RaftNetworkServer,
-    RaftNetworkServerConfig, RaftNetworkServerHandle,
-};
-#[cfg(feature = "async-net")]
 pub use readyz::{AsyncReadyzHttpServer, AsyncReadyzHttpServerHandle};
 pub use readyz::{
     ReadyzHttpServer, ReadyzHttpServerConfig, ReadyzHttpServerHandle, ReadyzPublisher,
 };
-pub use tls::{load_identity_from_pem, load_trust_store_from_pem, TlsIdentity, TlsTrustStore};
 #[cfg(feature = "async-net")]
-pub use why::{AsyncWhyHttpServer, AsyncWhyHttpServerHandle};
-pub use why::{WhyHttpServer, WhyHttpServerConfig, WhyHttpServerHandle, WhyPublisher};
+pub use replication::raft::{
+    AsyncRaftNetworkClient, AsyncRaftNetworkServer, AsyncRaftNetworkServerHandle,
+};
+pub use replication::raft::{
+    RaftNetworkClient, RaftNetworkClientConfig, RaftNetworkClientOptions, RaftNetworkServer,
+    RaftNetworkServerConfig, RaftNetworkServerHandle,
+};
+pub use tls::{load_identity_from_pem, load_trust_store_from_pem, TlsIdentity, TlsTrustStore};
 
 #[cfg(feature = "http-fuzz")]
 pub fn fuzz_http_request(input: &[u8]) {

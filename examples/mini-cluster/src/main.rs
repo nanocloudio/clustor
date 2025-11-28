@@ -19,9 +19,9 @@ use crate::state::{apply_committed_entries, new_consensus_core, AppState};
 use crate::storage::PersistentState;
 use crate::tls::{build_http_tls, new_mtls_manager, refresh_server_revocation, REVOCATION_REFRESH_INTERVAL};
 use anyhow::{Context, Result};
-use clustor::activation::{ShadowApplyState, WarmupReadinessRecord};
+use clustor::lifecycle::activation::{ShadowApplyState, WarmupReadinessRecord};
 use clustor::admin::{AdminHandler, AdminService};
-use clustor::cp::CpProofCoordinator;
+use clustor::control_plane::core::CpProofCoordinator;
 use clustor::cp_raft::CpPlacementClient;
 use clustor::feature_guard::{FeatureGateState, FeatureManifestBuilder};
 use clustor::net::{
@@ -36,7 +36,7 @@ use clustor::{
     IdempotencyLedger, RbacManifest, RbacManifestCache, RbacPrincipal, RbacRole, TlsIdentity,
     TlsTrustStore,
 };
-use clustor::transport::raft::RaftRpcServer;
+use clustor::replication::transport::raft::RaftRpcServer;
 use clustor::config_utils::state_dir_for_node;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as HyperServerBuilder;
@@ -373,7 +373,7 @@ fn build_why_publisher(runtime: &Arc<RaftRuntime>) -> WhyPublisher {
         leader_id,
         local_role,
         strict_state,
-        cp_cache_state: clustor::cp::CpCacheState::Fresh,
+        cp_cache_state: clustor::control_plane::core::CpCacheState::Fresh,
         quorum_status,
         pending_entries,
         runtime_terms: vec![clustor::terminology::TERM_STRICT],

@@ -5,16 +5,17 @@ mod http;
 #[path = "common/net.rs"]
 mod net;
 
-use clustor::activation::{ShadowApplyState, WarmupReadinessRecord};
-use clustor::consensus::{ConsensusCoreStatus, DemotionStatus, StrictFallbackState};
-use clustor::cp::CpCacheState;
-use clustor::feature_guard::{FeatureCapabilityMatrix, FeatureManifestBuilder};
-use clustor::raft::PartitionQuorumStatus;
+use clustor::control_plane::core::CpCacheState;
+use clustor::lifecycle::activation::{ShadowApplyState, WarmupReadinessRecord};
+use clustor::{
+    ConsensusCoreStatus, DemotionStatus, FeatureCapabilityMatrix, FeatureManifestBuilder,
+};
 use clustor::{
     LocalRole, ReadyStateProbe, ReadyzHttpServer, ReadyzHttpServerConfig, ReadyzPublisher,
     ReadyzSnapshot, WhyHttpServer, WhyHttpServerConfig, WhyNotLeader, WhyPublisher,
     WhySchemaHeader,
 };
+use clustor::{PartitionQuorumStatus, StrictFallbackState};
 use ed25519_dalek::SigningKey;
 use http::https_request;
 use net::{generate_tls_materials, next_loopback, TlsFixtures};

@@ -9,7 +9,7 @@ use clustor::admin::{
     AdminHandler, AdminService, CreatePartitionRequest, PartitionSpec, ReplicaSpec,
 };
 use clustor::consensus::{ConsensusCore, ConsensusCoreConfig};
-use clustor::cp::CpProofCoordinator;
+use clustor::control_plane::core::CpProofCoordinator;
 use clustor::cp_raft::CpPlacementClient;
 use clustor::net::{AdminHttpServer, AdminHttpServerConfig};
 use clustor::{IdempotencyLedger, RbacManifest, RbacManifestCache, RbacPrincipal, RbacRole};

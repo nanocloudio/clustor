@@ -291,8 +291,8 @@ pub(crate) fn map_readyz_handler_error(err: HttpHandlerError) -> Result<(), NetE
 #[cfg(test)]
 mod tests {
     use super::{handle_readyz_request, ReadyzPublisher};
-    use crate::activation::{ShadowApplyState, WarmupReadinessRecord};
     use crate::feature_guard::{FeatureGateState, FeatureManifestBuilder};
+    use crate::lifecycle::activation::{ShadowApplyState, WarmupReadinessRecord};
     use crate::net::http::{HttpRequestContext, RequestDeadline, SimpleHttpRequest};
     use crate::readyz::{ReadyStateProbe, ReadyzSnapshot};
     use crate::security::{Certificate, SerialNumber, SpiffeId};

@@ -5,128 +5,121 @@
 #![deny(unused_must_use)]
 #![cfg_attr(docsrs, warn(missing_docs))]
 
-pub mod activation;
-#[cfg(feature = "admin-http")]
-pub mod admin;
-pub mod apply;
-pub mod bootstrap;
-pub mod config_utils;
-pub mod consensus;
-pub mod cp;
-pub mod cp_raft;
-pub mod dr;
-pub mod durability;
-pub mod error;
-pub mod feature_guard;
-pub mod flow;
-#[cfg(feature = "snapshot-crypto")]
-pub mod follower;
-pub mod membership;
+pub mod control_plane;
+pub mod lifecycle;
 #[cfg(feature = "net")]
 pub mod net;
-pub mod overrides;
-pub mod profile;
-pub mod raft;
-pub mod read_index;
-pub mod readyz;
-pub mod retry;
+pub mod observability;
+pub mod persistence;
+pub mod replication;
 pub mod security;
-#[cfg(feature = "snapshot-crypto")]
-pub mod snapshot;
-pub mod spec_fixtures;
-pub mod spec_matrix;
-pub mod spec_self_test;
-pub mod storage;
-pub mod system_log;
-pub mod telemetry;
-pub mod terminology;
-pub mod transport;
-pub mod why;
-pub mod wire;
+pub mod spec;
+pub mod util;
 
-pub use activation::{
+// Re-export reorganized modules for API stability.
+pub use observability::{readyz, system_log, telemetry};
+#[cfg(feature = "snapshot-crypto")]
+pub use persistence::snapshot;
+pub use persistence::{durability, storage};
+
+// Legacy module aliases for moved spec helpers.
+pub use spec::fixtures as spec_fixtures;
+pub use spec::matrix as spec_matrix;
+pub use spec::self_test as spec_self_test;
+pub use spec::terminology;
+// Legacy module aliases for moved capability helpers.
+pub use control_plane::capabilities::feature_guard;
+pub use control_plane::capabilities::profile;
+// Legacy module alias for durability fence helpers.
+pub use durability::fence as dr;
+// Legacy module aliases for shared utilities.
+pub use util::config as config_utils;
+pub use util::retry;
+
+#[doc(hidden)]
+pub mod error {
+    pub use crate::util::error::*;
+}
+
+#[doc(hidden)]
+pub mod cp_raft {
+    pub use crate::control_plane::core::placement::{
+        CpPlacementClient, PlacementRecord, PlacementSnapshot, RoutingEpochError,
+    };
+}
+
+#[cfg(feature = "snapshot-crypto")]
+#[doc(hidden)]
+pub mod follower {
+    pub use crate::snapshot::{
+        FollowerCapabilityGate, FollowerReadError, FollowerSnapshotReadError,
+    };
+}
+
+#[doc(hidden)]
+pub mod read_index {
+    pub use crate::control_plane::core::{
+        CommitVisibility, ReadGateClause, ReadGateDecision, ReadGateEvaluator, ReadGateInputs,
+        ReadGateTelemetry,
+    };
+}
+
+#[doc(hidden)]
+pub mod overrides {
+    pub use crate::readyz::{
+        DiskOverrideDevice, DiskOverrideDocument, DiskWriteCacheMode, OverrideError,
+        OverrideStatus, OverrideType, QueueFlags,
+    };
+}
+
+#[cfg(feature = "net")]
+#[doc(hidden)]
+pub mod why {
+    pub use crate::net::control_plane::why::*;
+}
+
+#[doc(hidden)]
+pub mod wire {
+    pub use crate::replication::transport::{
+        BundleNegotiationEntry, BundleNegotiationLog, NegotiationError, WireCatalogNegotiator,
+    };
+}
+
+#[doc(hidden)]
+pub mod protocol {
+    pub use crate::replication;
+    pub use crate::replication::*;
+}
+
+pub use lifecycle::activation::{
     readiness_digest, ActivationBarrier, ActivationBarrierDecision, ActivationBarrierEvaluator,
     ActivationBarrierState, ActivationDigestError, ShadowApplyState, WarmupReadinessPublisher,
     WarmupReadinessRecord, WarmupReadinessSnapshot,
 };
-pub use apply::{
-    AckHandleError, AckHandleFailureReason, AckHandleMetrics, AckHandlePolicy, AckHandleStatus,
-    AckHandleSupervisor, AckTimeoutInfo, ApplyBatch, ApplyBudgetDecision, ApplyEntry, ApplyMetrics,
-    ApplyProfile, ApplyProfileError, ApplyProfileReport, ApplyRuntime, ApplyScheduler,
-    ApplySchedulerError, DedupeCache, DedupeConfig, DedupeSnapshot, DedupeToken,
-    InMemoryAckHandleMetrics, InMemoryApplyMetrics, ManagedAckHandle, ReplayGuard,
-    TelemetryAckHandleMetrics, TelemetryApplyMetrics,
-};
-pub use consensus::{
-    BundleDigest, CatalogVersion, ConsensusCore, ConsensusCoreConfig, ConsensusCoreManifest,
-    ConsensusCoreManifestBuilder, ConsensusCoreManifestError, ConsensusCoreStateSnapshot,
-    ConsensusCoreStatus, ConsensusCoreTelemetry, DemotionReason, DemotionStatus, DurabilityProof,
-    GateBlockMetrics, GateEvaluation, GateOperation, GateViolation, ProofBundleRef, RaftLogEntry,
-    RaftLogError, RaftLogStore, RaftMetadata, RaftMetadataError, RaftMetadataStore, SectionHash,
-    StrictFallbackBlockingReason, StrictFallbackMetricsPublisher, StrictFallbackState,
-    StrictFallbackWhy, TermIndexSnapshot,
-};
 
-pub use cp::{
-    client::{CpApiTransport, CpClientError, CpControlPlaneClient, TransportResponse},
-    CpCachePolicy, CpCacheState, CpGuardError, CpProofCoordinator, CpUnavailableReason,
-    CpUnavailableResponse, ReadIndexPermit,
-};
-#[cfg(feature = "snapshot-crypto")]
-pub use cp::{
-    StrictFallbackSnapshotImportError, StrictFallbackSnapshotImportReason,
-    StrictFallbackSnapshotImportRecord,
-};
-pub use cp_raft::{CpPlacementClient, PlacementRecord, PlacementSnapshot, RoutingEpochError};
+pub use replication::*;
+
+pub use control_plane::*;
+
 pub use dr::{DrFenceError, DrFenceManager, FenceState};
-pub use error::{ClustorError, GuardError, SerializationError};
-pub use profile::{
-    CapabilityGateViolation, PartitionProfile, ProfileCapabilities, ProfileCapability,
-    ProfileCapabilityError, ProfileCapabilityRegistry,
-};
-pub use read_index::{
-    CommitVisibility, ReadGateClause, ReadGateEvaluator, ReadGateInputs, ReadGateTelemetry,
-};
 pub use system_log::{SystemLogEntry, SystemLogError};
-
-#[cfg(feature = "async-net")]
-pub use raft::runtime_scaffold::{RaftNodeCallbacks, RaftNodeHandle, RaftNodeScaffold};
-pub use raft::{
-    AppendEntriesFrameError, AppendEntriesOutcome, AppendEntriesProcessor, AppendEntriesRequest,
-    AppendEntriesResponse, CandidateState, DeviceLatencyConfig, ElectionController,
-    ElectionProfile, ElectionTimer, HeartbeatBatcher, HighRttState, LatencyGuardReason,
-    LeaderStickinessConfig, LeaderStickinessController, LeaderStickinessGate, PartitionQuorum,
-    PartitionQuorumConfig, PartitionQuorumStatus, PreVoteDecision, PreVoteRejectReason,
-    PreVoteResponse, PreVoteResponseFrameError, QuorumError, ReplicaId, ReplicaProgress,
-    RequestVoteFrameError, RequestVoteRejectReason, RequestVoteRequest, RequestVoteResponse,
-    StickinessDecision, StickinessTelemetry,
-};
+pub use util::error::{ClustorError, GuardError, SerializationError};
 
 pub use durability::{
     AckHandle, AckRecord, DurabilityAckMessage, DurabilityLedger, DurabilityMetricsPublisher,
     IoMode, LedgerError, LedgerUpdate,
 };
-pub use flow::{
-    CreditHint, DualCreditPidController, FlowDecision, FlowIncidentKind, FlowLagClass, FlowProfile,
-    FlowSloIncidentRecord, FlowSloMonitor, FlowThrottleEnvelope, FlowThrottleReason,
-    FlowThrottleState, IngestStatusCode, QuotaOverrideRecord, TenantFlowController,
-    TenantFlowDecision, TenantQuota, TenantQuotaManager,
-};
-#[cfg(feature = "snapshot-crypto")]
-pub use follower::{FollowerCapabilityGate, FollowerReadError};
-pub use membership::{
-    evaluate_survivability, CatchUpDecision, CatchUpReason, LearnerCatchUpConfig,
-    LearnerCatchUpEvaluator, SurvivabilityInputs, SurvivabilityReport, SurvivabilityResult,
-};
-pub use overrides::{DiskOverrideDevice, DiskOverrideDocument, DiskWriteCacheMode, OverrideError};
 pub use readyz::{
     map_partition_ratios, map_partition_ratios_with_barriers, readyz_from_warmup_snapshot,
-    OverrideStatus, OverrideType, ReadyExplain, ReadyStateHealth, ReadyStateProbe,
+    DiskOverrideDevice, DiskOverrideDocument, DiskWriteCacheMode, OverrideError, OverrideStatus,
+    OverrideType, QueueFlags, ReadyExplain, ReadyStateHealth, ReadyStateProbe,
     ReadyzCapabilityRecord, ReadyzRecord, ReadyzSnapshot,
 };
+#[cfg(feature = "snapshot-crypto")]
+pub use snapshot::{FollowerCapabilityGate, FollowerReadError};
 
 #[cfg(feature = "admin-http")]
-pub use admin::{
+pub use control_plane::admin::{
     AdminCapability, AdminError, AdminHandler, AdminRequestContext, AdminService,
     AdminServiceError, CreatePartitionRequest, CreatePartitionResponse, DurabilityMode,
     IdempotencyLedger, PartitionSpec, ReplicaSpec, SetDurabilityModeRequest,
@@ -134,19 +127,22 @@ pub use admin::{
     SnapshotTriggerRequest, SnapshotTriggerResponse, ThrottleExplainResponse,
     TransferLeaderRequest, TransferLeaderResponse,
 };
-pub use feature_guard::{
+pub use control_plane::capabilities::feature_guard::{
     future_gates, FeatureCapabilityMatrix, FeatureCapabilityState, FeatureGateState,
     FeatureGateTelemetry, FeatureGateTelemetryEntry, FeatureManifest, FeatureManifestBuilder,
     FeatureManifestEntry, FeatureManifestError, FutureGateDescriptor, ParkedFeatureAudit,
     ParkedFeatureError, ParkedFeatureGate,
 };
+#[cfg(all(feature = "net", feature = "snapshot-crypto"))]
+pub use net::WhySnapshotBlocked;
 #[cfg(feature = "net")]
 pub use net::{
     load_identity_from_pem, load_trust_store_from_pem, HttpCpTransport, HttpCpTransportBuilder,
-    RaftNetworkClient, RaftNetworkClientConfig, RaftNetworkClientOptions, RaftNetworkServer,
-    RaftNetworkServerConfig, RaftNetworkServerHandle, ReadyzHttpServer, ReadyzHttpServerConfig,
-    ReadyzHttpServerHandle, ReadyzPublisher, TlsIdentity, TlsTrustStore, WhyHttpServer,
-    WhyHttpServerConfig, WhyHttpServerHandle, WhyPublisher,
+    LocalRole, RaftNetworkClient, RaftNetworkClientConfig, RaftNetworkClientOptions,
+    RaftNetworkServer, RaftNetworkServerConfig, RaftNetworkServerHandle, ReadyzHttpServer,
+    ReadyzHttpServerConfig, ReadyzHttpServerHandle, ReadyzPublisher, TlsIdentity, TlsTrustStore,
+    WhyHttpServer, WhyHttpServerConfig, WhyHttpServerHandle, WhyNotLeader, WhyPublisher,
+    WhySchemaHeader,
 };
 #[cfg(all(feature = "net", feature = "admin-http"))]
 pub use net::{AdminHttpServer, AdminHttpServerConfig, AdminHttpServerHandle};
@@ -180,12 +176,16 @@ pub use snapshot::{
     SnapshotThrottleReason, SnapshotThrottleState, SnapshotTrigger, SnapshotTriggerConfig,
     SnapshotTriggerDecision, SnapshotTriggerReason,
 };
-pub use spec_fixtures::{
+pub use spec::fixtures::{
     FixtureBundle, FixtureBundleGenerator, FixtureEntry, FixtureError, SpecLint,
 };
-pub use spec_matrix::{MatrixOutcome, MatrixReport, MatrixRunner, MatrixScenario};
-pub use spec_self_test::{
+pub use spec::matrix::{MatrixOutcome, MatrixReport, MatrixRunner, MatrixScenario};
+pub use spec::self_test::{
     SpecSelfTestError, SpecSelfTestHarness, SpecSelfTestResult, SpecTestOutcome,
+};
+pub use spec::terminology::{
+    runtime_terms, RuntimeTerm, TERM_DURABILITY_RECORD, TERM_FOLLOWER_READ_SNAPSHOT,
+    TERM_GROUP_FSYNC, TERM_LEASE_ENABLE, TERM_SNAPSHOT_DELTA, TERM_STRICT,
 };
 pub use storage::{
     CompactionAuthAck, CompactionBlockReason, CompactionDecision, CompactionGate,
@@ -204,19 +204,4 @@ pub use storage::{
 pub use telemetry::{
     CpDegradationMetrics, IncidentCorrelator, IncidentDecision, MetricsRegistry, MetricsSnapshot,
     SharedMetricsRegistry, TelemetryError,
-};
-pub use terminology::{
-    runtime_terms, RuntimeTerm, TERM_DURABILITY_RECORD, TERM_FOLLOWER_READ_SNAPSHOT,
-    TERM_GROUP_FSYNC, TERM_STRICT,
-};
-pub use transport::{
-    heartbeat::HeartbeatScheduler,
-    raft::{RaftRpcHandler, RaftRpcServer, RaftTransportError},
-    CatalogNegotiationConfig, CatalogNegotiationReport, ForwardCompatTracker,
-};
-#[cfg(feature = "snapshot-crypto")]
-pub use why::WhySnapshotBlocked;
-pub use why::{LocalRole, WhyNotLeader, WhySchemaHeader};
-pub use wire::{
-    BundleNegotiationEntry, BundleNegotiationLog, NegotiationError, WireCatalogNegotiator,
 };

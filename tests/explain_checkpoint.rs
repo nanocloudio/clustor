@@ -3,7 +3,7 @@
 use clustor::consensus::{
     ConsensusCoreStatus, DemotionStatus, StrictFallbackBlockingReason, StrictFallbackState,
 };
-use clustor::cp::CpCacheState;
+use clustor::control_plane::core::CpCacheState;
 use clustor::raft::PartitionQuorumStatus;
 use clustor::snapshot::{SnapshotFallbackTelemetry, SnapshotOnlyReadyState, SnapshotReadError};
 use clustor::why::{LocalRole, WhyNotLeader, WhySchemaHeader, WhySnapshotBlocked};

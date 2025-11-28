@@ -1,6 +1,6 @@
-use clustor::bootstrap::{
+use clustor::lifecycle::bootstrap::{
     BootstrapConfig, BootstrapError, BootstrapPipeline, BootstrapRequest, CatalogNegotiationConfig,
-    ManifestValidationConfig, ProfileLoader, ShutdownAction, ShutdownManager,
+    ManifestValidationConfig, ProfileLoader, ShutdownAction, ShutdownError, ShutdownManager,
 };
 use clustor::storage::{
     NonceLedgerConfig, NonceReservationLedger, StartupScrubEngine, MAX_RESERVATION_BLOCKS,
@@ -152,10 +152,7 @@ fn shutdown_manager_rejects_out_of_order_actions() {
     let err = manager
         .record_action_complete(&ShutdownAction::FlushWal, now)
         .expect_err("flush cannot run before transfer");
-    assert!(matches!(
-        err,
-        clustor::bootstrap::ShutdownError::UnexpectedAction { .. }
-    ));
+    assert!(matches!(err, ShutdownError::UnexpectedAction { .. }));
 }
 
 #[test]

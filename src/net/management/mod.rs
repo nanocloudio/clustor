@@ -1,13 +1,13 @@
-use super::admin::{handle_admin_request, ADMIN_REQUEST_TIMEOUT};
 use super::http::{
     spawn_tls_http_server, write_json_response, HttpHandlerError, HttpRequestContext,
     RequestDeadline, SimpleHttpRequest,
 };
 use super::readyz::{handle_readyz_request, ReadyzPublisher, READYZ_REQUEST_TIMEOUT};
 use super::tls::{TlsIdentity, TlsTrustStore};
-use super::why::{handle_why_request, WhyPublisher, WHY_REQUEST_TIMEOUT};
 use super::NetError;
-use crate::admin::AdminService;
+use crate::control_plane::AdminService;
+use crate::net::control_plane::admin::{handle_admin_request, ADMIN_REQUEST_TIMEOUT};
+use crate::net::control_plane::why::{handle_why_request, WhyPublisher, WHY_REQUEST_TIMEOUT};
 use log::{info, warn};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
@@ -255,19 +255,17 @@ fn map_management_handler_error(
 #[cfg(test)]
 mod tests {
     use super::{handle_management_request, ManagementRoute};
-    use crate::activation::WarmupReadinessRecord;
-    use crate::admin::{AdminHandler, AdminService};
-    use crate::consensus::{ConsensusCore, ConsensusCoreConfig, StrictFallbackState};
-    use crate::cp::CpProofCoordinator;
-    use crate::cp_raft::CpPlacementClient;
+    use crate::control_plane::admin::{AdminHandler, AdminService};
+    use crate::control_plane::core::{CpPlacementClient, CpProofCoordinator};
     use crate::feature_guard::{FeatureGateState, FeatureManifestBuilder};
+    use crate::lifecycle::activation::WarmupReadinessRecord;
+    use crate::net::control_plane::why::{LocalRole, WhyNotLeader, WhyPublisher, WhySchemaHeader};
     use crate::net::http::{HttpRequestContext, RequestDeadline, SimpleHttpRequest};
-    use crate::net::why::WhyPublisher;
-    use crate::raft::PartitionQuorumStatus;
     use crate::readyz::{ReadyStateProbe, ReadyzSnapshot};
+    use crate::replication::consensus::{ConsensusCore, ConsensusCoreConfig, StrictFallbackState};
+    use crate::replication::raft::PartitionQuorumStatus;
     use crate::security::{Certificate, SerialNumber, SpiffeId};
     use crate::terminology::TERM_STRICT;
-    use crate::why::{LocalRole, WhyNotLeader, WhySchemaHeader};
     use crate::{
         IdempotencyLedger, RbacManifest, RbacManifestCache, RbacPrincipal, RbacRole,
         ReadyzPublisher,
@@ -297,7 +295,7 @@ mod tests {
         let readiness = WarmupReadinessRecord {
             partition_id: "partition-a".into(),
             bundle_id: "bundle-a".into(),
-            shadow_apply_state: crate::activation::ShadowApplyState::Ready,
+            shadow_apply_state: crate::lifecycle::activation::ShadowApplyState::Ready,
             shadow_apply_checkpoint_index: 1,
             warmup_ready_ratio: 1.0,
             updated_at_ms: 0,
@@ -326,7 +324,7 @@ mod tests {
             leader_id: Some("leader-a".into()),
             local_role: LocalRole::Follower,
             strict_state: StrictFallbackState::LocalOnly,
-            cp_cache_state: crate::cp::CpCacheState::Fresh,
+            cp_cache_state: crate::control_plane::core::CpCacheState::Fresh,
             quorum_status: PartitionQuorumStatus {
                 committed_index: 1,
                 committed_term: 1,

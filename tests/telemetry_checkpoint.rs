@@ -1,5 +1,5 @@
-use clustor::bootstrap::probe::{FsyncProbeResult, GroupFsyncGuardConfig};
 use clustor::durability::RecoveryStatus;
+use clustor::lifecycle::bootstrap::probe::{FsyncProbeResult, GroupFsyncGuardConfig};
 use clustor::storage::{EntryFrameError, WalTruncation};
 use clustor::{
     ConsensusCore, ConsensusCoreConfig, CpDegradationMetrics, DurabilityProof, GateOperation,

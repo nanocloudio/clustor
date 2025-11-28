@@ -9,7 +9,7 @@ use clustor::admin::{
     AdminHandler, AdminService, CreatePartitionRequest, PartitionSpec, ReplicaSpec,
 };
 use clustor::consensus::{ConsensusCore, ConsensusCoreConfig};
-use clustor::cp::CpProofCoordinator;
+use clustor::control_plane::core::CpProofCoordinator;
 use clustor::cp_raft::CpPlacementClient;
 use clustor::feature_guard::{FeatureGateState, FeatureManifestBuilder};
 use clustor::net::{
@@ -112,10 +112,10 @@ fn build_readyz_publisher() -> ReadyzPublisher {
         .build(&signing_key)
         .expect("manifest");
     let matrix = manifest.capability_matrix().expect("matrix");
-    let record = clustor::activation::WarmupReadinessRecord {
+    let record = clustor::lifecycle::activation::WarmupReadinessRecord {
         partition_id: "partition-a".into(),
         bundle_id: "bundle-a".into(),
-        shadow_apply_state: clustor::activation::ShadowApplyState::Ready,
+        shadow_apply_state: clustor::lifecycle::activation::ShadowApplyState::Ready,
         shadow_apply_checkpoint_index: 1,
         warmup_ready_ratio: 1.0,
         updated_at_ms: 0,
@@ -144,7 +144,7 @@ fn build_why_publisher() -> WhyPublisher {
         leader_id: Some("leader-a".into()),
         local_role: LocalRole::Follower,
         strict_state: clustor::consensus::StrictFallbackState::LocalOnly,
-        cp_cache_state: clustor::cp::CpCacheState::Fresh,
+        cp_cache_state: clustor::control_plane::core::CpCacheState::Fresh,
         quorum_status: PartitionQuorumStatus {
             committed_index: 1,
             committed_term: 1,

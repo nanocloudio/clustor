@@ -1,11 +1,8 @@
-use clustor::{
-    bootstrap::{
-        FsyncProbeResult, GroupFsyncDecision, GroupFsyncGuard, GroupFsyncGuardConfig,
-        GuardrailReason,
-    },
-    cp::{CpProofCoordinator, CpUnavailableReason},
-    ConsensusCore, ConsensusCoreConfig, DurabilityProof,
+use clustor::control_plane::core::{CpProofCoordinator, CpUnavailableReason};
+use clustor::lifecycle::bootstrap::probe::{
+    FsyncProbeResult, GroupFsyncDecision, GroupFsyncGuard, GroupFsyncGuardConfig, GuardrailReason,
 };
+use clustor::{ConsensusCore, ConsensusCoreConfig, DurabilityProof};
 use std::time::{Duration, Instant};
 
 #[test]

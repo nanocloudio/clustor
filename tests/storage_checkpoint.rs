@@ -1,4 +1,4 @@
-use clustor::bootstrap::probe::GroupFsyncGuardConfig;
+use clustor::lifecycle::bootstrap::probe::GroupFsyncGuardConfig;
 use clustor::storage::{
     authorization_chain_hash, CompactionAuthAck, CompactionBlockReason, CompactionDecision,
     CompactionGate, CompactionPlanRequest, CompactionState, DataEncryptionKey, EntryFrameBuilder,
@@ -23,7 +23,7 @@ fn wal_segment_flush_order_preserved() {
 
 #[test]
 fn group_fsync_policy_switches_modes() {
-    use clustor::bootstrap::probe::FsyncProbeResult;
+    use clustor::lifecycle::bootstrap::probe::FsyncProbeResult;
     let mut policy = GroupFsyncPolicy::new(GroupFsyncGuardConfig::default());
     let probe = |ms| FsyncProbeResult {
         p99_ms: ms,
