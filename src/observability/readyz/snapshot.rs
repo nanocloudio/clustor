@@ -1,3 +1,5 @@
+#[cfg(feature = "admin-http")]
+use crate::control_plane::admin::ShrinkPlanStatus;
 use crate::feature_guard::FeatureCapabilityMatrix;
 use crate::lifecycle::activation::{
     ActivationDigestError, ReadinessDigestBuilder, WarmupReadinessRecord,
@@ -126,6 +128,8 @@ impl ReadyzSnapshotBuilder {
             skipped_publications_total: self.skipped_publications_total,
             capabilities: self.capabilities,
             overrides: self.overrides,
+            #[cfg(feature = "admin-http")]
+            shrink_plans: Vec::new(),
             #[cfg(feature = "snapshot-crypto")]
             export_telemetry: None,
             #[cfg(feature = "snapshot-crypto")]
@@ -218,6 +222,9 @@ pub struct ReadyzSnapshot {
     skipped_publications_total: u64,
     capabilities: Vec<ReadyzCapabilityRecord>,
     overrides: Vec<OverrideStatus>,
+    #[cfg(feature = "admin-http")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shrink_plans: Vec<ShrinkPlanStatus>,
     #[cfg(feature = "snapshot-crypto")]
     export_telemetry: Option<SnapshotExportTelemetry>,
     #[cfg(feature = "snapshot-crypto")]
@@ -266,6 +273,11 @@ impl ReadyzSnapshot {
         &self.overrides
     }
 
+    #[cfg(feature = "admin-http")]
+    pub fn shrink_plans(&self) -> &[ShrinkPlanStatus] {
+        &self.shrink_plans
+    }
+
     pub fn skipped_publications_total(&self) -> u64 {
         self.skipped_publications_total
     }
@@ -302,6 +314,12 @@ impl ReadyzSnapshot {
     #[cfg(feature = "snapshot-crypto")]
     pub fn delta_chain(&self) -> Option<&SnapshotDeltaChainTelemetry> {
         self.delta_chain.as_ref()
+    }
+
+    #[cfg(feature = "admin-http")]
+    pub fn with_shrink_plans(mut self, plans: Vec<ShrinkPlanStatus>) -> Self {
+        self.shrink_plans = plans;
+        self
     }
 
     pub fn why_not_ready(&self, partition_id: &str) -> Option<ReadyExplain> {

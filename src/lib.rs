@@ -121,9 +121,12 @@ pub use snapshot::{FollowerCapabilityGate, FollowerReadError};
 #[cfg(feature = "admin-http")]
 pub use control_plane::admin::{
     AdminCapability, AdminError, AdminHandler, AdminRequestContext, AdminService,
-    AdminServiceError, CreatePartitionRequest, CreatePartitionResponse, DurabilityMode,
-    IdempotencyLedger, PartitionSpec, ReplicaSpec, SetDurabilityModeRequest,
-    SetDurabilityModeResponse, SnapshotThrottleRequest, SnapshotThrottleResponse,
+    AdminServiceError, ArmShrinkPlanRequest, ArmShrinkPlanResponse, CancelShrinkPlanRequest,
+    CancelShrinkPlanResponse, CreatePartitionRequest, CreatePartitionResponse,
+    CreateShrinkPlanRequest, CreateShrinkPlanResponse, DurabilityMode, IdempotencyLedger,
+    ListShrinkPlansResponse, PartitionSpec, ReplicaSpec, RoutingPublication,
+    SetDurabilityModeRequest, SetDurabilityModeResponse, ShrinkPlanStatus, ShrinkPlanTelemetry,
+    ShrinkTargetPlacement, SnapshotThrottleRequest, SnapshotThrottleResponse,
     SnapshotTriggerRequest, SnapshotTriggerResponse, ThrottleExplainResponse,
     TransferLeaderRequest, TransferLeaderResponse,
 };

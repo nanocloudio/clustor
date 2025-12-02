@@ -7,5 +7,5 @@ pub use api::*;
 pub use audit::{AdminAuditRecord, AdminAuditStore};
 pub use workflows::{
     AdminCapability, AdminError, AdminHandler, AdminRequestContext, AdminService,
-    AdminServiceError, IdempotencyLedger,
+    AdminServiceError, IdempotencyLedger, RoutingPublication, ShrinkPlanTelemetry,
 };

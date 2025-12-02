@@ -260,6 +260,33 @@ fn dispatch_request(
                 .map_err(HttpAdminError::from)?;
             serialize_response(response, "snapshot_trigger")
         }
+        ("POST", "/admin/shrink-plan") => {
+            let payload: CreateShrinkPlanRequest = parse_body(&request)?;
+            let response = service
+                .create_shrink_plan(&ctx, payload, now)
+                .map_err(HttpAdminError::from)?;
+            serialize_response(response, "create_shrink_plan")
+        }
+        ("POST", "/admin/shrink-plan/arm") => {
+            let payload: ArmShrinkPlanRequest = parse_body(&request)?;
+            let response = service
+                .arm_shrink_plan(&ctx, payload, now)
+                .map_err(HttpAdminError::from)?;
+            serialize_response(response, "arm_shrink_plan")
+        }
+        ("POST", "/admin/shrink-plan/cancel") => {
+            let payload: CancelShrinkPlanRequest = parse_body(&request)?;
+            let response = service
+                .cancel_shrink_plan(&ctx, payload, now)
+                .map_err(HttpAdminError::from)?;
+            serialize_response(response, "cancel_shrink_plan")
+        }
+        ("GET", "/admin/shrink-plan") => {
+            let response = service
+                .list_shrink_plans(&ctx, now)
+                .map_err(HttpAdminError::from)?;
+            serialize_response(response, "list_shrink_plans")
+        }
         ("GET", "/admin/throttle") => {
             let partition = require_query(&request, "partition_id")?;
             let trace = request
@@ -411,6 +438,41 @@ impl From<AdminServiceError> for HttpAdminError {
                         "requested_mode": requested,
                     }),
                 },
+                AdminError::InvalidShrinkPlan { reason } => {
+                    HttpAdminError::status_message(400, format!("invalid shrink plan: {reason}"))
+                }
+                AdminError::ShrinkPlanExists { plan_id } => HttpAdminError {
+                    status: 409,
+                    body: serde_json::json!({
+                        "error": "ShrinkPlanExists",
+                        "status": 409,
+                        "plan_id": plan_id,
+                    }),
+                },
+                AdminError::ShrinkPlanNotFound { plan_id } => HttpAdminError {
+                    status: 404,
+                    body: serde_json::json!({
+                        "error": "ShrinkPlanNotFound",
+                        "status": 404,
+                        "plan_id": plan_id,
+                    }),
+                },
+                AdminError::ShrinkPlanActive { plan_id } => HttpAdminError {
+                    status: 409,
+                    body: serde_json::json!({
+                        "error": "ShrinkPlanActive",
+                        "status": 409,
+                        "plan_id": plan_id,
+                    }),
+                },
+                AdminError::ShrinkPlanCancelled { plan_id } => HttpAdminError {
+                    status: 409,
+                    body: serde_json::json!({
+                        "error": "ShrinkPlanCancelled",
+                        "status": 409,
+                        "plan_id": plan_id,
+                    }),
+                },
                 AdminError::CpUnavailable { clause, response } => HttpAdminError {
                     status: 503,
                     body: serde_json::json!({
@@ -443,7 +505,7 @@ pub(crate) fn map_admin_handler_error(err: HttpHandlerError) -> Result<(), NetEr
 mod tests {
     use super::{handle_admin_request, ADMIN_REQUEST_TIMEOUT};
     use crate::control_plane::admin::{AdminHandler, AdminService};
-    use crate::control_plane::core::{CpPlacementClient, CpProofCoordinator};
+    use crate::control_plane::core::{CpPlacementClient, CpProofCoordinator, PlacementRecord};
     use crate::net::http::{HttpRequestContext, RequestDeadline, SimpleHttpRequest};
     use crate::replication::consensus::{ConsensusCore, ConsensusCoreConfig};
     use crate::security::{Certificate, SerialNumber, SpiffeId};
@@ -474,7 +536,7 @@ mod tests {
             RbacManifest {
                 roles: vec![RbacRole {
                     name: "operator".into(),
-                    capabilities: vec!["CreatePartition".into()],
+                    capabilities: vec!["CreatePartition".into(), "ManageShrinkPlan".into()],
                 }],
                 principals: vec![RbacPrincipal {
                     spiffe_id: principal.into(),
@@ -547,5 +609,87 @@ mod tests {
         let response = String::from_utf8(buffer).expect("utf8");
         assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
         assert!(response.contains("unauthorized"));
+    }
+
+    #[test]
+    fn handler_routes_shrink_plan_requests() {
+        let now = Instant::now();
+        let principal = "spiffe://test.example/ns/default/sa/admin";
+        let service = Arc::new(Mutex::new(build_admin_service(now, principal)));
+        {
+            let mut guard = service.lock().expect("service lock");
+            guard.handler_mut().placements_mut().update(
+                PlacementRecord {
+                    partition_id: "p-shrink".into(),
+                    routing_epoch: 1,
+                    lease_epoch: 1,
+                    members: vec!["a".into(), "b".into(), "c".into()],
+                },
+                now,
+            );
+        }
+        let ctx = request_context(principal);
+        let create_body = json!({
+            "plan_id": "plan-http",
+            "target_placements": [{
+                "prg_id": "p-shrink",
+                "target_members": ["a", "b"],
+                "target_routing_epoch": 2
+            }]
+        })
+        .to_string()
+        .into_bytes();
+        let create = SimpleHttpRequest {
+            method: "POST".into(),
+            path: "/admin/shrink-plan".into(),
+            query: None,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: create_body,
+        };
+        let mut buffer = Vec::new();
+        handle_admin_request(&ctx, create, &service, &mut buffer, now).expect("create plan");
+        let response = String::from_utf8(buffer).expect("utf8");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"plan_id\":\"plan-http\""));
+
+        let arm_body = json!({ "plan_id": "plan-http" }).to_string().into_bytes();
+        let arm = SimpleHttpRequest {
+            method: "POST".into(),
+            path: "/admin/shrink-plan/arm".into(),
+            query: None,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: arm_body,
+        };
+        let mut buffer = Vec::new();
+        handle_admin_request(
+            &ctx,
+            arm,
+            &service,
+            &mut buffer,
+            now + Duration::from_millis(1),
+        )
+        .expect("arm plan");
+        let response = String::from_utf8(buffer).expect("utf8");
+        assert!(response.contains("\"state\":\"Armed\""));
+
+        let list = SimpleHttpRequest {
+            method: "GET".into(),
+            path: "/admin/shrink-plan".into(),
+            query: None,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let mut buffer = Vec::new();
+        handle_admin_request(
+            &ctx,
+            list,
+            &service,
+            &mut buffer,
+            now + Duration::from_millis(2),
+        )
+        .expect("list plans");
+        let response = String::from_utf8(buffer).expect("utf8");
+        assert!(response.contains("\"plans\""));
+        assert!(response.contains("\"plan-http\""));
     }
 }

@@ -7,17 +7,21 @@ use crate::replication::flow::{
 };
 use crate::security::{BreakGlassToken, RbacManifestCache, SecurityError, SpiffeId};
 use crate::system_log::SystemLogEntry;
+use crate::telemetry::MetricsRegistry;
 use log::{info, warn};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
 use super::api::{
-    CreatePartitionRequest, CreatePartitionResponse, DurabilityMode, PartitionSpec, ReplicaSpec,
-    SetDurabilityModeRequest, SetDurabilityModeResponse, SnapshotThrottleRequest,
-    SnapshotThrottleResponse, SnapshotTriggerRequest, SnapshotTriggerResponse,
-    ThrottleExplainResponse, TransferLeaderRequest, TransferLeaderResponse, ADMIN_API_SPEC,
-    ADMIN_AUDIT_SPEC_CLAUSE, THROTTLE_SPEC_CLAUSE,
+    ArmShrinkPlanRequest, ArmShrinkPlanResponse, CancelShrinkPlanRequest, CancelShrinkPlanResponse,
+    CreatePartitionRequest, CreatePartitionResponse, CreateShrinkPlanRequest,
+    CreateShrinkPlanResponse, DurabilityMode, ListShrinkPlansResponse, PartitionSpec, ReplicaSpec,
+    SetDurabilityModeRequest, SetDurabilityModeResponse, ShrinkPlanState, ShrinkPlanStatus,
+    ShrinkTargetPlacement, SnapshotThrottleRequest, SnapshotThrottleResponse,
+    SnapshotTriggerRequest, SnapshotTriggerResponse, ThrottleExplainResponse,
+    TransferLeaderRequest, TransferLeaderResponse, ADMIN_API_SPEC, ADMIN_AUDIT_SPEC_CLAUSE,
+    THROTTLE_SPEC_CLAUSE,
 };
 use super::audit::{AdminAuditRecord, AdminAuditStore};
 use super::guard;
@@ -83,6 +87,51 @@ impl<T: Clone> IdempotencyLedger<T> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ShrinkTarget {
+    prg_id: String,
+    target_members: Vec<String>,
+    target_routing_epoch: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ShrinkPlanRecord {
+    plan_id: String,
+    targets: Vec<ShrinkTarget>,
+    state: ShrinkPlanState,
+    created_at_ms: u64,
+    armed_at_ms: Option<u64>,
+    cancelled_at_ms: Option<u64>,
+}
+
+impl ShrinkPlanRecord {
+    fn status(&self) -> ShrinkPlanStatus {
+        ShrinkPlanStatus {
+            plan_id: self.plan_id.clone(),
+            state: self.state.clone(),
+            target_placements: self
+                .targets
+                .iter()
+                .map(|target| ShrinkTargetPlacement {
+                    prg_id: target.prg_id.clone(),
+                    target_members: target.target_members.clone(),
+                    target_routing_epoch: target.target_routing_epoch,
+                })
+                .collect(),
+            created_at_ms: self.created_at_ms,
+            armed_at_ms: self.armed_at_ms,
+            cancelled_at_ms: self.cancelled_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ShrinkPlanTelemetry {
+    pub total: usize,
+    pub armed: usize,
+    pub cancelled: usize,
+}
+
 pub struct AdminHandler {
     cp_guard: CpProofCoordinator,
     placements: CpPlacementClient,
@@ -92,9 +141,11 @@ pub struct AdminHandler {
     snapshot_trigger_ledger: IdempotencyLedger<SnapshotTriggerResponse>,
     durability_modes: HashMap<String, DurabilityState>,
     throttle_state: HashMap<String, FlowThrottleEnvelope>,
+    shrink_plans: HashMap<String, ShrinkPlanRecord>,
     audit_log: AdminAuditStore,
     apply_reports: HashMap<String, WhyApply>,
     durability_log: Vec<SystemLogEntry>,
+    clock_base: Instant,
 }
 
 impl AdminHandler {
@@ -113,9 +164,11 @@ impl AdminHandler {
             snapshot_trigger_ledger: IdempotencyLedger::new(retention),
             durability_modes: HashMap::new(),
             throttle_state: HashMap::new(),
+            shrink_plans: HashMap::new(),
             audit_log: AdminAuditStore::with_default_capacity(),
             apply_reports: HashMap::new(),
             durability_log: Vec::new(),
+            clock_base: Instant::now(),
         }
     }
 
@@ -358,6 +411,10 @@ impl AdminHandler {
         }
     }
 
+    fn timestamp_ms(&self, now: Instant) -> u64 {
+        now.saturating_duration_since(self.clock_base).as_millis() as u64
+    }
+
     pub fn explain_throttle(
         &mut self,
         partition_id: &str,
@@ -390,6 +447,11 @@ impl AdminHandler {
         &self.placements
     }
 
+    #[cfg(test)]
+    pub fn placements_mut(&mut self) -> &mut CpPlacementClient {
+        &mut self.placements
+    }
+
     pub fn audit_log(&self) -> Vec<AdminAuditRecord> {
         self.audit_log.snapshot()
     }
@@ -417,6 +479,214 @@ impl AdminHandler {
             .cloned()
             .ok_or(AdminError::UnknownPartition)
     }
+
+    pub fn handle_create_shrink_plan(
+        &mut self,
+        request: CreateShrinkPlanRequest,
+        now: Instant,
+    ) -> Result<CreateShrinkPlanResponse, AdminError> {
+        self.guard_cp(now)?;
+        if self.shrink_plans.contains_key(&request.plan_id) {
+            return Err(AdminError::ShrinkPlanExists {
+                plan_id: request.plan_id,
+            });
+        }
+        if request.target_placements.is_empty() {
+            return Err(AdminError::InvalidShrinkPlan {
+                reason: "at least one target placement is required".into(),
+            });
+        }
+        let created_at_ms = self.timestamp_ms(now);
+        let mut targets = Vec::new();
+        for target in request.target_placements.iter() {
+            let placement = self
+                .placements
+                .placement_snapshot(&target.prg_id)
+                .ok_or(AdminError::UnknownPartition)?;
+            if target.target_members.is_empty() {
+                return Err(AdminError::InvalidShrinkPlan {
+                    reason: format!("target_members empty for {}", target.prg_id),
+                });
+            }
+            let mut seen = HashSet::new();
+            let mut members = Vec::new();
+            for member in &target.target_members {
+                if seen.insert(member.clone()) {
+                    members.push(member.clone());
+                }
+            }
+            if members.len() >= placement.record.members.len() {
+                return Err(AdminError::InvalidShrinkPlan {
+                    reason: format!(
+                        "shrink must reduce member count for {} (current {}, target {})",
+                        target.prg_id,
+                        placement.record.members.len(),
+                        members.len()
+                    ),
+                });
+            }
+            if !members
+                .iter()
+                .all(|member| placement.record.members.contains(member))
+            {
+                return Err(AdminError::InvalidShrinkPlan {
+                    reason: format!(
+                        "target_members for {} must be subset of current placement",
+                        target.prg_id
+                    ),
+                });
+            }
+            if target.target_routing_epoch <= placement.record.routing_epoch {
+                return Err(AdminError::InvalidShrinkPlan {
+                    reason: format!(
+                        "target_routing_epoch for {} must be greater than current epoch {}",
+                        target.prg_id, placement.record.routing_epoch
+                    ),
+                });
+            }
+            targets.push(ShrinkTarget {
+                prg_id: target.prg_id.clone(),
+                target_members: members,
+                target_routing_epoch: target.target_routing_epoch,
+            });
+        }
+        let record = ShrinkPlanRecord {
+            plan_id: request.plan_id.clone(),
+            targets,
+            state: ShrinkPlanState::Draft,
+            created_at_ms,
+            armed_at_ms: None,
+            cancelled_at_ms: None,
+        };
+        let status = record.status();
+        self.shrink_plans.insert(request.plan_id, record);
+        Ok(CreateShrinkPlanResponse { plan: status })
+    }
+
+    pub fn handle_arm_shrink_plan(
+        &mut self,
+        request: ArmShrinkPlanRequest,
+        now: Instant,
+    ) -> Result<ArmShrinkPlanResponse, AdminError> {
+        self.guard_cp(now)?;
+        let armed_ts = self.timestamp_ms(now);
+        if let Some((plan_id, _)) = self
+            .shrink_plans
+            .iter()
+            .find(|(id, plan)| plan.state == ShrinkPlanState::Armed && **id != request.plan_id)
+        {
+            return Err(AdminError::ShrinkPlanActive {
+                plan_id: plan_id.clone(),
+            });
+        }
+        let plan =
+            self.shrink_plans
+                .get_mut(&request.plan_id)
+                .ok_or(AdminError::ShrinkPlanNotFound {
+                    plan_id: request.plan_id.clone(),
+                })?;
+        if plan.state == ShrinkPlanState::Cancelled {
+            return Err(AdminError::ShrinkPlanCancelled {
+                plan_id: request.plan_id,
+            });
+        }
+        plan.state = ShrinkPlanState::Armed;
+        plan.armed_at_ms = Some(armed_ts);
+        plan.cancelled_at_ms = None;
+        Ok(ArmShrinkPlanResponse {
+            plan: plan.status(),
+        })
+    }
+
+    pub fn handle_cancel_shrink_plan(
+        &mut self,
+        request: CancelShrinkPlanRequest,
+        now: Instant,
+    ) -> Result<CancelShrinkPlanResponse, AdminError> {
+        self.guard_cp(now)?;
+        let ts = self.timestamp_ms(now);
+        let plan =
+            self.shrink_plans
+                .get_mut(&request.plan_id)
+                .ok_or(AdminError::ShrinkPlanNotFound {
+                    plan_id: request.plan_id.clone(),
+                })?;
+        plan.cancelled_at_ms = Some(ts);
+        plan.state = match plan.state {
+            ShrinkPlanState::Armed => ShrinkPlanState::RolledBack,
+            ShrinkPlanState::Cancelled => ShrinkPlanState::Cancelled,
+            _ => ShrinkPlanState::Cancelled,
+        };
+        Ok(CancelShrinkPlanResponse {
+            plan: plan.status(),
+        })
+    }
+
+    pub fn list_shrink_plans(&self) -> ListShrinkPlansResponse {
+        let mut plans: Vec<_> = self
+            .shrink_plans
+            .values()
+            .map(ShrinkPlanRecord::status)
+            .collect();
+        plans.sort_by(|a, b| a.plan_id.cmp(&b.plan_id));
+        ListShrinkPlansResponse { plans }
+    }
+
+    pub fn shrink_plan_status(&self) -> Vec<ShrinkPlanStatus> {
+        self.list_shrink_plans().plans
+    }
+
+    pub fn routing_bundle(&self) -> RoutingPublication {
+        let mut placements = self.placements.records();
+        let mut applied_plan = None;
+        if let Some(plan) = self
+            .shrink_plans
+            .values()
+            .find(|plan| plan.state == ShrinkPlanState::Armed)
+        {
+            applied_plan = Some(plan.plan_id.clone());
+            for target in &plan.targets {
+                if let Some(record) = placements.get_mut(&target.prg_id) {
+                    record.routing_epoch = target.target_routing_epoch;
+                    record.members = target.target_members.clone();
+                }
+            }
+        }
+        RoutingPublication {
+            placements,
+            shrink_plans: self.shrink_plan_status(),
+            applied_plan_id: applied_plan,
+        }
+    }
+
+    pub fn shrink_plan_telemetry(&self) -> ShrinkPlanTelemetry {
+        let mut telemetry = ShrinkPlanTelemetry::default();
+        for plan in self.shrink_plans.values() {
+            telemetry.total += 1;
+            match plan.state {
+                ShrinkPlanState::Armed => telemetry.armed += 1,
+                ShrinkPlanState::Cancelled | ShrinkPlanState::RolledBack => {
+                    telemetry.cancelled += 1
+                }
+                ShrinkPlanState::Draft => {}
+            }
+        }
+        telemetry
+    }
+
+    pub fn publish_shrink_plan_metrics(&self, registry: &mut MetricsRegistry) {
+        let telemetry = self.shrink_plan_telemetry();
+        registry.set_gauge("cp.shrink_plans.total", telemetry.total as u64);
+        registry.set_gauge("cp.shrink_plans.armed", telemetry.armed as u64);
+        registry.set_gauge("cp.shrink_plans.cancelled", telemetry.cancelled as u64);
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RoutingPublication {
+    pub placements: HashMap<String, PlacementRecord>,
+    pub shrink_plans: Vec<ShrinkPlanStatus>,
+    pub applied_plan_id: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -433,6 +703,16 @@ pub enum AdminError {
         current: DurabilityMode,
         requested: DurabilityMode,
     },
+    #[error("invalid shrink plan: {reason}")]
+    InvalidShrinkPlan { reason: String },
+    #[error("shrink plan {plan_id} already exists")]
+    ShrinkPlanExists { plan_id: String },
+    #[error("shrink plan {plan_id} not found")]
+    ShrinkPlanNotFound { plan_id: String },
+    #[error("shrink plan {plan_id} already armed")]
+    ShrinkPlanActive { plan_id: String },
+    #[error("shrink plan {plan_id} is cancelled")]
+    ShrinkPlanCancelled { plan_id: String },
 }
 
 impl From<CpGuardError> for AdminError {
@@ -472,6 +752,7 @@ pub enum AdminCapability {
     SnapshotThrottle,
     TransferLeader,
     TriggerSnapshot,
+    ManageShrinkPlan,
 }
 
 impl AdminCapability {
@@ -482,6 +763,7 @@ impl AdminCapability {
             Self::SnapshotThrottle => "SnapshotThrottle",
             Self::TransferLeader => "TransferLeader",
             Self::TriggerSnapshot => "TriggerSnapshot",
+            Self::ManageShrinkPlan => "ManageShrinkPlan",
         }
     }
 }
@@ -579,6 +861,54 @@ impl AdminService {
         self.handler
             .explain_apply_profile(partition_id)
             .map_err(AdminServiceError::from)
+    }
+
+    pub fn create_shrink_plan(
+        &mut self,
+        ctx: &AdminRequestContext,
+        request: CreateShrinkPlanRequest,
+        now: Instant,
+    ) -> Result<CreateShrinkPlanResponse, AdminServiceError> {
+        self.authorize(ctx, AdminCapability::ManageShrinkPlan, now)?;
+        validate_create_shrink_plan(&request)?;
+        self.handler
+            .handle_create_shrink_plan(request, now)
+            .map_err(AdminServiceError::from)
+    }
+
+    pub fn arm_shrink_plan(
+        &mut self,
+        ctx: &AdminRequestContext,
+        request: ArmShrinkPlanRequest,
+        now: Instant,
+    ) -> Result<ArmShrinkPlanResponse, AdminServiceError> {
+        self.authorize(ctx, AdminCapability::ManageShrinkPlan, now)?;
+        validate_plan_id(&request.plan_id)?;
+        self.handler
+            .handle_arm_shrink_plan(request, now)
+            .map_err(AdminServiceError::from)
+    }
+
+    pub fn cancel_shrink_plan(
+        &mut self,
+        ctx: &AdminRequestContext,
+        request: CancelShrinkPlanRequest,
+        now: Instant,
+    ) -> Result<CancelShrinkPlanResponse, AdminServiceError> {
+        self.authorize(ctx, AdminCapability::ManageShrinkPlan, now)?;
+        validate_plan_id(&request.plan_id)?;
+        self.handler
+            .handle_cancel_shrink_plan(request, now)
+            .map_err(AdminServiceError::from)
+    }
+
+    pub fn list_shrink_plans(
+        &mut self,
+        ctx: &AdminRequestContext,
+        now: Instant,
+    ) -> Result<ListShrinkPlansResponse, AdminServiceError> {
+        self.authorize(ctx, AdminCapability::ManageShrinkPlan, now)?;
+        Ok(self.handler.list_shrink_plans())
     }
 
     fn authorize(
@@ -733,6 +1063,36 @@ fn validate_snapshot_trigger(request: &SnapshotTriggerRequest) -> Result<(), Adm
     Ok(())
 }
 
+fn validate_create_shrink_plan(request: &CreateShrinkPlanRequest) -> Result<(), AdminServiceError> {
+    validate_plan_id(&request.plan_id)?;
+    if request.target_placements.is_empty() {
+        return Err(AdminServiceError::InvalidRequest(
+            "at least one target placement is required".into(),
+        ));
+    }
+    for target in &request.target_placements {
+        validate_shrink_target(target)?;
+    }
+    Ok(())
+}
+
+fn validate_shrink_target(target: &ShrinkTargetPlacement) -> Result<(), AdminServiceError> {
+    validate_identifier(&target.prg_id, "prg_id", 64)?;
+    if target.target_members.is_empty() {
+        return Err(AdminServiceError::InvalidRequest(
+            "target_members must not be empty".into(),
+        ));
+    }
+    for member in &target.target_members {
+        validate_identifier(member, "target_member", 64)?;
+    }
+    Ok(())
+}
+
+fn validate_plan_id(plan_id: &str) -> Result<(), AdminServiceError> {
+    validate_identifier(plan_id, "plan_id", 128)
+}
+
 fn validate_partition_spec(spec: &PartitionSpec) -> Result<(), AdminServiceError> {
     validate_identifier(&spec.partition_id, "partition_id", 64)?;
     if spec.replicas.is_empty() {
@@ -780,6 +1140,7 @@ mod tests {
         BreakGlassToken, RbacManifest, RbacManifestCache, RbacPrincipal, RbacRole, SpiffeId,
     };
     use crate::system_log::SystemLogEntry;
+    use crate::telemetry::MetricsRegistry;
     use std::time::SystemTime;
 
     #[test]
@@ -1080,6 +1441,127 @@ mod tests {
             )
             .expect_err("stale caller receives ModeConflict");
         assert!(matches!(err, AdminError::ModeConflict { .. }));
+    }
+
+    #[test]
+    fn shrink_plan_requires_arm_and_rolls_back() {
+        let now = Instant::now();
+        let mut handler = build_handler(now);
+        handler.placements.update(
+            PlacementRecord {
+                partition_id: "p1".into(),
+                routing_epoch: 1,
+                lease_epoch: 1,
+                members: vec!["a".into(), "b".into(), "c".into()],
+            },
+            now,
+        );
+        let created = handler
+            .handle_create_shrink_plan(
+                CreateShrinkPlanRequest {
+                    plan_id: "plan-1".into(),
+                    target_placements: vec![ShrinkTargetPlacement {
+                        prg_id: "p1".into(),
+                        target_members: vec!["a".into(), "b".into()],
+                        target_routing_epoch: 2,
+                    }],
+                },
+                now,
+            )
+            .expect("plan created");
+        assert_eq!(created.plan.state, ShrinkPlanState::Draft);
+        let initial = handler.routing_bundle();
+        assert!(initial.applied_plan_id.is_none());
+        assert_eq!(initial.placements["p1"].members.len(), 3);
+
+        handler
+            .handle_arm_shrink_plan(
+                ArmShrinkPlanRequest {
+                    plan_id: "plan-1".into(),
+                },
+                now + Duration::from_millis(1),
+            )
+            .expect("plan armed");
+        let armed = handler.routing_bundle();
+        assert_eq!(armed.applied_plan_id.as_deref(), Some("plan-1"));
+        assert_eq!(
+            armed.placements["p1"].members,
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert_eq!(armed.placements["p1"].routing_epoch, 2);
+
+        handler
+            .handle_cancel_shrink_plan(
+                CancelShrinkPlanRequest {
+                    plan_id: "plan-1".into(),
+                },
+                now + Duration::from_millis(2),
+            )
+            .expect("plan cancelled");
+        let rolled_back = handler.routing_bundle();
+        assert!(rolled_back.applied_plan_id.is_none());
+        assert_eq!(rolled_back.placements["p1"].members.len(), 3);
+        let status = handler.list_shrink_plans().plans;
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].state, ShrinkPlanState::RolledBack);
+    }
+
+    #[test]
+    fn shrink_plan_validates_subset_and_reports_telemetry() {
+        let now = Instant::now();
+        let mut handler = build_handler(now);
+        handler.placements.update(
+            PlacementRecord {
+                partition_id: "p2".into(),
+                routing_epoch: 5,
+                lease_epoch: 1,
+                members: vec!["x".into(), "y".into(), "z".into()],
+            },
+            now,
+        );
+        let err = handler
+            .handle_create_shrink_plan(
+                CreateShrinkPlanRequest {
+                    plan_id: "plan-2".into(),
+                    target_placements: vec![ShrinkTargetPlacement {
+                        prg_id: "p2".into(),
+                        target_members: vec!["x".into(), "missing".into()],
+                        target_routing_epoch: 6,
+                    }],
+                },
+                now,
+            )
+            .expect_err("invalid member rejected");
+        assert!(matches!(err, AdminError::InvalidShrinkPlan { .. }));
+
+        handler
+            .handle_create_shrink_plan(
+                CreateShrinkPlanRequest {
+                    plan_id: "plan-2".into(),
+                    target_placements: vec![ShrinkTargetPlacement {
+                        prg_id: "p2".into(),
+                        target_members: vec!["x".into(), "y".into()],
+                        target_routing_epoch: 6,
+                    }],
+                },
+                now,
+            )
+            .expect("second plan created");
+        let telemetry = handler.shrink_plan_telemetry();
+        assert_eq!(telemetry.total, 1);
+        assert_eq!(telemetry.armed, 0);
+        assert_eq!(telemetry.cancelled, 0);
+        let mut registry = MetricsRegistry::new("clustor");
+        handler.publish_shrink_plan_metrics(&mut registry);
+        let snapshot = registry.snapshot();
+        assert_eq!(
+            snapshot.gauges.get("clustor.cp.shrink_plans.total"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot.gauges.get("clustor.cp.shrink_plans.armed"),
+            Some(&0)
+        );
     }
 
     fn build_service(now: Instant, capabilities: Vec<&str>) -> (AdminService, AdminRequestContext) {

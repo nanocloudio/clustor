@@ -108,3 +108,66 @@ pub struct ThrottleExplainResponse {
     pub routing_epoch: u64,
     pub spec_clause: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShrinkPlanState {
+    Draft,
+    Armed,
+    Cancelled,
+    RolledBack,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShrinkTargetPlacement {
+    pub prg_id: String,
+    pub target_members: Vec<String>,
+    pub target_routing_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShrinkPlanStatus {
+    pub plan_id: String,
+    pub state: ShrinkPlanState,
+    pub target_placements: Vec<ShrinkTargetPlacement>,
+    pub created_at_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub armed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateShrinkPlanRequest {
+    pub plan_id: String,
+    pub target_placements: Vec<ShrinkTargetPlacement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CreateShrinkPlanResponse {
+    pub plan: ShrinkPlanStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArmShrinkPlanRequest {
+    pub plan_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArmShrinkPlanResponse {
+    pub plan: ShrinkPlanStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CancelShrinkPlanRequest {
+    pub plan_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelShrinkPlanResponse {
+    pub plan: ShrinkPlanStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListShrinkPlansResponse {
+    pub plans: Vec<ShrinkPlanStatus>,
+}

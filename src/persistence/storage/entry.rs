@@ -159,6 +159,11 @@ impl EntryFrameBuilder {
         self
     }
 
+    pub fn timestamp_ms(mut self, timestamp_ms: u64) -> Self {
+        self.header.timestamp_ms = timestamp_ms;
+        self
+    }
+
     pub fn payload(mut self, bytes: Vec<u8>) -> Self {
         self.payload = bytes;
         self
