@@ -12,8 +12,8 @@ use crate::config::{load_cluster_config, ClusterConfig, NodeConfig};
 use crate::http_api::build_router;
 use crate::peers::build_peer_map;
 use crate::raft::{
-    new_durability_ledger, new_election_controller, new_role_state, MiniClusterRaftHandler,
-    RaftRuntime,
+    default_routing, new_durability_ledger, new_election_controller, new_role_state,
+    MiniClusterRaftHandler, RaftRuntime,
 };
 use crate::state::{apply_committed_entries, new_consensus_core, AppState};
 use crate::storage::PersistentState;
@@ -26,8 +26,8 @@ use clustor::cp_raft::CpPlacementClient;
 use clustor::feature_guard::{FeatureGateState, FeatureManifestBuilder};
 use clustor::net::{
     load_identity_from_pem, load_trust_store_from_pem, AsyncManagementHttpServer,
-    AsyncRaftNetworkServer, ManagementHttpServerConfig, RaftNetworkServerConfig, ReadyzPublisher,
-    WhyPublisher,
+    AsyncRaftNetworkServer, AsyncRaftTransportServerConfig, ManagementHttpServerConfig,
+    ReadyzPublisher, WhyPublisher,
 };
 use clustor::readyz::{ReadyStateProbe, ReadyzSnapshot};
 use clustor::security::{SecurityError, SpiffeId};
@@ -156,12 +156,16 @@ async fn run_node(cli: Cli, shutdown_signal: impl Future<Output = ()> + Send) ->
         Duration::from_secs(600),
     );
     server_mtls.rotate(Instant::now()).ok();
-    let raft_server = RaftRpcServer::new(server_mtls, MiniClusterRaftHandler::new(runtime.clone()));
+    let raft_server = RaftRpcServer::new(
+        server_mtls,
+        MiniClusterRaftHandler::new(runtime.clone()),
+        default_routing(),
+    );
     let server_identity_handle = raft_server.identity_handle();
 
     let raft_bind: SocketAddr = node_cfg.raft_bind.parse()?;
     let mut raft_handle = AsyncRaftNetworkServer::spawn(
-        RaftNetworkServerConfig {
+        AsyncRaftTransportServerConfig {
             bind: raft_bind,
             identity: tls_identity.clone(),
             trust_store: trust_store.clone(),

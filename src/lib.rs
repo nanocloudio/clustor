@@ -141,16 +141,21 @@ pub use net::WhySnapshotBlocked;
 #[cfg(feature = "net")]
 pub use net::{
     load_identity_from_pem, load_trust_store_from_pem, HttpCpTransport, HttpCpTransportBuilder,
-    LocalRole, RaftNetworkClient, RaftNetworkClientConfig, RaftNetworkClientOptions,
-    RaftNetworkServer, RaftNetworkServerConfig, RaftNetworkServerHandle, ReadyzHttpServer,
-    ReadyzHttpServerConfig, ReadyzHttpServerHandle, ReadyzPublisher, TlsIdentity, TlsTrustStore,
-    WhyHttpServer, WhyHttpServerConfig, WhyHttpServerHandle, WhyNotLeader, WhyPublisher,
-    WhySchemaHeader,
+    LocalRole, ReadyzHttpServer, ReadyzHttpServerConfig, ReadyzHttpServerHandle, ReadyzPublisher,
+    TlsIdentity, TlsTrustStore, WhyHttpServer, WhyHttpServerConfig, WhyHttpServerHandle,
+    WhyNotLeader, WhyPublisher, WhySchemaHeader,
 };
 #[cfg(all(feature = "net", feature = "admin-http"))]
 pub use net::{AdminHttpServer, AdminHttpServerConfig, AdminHttpServerHandle};
 #[cfg(all(feature = "management", feature = "async-net"))]
 pub use net::{AsyncManagementHttpServer, AsyncManagementHttpServerHandle};
+#[cfg(all(feature = "net", feature = "async-net"))]
+pub use net::{
+    AsyncRaftNetworkClient, AsyncRaftNetworkServer, AsyncRaftNetworkServerHandle,
+    AsyncRaftTransportClient, AsyncRaftTransportClientConfig, AsyncRaftTransportClientOptions,
+    AsyncRaftTransportPoolManager, AsyncRaftTransportServer, AsyncRaftTransportServerConfig,
+    AsyncRaftTransportServerHandle, PeerEndpoint,
+};
 #[cfg(feature = "management")]
 pub use net::{ManagementHttpServer, ManagementHttpServerConfig, ManagementHttpServerHandle};
 #[cfg(feature = "admin-http")]

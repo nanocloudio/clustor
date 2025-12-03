@@ -225,12 +225,17 @@ impl HeartbeatBatcher {
 mod tests {
     use super::*;
     use crate::replication::consensus::RaftLogEntry;
+    use crate::replication::raft::rpc::RaftRouting;
     use tempfile::TempDir;
 
     fn store() -> (TempDir, RaftLogStore) {
         let tmp = TempDir::new().unwrap();
         let log = RaftLogStore::open(tmp.path().join("raft.log")).unwrap();
         (tmp, log)
+    }
+
+    fn routing(epoch: u64) -> RaftRouting {
+        RaftRouting::alias("partition-test", epoch)
     }
 
     #[test]
@@ -249,6 +254,7 @@ mod tests {
                 RaftLogEntry::new(2, 3, b"c".to_vec()),
                 RaftLogEntry::new(2, 4, b"d".to_vec()),
             ],
+            routing: routing(2),
         };
         let outcome = processor.apply(&request).unwrap();
         assert!(outcome.success);
@@ -270,6 +276,7 @@ mod tests {
             prev_log_term: 2,
             leader_commit: 1,
             entries: vec![RaftLogEntry::new(3, 3, b"x".to_vec())],
+            routing: routing(3),
         };
         let outcome = processor.apply(&request).unwrap();
         assert!(outcome.success);
@@ -287,6 +294,7 @@ mod tests {
             prev_log_term: 1,
             leader_commit: 0,
             entries: Vec::new(),
+            routing: routing(1),
         };
         let outcome = processor.apply(&request).unwrap();
         assert!(!outcome.success);
@@ -297,10 +305,10 @@ mod tests {
     fn batches_heartbeats() {
         let mut batcher = HeartbeatBatcher::new(2);
         assert!(batcher
-            .enqueue(AppendEntriesRequest::heartbeat(1, "l", 0))
+            .enqueue(AppendEntriesRequest::heartbeat(1, "l", 0, routing(1)))
             .is_none());
         let flushed = batcher
-            .enqueue(AppendEntriesRequest::heartbeat(1, "l", 0))
+            .enqueue(AppendEntriesRequest::heartbeat(1, "l", 0, routing(1)))
             .unwrap();
         assert_eq!(flushed.len(), 2);
         assert!(batcher.flush().is_empty());
@@ -322,6 +330,7 @@ mod tests {
                 RaftLogEntry::new(2, 2, b"b".to_vec()),
                 RaftLogEntry::new(2, 3, b"c".to_vec()),
             ],
+            routing: routing(2),
         };
         let report = coordinator.apply(&request).unwrap();
         assert!(report.success());
@@ -343,6 +352,7 @@ mod tests {
             prev_log_term: 1,
             leader_commit: 2,
             entries: vec![RaftLogEntry::new(3, 3, b"c".to_vec())],
+            routing: routing(3),
         };
         let report = coordinator.apply(&request).unwrap();
         assert!(!report.success());

@@ -3,9 +3,106 @@ use std::convert::TryInto;
 use std::str::from_utf8;
 use thiserror::Error;
 
-const REQUEST_VOTE_VERSION: u8 = 1;
+const REQUEST_VOTE_VERSION: u8 = 2;
 const REQUEST_VOTE_RESPONSE_VERSION: u8 = 1;
-const APPEND_ENTRIES_VERSION: u8 = 1;
+const APPEND_ENTRIES_VERSION: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RaftRouting {
+    pub partition_id: String,
+    pub prg_id: String,
+    pub routing_epoch: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoutingValidationError {
+    PartitionMismatch {
+        expected: String,
+        observed: String,
+    },
+    PrgMismatch {
+        expected: String,
+        observed: String,
+    },
+    RoutingEpochMismatch {
+        expected: u64,
+        observed: u64,
+    },
+    MissingMetadata,
+    UnknownPlacement {
+        partition_id: String,
+        prg_id: String,
+        routing_epoch: u64,
+    },
+}
+
+impl std::fmt::Display for RoutingValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RoutingValidationError::PartitionMismatch { expected, observed } => write!(
+                f,
+                "partition mismatch (expected={expected}, observed={observed})"
+            ),
+            RoutingValidationError::PrgMismatch { expected, observed } => write!(
+                f,
+                "prg mismatch (expected={expected}, observed={observed})"
+            ),
+            RoutingValidationError::RoutingEpochMismatch { expected, observed } => write!(
+                f,
+                "routing_epoch mismatch (expected={expected}, observed={observed})"
+            ),
+            RoutingValidationError::MissingMetadata => write!(f, "routing metadata missing"),
+            RoutingValidationError::UnknownPlacement {
+                partition_id,
+                prg_id,
+                routing_epoch,
+            } => write!(
+                f,
+                "unknown placement (partition_id={partition_id}, prg_id={prg_id}, routing_epoch={routing_epoch})"
+            ),
+        }
+    }
+}
+
+impl RaftRouting {
+    pub fn alias(partition_id: impl Into<String>, routing_epoch: u64) -> Self {
+        let partition_id = partition_id.into();
+        Self {
+            prg_id: partition_id.clone(),
+            partition_id,
+            routing_epoch,
+        }
+    }
+
+    pub fn validate(&self, expected: &RaftRouting) -> Result<(), RoutingValidationError> {
+        if self.partition_id.is_empty()
+            || self.prg_id.is_empty()
+            || self.routing_epoch == 0
+            || expected.routing_epoch == 0
+        {
+            return Err(RoutingValidationError::MissingMetadata);
+        }
+        if self.partition_id != expected.partition_id {
+            return Err(RoutingValidationError::PartitionMismatch {
+                expected: expected.partition_id.clone(),
+                observed: self.partition_id.clone(),
+            });
+        }
+        if self.prg_id != expected.prg_id {
+            return Err(RoutingValidationError::PrgMismatch {
+                expected: expected.prg_id.clone(),
+                observed: self.prg_id.clone(),
+            });
+        }
+        if self.routing_epoch != expected.routing_epoch {
+            return Err(RoutingValidationError::RoutingEpochMismatch {
+                expected: expected.routing_epoch,
+                observed: self.routing_epoch,
+            });
+        }
+        Ok(())
+    }
+}
 
 fn read_u64_le<E, F>(bytes: &[u8], cursor: &mut usize, mut truncated: F) -> Result<u64, E>
 where
@@ -62,6 +159,7 @@ pub struct RequestVoteRequest {
     pub last_log_index: u64,
     pub last_log_term: u64,
     pub pre_vote: bool,
+    pub routing: RaftRouting,
 }
 
 impl RequestVoteRequest {
@@ -72,23 +170,47 @@ impl RequestVoteRequest {
                 len: candidate_bytes.len(),
             });
         }
-        let mut buf = Vec::with_capacity(32 + candidate_bytes.len());
+        if self.routing.partition_id.is_empty()
+            || self.routing.prg_id.is_empty()
+            || self.routing.routing_epoch == 0
+        {
+            return Err(RequestVoteFrameError::MissingRoutingMetadata);
+        }
+        let partition_bytes = self.routing.partition_id.as_bytes();
+        let prg_bytes = self.routing.prg_id.as_bytes();
+        if partition_bytes.len() > u16::MAX as usize || prg_bytes.len() > u16::MAX as usize {
+            return Err(RequestVoteFrameError::RoutingMetadataTooLong {
+                partition_len: partition_bytes.len(),
+                prg_len: prg_bytes.len(),
+            });
+        }
+        let mut buf = Vec::with_capacity(
+            64 + candidate_bytes.len() + partition_bytes.len() + prg_bytes.len(),
+        );
         buf.push(REQUEST_VOTE_VERSION);
         buf.push(if self.pre_vote { 0x01 } else { 0x00 });
+        buf.extend_from_slice(&self.routing.routing_epoch.to_le_bytes());
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.last_log_index.to_le_bytes());
         buf.extend_from_slice(&self.last_log_term.to_le_bytes());
         buf.extend_from_slice(&(candidate_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(partition_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(prg_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(candidate_bytes);
+        buf.extend_from_slice(partition_bytes);
+        buf.extend_from_slice(prg_bytes);
         Ok(buf)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, RequestVoteFrameError> {
-        if bytes.len() < 1 + 1 + 8 * 3 + 2 {
+        if bytes.len() < 1 + 1 + 8 * 4 + 2 * 3 {
             return Err(RequestVoteFrameError::Truncated);
         }
         let version = bytes[0];
         if version != REQUEST_VOTE_VERSION {
+            if version == 1 {
+                return Err(RequestVoteFrameError::MissingRoutingMetadata);
+            }
             return Err(RequestVoteFrameError::InvalidVersion {
                 observed: version,
                 expected: REQUEST_VOTE_VERSION,
@@ -96,22 +218,43 @@ impl RequestVoteRequest {
         }
         let flags = bytes[1];
         let mut cursor = 2;
+        let routing_epoch = read_u64_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)?;
         let term = read_u64_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)?;
         let last_log_index = read_u64_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)?;
         let last_log_term = read_u64_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)?;
         let candidate_len =
             read_u16_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)? as usize;
-        if bytes.len() < cursor + candidate_len {
+        let partition_len =
+            read_u16_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)? as usize;
+        let prg_len =
+            read_u16_le(bytes, &mut cursor, || RequestVoteFrameError::Truncated)? as usize;
+        if bytes.len() < cursor + candidate_len + partition_len + prg_len {
             return Err(RequestVoteFrameError::Truncated);
         }
         let candidate = from_utf8(&bytes[cursor..cursor + candidate_len])
             .map_err(|_| RequestVoteFrameError::InvalidUtf8)?;
+        cursor += candidate_len;
+        let partition_id = from_utf8(&bytes[cursor..cursor + partition_len])
+            .map_err(|_| RequestVoteFrameError::InvalidUtf8)?
+            .to_string();
+        cursor += partition_len;
+        let prg_id = from_utf8(&bytes[cursor..cursor + prg_len])
+            .map_err(|_| RequestVoteFrameError::InvalidUtf8)?
+            .to_string();
+        if partition_id.is_empty() || prg_id.is_empty() || routing_epoch == 0 {
+            return Err(RequestVoteFrameError::MissingRoutingMetadata);
+        }
         Ok(Self {
             term,
             candidate_id: candidate.to_string(),
             last_log_index,
             last_log_term,
             pre_vote: flags & 0x01 == 0x01,
+            routing: RaftRouting {
+                partition_id,
+                prg_id,
+                routing_epoch,
+            },
         })
     }
 }
@@ -268,10 +411,16 @@ pub struct AppendEntriesRequest {
     pub prev_log_term: u64,
     pub leader_commit: u64,
     pub entries: Vec<RaftLogEntry>,
+    pub routing: RaftRouting,
 }
 
 impl AppendEntriesRequest {
-    pub fn heartbeat(term: u64, leader_id: impl Into<String>, leader_commit: u64) -> Self {
+    pub fn heartbeat(
+        term: u64,
+        leader_id: impl Into<String>,
+        leader_commit: u64,
+        routing: RaftRouting,
+    ) -> Self {
         Self {
             term,
             leader_id: leader_id.into(),
@@ -279,6 +428,7 @@ impl AppendEntriesRequest {
             prev_log_term: 0,
             leader_commit,
             entries: Vec::new(),
+            routing,
         }
     }
 
@@ -294,15 +444,35 @@ impl AppendEntriesRequest {
                 count: self.entries.len(),
             });
         }
-        let mut buf = Vec::with_capacity(64 + leader_bytes.len());
+        let partition_bytes = self.routing.partition_id.as_bytes();
+        let prg_bytes = self.routing.prg_id.as_bytes();
+        if self.routing.partition_id.is_empty()
+            || self.routing.prg_id.is_empty()
+            || self.routing.routing_epoch == 0
+        {
+            return Err(AppendEntriesFrameError::MissingRoutingMetadata);
+        }
+        if partition_bytes.len() > u16::MAX as usize || prg_bytes.len() > u16::MAX as usize {
+            return Err(AppendEntriesFrameError::RoutingMetadataTooLong {
+                partition_len: partition_bytes.len(),
+                prg_len: prg_bytes.len(),
+            });
+        }
+        let mut buf =
+            Vec::with_capacity(80 + leader_bytes.len() + partition_bytes.len() + prg_bytes.len());
         buf.push(APPEND_ENTRIES_VERSION);
         buf.push(0);
+        buf.extend_from_slice(&self.routing.routing_epoch.to_le_bytes());
         buf.extend_from_slice(&self.term.to_le_bytes());
         buf.extend_from_slice(&self.prev_log_index.to_le_bytes());
         buf.extend_from_slice(&self.prev_log_term.to_le_bytes());
         buf.extend_from_slice(&self.leader_commit.to_le_bytes());
         buf.extend_from_slice(&(leader_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(partition_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(prg_bytes.len() as u16).to_le_bytes());
         buf.extend_from_slice(leader_bytes);
+        buf.extend_from_slice(partition_bytes);
+        buf.extend_from_slice(prg_bytes);
         buf.extend_from_slice(&(self.entries.len() as u16).to_le_bytes());
         for entry in &self.entries {
             buf.extend_from_slice(&entry.term.to_le_bytes());
@@ -319,16 +489,20 @@ impl AppendEntriesRequest {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, AppendEntriesFrameError> {
-        if bytes.len() < 1 + 1 + 8 * 4 + 2 {
+        if bytes.len() < 1 + 1 + 8 * 5 + 2 * 4 {
             return Err(AppendEntriesFrameError::Truncated);
         }
         if bytes[0] != APPEND_ENTRIES_VERSION {
+            if bytes[0] == 1 {
+                return Err(AppendEntriesFrameError::MissingRoutingMetadata);
+            }
             return Err(AppendEntriesFrameError::InvalidVersion {
                 observed: bytes[0],
                 expected: APPEND_ENTRIES_VERSION,
             });
         }
         let mut cursor = 2;
+        let routing_epoch = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
         let term = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
         let prev_log_index =
             read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
@@ -336,13 +510,28 @@ impl AppendEntriesRequest {
         let leader_commit = read_u64_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)?;
         let leader_len =
             read_u16_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)? as usize;
-        if bytes.len() < cursor + leader_len + 2 {
+        let partition_len =
+            read_u16_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)? as usize;
+        let prg_len =
+            read_u16_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)? as usize;
+        if bytes.len() < cursor + leader_len + partition_len + prg_len + 2 {
             return Err(AppendEntriesFrameError::Truncated);
         }
         let leader_id = from_utf8(&bytes[cursor..cursor + leader_len])
             .map_err(|_| AppendEntriesFrameError::InvalidUtf8)?
             .to_string();
         cursor += leader_len;
+        let partition_id = from_utf8(&bytes[cursor..cursor + partition_len])
+            .map_err(|_| AppendEntriesFrameError::InvalidUtf8)?
+            .to_string();
+        cursor += partition_len;
+        let prg_id = from_utf8(&bytes[cursor..cursor + prg_len])
+            .map_err(|_| AppendEntriesFrameError::InvalidUtf8)?
+            .to_string();
+        cursor += prg_len;
+        if partition_id.is_empty() || prg_id.is_empty() || routing_epoch == 0 {
+            return Err(AppendEntriesFrameError::MissingRoutingMetadata);
+        }
         let entry_count =
             read_u16_le(bytes, &mut cursor, || AppendEntriesFrameError::Truncated)? as usize;
         let mut entries = Vec::with_capacity(entry_count);
@@ -368,6 +557,11 @@ impl AppendEntriesRequest {
             prev_log_term,
             leader_commit,
             entries,
+            routing: RaftRouting {
+                partition_id,
+                prg_id,
+                routing_epoch,
+            },
         })
     }
 }
@@ -434,6 +628,13 @@ pub enum RequestVoteFrameError {
     InvalidCombination,
     #[error("unknown reject code {0}")]
     UnknownRejectCode(u8),
+    #[error("routing metadata missing")]
+    MissingRoutingMetadata,
+    #[error("routing metadata too long (partition {partition_len} bytes, prg {prg_len} bytes)")]
+    RoutingMetadataTooLong {
+        partition_len: usize,
+        prg_len: usize,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -450,6 +651,13 @@ pub enum AppendEntriesFrameError {
     TooManyEntries { count: usize },
     #[error("leader id is not valid UTF-8")]
     InvalidUtf8,
+    #[error("routing metadata missing")]
+    MissingRoutingMetadata,
+    #[error("routing metadata too long (partition {partition_len} bytes, prg {prg_len} bytes)")]
+    RoutingMetadataTooLong {
+        partition_len: usize,
+        prg_len: usize,
+    },
 }
 
 #[cfg(test)]
@@ -464,6 +672,7 @@ mod tests {
             last_log_index: 42,
             last_log_term: 4,
             pre_vote: true,
+            routing: RaftRouting::alias("partition-a", 7),
         };
         let encoded = request.encode().unwrap();
         let decoded = RequestVoteRequest::decode(&encoded).unwrap();
@@ -494,6 +703,7 @@ mod tests {
                 RaftLogEntry::new(7, 10, b"cmd1".to_vec()),
                 RaftLogEntry::new(7, 11, b"cmd2".to_vec()),
             ],
+            routing: RaftRouting::alias("partition-a", 9),
         };
         let encoded = request.encode().unwrap();
         let decoded = AppendEntriesRequest::decode(&encoded).unwrap();

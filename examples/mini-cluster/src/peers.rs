@@ -2,9 +2,11 @@ use crate::config::NodeConfig;
 use crate::tls::new_mtls_manager;
 use anyhow::Context;
 use clustor::net::{
-    AsyncRaftNetworkClient, PeerHealth, RaftNetworkClientConfig, TlsIdentity, TlsTrustStore,
+    AsyncRaftNetworkClient, AsyncRaftTransportClientConfig, AsyncRaftTransportClientOptions,
+    PeerHealth, TlsIdentity, TlsTrustStore,
 };
 use log::warn;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -49,13 +51,19 @@ pub fn build_peer_map(
         let port = addr.port();
         let mut mtls = new_mtls_manager(tls_identity, trust_domain, std::time::Duration::from_secs(600));
         mtls.rotate(Instant::now()).ok();
-        let client = AsyncRaftNetworkClient::new(RaftNetworkClientConfig {
-            host: host.clone(),
-            port,
-            identity: tls_identity.clone(),
-            trust_store: trust_store.clone(),
-            mtls,
-        })
+        let client = AsyncRaftNetworkClient::with_options(
+            AsyncRaftTransportClientConfig {
+                host: host.clone(),
+                port,
+                identity: tls_identity.clone(),
+                trust_store: trust_store.clone(),
+                mtls: Arc::new(Mutex::new(mtls)),
+            },
+            AsyncRaftTransportClientOptions::default()
+                .pool_size_per_peer_max(2)
+                .pool_warmup(true)
+                .peer_node_id(peer_cfg.id.clone()),
+        )
         .with_context(|| format!("failed to build Raft client for peer {}", peer_cfg.id))?;
         let health = Arc::new(PeerHealth::new(Instant::now()));
         peers.push(PeerInfo {

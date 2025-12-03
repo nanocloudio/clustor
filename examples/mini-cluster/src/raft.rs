@@ -3,7 +3,7 @@ use crate::state::{apply_committed_entries, AppState};
 use clustor::raft::{
     AppendEntriesProcessor, AppendEntriesRequest, AppendEntriesResponse, ElectionController,
     ElectionProfile, PartitionQuorumConfig, RequestVoteRejectReason, RequestVoteRequest,
-    RequestVoteResponse,
+    RequestVoteResponse, RaftRouting,
 };
 use clustor::transport::raft::RaftRpcHandler;
 use log::{debug, error, info, trace, warn};
@@ -439,6 +439,7 @@ impl RaftRuntime {
             last_log_index: last_index,
             last_log_term: last_term,
             pre_vote: false,
+            routing: default_routing(),
         };
         let total = self.state.peers.len() + 1;
         let majority = total / 2 + 1;
@@ -812,6 +813,7 @@ async fn send_to_peer(
             prev_log_term,
             leader_commit: commit_index,
             entries,
+            routing: default_routing(),
         };
         let heartbeat = request.entries.is_empty();
         let last_entry_index = request
@@ -944,4 +946,9 @@ pub fn new_durability_ledger(peers: &[PeerInfo], node_id: &str) -> clustor::dura
         durability_ledger.register_replica(peer.id.clone());
     }
     durability_ledger
+}
+
+pub fn default_routing() -> RaftRouting {
+    // Mini-cluster runs a single placement group, so keep a static routing epoch.
+    RaftRouting::alias("mini-cluster", 1)
 }

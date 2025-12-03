@@ -7,6 +7,7 @@ use std::time::Instant;
 use tokio::time::interval;
 use tokio_rustls::rustls;
 use clustor::security::RevocationSource;
+use parking_lot::RwLock;
 
 pub const REVOCATION_REFRESH_INTERVAL: Duration = Duration::from_secs(240);
 
@@ -35,15 +36,14 @@ pub fn build_http_tls(identity: &TlsIdentity) -> anyhow::Result<rustls::ServerCo
 }
 
 pub async fn refresh_server_revocation(
-    identity: Arc<std::sync::RwLock<MtlsIdentityManager>>,
+    identity: Arc<RwLock<MtlsIdentityManager>>,
 ) {
     let mut ticker = interval(REVOCATION_REFRESH_INTERVAL);
     loop {
         ticker.tick().await;
         let now = Instant::now();
-        if let Ok(mut guard) = identity.write() {
-            guard.record_revocation_refresh(RevocationSource::Ocsp, now);
-            guard.record_revocation_refresh(RevocationSource::Crl, now);
-        }
+        let mut guard = identity.write();
+        guard.record_revocation_refresh(RevocationSource::Ocsp, now);
+        guard.record_revocation_refresh(RevocationSource::Crl, now);
     }
 }

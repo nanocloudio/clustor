@@ -177,7 +177,12 @@ fn classify_lag(lag_ms: u64) -> LagClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::replication::raft::{AppendEntriesRequest, HeartbeatBatcher};
+    use crate::replication::raft::quorum::ReplicaId;
+    use crate::replication::raft::{AppendEntriesRequest, HeartbeatBatcher, RaftRouting};
+
+    fn routing(epoch: u64) -> RaftRouting {
+        RaftRouting::alias("partition-test", epoch)
+    }
 
     #[test]
     fn scheduler_tracks_due_followers() {
@@ -278,7 +283,9 @@ mod tests {
         assert_eq!(commands.len(), 3);
         let mut flushed_batches = 0;
         for _cmd in commands {
-            if let Some(batch) = batcher.enqueue(AppendEntriesRequest::heartbeat(1, "l", 0)) {
+            if let Some(batch) =
+                batcher.enqueue(AppendEntriesRequest::heartbeat(1, "l", 0, routing(1)))
+            {
                 flushed_batches += 1;
                 assert_eq!(batch.len(), 2);
             }

@@ -1,9 +1,9 @@
 use clustor::security::{Certificate, MtlsIdentityManager, SerialNumber, SpiffeId};
 use clustor::{
     AppendEntriesProcessor, AppendEntriesRequest, AppendEntriesResponse, BundleNegotiationEntry,
-    CatalogNegotiationConfig, CatalogVersion, RaftLogEntry, RaftLogStore, RaftRpcHandler,
-    RaftRpcServer, RaftTransportError, RequestVoteRequest, RequestVoteResponse, SystemLogEntry,
-    SystemLogError,
+    CatalogNegotiationConfig, CatalogVersion, RaftLogEntry, RaftLogStore, RaftRouting,
+    RaftRpcHandler, RaftRpcServer, RaftTransportError, RequestVoteRequest, RequestVoteResponse,
+    SystemLogEntry, SystemLogError,
 };
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -31,6 +31,10 @@ fn dataset_and_config(partition: &str) -> (tempfile::TempDir, PathBuf, CatalogNe
         remote_version: CatalogVersion::new(0, 1, 1),
     };
     (dir, dataset, config)
+}
+
+fn routing(partition: &str, epoch: u64) -> RaftRouting {
+    RaftRouting::alias(partition.to_string(), epoch)
 }
 
 #[test]
@@ -103,10 +107,11 @@ fn raft_transport_replication_and_revocation_checkpoint() {
     let now = Instant::now();
     let client = certificate("spiffe://example.org/clients/follower", 7, now);
 
-    let (_tmp1, dataset1, config1) = dataset_and_config("partition-replica1");
+    let partition_id = "partition-replica";
+    let (_tmp1, dataset1, config1) = dataset_and_config(partition_id);
     let log1 = dataset1.join("raft.log");
     let handler1 = ReplicaHandler::new(&log1);
-    let mut server1 = RaftRpcServer::new(identity_manager(now), handler1);
+    let server1 = RaftRpcServer::new(identity_manager(now), handler1, routing(partition_id, 4));
     server1
         .negotiate_catalog(&dataset1, &config1, CatalogVersion::new(0, 1, 2))
         .unwrap();
@@ -121,6 +126,7 @@ fn raft_transport_replication_and_revocation_checkpoint() {
             RaftLogEntry::new(4, 1, b"cmd1".to_vec()),
             RaftLogEntry::new(4, 2, b"cmd2".to_vec()),
         ],
+        routing: routing(partition_id, 4),
     };
     let frame = append.encode().unwrap();
     server1
@@ -130,10 +136,10 @@ fn raft_transport_replication_and_revocation_checkpoint() {
     let follower_log = RaftLogStore::open(&log1).unwrap();
     assert_eq!(follower_log.last_index(), 2);
 
-    let (_tmp2, dataset2, config2) = dataset_and_config("partition-replica2");
+    let (_tmp2, dataset2, config2) = dataset_and_config(partition_id);
     let log2 = dataset2.join("raft.log");
     let handler2 = ReplicaHandler::new(&log2);
-    let mut server2 = RaftRpcServer::new(identity_manager(now), handler2);
+    let server2 = RaftRpcServer::new(identity_manager(now), handler2, routing(partition_id, 4));
     server2
         .negotiate_catalog(&dataset2, &config2, CatalogVersion::new(0, 1, 2))
         .unwrap();

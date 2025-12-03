@@ -21,8 +21,8 @@ pub use quorum::{
 
 pub use rpc::{
     AppendEntriesFrameError, AppendEntriesRequest, AppendEntriesResponse, PreVoteResponse,
-    PreVoteResponseFrameError, RequestVoteFrameError, RequestVoteRejectReason, RequestVoteRequest,
-    RequestVoteResponse,
+    PreVoteResponseFrameError, RaftRouting, RequestVoteFrameError, RequestVoteRejectReason,
+    RequestVoteRequest, RequestVoteResponse, RoutingValidationError,
 };
 pub use stickiness::{
     DeviceLatencyConfig, LatencyGuardReason, LeaderStickinessConfig, LeaderStickinessController,

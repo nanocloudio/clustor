@@ -43,10 +43,9 @@ pub use readyz::{
 #[cfg(feature = "async-net")]
 pub use replication::raft::{
     AsyncRaftNetworkClient, AsyncRaftNetworkServer, AsyncRaftNetworkServerHandle,
-};
-pub use replication::raft::{
-    RaftNetworkClient, RaftNetworkClientConfig, RaftNetworkClientOptions, RaftNetworkServer,
-    RaftNetworkServerConfig, RaftNetworkServerHandle,
+    AsyncRaftTransportClient, AsyncRaftTransportClientConfig, AsyncRaftTransportClientOptions,
+    AsyncRaftTransportPoolManager, AsyncRaftTransportServer, AsyncRaftTransportServerConfig,
+    AsyncRaftTransportServerHandle, PeerEndpoint,
 };
 pub use tls::{load_identity_from_pem, load_trust_store_from_pem, TlsIdentity, TlsTrustStore};
 

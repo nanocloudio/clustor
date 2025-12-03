@@ -1,6 +1,6 @@
 use clustor::{
     AppendEntriesProcessor, AppendEntriesRequest, ElectionController, ElectionProfile,
-    RaftLogEntry, RaftLogStore,
+    RaftLogEntry, RaftLogStore, RaftRouting,
 };
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -9,6 +9,10 @@ fn new_store() -> (TempDir, RaftLogStore) {
     let tmp = TempDir::new().unwrap();
     let store = RaftLogStore::open(tmp.path().join("raft.log")).unwrap();
     (tmp, store)
+}
+
+fn routing(epoch: u64) -> RaftRouting {
+    RaftRouting::alias("partition-test", epoch)
 }
 
 #[test]
@@ -32,6 +36,7 @@ fn append_entries_resolves_log_divergence() {
         prev_log_term: 1,
         leader_commit: 3,
         entries,
+        routing: routing(3),
     };
     let mut processor = AppendEntriesProcessor::new(&mut follower);
     let outcome = processor.apply(&request).unwrap();
@@ -55,6 +60,7 @@ fn follower_catches_up_over_multiple_batches() {
             RaftLogEntry::new(5, 1, b"cmd1".to_vec()),
             RaftLogEntry::new(5, 2, b"cmd2".to_vec()),
         ],
+        routing: routing(5),
     };
     processor.apply(&batch_a).unwrap();
 
@@ -68,6 +74,7 @@ fn follower_catches_up_over_multiple_batches() {
             RaftLogEntry::new(5, 3, b"cmd3".to_vec()),
             RaftLogEntry::new(5, 4, b"cmd4".to_vec()),
         ],
+        routing: routing(5),
     };
     let outcome = processor.apply(&batch_b).unwrap();
     assert!(outcome.success);

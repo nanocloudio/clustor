@@ -1,5 +1,7 @@
-use super::client::{RaftNetworkClient, RaftNetworkClientConfig, RaftNetworkClientOptions};
-use super::server::{RaftNetworkServer, RaftNetworkServerConfig, RaftNetworkServerHandle};
+use super::async_transport::{
+    AsyncRaftTransportClient, AsyncRaftTransportClientConfig, AsyncRaftTransportClientOptions,
+    AsyncRaftTransportServer, AsyncRaftTransportServerConfig, AsyncRaftTransportServerHandle,
+};
 use crate::net::NetError;
 use crate::replication::raft::{
     AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
@@ -8,25 +10,22 @@ use crate::replication::transport::raft::{RaftRpcHandler, RaftRpcServer};
 use log::warn;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::task;
 
 pub struct AsyncRaftNetworkClient {
-    inner: Arc<RaftNetworkClient>,
+    inner: Arc<AsyncRaftTransportClient>,
 }
 
 impl AsyncRaftNetworkClient {
-    pub fn new(config: RaftNetworkClientConfig) -> Result<Self, NetError> {
-        Ok(Self {
-            inner: Arc::new(RaftNetworkClient::new(config)?),
-        })
+    pub fn new(config: AsyncRaftTransportClientConfig) -> Result<Self, NetError> {
+        Self::with_options(config, AsyncRaftTransportClientOptions::default())
     }
 
     pub fn with_options(
-        config: RaftNetworkClientConfig,
-        options: RaftNetworkClientOptions,
+        config: AsyncRaftTransportClientConfig,
+        options: AsyncRaftTransportClientOptions,
     ) -> Result<Self, NetError> {
         Ok(Self {
-            inner: Arc::new(RaftNetworkClient::with_options(config, options)?),
+            inner: Arc::new(AsyncRaftTransportClient::new(config, options)?),
         })
     }
 
@@ -35,10 +34,8 @@ impl AsyncRaftNetworkClient {
         request: RequestVoteRequest,
         now: Instant,
     ) -> Result<RequestVoteResponse, NetError> {
-        let inner = self.inner.clone();
-        task::spawn_blocking(move || inner.request_vote(&request, now))
-            .await
-            .map_err(map_join_error)?
+        let _ = now;
+        self.inner.request_vote(&request).await
     }
 
     pub async fn append_entries(
@@ -46,6 +43,7 @@ impl AsyncRaftNetworkClient {
         request: AppendEntriesRequest,
         now: Instant,
     ) -> Result<AppendEntriesResponse, NetError> {
+        let _ = now;
         self.append_entries_with_abort(request, now, || false).await
     }
 
@@ -58,19 +56,14 @@ impl AsyncRaftNetworkClient {
     where
         F: Fn() -> bool + Send + 'static,
     {
-        let inner = self.inner.clone();
-        task::spawn_blocking(move || inner.append_entries_with_abort(&request, now, should_abort))
+        let _ = now;
+        self.inner
+            .append_entries_with_abort(&request, should_abort)
             .await
-            .map_err(map_join_error)?
     }
 
     pub async fn refresh_revocation(&self, now: Instant) -> Result<(), NetError> {
-        let inner = self.inner.clone();
-        task::spawn_blocking(move || {
-            inner.refresh_revocation(now);
-        })
-        .await
-        .map_err(map_join_error)?;
+        self.inner.refresh_revocation(now);
         Ok(())
     }
 
@@ -90,7 +83,7 @@ impl Clone for AsyncRaftNetworkClient {
 pub struct AsyncRaftNetworkServer;
 
 pub struct AsyncRaftNetworkServerHandle {
-    inner: Option<RaftNetworkServerHandle>,
+    inner: Option<AsyncRaftTransportServerHandle>,
 }
 
 impl AsyncRaftNetworkServerHandle {
@@ -101,10 +94,9 @@ impl AsyncRaftNetworkServerHandle {
     }
 
     pub async fn try_shutdown(&mut self, timeout: Duration) -> Result<(), NetError> {
+        let _ = timeout;
         if let Some(mut handle) = self.inner.take() {
-            task::spawn_blocking(move || handle.try_shutdown(timeout))
-                .await
-                .map_err(map_join_error)??;
+            handle.shutdown().await;
         }
         Ok(())
     }
@@ -113,30 +105,35 @@ impl AsyncRaftNetworkServerHandle {
 impl Drop for AsyncRaftNetworkServerHandle {
     fn drop(&mut self) {
         if let Some(mut handle) = self.inner.take() {
-            let _ = handle.try_shutdown(Duration::from_secs(5));
+            // Best-effort async shutdown if a runtime is available.
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    handle.shutdown().await;
+                });
+            }
         }
     }
 }
 
 impl AsyncRaftNetworkServer {
     pub async fn spawn<H>(
-        config: RaftNetworkServerConfig,
+        config: AsyncRaftTransportServerConfig,
         server: RaftRpcServer<H>,
     ) -> Result<AsyncRaftNetworkServerHandle, NetError>
     where
         H: RaftRpcHandler + Send + 'static,
     {
-        let handle = task::spawn_blocking(move || RaftNetworkServer::spawn(config, server))
-            .await
-            .map_err(map_join_error)??;
+        let handle = AsyncRaftTransportServer::spawn(
+            AsyncRaftTransportServerConfig {
+                bind: config.bind,
+                identity: config.identity,
+                trust_store: config.trust_store,
+            },
+            server,
+        )
+        .await?;
         Ok(AsyncRaftNetworkServerHandle {
             inner: Some(handle),
         })
     }
-}
-
-fn map_join_error(err: task::JoinError) -> NetError {
-    NetError::Io(std::io::Error::other(format!(
-        "async task cancelled: {err}"
-    )))
 }
