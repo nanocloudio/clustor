@@ -4,7 +4,7 @@ use crate::replication::raft::{
 };
 use crate::telemetry::MetricsRegistry;
 use crate::terminology::{RuntimeTerm, TERM_GROUP_FSYNC, TERM_STRICT};
-use log::info;
+use log::trace;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -61,7 +61,7 @@ impl DurabilityLedger {
         self.last_record = Some(record.clone());
         if quorum_index > previous_committed {
             let runtime_term = record.io_mode.runtime_term();
-            info!(
+            trace!(
                 "event=durability_proof clause={} replica={:?} term={} index={} quorum_index={} io_mode={} term_id={}",
                 DURABILITY_SPEC_CLAUSE,
                 record.replica,

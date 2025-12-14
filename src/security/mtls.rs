@@ -77,6 +77,7 @@ pub struct MtlsIdentityManager {
     waiver_extension: Duration,
     revocation_waiver: Option<RevocationWaiver>,
     quarantined: bool,
+    revocation_required: bool,
 }
 
 impl MtlsIdentityManager {
@@ -100,6 +101,7 @@ impl MtlsIdentityManager {
             quarantined: false,
             pending: None,
             active,
+            revocation_required: true,
         }
     }
 
@@ -229,6 +231,10 @@ impl MtlsIdentityManager {
     }
 
     fn enforce_revocation(&mut self, now: Instant) -> Result<(), SecurityError> {
+        if !self.revocation_required {
+            self.quarantined = false;
+            return Ok(());
+        }
         match self.evaluate_revocation_state(now) {
             RevocationState::Fresh => Ok(()),
             RevocationState::Waived => {
@@ -291,6 +297,14 @@ impl MtlsIdentityManager {
                 self.revocation_waiver = None;
                 false
             }
+        }
+    }
+
+    pub fn set_revocation_enforcement(&mut self, required: bool) {
+        self.revocation_required = required;
+        if !required {
+            self.quarantined = false;
+            self.revocation_waiver = None;
         }
     }
 }

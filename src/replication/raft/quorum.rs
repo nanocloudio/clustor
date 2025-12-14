@@ -1,5 +1,6 @@
-use log::{info, warn};
+use log::{trace, warn};
 use serde::{Deserialize, Serialize};
+use std::backtrace::Backtrace;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -118,6 +119,14 @@ impl PartitionQuorum {
                 replica_label(&replica_id),
                 progress.matched_index,
                 matched_index
+            );
+            let bt = Backtrace::force_capture();
+            warn!(
+                "matched_index_regression_backtrace replica={} previous={} attempted={} backtrace={:?}",
+                replica_label(&replica_id),
+                progress.matched_index,
+                matched_index,
+                bt
             );
             return Err(QuorumError::MatchedIndexRegression {
                 previous: progress.matched_index,
@@ -260,7 +269,7 @@ impl PartitionQuorum {
         if candidate.matched_index > self.committed_index && candidate.matched_term == leader_term {
             self.committed_index = candidate.matched_index;
             self.committed_term = candidate.matched_term;
-            info!(
+            trace!(
                 "event=raft_commit_advance clause={} committed_index={} committed_term={} quorum_size={}",
                 QUORUM_SPEC_CLAUSE,
                 self.committed_index,

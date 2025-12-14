@@ -1,4 +1,4 @@
-use log::{info, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -35,14 +35,30 @@ impl CpPlacementClient {
     }
 
     pub fn update(&mut self, record: PlacementRecord, fetched_at: Instant) {
-        info!(
-            "event=cp_placement_update clause={} partition_id={} routing_epoch={} lease_epoch={} cache_grace_ms={}",
-            CP_PLACEMENT_SPEC,
-            record.partition_id,
-            record.routing_epoch,
-            record.lease_epoch,
-            self.cache_grace.as_millis()
-        );
+        let unchanged = self
+            .placements
+            .get(&record.partition_id)
+            .map(|state| state.record == record)
+            .unwrap_or(false);
+        if unchanged {
+            debug!(
+                "event=cp_placement_refresh clause={} partition_id={} routing_epoch={} lease_epoch={} cache_grace_ms={}",
+                CP_PLACEMENT_SPEC,
+                record.partition_id,
+                record.routing_epoch,
+                record.lease_epoch,
+                self.cache_grace.as_millis()
+            );
+        } else {
+            info!(
+                "event=cp_placement_update clause={} partition_id={} routing_epoch={} lease_epoch={} cache_grace_ms={}",
+                CP_PLACEMENT_SPEC,
+                record.partition_id,
+                record.routing_epoch,
+                record.lease_epoch,
+                self.cache_grace.as_millis()
+            );
+        }
         self.placements.insert(
             record.partition_id.clone(),
             PlacementState {

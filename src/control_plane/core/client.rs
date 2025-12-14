@@ -38,6 +38,10 @@ impl<T> CpControlPlaneClient<T> {
             feature_endpoint: feature_endpoint.into(),
         }
     }
+
+    pub fn apply_revocation_waiver(&mut self, reason: impl Into<String>, now: Instant) {
+        self.mtls.apply_revocation_waiver(reason, now);
+    }
 }
 
 impl<T: CpApiTransport> CpControlPlaneClient<T> {
