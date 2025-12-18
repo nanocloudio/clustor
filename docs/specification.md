@@ -1,1364 +1,523 @@
-# Clustor – Raft Consensus Core
-Version: Draft 0.1 (condensed)
-Language: Rust (no GC runtime)
-Deployment: Library crate + sidecar utilities shared across product binaries
-Clustor is a Raft Consensus Core embedded as a library crate with sidecar utilities.
+1. Title
+Clustor Raft Consensus Core Technical Specification v0.1
 
-## Table of Contents
-0. Specification Provenance & Wire Freeze
-1. Architecture & Crash Model
-2. Definitions & Vocabulary
-3. Replication & Consistency Semantics
-4. Partitioning & Topology
-5. Log Entry Interfaces
-6. Durability & Write-Ahead Log
-7. Apply Pipeline & State Machine Hooks
-8. Snapshots & State Transfer
-9. Storage Layout, Encryption & Recovery
-10. Flow Control & Backpressure
-11. Control Plane – ControlPlaneRaft
-12. Security & Isolation
-13. Admin & Lifecycle APIs
-14. Telemetry & Observability
-15. Deployment & Bootstrap
-16. Summary of Guarantees
-Appendices A–E
+2. Overview
+- Clustor provides a Raft-based consensus library plus sidecar services that replicate ordered log entries within each partition with crash-consistent durability and security guardrails.
+- Every replica participates in a crash-consistent write-ahead log (WAL) with configurable durability modes: Strict (per-append `fdatasync`) and Group-Fsync (batched `fdatasync` bounded by profile ceilings).
+- A dedicated control plane (ControlPlaneRaft) stores placements, durability proofs, feature gates, DR fences, overrides, and readiness records used by all partitions.
+- Linearizable reads satisfy the read-gate predicate (`commit_visibility=DurableOnly`, cache state Fresh/Cached, ControlPlaneRaft proof equality, and `wal_committed_index == raft_commit_index`); when any clause fails—such as Stale/Expired caches or strict fallback—leaders continue accepting writes in Strict mode while ReadIndex/lease requests fail closed.
+- Snapshot import/export, flow control, telemetry, RBAC, and cryptographic requirements are integrated into the runtime so every deployment produces auditable behavior across profiles (ConsistencyProfile, Throughput, WAN, ZFS, Aggregator).
 
-### Appendix Cross-Index
-| Appendix | Topic |
+3. Scope
+- Raft replication behavior, leader election, quorum handling, and observer semantics.
+- WAL layout, entry encoding, durability ledger ordering, nonce reservation, compaction, and scrub.
+- Apply pipeline contracts, ack handling, flow control, throttling, snapshots (full and incremental), and state-transfer requirements.
+- ControlPlaneRaft contracts covering placements, caches, feature gates, overrides, barriers, and readiness.
+- Wire encoding, message catalogs, error handling, telemetry, security (mTLS, AEAD, RBAC, break-glass), and compatibility/versioning expectations.
+- Operational states such as strict fallback, quarantine, repair mode, and structural lag mitigation.
+
+**Normative language and units:** This specification uses “MUST/SHALL”, “SHOULD”, and “MAY” in the RFC 2119 sense. Failing a MUST/SHALL requirement is a protocol violation. SHOULD clauses describe safety or interoperability guidance; deviating requires a documented justification and may affect SLO commitments. MAY clauses describe optional behavior. All numeric ceilings called out as profile parameters (e.g., `snapshot.delta_emit_period_ms`) are SLO defaults drawn from App.B; deployments MAY tighten them but MUST NOT exceed the hard bounds noted in App.B without a profile update. Unless explicitly stated otherwise, KiB/MiB/GiB units use binary powers (2^10, 2^20, 2^30 bytes respectively), and `_ms` suffixes denote milliseconds.
+
+4. Non-Goals
+- Product-specific state machines above `on_commit`/`on_applied`.
+- Alternate consensus algorithms, eventual-consistency modes, or speculative leader extensions beyond the defined lease/read gates.
+- New cryptographic primitives beyond AES-256-GCM, SHA-256/BLAKE3 hash suites (used for Merkle leaves and, when gated, IV derivation), and HMAC-SHA256 MAC trailers described herein.
+- Fleet orchestration, CI tooling, or release workflow automation (captured separately as non-normative guidance).
+
+5. Terminology and Concepts
+
+5.1 Core Terms
+| Term | Definition |
 | --- | --- |
-| Appendix A (App.A) | SLOs, alert thresholds, telemetry policies |
-| Appendix B (App.B) | Operational profiles & limits |
-| Appendix C (App.C) | Test matrix, fixtures, conformance helpers |
-| Appendix D (App.D) | Wire envelope schemas & override scopes |
-| Appendix E (App.E) | ChunkedList framing rules |
+| `raft_commit_index` | Highest log index considered committed under Raft rules (replicated on a majority, with the leader only using entries from its current term to advance the index even though earlier entries become committed as a result); implied when `commit_index` is referenced. |
+| `local_wal_durable_index` | Replica-local watermark equal to the last log index whose WAL bytes completed §10.5 step (2) and whose `DurabilityRecord` completed §10.5 step (4); step (2) means the bytes are already on stable storage regardless of Strict vs Group-Fsync batching. |
+| `wal_committed_index` | Leader-only quorum durable watermark computed as the maximum index *m* such that (a) the leader’s `local_wal_durable_index ≥ m`, (b) at least quorum-size replicas (including the leader) have advertised `local_wal_durable_index ≥ m`, (c) the log entry at *m* has `term(m) == current_term`, and (d) `m ≤ raft_commit_index`. Followers never compute or approximate this value; they gate snapshot-only reads using `local_wal_durable_index` vs their defined `applied_index_floor`. |
+| `sm_durable_index` | Product-visible watermark that side effects are durably materialized (non-normative for consensus, but surfaced for compaction/readiness decisions). |
+| `quorum_applied_index` | Smallest `applied_index` among the most recent quorum heartbeat bundle; forms a compaction floor. |
+| `applied_index_floor` | Follower-local watermark equal to `min(applied_index, snapshot_base_index)` persisted alongside snapshot authorization; follower snapshot-only reads require `local_wal_durable_index ≥ applied_index_floor`. |
+| `commit_visibility` | `CommitVisibility::DurableOnly` or `CommitVisibility::CommitAllowsPreDurable`; controls whether reads may observe entries ahead of `wal_committed_index`. |
+| `lease_gap_max` | Profile-specific bound on `(raft_commit_index - wal_committed_index)` while leases are enabled (0 disables leases); equality is already required for linearizable reads, so this guard functions as an additional telemetry clamp/alert when the gap deviates even temporarily. |
+| `lease_epoch` | Monotone identifier carried on heartbeats; followers reject lease reads on epoch mismatch. |
+| `routing_epoch` | Placement/reconfiguration version issued by ControlPlaneRaft. |
+| `durability_mode` | Consensus mode `Strict` or `Group-Fsync`, fenced by `DurabilityTransition` entries. |
+| `wal.fs_block_bytes` | WAL I/O alignment hint derived from the filesystem’s preferred block size (`st_blksize` from `fstat`) or an operator override; implementations align WAL writes/truncations to this quantum but may override it explicitly when the operator configures a safer value. |
+| `wal.crypto_block_bytes` | Fixed AEAD block size (4096 bytes) used for nonce counters and reservations. |
+| `ControlPlaneUnavailablePriorityOrder` | Rejection precedence `{CacheExpired, CacheNotFresh, NeededForReadIndex}` applied after clause evaluation when mapping read/lease gate failures to `ControlPlaneUnavailable`; cache expiry/staleness clauses map to the first two reasons, all other read-gate clauses map to `NeededForReadIndex`. Admin/control APIs MAY introduce additional reasons (e.g., `ModeConflict(strict_fallback)`) but MUST document deviations. |
+| `CanonicalJson` | Unless otherwise noted, “canonical JSON” refers to RFC 8785 Canonical JSON (UTF-8, deterministic object member ordering, no insignificant whitespace); all signatures and `content_hash` calculations over JSON/JSONL payloads use this encoding after removing any explicitly excluded fields called out in §7/§9/§12. |
+| `Clustor`, `Strict`, `Group-Fsync`, `DurabilityRecord`, `FollowerReadSnapshot`, `LeaseEnable`, `SnapshotDeltaEnable`, `ControlPlaneRaft`, `ConsistencyProfile` | Canonical runtime nouns whose casing must match telemetry and APIs. |
 
-For automation that addresses appendices numerically, appendices A–E map to ordinal IDs 16–20 (A=16, B=17, …, E=20); spec-lint publishes the same alias list so tooling never depends on prose strings.
-[Informative] Citation shorthand: whenever this spec references an appendix it uses the compact token `App.<Letter>` (e.g., `App.B`). Tooling auto-links the token to the cross-index above, so additional “see Appendix …” prose is unnecessary and discouraged for new text.
+5.2 Profiles and Roles
+- Profiles (ConsistencyProfile, Throughput, WAN, ZFS, Aggregator) define hard ceilings for durability batching, ack deferral, flow control, telemetry sampling, and feature availability.
+- Roles include Leaders (serve writes and ReadIndex), Followers (replicate and expose snapshot-only reads once allowed), Learners (catch-up replicas), Observers (read-only/telemetry), and ControlPlaneRaft which governs placements and proofs.
 
----
+6. System Model
 
-## 0  Specification Provenance & Wire Freeze (v0.1)
+6.1 Components
+- **Data-plane nodes** host one or more Raft Partition Groups (RPGs). Each RPG maintains WAL segments, durability ledgers, apply pipelines, snapshot emitters/importers, flow controllers, and telemetry streams.
+- **ControlPlaneRaft** is an independent Raft cluster storing routing epochs, durability proofs, feature manifests, overrides, DR fences, DefinitionBundle metadata, and readiness signals. Data-plane nodes rely on its caches as the source of truth for placement and durability policy.
+- **Clients** interact with leaders via Raft RPCs or Admin APIs carrying `routing_epoch` plus durability/lease epochs.
+- **Observers** receive read-only streams using dedicated bandwidth quotas (`0.1 × snapshot.max_bytes_per_sec` per partition) and do not participate in quorum.
 
-The Consensus Core is normative for v0.1; where conflicts exist, this section governs. Later sections cite the controlling clauses as “per §0.x” whenever they restate the invariants, and any divergence defaults to §0 without additional errata.
+6.2 Environment and Crash Model
+- Nodes target Linux ≥5.15 with `io_uring`, PHC/PTP clock discipline, and storage configured with explicit write barriers (e.g., XFS/ext4 with barriers enabled, ZFS with `sync=always` and `logbias=throughput`).
+- WAL segments are preallocated (≥1 GiB) and aligned to `wal.fs_block_bytes`. Strict mode issues `pwrite` + `fdatasync` per append; Group-Fsync batches operations under profile ceilings.
+- Crash model assumes fail-stop nodes, power loss between any ordered step, and storage that may reorder writes unless a step explicitly orders/durably commits via `fdatasync` (or an equivalent barrier).
 
-### 0.1 Specification Provenance
+6.3 Assumptions
+- A minimum of three voters per partition (five for DR profile) ensures quorum.
+- ControlPlaneRaft outages may last up to `controlplane.cache_grace_ms` (300,000 ms default). While caches remain `Fresh`, nodes continue in their configured durability modes; `Cached` allows existing predicates to continue (with telemetry warnings) and does not itself force strict fallback or block ReadIndex/lease gates, though other clauses (e.g., proof mismatch/TTL expiry) may independently assert strict fallback even while the cache is merely Cached. Once caches age into `Stale` or `Expired`, nodes automatically clamp to Strict durability, revoke leases, pause incremental snapshots, and halve credits once `strict_only_runtime_ms` exceeds the profile’s backpressure bound.
+- Observers and follower-read capabilities are gated on Strict durability, fresh proofs, and capability bits issued by ControlPlaneRaft.
+- Fault model: consensus safety assumes crash-only (non-Byzantine) failures. Cryptographic signatures on telemetry and proofs provide auditability and tamper evidence but do not convert the system into a Byzantine-tolerant protocol; replicas that actively lie must be removed by operators.
 
-**Change Control:** spec-lint deterministically re-derives the normative bundles `wire_catalog.json`, `chunked_list_schema.json`, and `wide_int_catalog.json` (plus the shared fixture archive noted in App.C) from the shipping source tree on every build. Releases therefore fail if the prose and generated artifacts disagree, and any change to this section must land together with regenerated bundles so downstream auditors can diff byte-for-byte.
+7. Data Model
 
-[Normative] The build also emits `consensus_core_manifest.json`, a hash chain that binds every numbered §0–§16 heading (and Appendix identifiers) to the SHA-256 digest of the generated bundles. spec-lint fails when any section hash changes without the manifest being regenerated, preventing renumbering or silent prose edits from producing bundles that auditors cannot correlate to the controlling text. The manifest MUST also embed `{proof_bundle_schema_version:u16, proof_bundle_sha256, proof_bundle_signature, feature_manifest_sha256}` so both proof artifacts and the feature manifest can be verified independently of the prose. `proof_bundle_schema_version` increments whenever the Loom/TLA+ archive format or signing process changes; `proof_bundle_signature` is a detached Ed25519 signature over `{schema_version || proof_bundle_sha256}` signed by the release automation key (public half published alongside the manifest). Nodes refuse to start if the schema version is unknown or the signature fails to verify, ensuring provers, feature declarations, and binaries remain in lockstep. The manifest additionally records `spec_sha256_tree_root`, the SHA-256 Merkle root derived from the per-section digests, giving auditors a single reproducible value to compare when reconstructing the spec hash tree.
-[Normative] Each release ships a companion `proof_artifacts.json` that enumerates every Loom/TLA+ archive and supporting model artifact consumed by CI. Entries take the form `{artifact_name, sha256, size_bytes, download_uri}` and MUST match the bytes referenced by `proof_bundle_sha256`; auditors validate artifacts by recomputing the listed checksums without requiring CI access.
-[Normative] Section hashes inside `consensus_core_manifest.json` are derived from a deterministic “SpecHash v1” byte stream so editors cannot influence the digest by changing encoding or line endings. SpecHash v1 converts every paragraph to UTF-8 NFC, rewrites CRLF/CR to LF, strips trailing horizontal whitespace, guarantees exactly one trailing newline per section, and omits any UTF-8 BOM before computing SHA-256. The manifest records `spec_hash_format="SpecHashV1"` and spec-lint refuses releases whose prose cannot be normalized, allowing auditors to reproduce the hash inputs exactly from the published Markdown.
+7.1 Entities
+- **WAL Entry Frame**: `EntryFrameHeader{version:u8, codec:u8, flags:u16, body_len:u32, trailer_len:u32}` followed by body and `EntryFrameTrailer{crc32c:u32, [merkle_leaf_digest:32 bytes]}`. `trailer_len` MUST be either 4 (CRC-only) or 36 (CRC+Merkle). `EntryFrameTrailer.crc32c` covers the serialized header bytes concatenated with the frame body bytes (it excludes the trailer itself). Frame bodies ≤1 MiB (ConsistencyProfile) or ≤4 MiB (Throughput/WAN); these WAL-specific caps are independent of any RPC body caps described in §8.
+- **Segment Trailer**: `segment_mac_trailer{version:u8, mac_suite_id:u8, segment_seq:u64, first_index:u64, last_index:u64, entry_count:u32, entries_crc32c_lanes_bytes[16], offsets_crc32c_lanes_bytes[16], mac:32 bytes}` using HMAC-SHA256 keyed per `integrity_mac_epoch`. Packed CRC lanes are derived deterministically: for every entry in physical WAL order, append the exact byte range used by that entry’s `EntryFrameTrailer.crc32c` calculation (serialized header bytes followed by body bytes, excluding the trailer) to a canonical byte stream with no separators or padding. Treat that stream as a sequence of 32-bit little-endian words, pad the tail with zero bytes (padding exists only for this CRC-lane computation and is not persisted elsewhere) if necessary so the length is a multiple of 4, distribute each word into lane `word_index mod 4`, compute CRC32C (Castagnoli) independently per lane, then emit four little-endian `u32` lane CRCs ordered lane0 → lane3. The packed field `entries_crc32c_lanes_bytes` therefore contains exactly 16 bytes. `offsets_crc32c_lanes_bytes` uses the .idx offsets serialized as contiguous 64-bit little-endian values (two 32-bit words each) with no separators; because each offset is 8 bytes (two words), the stream is inherently word-aligned and therefore needs no additional padding. The packed 16-byte field follows the same lane ordering. The segment MAC covers every trailer field except `mac` itself and therefore authenticates the serialized CRC-lane bytes verbatim.
+- **Durability Ledger**: Append-only `DurabilityRecord{term, index, segment_seq, io_writer_mode, record_crc32c}` persisted beside the WAL. Additional record families include `NonceReservationRange{segment_seq, start_block_counter, reserved_blocks}`, `NonceReservationAbandon{segment_seq, abandon_reason}`, and `DurabilityTransition`.
+- **DurabilityAck Attestation**: Followers return `DurabilityAck{partition_id, replica_id, last_fsynced_index, segment_seq, io_writer_mode}` only after `(a)` the WAL bytes for `last_fsynced_index` are durable via step (2) in §10.5, `(b)` the matching `DurabilityRecord` is appended to `wal/durability.log`, and `(c)` `fdatasync(wal/durability.log)` completes per §10.5 step (4). Leaders treat the tuple `{last_fsynced_index, segment_seq, io_writer_mode}` as a peer-authenticated statement (integrity provided by the mTLS channel and node identity in the crash-only fault model) proving the follower can regenerate the quorum proof after a crash; acknowledgements emitted before step (2) or step (4) completes are protocol violations and must be discarded. `io_writer_mode` is carried so leaders can fence Group-Fsync eligibility, not because it contributes to replay-proof durability. Because the model is crash-only, transport authentication suffices, but leaders MUST bind received tuples to the current term/stream context so stale tuples cannot help clear a read gate without a fresh ControlPlaneRaft proof.
+- **Durability mode epoch**: `durability_mode_epoch:u32` is a monotone epoch stored in ControlPlaneRaft and mirrored into `DurabilityTransition` entries, envelopes, and telemetry. ControlPlaneRaft increments it every time a partition toggles Strict ↔ Group. Every Raft control message (AppendEntries/heartbeats, RequestVote/PreVote) carries the sender’s current epoch, and `DurabilityTransition` entries include the epoch fence. Nodes persist the current epoch alongside `wal/durability.log`; any message or ledger record that regresses the epoch must be rejected (`ModeConflict` returned on admin RPCs, Raft streams closed or answered with a `ModeConflict` envelope), and leaders only acknowledge a transition after the epoch and durability proof checkpoint are durably recorded.
+- **Snapshot Manifest**: canonical JSON (per the `CanonicalJson` entry in §5.1) containing `{manifest_id, version_id, producer_version, emit_version, base_term, base_index, snapshot_kind, delta_parent_manifest_id?, delta_chain_length, content_hash, signature, encryption{dek_epoch, iv_salt}, chunks[], logical_markers[], ap_pane_digest, dedup_shards[], commit_epoch_vector[]}`. Incremental manifests set `snapshot_kind=Delta` and record parent information, and their `encryption{…}` fields use the snapshot-specific IV derivation in §12.2 (snapshots consume `iv_salt`; WAL IV derivation ignores this field). Computing `content_hash` or signature digests removes the top-level `content_hash` and `signature` fields first, then hashes/signs the canonical encoding of the remaining object. Every manifest is signed with the cluster’s `SnapshotManifestKey` (see §12.4) so verifiers can authenticate runtime exports.
+- **Filesystem Layout**:
+```
+/state/<partition>/wal/segment-*.log
+/state/<partition>/wal/segment-*.idx
+/state/<partition>/wal/durability.log
+/state/<partition>/snapshot/<term>-<index>/manifest.json
+/state/<partition>/snapshot/chunks/
+/state/<partition>/definitions/<bundle_id>.blob
+/state/<partition>/metadata.json
+/state/<partition>/boot_record.json
+```
+Implementations MAY add other tenant- or product-specific files under `/state/<partition>/…` so long as the layout above remains intact.
+- **ControlPlaneRaft Objects**: Partition manifests, durability ledger entries, QuarantineCleared records, DefinitionBundles, ActivationBarriers, WarmupReadiness entries, Override ledger items, Feature manifest rows, DR fences, Key epochs, RBAC manifests.
+- **Throttle Envelope Payload**: JSON envelope with reason, retry hints, backlog, credit levels, durability metadata, decision trace ID, credit hint, ingest/durability status codes, and sorted/truncated ID lists with continuation tokens.
+- **ChunkedList Frame**: `ChunkedListFrame{total_count:u32, chunk_offset:u32, chunk_len:u16, chunk_flags:u8, items[], [chunk_crc32c:u32 when has_crc=1]}`. `chunk_len ≤ 1024`, serialized payload ≤64 KiB, reassembly cap 8 MiB, `total_count ≤ 1,000,000`.
 
-### 0.2 Consensus Core (invariants)
-- **Raft:** log matching, leader completeness, and monotone `commit_index` hold for every replica (§3.1).
-- **Durability:** acknowledgements follow quorum `fdatasync(data_fd)`; `wal_committed_index` is monotone; `DurabilityTransition` entries fence every mode change so no batch straddles a transition (§6.2).
-- **Reads:** Linearizability uses ReadIndex; leader leases are disabled by default. Crash-linearizable reads require `commit_visibility=DurableOnly` (§3.3).
-- **Snapshots:** Full and incremental snapshots ship in v0.1. Imports require signed manifests, AEAD-authenticated chunks, and digest verification before state is touched (§8); incremental cadence follows the 10 s / 30 s rules in §8.4.
-- **Startup scrub:** Always decrypt + verify AEAD tags in constant time → zeroize buffers on failure → verify CRC/Merkle/idx-MAC → act (§6.3). No plaintext may influence state before tag verification succeeds, and any AEAD failure quarantines the replica.
+7.2 Invariants
+- **Raft**: Log matching, leader completeness, and monotone `raft_commit_index` hold for every replica. `raft_commit_index` itself follows the Raft current-term rule (only entries from the current term may become committed in the current term). `wal_committed_index ≤ raft_commit_index` always; equality is enforced whenever `commit_visibility=DurableOnly`.
+- **Durability**: Client ACKs occur only after `(a)` leader persistence, `(b)` quorum `DurabilityAck` evidence, `(c)` ledger append + `fdatasync`, and `(d)` `wal_committed_index` advance. `DurabilityTransition` entries fence every Strict↔Group change; no batch may span a fence.
+- **Read Safety**: Linearizable reads require `strict_fallback=false`, `commit_visibility=DurableOnly`, cache freshness, proof equality (the `DurabilityProofTupleV1` subset `{last_durable_term, last_durable_index, segment_seq, io_writer_mode, durability_mode_epoch}` matching the leader’s last quorum-fsynced tuple), and `wal_committed_index == raft_commit_index`.
+- **Snapshots**: Full and incremental snapshots must use signed manifests, AEAD-authenticated chunks, digest verification prior to apply, and profile-bound cadence controls (`snapshot.delta_emit_period_ms_hard_profile`, `snapshot.full_emit_period_ms_hard_profile`, `snapshot.delta_chain_max_profile`). Implementations SHOULD meet the App.B SLO targets (`snapshot.delta_emit_period_ms_target ≤ 10,000`, `snapshot.full_emit_period_ms_target ≤ 30,000`), but hard rejection occurs only when the operator or profile hard bounds are exceeded without progress.
+- **Nonce Reuse**: `(segment_seq, block_counter)` pairs are globally unique. Reservations are contiguous, bounded (≤`nonce.reservation_max_blocks_profile`), proactively flushed (writers attempt to persist after ≤5 ms of inactivity and whenever windows fill as an optimization) yet MUST still be durably recorded before any ciphertext uses the counters, and are abandoned explicitly before compaction.
+- **Startup Scrub**: Nodes authenticate AEAD tags in constant time, zeroize buffers on failure, verify MACs, CRC/Merkle, and ledger ordering before taking action. No plaintext influences state before authentication completes.
+- **Quarantine**: AEAD or MAC failures, repeated fatal apply outcomes, nonce reuse suspicion, integrity policy violations, or admin pause force Quarantine. Exiting requires snapshot/WAL rebuild plus ControlPlaneRaft acknowledgement.
 
-### 0.2 Defaults and Clause Classification
-| Item | Default |
+7.3 Snapshot and Ledger Metadata
+- Snapshot authorization requires manifest `fsync`, re-list (stat + checksum), `SnapshotAuthorizationRecord{manifest_id, base_index, auth_seq, manifest_hash}`, and `CompactionAuthAck{manifest_id, auth_seq}` with hash chaining.
+- `boot_record.json` captures scrub outcome, durability watermark, WAL geometry, `io_writer_mode`, and spec self-test metadata for audit; readiness surfaces same data.
+
+8. Interfaces and Wire Format
+
+8.1 Encoding Rules
+- Wire RPC/envelope frames use little-endian fixed-width integers and 32-bit length prefixes for slices/strings. Clustor raw TCP envelopes and other non-gRPC frames always begin with a 32-bit little-endian length prefix that counts only the body bytes; receivers MUST raise `WireBodyTooShort` whenever fewer body bytes arrive than promised. gRPC payloads retain their native 5-byte header framing on HTTP/2, so implementations rely on the runtime for that layer. Body caps: 4 MiB for Raft/admin RPCs, 32 KiB for Explain/Throttle/Why* envelopes, and these Explain/Throttle caps remain in force even when `WireExtension::WideFrame` is negotiated. WAL entry frames follow §7.1 and already carry `body_len`/`trailer_len` inside the `EntryFrameHeader`.
+- Enumerated fields are encoded as a single `u8` discriminant; once assigned, discriminant values are stable for that enum. Additive enum variants allocate a fresh discriminant at the tail, and receivers MUST reject unknown enum discriminants as `WireUnknownField` even when they appear inside optional/tail structures—forward-compat tails are opaque byte ranges appended after all known fields and MUST NOT contain enums or other mandatory semantics, so new required fields demand either a schema-version bump or a new message ID rather than a tail extension.
+- Optional fields use `u8 has_field` followed by the value. Receivers may skip unknown trailing bytes only when both peers have negotiated `WireExtension::ForwardCompat` and the surrounding framing (message ID, schema header, and body_len) is recognized; mandatory fields (including enums) that are unknown still trigger `WireUnknownField`, even if they reside inside a region that would otherwise be skippable, and unnegotiated trailing bytes are reported under the same error.
+- Frames shorter than the mandatory minimum bytes are rejected as `WireBodyTooShort`; frames exceeding caps are rejected as `WireBodyTooLarge`. Streaming parsers enforce rolling-window buffers for payloads >64 KiB.
+- Experimental enum range `0xF0–0xFF` is reserved; production builds reject messages that use it.
+- Chunked lists follow Appendix E framing with strict CRC enforcement when `has_crc=1` (absence of the CRC when `has_crc=0` is permitted but integrity then relies on the transport) and deduplication by `chunk_offset`. JSON mirrors sort entries lexicographically and include continuation tokens when truncating.
+
+8.2 Message Catalog
+- System log entries: `MembershipChange (0x01)`, `MembershipRollback (0x02)`, `DurabilityTransition (0x03)`, `FenceCommit (0x04)`, `DefineActivate (0x05)`.
+- Messages: `DurabilityAck{partition_id, replica_id, last_fsynced_index, segment_seq, io_writer_mode}`, `PreVoteResponse{term:u64, vote_granted:u8, [has_high_rtt:u8, high_rtt:u8]}`. v0.1+ senders append `has_high_rtt` and the optional `high_rtt` flag as a tail extension; legacy peers send only `term` and `vote_granted`. Receivers treat the absence of the extension as `has_high_rtt=0` and MAY ignore additional tail bytes beyond the defined extension only when the peers have negotiated `WireExtension::ForwardCompat` and `body_len` allows skipping; skipped tails are opaque blobs appended after all known fields (they MUST NOT contain mandatory enums or semantics, and `high_rtt` is a single boolean byte, not an enum discriminant), and absent negotiation any unknown tail bytes trigger `WireUnknownField`.
+- Envelopes: `RoutingEpochMismatch`, `ModeConflict`, `ThrottleEnvelope`, `ControlPlaneUnavailable`, `snapshot_full_invalidated`, `snapshot_delta_invalidated`, `Why*` payloads, `OverrideLedgerEntry`. Each includes `{schema_version, generated_at, partition_id, routing_epoch, durability_mode_epoch}` plus reason-specific fields. Lists carry `truncated_ids_count` and `continuation_token` when truncated.
+- Control-plane readiness surfaces `/readyz` with `{definition_bundle_id, activation_barrier_id, shadow_apply_state, shadow_apply_checkpoint_index, warmup_ready_ratio, partition_ready_ratio, feature.<name>_gate_state, feature.<name>_predicate_digest, readiness_digest}`.
+- Nodes MUST expose `GET /.well-known/wide-int-registry` returning the canonical JSON listing of fields encoded as decimal strings (including all `*_ms`, timestamps, counters, CRC hex strings). JSON outputs accept numeric enums but emit enum strings.
+
+8.3 Handshake and Negotiation
+- Peers exchange `wire.catalog_version={major:u8, minor:u8}` plus negotiated `wire.max_body_len` during the Raft handshake. Optional extension fields ride in the same handshake envelope; when a node advertises `WireExtension::ForwardCompat (0x20)` it MUST include `forward_parse_max_minor:u8` alongside the extension bitmask (typically set to `minor+1`). Both sides must enforce `(remote_minor ≤ local_forward_parse_max_minor)` and `(local_minor ≤ remote_forward_parse_max_minor)` whenever either side advertises ForwardCompat. Violations close the transport before log traffic.
+- `WireExtension::WideFrame (0x10)` reserves larger frame caps (up to 32 MiB) once both peers advertise it; until then, senders must keep RPCs ≤4 MiB, and even after negotiation Explain/Throttle/Why* envelopes remain capped at 32 KiB per §8.1. `WireExtension::WideCount (0x11)` allows `u32` element counts for fields explicitly marked “wide count capable” only when both peers support it; otherwise counts remain `u16` with chunking.
+- Unknown extensions require explicit negotiation; peers reject opportunistic usage with `WireCatalogMismatch`.
+
+8.4 Error Codes
+| Range | Codes |
 | --- | --- |
-| `commit_visibility` | `DurableOnly` (Throughput may gate `CommitAllowsPreDurable`). |
-| Leader leases | Disabled for all profiles. |
-| Merkle enforcement | Mandatory for ControlPlaneRaft / DR / ZFS / Latency; optional elsewhere, default-off only for Throughput. |
-| Observers | Supported in all profiles; Latency/ConsistencyProfile limit ≤2 per partition with dedicated bandwidth pool `0.1 × snapshot.max_bytes_per_sec`. |
-| Durability mode | Strict on boot; Group-Fsync is opt-in with guardrails (§6.2). |
+| `1000–1089` | Main wire errors (`WireBodyTooShort=1001`, `WireBodyTooLarge=1002`, `WireUnknownField=1003`, `WireChunkMissing=1004`, `WireChunkOverlap=1005`, `WireChunkMissingCrc=1006`, `WireChunkCrcMismatch=1007`, `WireChunkDuplicateItem=1008`, `WireChunkReassemblyAborted=1009`, `WireCatalogMismatch=1010`). |
+| `1090–1099` | Vendor-specific extensions; production deployments must relinquish IDs if Clustor later assigns them. |
+| `1100–1199` | Reserved for future Clustor wire-level errors. |
 
-[Informative] To keep the separation between normative requirements, operational guidance, and informational context machine-readable, spec-lint now emits paragraph-level tags `[Normative]`, `[Operational]`, or `[Informative]` into the metadata bundle referenced above. Contributors SHOULD prefix new paragraphs with the appropriate tag (e.g., `[Normative] Crash-linearizable reads require …`) and spec-lint will reject mixed or missing tags once the migration completes. Until all legacy text is annotated, the default interpretation remains “normative unless otherwise tagged,” but downstream tooling can already consume the emitted metadata to filter for the required subset.
+9. State and Lifecycle
 
-[Normative] Releases MAY NOT ship while any paragraph lacks an explicit tag. Spec-lint exposes `clause_tag_coverage` per file; cutting a public build requires `clause_tag_coverage = 100%` and the generated `wire_catalog.json`/`chunked_list_schema.json` bundles MUST embed the same coverage hash so auditors can prove the prose and artifacts were tagged together.
-[Operational] Style guidance: use `reject`/`Reject` for API-level failures that return a cataloged error, reserve `MUST enter Quarantine` for state transitions, and use “fail closed” for read-path behavior. Mixing the verbs is now forbidden in lint, keeping audit language consistent.
-[Informative] To limit terminology drift, every runtime noun or state MUST appear in §2.2’s vocabulary table; sections that introduce new names SHALL reference that table rather than re-describing synonyms inline.
-[Normative] `[Deprecation]` is now a first-class tag for clauses that remain visible for operators but are superseded in a later minor. Spec-lint rejects any `[Deprecation]` paragraph that lacks `clause_superseded_by=<section/App token>` metadata or omits `deprecation_active_until_ms`. The metadata bundle mirrors those references so downstream auditors can prove which successor clause governs the replacement text, and release builds fail when the successor is missing.
-[Operational] Contributors MUST only apply `[Deprecation]` when both the original clause ID and its successor are listed in the metadata bundle. Once the successor version is the sole normative text across all supported minors, either delete the deprecated paragraph or retag it `[Informative]` with the historical context; leaving stale `[Deprecation]` tags in place blocks `clause_tag_coverage = 100%`.
+9.1 Strict Fallback and Read Gate
+- `strict_fallback=true` whenever either (a) the ControlPlaneRaft cache is `Stale` or `Expired` or (b) the leader lacks a ControlPlaneRaft-published `DurabilityProofTupleV1` whose equality subset matches the leader’s last quorum-fsynced tuple (and therefore proves the current-term durable watermark). This latch gates read/lease capability and forces the leader’s local I/O into Strict mode without appending a new durability or `commit_visibility` transition; instead, the leader must behave as though `commit_visibility=DurableOnly` until the latch clears even if the configured mode differed. While set, leaders must:
+  - Reject Group-Fsync enablement (`DurabilityTransition{to=Group}`), leases, follower-read capabilities, incremental snapshot enablement, observer admission, and any admin overrides attempting to bypass the gate.
+  - Clamp read exposure by serving only the DurableOnly semantics (leaders MUST NOT enable or continue serving `CommitAllowsPreDurable` while strict fallback holds) and disable `lease_gap_max`.
+  - Continue accepting writes strictly (each append increments `strict_fallback_pending_entries`) but block ReadIndex and lease reads with `ControlPlaneUnavailable{reason=NeededForReadIndex}`.
+- Followers continue honoring whatever `DurabilityTransition` entries already exist in the log; clamping to Strict while in strict fallback is purely a leader-local I/O behavior until a new transition entry commits.
+- Cache freshness and strict fallback are tightly coupled: once a cache transitions to `Stale` or `Expired`, clause (a) above forces `strict_fallback=true` (and therefore clamps local I/O to Strict mode) until ControlPlaneRaft publishes a proof covering the current `raft_commit_index` and the cache returns to `Fresh/Cached`; clause (b) can also keep the latch asserted independently even if caches are still Fresh/Cached.
+- State tracking: `strict_fallback_state ∈ {Healthy, LocalOnly, ProofPublished}`, `strict_fallback_last_local_proof`, `strict_fallback_blocking_reason`, `strict_fallback_gate_blocked{operation}`, `strict_fallback_decision_epoch`. `strict_fallback_state=LocalOnly` lasting longer than `strict_fallback_local_only_demote_ms` (profile-selected defaults: 14,400,000 ms for Consistency/Throughput, 21,600,000 ms for WAN) forces self-demotion unless a Break-Glass override renews the timer.
+- When a ControlPlaneRaft outage exceeds `strict_fallback_local_only_demote_ms`, the leader must explicitly step down and wait at least `min_leader_term_ms` before campaigning again. After demotion, the node remains barred from leadership until (a) ControlPlaneRaft returns, (b) a fresh `DurabilityProofTupleV1` is published and observed in cache, and (c) a jittered backoff of `strict_fallback_recampaign_backoff_ms = 60,000` elapses. This prevents thrash where the same leader repeatedly regains term without clearing strict fallback.
+- While barred, the node MUST:
+  - Suppress local `Campaign`/`PreVote` attempts (it does not start elections) but still respond to inbound `PreVote`/`RequestVote` RPCs truthfully, granting votes when the candidate’s log is at least as up to date. The response carries `vote_annotation=StrictFallbackBarred` so operators know why the node is not seeking leadership.
+  - Continue processing AppendEntries from the active leader, updating `match_index` and durability state normally so it can rejoin quickly once the bar lifts.
+  - Expose `strict_fallback_barred_until_ms` telemetry so operators can correlate the enforced backoff.
+- Liveness escape hatch: if no leader is observed for `strict_fallback_no_leader_grace_ms = 120,000`, barred nodes MAY temporarily lift the campaign suppression (while remaining in strict fallback) to restore write availability. This escape hatch never re-enables ReadIndex or leases and therefore does not bypass the proof requirement. The bar automatically reactivates once a leader is elected or ControlPlaneRaft `DurabilityProofTupleV1` caches become Fresh.
 
-### 0.3 Wire/API Freeze (v0.1)
-Frozen wire catalog for 0.1.x (new fields may append, no breaking changes):
-- [Informative] App.C is the canonical source for the wide-int and `has_*` patterns, plus the per-message fixtures; §0.3 quotes the same rules only for readability. Spec-lint asserts byte-for-byte equality between this subsection and the App.C bundle so tooling always defers to a single machine-checked narrative.
-- System entries: `MembershipChange (0x01)`, `MembershipRollback (0x02)`, `DurabilityTransition (0x03)`, `FenceCommit (0x04)`.
-- [Normative] §11.4’s System Log Entry Catalog references the same IDs; spec-lint diff-checks `wire_catalog.json` and `system_log_catalog.json` so editors MUST regenerate both artifacts (and update §0.3/§11.4 together) before landing a new entry or renumbering an existing one.
-- Messages: `DurabilityAck{partition_id, replica_id, last_fsynced_index, segment_seq, io_writer_mode}`, `PreVoteResponse{term, vote_granted, high_rtt}`.
-- `PreVoteResponse` serialization: `{term:u64, vote_granted:u8, has_high_rtt:u8, [high_rtt:u8 when has_high_rtt=1]}`. v0.1 senders MUST set `has_high_rtt=1` and include `high_rtt ∈ {0=false,1=true}`. For backward compatibility, receivers MUST treat the absence of the tail bytes (i.e., legacy peers that omit `has_high_rtt`) as `has_high_rtt=0` and MUST ignore any additional tail bytes beyond the known optional fields when `body_len` allows skipping, per the general rule in §0.3. Frames whose `body_len` is shorter than the mandatory `{term(8) + vote_granted(1) + has_high_rtt(1)}` = 10-byte floor (or 9 bytes when legacy peers legitimately omit `has_high_rtt`) MUST be rejected as `WireBodyTooShort`. Future optional fields MUST follow the same “has_*/value” pattern so older parsers can skip them safely.
-- Envelopes: `RoutingEpochMismatch`, `ModeConflict`, `ThrottleEnvelope`, and the shared `Why*` schema header.
-- Encoding freeze:
-  - Binary wires use little-endian fixed-width integers (`u8/u16/u32/u64` as declared) and 32-bit little-endian length prefixes for slices/strings. Arrays first carry a `u16` element count followed by tightly packed elements. Enumerations consume `u8` discriminants; new values append at the tail. Receivers MUST treat any discriminant beyond the highest cataloged value as `WireUnknownField` (never “best-effort” parsing) so forward compatibility remains fail-closed.
-  - Enumerations reserve the `0xF0–0xFF` range as an explicit experimental block. Test-only builds MAY emit those discriminants only when both peers advertise `WireExtension::Experimental (0x40)` and `wire.experimental_range_enable=true`; production builds MUST fail closed with `WireExperimentalField` if any frame in the reserved block arrives. spec-lint enforces that GA catalogs never assign values inside the block, keeping experiments from colliding with future mainline IDs.
-  - Lists that could exceed `u16::MAX` entries MUST be chunked across multiple envelopes/messages. v0.1 reserves `WideCount(u32)` extension IDs for v0.2 so implementers can plan a drop-in upgrade path without rewriting payload semantics; until that extension lands, every field that might grow beyond 65,535 elements must document its chunking rules. The canonical `ChunkedList` framing—including layout, CRC policy, receiver obligations, and JSON mirror rules—is defined in App.E. Fields that adopt `ChunkedList` MUST cite App.E and follow its behavioral requirements verbatim so streaming parsers can recover deterministically.
-  - Unknown binary fields MUST be ignored when they appear after known fields and the enclosing length permits skipping; unknown mandatory fields before the known region cause `WireUnknownField` rejects. Implementations SHALL compute the minimum required byte length for all mandatory fields of a message; if the declared `body_len` (or envelope length) is shorter than that floor, the receiver MUST reject the payload as `WireUnknownField` even before parsing tail fields.
-  - App.C (“Binary Schema & `has_*` Pattern Vectors”) publishes normative byte layouts plus pass/fail fixtures for the length-prefixed strings, arrays, and `has_optional_field` pattern described here. Implementations MUST round-trip those vectors exactly before claiming §0.3 compliance.
-  - Every message/envelope is length-delimited: a 32-bit little-endian byte length (or message-specific 32-bit `body_len`) precedes the payload so receivers can skip unknown tail fields without stream corruption. Each catalog entry therefore declares a maximum `body_len`: unless noted otherwise, Raft RPCs and admin messages MUST set `body_len ≤ 4 MiB`, while Explain/Why*/Throttle envelopes MUST remain ≤32 KiB. The total frame on the wire is therefore `4 bytes (length prefix) + body_len`; no implementation may hide bytes outside that window, and the effective “frame cap” is `4 MiB + 4` for Raft RPCs and `32 KiB + 4` for envelopes. Receivers MUST begin parsing as a streaming read with bounded buffers and MUST abort with `WireBodyTooLarge` if `body_len` exceeds the catalog cap or if more than the declared length arrives on the wire (protecting against DoS). Payloads that exceed the cap MUST be rejected in their entirety—truncation or “best effort” processing is forbidden so that senders cannot smuggle partial frames past the cap. When a frame is shorter than the mandatory floor, both transports behave identically: gRPC replies with `INTERNAL` carrying `WireBodyTooShort`, and raw TCP peers emit the same `WireBodyTooShort` catalog code before tearing down the connection. Streaming parsers MAY buffer the entire payload only when the cap is ≤64 KiB; beyond that they MUST enforce a rolling window.
-  - Large-frame roadmap: catalog bit `WireExtension::WideFrame (0x10)` is reserved for v0.2 so future snapshot-control or bulk-admin RPCs can negotiate `body_len` up to 32 MiB without fragmenting payloads. The sanctioned upgrade path is: (1) ControlPlaneRaft flips the `feature.wide_frame` gate, (2) both peers advertise `WireExtension::WideFrame` during the Raft handshake along with the negotiated `wire.max_body_len`, and (3) senders keep every RPC ≤4 MiB until the extension is observed in **both** handshake directions. v0.1 implementations MUST reject ad-hoc frame increases that attempt to bypass this sequence and MUST fall back to the 4 MiB cap whenever the extension bit clears mid-connection.
-  - `WideCount(u32)` placeholder: v0.1 reserves `WireExtension::WideCount (0x11)` for payloads whose element counts may exceed `u16::MAX`. Until the extension is negotiated bidirectionally, senders MUST continue chunking via App.E and MUST bound every serialized `element_count` to `u16`. When both peers advertise `WireExtension::WideCount`, fields explicitly marked “wide count capable” MAY encode a `u32` count while maintaining the same `ChunkedList` framing; all other fields remain unchanged.
-  - gRPC services always transmit enums numerically; JSON mirrors emit enum **strings** and also accept the numeric value for backward compatibility. Servers reject unknown enum **strings** with `WireUnknownField` (or HTTP 400) but MUST accept recognized numeric IDs so upgraded clients can talk to older servers. Field names and casing are frozen; clients must tolerate additive fields but reject missing required ones.
-  - [Informative] JSON wide-int summary: App.C is the sole normative catalog for the JSONPath list, `json_numeric_exception_list`, `WireWideIntNotString`, and the golden `wide_int_catalog.json`. Per App.C, wide-integer fields (including every `*_ms` timestamp and ledger counter) continue to emit decimal strings even when the value fits inside `2^53-1`, optional numeric parsing is allowed only when `json.accept_numeric_wide_ints=true` and the token round-trips losslessly, and `entries_crc32c`/`offsets_crc32c` stay 34-character hex strings. This subsection captures the effect of that mandate so mainline docs and generators import the App.C bundle verbatim, expose `/.well-known/wide-int-registry`, and diff the generated catalog on every build instead of rephrasing the rules independently.
-  - To keep client generators in sync, nodes MUST expose the same catalog at runtime via `GET /.well-known/wide-int-registry` (JSON). The payload is exactly the canonical artifact above (`schema_version`, list of JSONPaths, and exception list hash). Clients MAY cache it, but servers MUST update the endpoint whenever App.C changes so automation never scrapes prose to discover wide integers.
-  - Machine-readable schema bundle: every build MUST emit a deterministic `wire_catalog.json` (system entries, RPCs, envelopes, enums, field ordering, byte widths) plus `chunked_list_schema.json` derived mechanically from §0.3 and Appendices C/E. Spec-lint fails the build if those artifacts drift from the prose, and release manifests MUST include the exact git hash of the emitted bundle so downstreams can diff their generators. Nodes carry the same bundle at runtime and refuse to start when the embedded bytes differ from the published catalog.
-  - Forward-compatibility negotiation: transports MUST exchange `wire.catalog_version = {major:u8, minor:u8}` during the initial Raft handshake. Peers MAY communicate tolerance for one future minor by setting `WireExtension::ForwardCompat (0x20)` and advertising `forward_parse_max_minor = minor+1`; any larger gap forces the connection to close with `WireCatalogMismatch`. Major changes (e.g., 0.1 → 0.2) therefore require both ends to upgrade before traffic resumes, while minor bumps can flow one direction so long as the older peer sets `forward_parse_max_minor >= sender.minor`. During rolling upgrades, each side MUST validate both inequalities: `(remote_minor ≤ local_forward_parse_max_minor)` **and** `(local_minor ≤ remote_forward_parse_max_minor)`; violating either closes the transport before log traffic begins so asymmetric tolerances cannot silently downgrade safety. Older peers that advertise `forward_parse_max_minor = minor+1` MUST record that pledge in `bundle_negotiation_log` (the per-partition handshake transcript stored beside `wire_catalog.json`) and revoke it immediately after the handshake if the newer peer uses fields outside the catalog diff; skipping the revocation forces `WireCatalogMismatch` on the next RPC. The same version tuple MUST appear in `consensus_core_manifest.json` so bundle hashes, negotiation bytes, and ControlPlaneRaft durability proofs cannot diverge.
-  - [Normative] Error code registry: spec-lint enforces the allocation table below so tooling has a single authoritative range map. Any change requires updating this subsection and regenerating the catalog in the same commit.
+9.2 Leader and Follower Lifecycle
+- Leaders must persist `current_term` before AppendEntries, enforce `wal_committed_index ≤ raft_commit_index`, and export telemetry referencing the controlling clauses (e.g., durability equality).
+- Elections: timeouts `[150,300] ms` (ConsistencyProfile/Throughput) or `[300,600]` ms (WAN); heartbeats every 50 ms; PreVote always enabled. `PreVoteResponse.high_rtt=true` widens the next election window when a follower observes high RTT for three consecutive heartbeats. `min_leader_term_ms=750` ensures stickiness; step-down occurs on structural lag, device latency violations (three consecutive samples above threshold or moving average > bound), or ControlPlaneRaft `TransferLeader`.
+- Followers never serve ReadIndex; they operate snapshot-only reads after ControlPlaneRaft grants `follower_read_snapshot_capability`. Capabilities are revoked within 100 ms when guardrails fail, and RPCs must close with `FollowerCapabilityRevoked`.
+- Observers rely on dedicated bandwidth pools and are revoked whenever `strict_fallback` or cache freshness fails.
+- All numeric guardrails referenced in this section (`observer.bandwidth_cap`, `membership.catchup_slack_bytes`, etc.) originate from the profile bundles in App.B; deployments MAY tighten them but MUST keep them within the documented profile ranges.
 
-    | Range | Assignment |
-    | --- | --- |
-    | `1000–1089` | Mainline wire-level errors (e.g., `WireBodyTooShort=1001`, `WireBodyTooLarge=1002`, `WireUnknownField=1003`, `WireChunkMissing=1004`, `WireChunkOverlap=1005`). |
-    | `1090–1099` | Vendor-specific extensions; downstream experiments MAY use these IDs but must relinquish them if Clustor later assigns the value. |
-    | `1100–1199` | Reserved for future Clustor wire-level extensions after v0.1; vendors MUST NOT allocate from this block until §0.3 is updated with the concrete assignments. |
-    | `2000–2010` | Control-plane availability errors (e.g., `ControlPlaneUnavailable{NeededForReadIndex}=2000`, `ControlPlaneUnavailable{CacheExpired}=2001`). |
-    | `2011` | Snapshot fallback exhausted (`SnapshotOnlyUnavailable`). |
-    | `2012` | Follower capability revoked (`FollowerCapabilityRevoked`), emitted when ControlPlaneRaft yanks the follower-read capability (§3.3). |
+9.3 Durability Modes and I/O Writer States
+- `io_writer_mode ∈ {FixedUring, RegisteredUring, Blocking}`. Group-Fsync is disabled whenever any voter reports `Blocking` and remains disabled until all voters report non-Blocking modes (`FixedUring`/`RegisteredUring`) for the recovery window. Downgrades clamp group batch sizes/timers and emit incidents after `io_writer_mode.downgrade_incident_ms`.
+- Leaders authenticate `io_writer_mode` via the same Raft heartbeat metadata used for flow-control telemetry; the mTLS channel plus replica identity/term fields provide integrity, so spoofing requires a compromised replica (the same trust model as `DurabilityAck`). Because the fault model is crash-only, a single voter stuck in `Blocking` is sufficient to fence Group-Fsync; operators must demote or repair the replica if it wedges the gate. Byzantine behavior is out of scope—if a replica maliciously reports `Blocking`, the operator must remove it from the voter set.
+- Group-Fsync re-enablement predicate:
+  ```
+  fn can_enable_group_fsync(state) -> bool {
+      !state.strict_fallback &&
+      state.controlplane.cache_state == CacheState::Fresh &&
+      now() >= state.downgrade_backoff_deadline &&
+      state.voters.iter().all(|v| v.io_mode != Blocking) &&
+      state.device_latency_violations_in_window < 3 &&
+      !state.incident_flags.contains("GroupFsyncQuarantine") // incident flag that fences Group-Fsync batches
+  }
+  ```
+- Per-partition limits: `group_fsync.max_batch_bytes ≤64 KiB`, `max_batch_ms ≤5 ms`, inflight bytes ≤4 MiB per partition, ≤64 MiB per node, `overrun_limit=2`, exponential backoff up to 15 min. Node-level incidents may further clamp credits without changing the predicate.
+- `durability_mode_epoch` MUST be monotone across the cluster. A follower that has persisted epoch `E` MUST reject any AppendEntries or admin RPC that carries an older epoch (`E' < E`) by replying with `ModeConflict(durability_mode_epoch)` over RPC (or closing the Raft stream) and logging `DurabilityModeEpochConflict`. The stale leader must step down immediately and replay the transition fences once it has refreshed its proof cache. ControlPlaneRaft mirrors the conflict as an incident so operators can audit stale binaries.
 
-    gRPC enumerations SHALL use these numeric IDs verbatim, and JSON payloads SHOULD include the matching `error_code` field so telemetry and clients never rely on free-form strings.
-  - `ChunkedList` receiver rules: chunks may arrive out of order. Receivers MUST deduplicate by `chunk_offset`, reject overlaps or gaps, verify that `∑ chunk_len == total_count`, and validate `chunk_crc32c` whenever the field requires it. Fields that legitimately omit the CRC MUST continue to perform strict offset accounting. Missing chunks MUST produce `WireChunkMissing`.
+9.4 Startup, Scrub, and Quarantine
+- Startup scrub authenticates AEAD blocks, validates MACs/CRC/Merkle, rebuilds `.idx` files, verifies ledger ordering, truncates unreadable tails, and records `boot_record.scrub_state`. AEAD or MAC failures immediately quarantine the partition; CRC-only failures mark `needs_repair` with exponential backoff (up to three retries) before escalation.
+- Background scrub samples ≥1% of entries per segment every 21,600,000 ms (6 h), ensuring every WAL byte is hashed at least once every 604,800,000 ms (7 days) and reporting `scrub.coverage_age_days`. Repair escalation enters Quarantine on repeated anomalies.
+- Quarantine states: `Healthy → Quarantine` on integrity faults, `Quarantine → RepairMode` for offline work, `Quarantine → Decommissioned` when removed. While quarantined, writes and membership changes are disabled, follower reads and snapshot exports depend on reason, and readiness surfaces `WhyQuarantined{reason, since_ms}`.
+- Quarantine scope is strictly per-partition. ControlPlaneRaft records `quarantine_reason` and `since_ms`, but other partitions on the same node continue operating unless they independently violate guardrails. Admin tooling MUST NOT propagate quarantine automatically; operators must investigate neighboring partitions separately to avoid cascading outages.
 
-### 0.4 Negative Space (out of scope in v0.1)
-- Lease reads and observers never contribute to quorum, ReadIndex, compaction, or durability.
-- No relaxed crash model beyond fail-stop + ordered filesystems.
-- ZFS deployments are treated as “ordered” only when `sync=always` pins intent log semantics (SLOG or main pool). Operators must ensure the SLOG/main pool pair delivers the same write-ordering guarantees promised in §1.2.1 or downgrade the filesystem profile.
+9.5 Snapshot Lifecycle
+- Emit full snapshots when log bytes reach `snapshot.log_bytes_target = 512 MiB`, when the elapsed wall-clock time since the last successful full snapshot would exceed the operator/ hard bound (`snapshot.full_emit_period_ms_operator` if set, otherwise the profile hard bound `snapshot.full_emit_period_ms_hard_profile`), or when follower lag ≥64 MiB. Implementations SHOULD meet `snapshot.full_emit_period_ms_target` (30,000 ms default) and SHOULD emit `delta_chain_state=GracefulCatchup` plus telemetry whenever the target is missed by >25%, but they MUST only disable incrementals (set `delta_chain_state=Orphaned`) when the operator or hard bound is exceeded without progress; failure to meet a target alone never forces a mode change. Snapshot emission, `content_hash` computation, and manifest signing follow the canonical JSON procedure in §7.1 (remove `content_hash`/`signature` before hashing).
+- Incremental snapshots run on an independent cadence measured from the `manifest_id.emit_ts` of the previous delta. Implementations SHOULD meet `snapshot.delta_emit_period_ms_target` (10,000 ms default) and MUST NOT exceed `snapshot.delta_emit_period_ms_operator` (if configured) or the profile hard bound `snapshot.delta_emit_period_ms_hard_profile`. Temporary overruns produce `GracefulCatchup`; only exceeding the operator/hard bound without emission forces a full snapshot and marks the chain orphaned until a compliant delta resumes the cadence.
+- Snapshot import steps: (1) canonicalize & verify manifest signature/DEK epoch; (2) check `version_id` bounds; (3) stream AEAD-authenticated chunks, zeroizing buffers and retrying up to three times (≤60 s) before quarantining; (4) buffer AppendEntries (bounded per partition by `snapshot.import_buffer_max_entries_profile` (default 8,192) and `snapshot.import_buffer_max_bytes_profile` (default 8 GiB) but also globally capped by `snapshot.import_node_buffer_hard_cap_bytes_profile` (default min(32 GiB, 15% RAM) per node)—the effective limit is `min(per-partition cap, remaining node budget)` and implementations MUST treat the per-partition values as upper bounds subject to the node cap, spilling to disk-backed staging if necessary) until `applied_index >= base_index`; (5) reconcile follower checkpoints and ControlPlaneRaft trust caches. Buffer exhaustion emits `ThrottleEnvelope{reason=SnapshotImport}`. Profiles MAY tune these SLO parameters within the bounds in App.B.
+- Snapshot bandwidth budgets: `snapshot.max_bytes_per_sec = 128 MiB/s` per peer with 90%/60% hysteresis; node-level cap `min(0.7 × NIC capacity, 1 GiB/s)`.
 
-### 0.5 Strict Fallback Gate (normative table)
-`strict_fallback_state` ties every guardrail in §§3, 6, 8, 9, and 11 back to the Consensus Core. `LocalOnly` corresponds to `strict_fallback=true`. This table now lives in §0 so that future drafts cannot diverge without an explicit Consensus Core change; App.C only mirrors it for telemetry guidance.
+9.6 Compaction and Storage Hygiene
+- WAL deletion requires `(a)` at least `compaction.quorum_ack_count` replicas reporting `sm_durable_index ≥ snapshot_base_index`, `(b)` floor `max(learner_slack_floor, min(quorum_applied_index, snapshot_base_index))`, `(c)` manifest authorization handshake, `(d)` learner retirement guardrails, `(e)` nonce reservations cleared or abandoned, `(f)` no integrity/quarantine blocks. Disk policy checks enforce safe write cache modes, barriers, and stacked-device validation before bootstrap.
 
-| Operation | Healthy | LocalOnly | ProofPublished |
-| --- | --- | --- | --- |
-| Accept Strict-mode writes | Allowed | Allowed (forced Strict, `group_fsync=false`) | Allowed |
-| Enable Group-Fsync / `DurabilityTransition{to=Group}` | Allowed (subject to other guards) | Reject with `ModeConflict(strict_fallback)` | Allowed |
-| Expose `CommitAllowsPreDurable` reads | Allowed where profile permits | Forced `commit_visibility=DurableOnly` | Allowed |
-| ReadIndex / linearizable reads | Allowed | Reject with `ControlPlaneUnavailable{reason=NeededForReadIndex}` | Allowed |
-| Grant `follower_read_snapshot_capability` | Allowed when other caps satisfied | Reject (`FollowerCapabilityRevoked`/ControlPlaneRaft refuses bit) | Allowed |
-| Enable delta snapshots / `snapshot_delta` APIs | Allowed | Reject with `ControlPlaneUnavailable{reason=CacheExpired}` | Allowed |
+9.7 Definition Bundles and Activation Barriers
+- ControlPlaneRaft issues `DefinitionBundle{bundle_id, version, sha256, definition_blob, warmup_recipe}` plus `ActivationBarrier{barrier_id, bundle_id, readiness_threshold, warmup_deadline_ms, readiness_window_ms, partitions[]}`. Nodes stage bundles under `/state/<partition>/definitions`, verify digests, run shadow apply queues, and publish `WarmupReadiness{partition_id, bundle_id, shadow_apply_checkpoint_index, partition_ready_ratio}`. `DefineActivate` commits only when every partition reports `warmup_ready_ratio ≥ readiness_threshold` within the deadline; mismatches abort with `ActivationBarrierExpired`.
 
-`ProofPublished` is a telemetry-only state indicating ControlPlaneRaft has mirrored the leader’s proof; once it lands, the gate behaves identically to `Healthy`.
-[Normative] During `LocalOnly`, ReadIndex is always rejected regardless of cached proofs; only Snapshot-Only reads per §3.3 remain permitted until ControlPlaneRaft mirrors the durability proof.
-[Normative] When `strict_fallback=true` and `controlplane.cache_state=Expired` occur simultaneously (common during extended ControlPlaneRaft outages), the stricter interpretation prevails: partitions remain in Strict mode, linearizable reads fail closed with `ControlPlaneUnavailable{reason=NeededForReadIndex}`, and admin operations that already require a fresh ControlPlaneRaft cache MUST fail with `ControlPlaneUnavailable{reason=CacheExpired}` even if the strict-fallback table would otherwise allow them. Implementations MUST NOT attempt to “partially” honor an operation because one state is less restrictive; instead, evaluate the strict-fallback truth table **and** the ControlPlaneRaft cache state, returning the first rejection reason per `StrictFallbackPriorityOrder` and surfacing the same ordering via telemetry (`strict_fallback_blocking_reason`). This keeps operators from seeing divergent gate decisions during long outages.
-[Normative] Every transition of the strict-fallback decision logic MUST increment a monotone `strict_fallback_decision_epoch:u64`. All rejection telemetry (`strict_fallback_gate_blocked{operation}`, `ControlPlaneUnavailable{...}` driven by §0.5, `/readyz` fields, incidents) MUST carry the current epoch so overlapping rejections sharing the same predicate result can be correlated without appearing as flapping.
-[Normative] `strict_fallback_state=LocalOnly` continues to authorize snapshot imports needed for DR so long as (a) the manifest’s ControlPlaneRaft signature validates against the last trusted keys, (b) the trust cache remains fresh (i.e., has not exceeded `controlplane.cache_grace_ms`), and (c) the import records `strict_fallback_snapshot_import_reason`. Imports MAY NOT clear strict fallback or advance ControlPlaneRaft durability proofs on their own, and any manifest authorized during LocalOnly MUST be revalidated once ControlPlaneRaft connectivity returns before compaction consumes it. Failed validations push the partition to Quarantine immediately even if the import initiated under LocalOnly.
+9.8 ControlPlaneRaft Proof Publication
+- The proof consumed by read gates and strict-fallback clearance is serialized as `DurabilityProofTupleV1 = {partition_id, last_durable_term, last_durable_index, segment_seq, io_writer_mode, durability_mode_epoch, controlplane_signature, updated_at}`. `controlplane_signature` is an Ed25519 signature produced by the ControlPlaneRaft proof-signing key (`ControlPlaneProofKey` in §12.4). ControlPlaneRaft enforces that this tuple is strictly monotone when compared lexicographically on `(last_durable_term, last_durable_index, segment_seq, durability_mode_epoch)` per partition; toggling `durability_mode_epoch` therefore requires the same `DurabilityTransition` entry to advance `(last_durable_term, last_durable_index)` as well. Nodes MUST verify the signature, then compare `{last_durable_term, last_durable_index, segment_seq, io_writer_mode, durability_mode_epoch}` to the last `DurabilityRecord` persisted locally; `updated_at` and the signature bytes are excluded from the equality check. Reads are refused whenever the signed tuple and the local record diverge. Whenever this document says the proof “matches” or references `controlplane.proof`, it refers to equality on that exact subset.
+- When two proofs are observed (e.g., after a partitioned ControlPlaneRaft quorum) replicas accept only the one with the higher `(last_durable_term, last_durable_index, segment_seq, durability_mode_epoch)` tuple. Observing identical `(last_durable_term, last_durable_index)` values with different `segment_seq` or `durability_mode_epoch` immediately raises `ControlPlaneProofConflict`; replicas stay in strict fallback and require operators to reconcile ControlPlaneRaft before proceeding.
+- Leaders may leave strict fallback only after ControlPlaneRaft durably appends the proof that matches their local ledger. Possessing a locally verified tuple without the ControlPlaneRaft append is insufficient, and leaders must continue in Strict mode until they can publish a fresh proof and observe it replicated with the correct signature.
 
----
+9.9 Membership Changes and Joint Consensus
+- Reconfigurations follow four phases:
+  1. **Preflight**: ControlPlaneRaft validates placement feasibility (≤70% utilization after the move), survivability prechecks (`Q` and `H` ratios), and deterministic rehearsal (`placement_digest`). Failure produces a structured error; overrides require signed justification in the override ledger.
+  2. **Catch-up**: Joining replicas enter `Learner` state and must satisfy either `(raft_commit_index - membership.catchup_slack_bytes)` with default 4 MiB or `(leader.last_log_index - membership.catchup_index_slack)` with default 1024 entries within `membership.catchup_timeout = 120,000` ms. Meeting either guard is sufficient unless policy demands both.
+  3. **Joint consensus**: After catch-up, the leader writes `MembershipChange{old_members[], new_members[], routing_epoch, placement_digest}` and operates with the union quorum. Voluntary leader transfers are blocked while in joint config. Each `MembershipChange` carries the rehearsal digest so replay can prove the change was prevalidated.
+  4. **Finalize**: Once `joint_commit_count >= membership.finalize_window` (default 64) and structural lag is below both `lag_bytes < 64 MiB` and `lag_duration < 30 s`, the leader commits the pure new configuration and mirrors it back to ControlPlaneRaft. ControlPlaneRaft records the resulting proof so subsequent joins can cite the exact ledger index.
+- Rollback occurs when catch-up fails, lag remains structural beyond `membership.rollback_grace_ms = 3000`, or survivability prechecks fail mid-flight. Rollback appends `MembershipRollback{reason, failing_nodes[], override_ref}`, commits it under the joint quorum, records the durability proof for the rollback index, and only then allows elections to proceed.
+- Every membership transition emits `DurabilityTransition`/`FenceCommit` proofs if durability modes or DR fences change simultaneously. Replicas must persist the ControlPlaneRaft ack containing `{routing_epoch, membership_digest, durability_mode_epoch}` before serving client traffic under the new membership, ensuring observers can prove which quorum composition produced the active log suffix.
 
-## 1  Architecture & Crash Model
+10. Algorithms and Consistency Rules
 
-Clustor is a reusable Raft consensus core that embeds in higher-level services. All behavior is subordinate to §0.
+10.1 Election and Pre-Vote Logic
+- Election timeout draws uniformly from `[150,300]` ms (ConsistencyProfile/Throughput) or `[300,600]` ms (WAN). PreVote high-RTT detection requires `ema_heartbeat_rtt_ms ≥ threshold` for three consecutive heartbeats; thresholds: 150 ms (ConsistencyProfile/Throughput), 350 ms (WAN). High-RTT followers widen their next election window to the WAN range for the next leadership attempt and revert to their profile’s normal window as soon as they observe a healthy leader heartbeat or grant a vote in a successful election.
+- Leader stickiness: `min_leader_term_ms=750`. Device latency hysteresis requires 3 consecutive fsync samples above `durability.max_device_latency_ms` or a 500 ms moving average before forcing step-down; recovery requires 5 consecutive samples below 80% of the threshold.
 
-### Goals
-- Ship a replicated log + WAL stack with explicit hooks for encoding, apply, snapshot, and audit extensions.
-- Align durability and ordering semantics with downstream terminology so products can map acknowledgment policies directly.
-- Provide PID-style flow-control hooks for ingest-heavy services.
-- Include ControlPlaneRaft for tenants, placements, keys, feature gates, and DR fencing.
-- Deliver deterministic recovery, explainable throttling, and auditable operations.
+10.2 Lease Inequality
+- Leases may run only when:
+  ```
+  lease_duration_ms + lease_rtt_margin_ms + clock_skew_bound_ms + heartbeat_period_ms
+  < min_election_timeout_ms
+  ```
+- `min_election_timeout_ms` equals the lower bound of the election-timeout range for the active profile (150 ms for ConsistencyProfile/Throughput, 300 ms for WAN).
+- Operators MUST verify the inequality using the profile parameters in Appendix B (lease duration, RTT margin, clock skew bound, heartbeat period); v0.1 profiles meet the guard but ship with `lease_gap_max=0`, keeping leases disabled until a future profile explicitly enables them. Additional prerequisites: `strict_fallback=false`, `commit_visibility=DurableOnly`, ControlPlaneRaft cache ∈ {Fresh, Cached}, the `DurabilityProofTupleV1` subset `{last_durable_term, last_durable_index, segment_seq, io_writer_mode, durability_mode_epoch}` matches the local ledger tuple, `wal_committed_index == raft_commit_index`, `clock_guard_alarm=0`. Even though equality is already enforced, `lease_gap_max` continues to emit `LeaseGapExceeded` incidents whenever the instantaneous gap deviates, so operators retain telemetry on near-miss conditions.
+- Skew alarms trigger voluntary leader step-down within 500 ms and immediately revoke leases. NTP-only deployments must declare `clock_guard_source=NtpOnly`, relax bounds (15/20/60 ms), keep leases disabled, and continue step-down behavior on alarms.
 
-### 1.1 Integration Targets & Use Cases
-| Product | What Clustor Provides | Upper-Layer Responsibility |
+10.3 Read Gate Predicate and Service Matrix
+- Leaders serve ReadIndex requests only when:
+  - `strict_fallback == false`
+  - `controlplane.cache_state ∈ {Fresh, Cached}` (i.e., caches are not `Stale` or `Expired`)
+  - `commit_visibility == DurableOnly`
+  - the `DurabilityProofTupleV1` subset `{last_durable_term, last_durable_index, segment_seq, io_writer_mode, durability_mode_epoch}` equals the leader’s last quorum-fsynced tuple
+  - `wal_committed_index == raft_commit_index`
+- Violations emit `ControlPlaneUnavailable{reason ∈ {CacheNotFresh, CacheExpired, NeededForReadIndex}}` per the priority order (`CacheExpired` for `Expired`, `CacheNotFresh` for `Stale`, `NeededForReadIndex` for strict-fallback/proof failures). Telemetry must expose `read_gate.can_serve_readindex` and `read_gate.failed_clause`.
+- Reference predicate used across the spec:
+  ```
+  fn read_gate_predicate(state: &LeaderState) -> (bool, FailedClause) {
+      if state.controlplane.cache_state == CacheState::Expired {
+          return (false, FailedClause::ControlPlaneCacheExpired);
+      }
+      if state.controlplane.cache_state == CacheState::Stale {
+          return (false, FailedClause::ControlPlaneCacheStale);
+      }
+      if state.strict_fallback { return (false, FailedClause::StrictFallback); }
+      if state.commit_visibility != CommitVisibility::DurableOnly {
+          return (false, FailedClause::CommitVisibility);
+      }
+      if state.controlplane_proof_tuple != state.last_quorum_fsynced_tuple {
+          return (false, FailedClause::ControlPlaneProofMismatch);
+      }
+      if state.wal_committed_index != state.raft_commit_index {
+          return (false, FailedClause::IndexInequality);
+      }
+      (true, FailedClause::None)
+  }
+  ```
+  Follower versions replace the last clause with `local_wal_durable_index ≥ applied_index_floor` when serving snapshot-only reads.
+- Read availability across modes:
+| Node role / read type | Normal mode | Strict fallback |
 | --- | --- | --- |
-| MQTT Broker | Partitioned Raft log for session state + retained messages; ControlPlaneRaft tenancy objects | MQTT protocol, routing, QoS |
-| Key-Value Store | Ordered log, snapshot shipping, placement metadata | Serialization, compaction, read serving |
-| Control-Plane Services | ControlPlaneRaft tenancy, DR fencing, placement enforcement | API surface, orchestration, IAM |
-| Streaming Processors | Flow-controlled append API with strict/batched durability and trace metadata | Payload encoding, windowing, higher-level semantics |
-
-### 1.2 Architectural Guarantees
-| Dimension | Guarantee |
-| --- | --- |
-| Consistency | Linearizable writes per partition; followers serve only `applied_index` checkpoints (§3.3). |
-| Availability | Raft majority progress with hot-standby followers. |
-| Durability modes | Strict (per-append fdatasync) and Group-Fsync (bounded batching with auto-downgrade). |
-| Storage | Segment-structured WAL + signed snapshot manifests. |
-| Telemetry | Uniform metrics, explain endpoints, signed audit streams. |
-| Security | mTLS/SPIFFE, AEAD WAL/snapshots, keyed epochs. |
-
-† Crash-linearizable reads require `commit_visibility=DurableOnly` (§1.2.1, §3.3) per the §0.2 default.
-†† Follower-serving APIs are limited to signed snapshot exports or `FollowerReadSnapshot` capability surfaces; followers never respond to ReadIndex RPCs (§3.3).
-
-> **Availability note:** Linearizable reads remain ControlPlaneRaft-dependent. During ControlPlaneRaft outages, leaders continue to accept writes in Strict mode but ReadIndex/follower reads fail closed with `ControlPlaneUnavailable{reason=NeededForReadIndex}` until ControlPlaneRaft acknowledges the durability watermark (§3.3). Users who require read availability during ControlPlaneRaft partitions must provision snapshot-only fallbacks or accept degraded semantics.
-
-[Normative] Nodes MUST expose `/partitions/{id}:snapshot_read` (and the equivalent gRPC) during `strict_fallback_state ∈ {LocalOnly, ProofPublished}` with the header `read_semantics=SnapshotOnly`. Requests lacking the header continue to fail with `ControlPlaneUnavailable{reason=NeededForReadIndex}`; requests that include it return data exclusively from the latest durably verified snapshot (`manifest_id`, `base_index`, `content_hash`) plus the `applied_index` watermark recorded before the outage. Responses MUST carry `Snapshot-Only: true`, `Snapshot-Manifest-Id`, and `ControlPlane-Cache-Age-Ms` headers so clients can audit which checkpoint served the read.
-[Normative] Even while ControlPlaneRaft durability proofs are stale, leaders MUST emit `partition_ready_ratio_snapshot`, `snapshot_manifest_age_ms`, and `snapshot_only_ready_state ∈ {Healthy, Degraded, Expired}` via telemetry and `/readyz`. `partition_ready_ratio_snapshot` is defined as `(applied_index_snapshot / last_advertised_ready_index)` clamped to `[0,1]` and is derived solely from locally persisted manifests so it remains valid without ControlPlaneRaft. Read fallback remains enabled only while the ratio ≥ `snapshot_only_min_ready_ratio = 0.80`; falling below forces snapshot reads to fail with `SnapshotOnlyUnavailable` and pages operators.
-[Operational] The SnapshotOnly path carries an SLO of ≥99.5% success and ≤400 ms p99 latency for steady-state partitions; exceeding either threshold for `snapshot_only_slo_window_ms = 300000` increments `snapshot_only_slo_breach_total` and requires an incident. Dashboards MUST surface the SLO plus the readiness ratio so tenants know when reads are degraded but still within the documented guardrails.
-
-#### 1.2.1 Crash Model & Visibility Policy
-- Fail-stop crashes: dirty cache lost unless `fdatasync` completes; multiple replicas may fail simultaneously.
-- Supported filesystems: XFS, ext4 with ordered barriers, or ZFS with `sync=always`. Bootstrap rejects incompatible mounts per the table below.
-
-| Filesystem | Required policy | Notes | Enforcement outcome |
-| --- | --- | --- | --- |
-| ext4 | `data=ordered`, barriers and `auto_da_alloc` enabled, `commit <= 5`, `nojournal_checksum=false`, and device write cache configured for `write through` or `write back` with `fua=1`. `nobarrier`, `data=writeback`, `commit>5`, or `write_cache=unsafe` mounts are rejected. | `journal_async_commit` is recommended for latency but optional; operators must document deviations. | Reject the mount during bootstrap; node remains quarantined until policy-compliant settings are observed. |
-| XFS | `logbsize >= 256k`, device reports `queue/write_cache ∈ {write through, write back}` with `queue/fua=1` or `queue/flush=1`. Mount options that disable barriers are disallowed even if ignored by the kernel. | Barrier enforcement is verified via `/sys/block/*/queue` capabilities rather than mount strings. | Reject on bootstrap or quarantine immediately if live telemetry diverges from the recorded capabilities. |
-| ZFS | Dataset property `sync=always`, `logbias=throughput`, devices expose `queue/fua=1`. | Group-Fsync remains disabled unless devices prove `<20 ms` fsync (§App.B). | Allow Strict mode; quarantine Group-Fsync enablement until the fsync proof stays beneath the threshold. |
-[Normative] Any future table that describes policy guardrails MUST reuse the `Enforcement outcome` header with `{Allow, Reject, Quarantine}` semantics so spec-lint can parse the Markdown mechanically and keep automation aligned with the prose.
-- ZFS proof of `<20 ms` fsync: nodes MUST run the built-in `fsync_probe` (128 sequential `fdatasync`s against the WAL device) at bootstrap and every `zfs.fsync_probe_interval = 3600 s`. Results (`fsync_probe_p99_ms`, sample count, dataset GUID, device serial) are recorded in `boot_record.json` and telemetered to ControlPlaneRaft. Group-Fsync may only be enabled when the most recent probe shows `p99 ≤ 20 ms` and at least 128 samples; a regression above 20 ms for three consecutive probes forces automatic Strict downgrade with hysteresis matching `durability.max_device_latency_ms`.
-- Mirrored SLOG devices that rely on asynchronous replication are acceptable only when the probe above still reports `p99 ≤ 20 ms`; otherwise Group-Fsync remains locked out even if individual devices appear healthy.
-- The probe writes to a dedicated file under the same dataset/mount as the WAL (default path `wal/.fsync_probe/probe.bin`) so the measurement captures the exact storage stack. Each run truncates the file to `zfs.fsync_probe_bytes = 4 MiB`, issues the 128 `fdatasync`s, and then unlinks the file; no residual state remains beyond telemetry.
-- Multi-device WAL environments (RAID, dm-crypt, dm-multipath) are permitted only when the **composite** stack can prove ordered flushes: every layer between the filesystem and physical media MUST advertise barriers and FUA, and operators MUST document the journaling or write-intent mechanism (e.g., MD journal mode, battery-backed cache) that preserves `pwrite → fdatasync` ordering. Stacks lacking such attestations are treated as “unknown filesystem” and quarantined until ControlPlaneRaft records an explicit `disk_override`.
-  - `disk_override` objects are canonical JSON documents stored in ControlPlaneRaft and MUST match the schema below so tooling can diff overrides automatically:
-    | Field | Type | Description |
-    | --- | --- | --- |
-    | `override_id` | `string` (UUIDv7) | Primary key referenced by telemetry/audit logs. |
-    | `devices[]` | array | Each entry describes one block device participating in the stack. |
-    | `devices[].sys_path` | string | Absolute `/sys/block/...` path captured when the override was minted. |
-    | `devices[].serial` | string | Stable serial/WWN so replacements can be detected. |
-    | `devices[].queue.flush` / `devices[].queue.fua` | bool | Capabilities observed at mint time; nodes compare them to the current kernel view and reject mismatches. |
-    | `devices[].write_cache` | enum `{"write through","write back"}` | Expected cache policy. |
-    | `stack_diagram` | string | Free-form diagram describing the exact layering (dm-crypt → mdraid → NVMe, etc.). |
-    | `attested_by` | string | Operator identity who supplied the proof. |
-    | `ticket_url` | string | Change-management reference. |
-    | `expires_at_ms` | string wide-int | RFC 3339 or epoch encoded per App.C so overrides cannot silently live forever. |
-  Nodes MUST refuse the override if any field is missing, if `expires_at_ms` is in the past, or if the live `/sys/block/*` capabilities differ from the recorded tuple; quarantining remains the fallback if the operator cannot refresh the document in time.
-- Supported OS matrix: v0.1 targets Linux kernels ≥5.15 with `io_uring`; other kernels/OSes are “best effort” only if they can prove the same cache/barrera semantics. Bootstrap rejects unknown platforms unless an explicit compatibility waiver is recorded in ControlPlaneRaft so operators cannot assume portability from the table above.
-- For ext4 the phrase “barriers and `auto_da_alloc` enabled” means both safeguards must be on simultaneously (barriers enforced, `auto_da_alloc=1`); turning off either guardrail rejects the mount.
-- `commit_visibility` governs whether `raft_commit_index` may exceed `wal_committed_index`:
-  - `DurableOnly` (default) enforces equality for crash-linearizable reads.
-  - `CommitAllowsPreDurable` (Throughput-only gate) allows a gap for lower-latency reads; leaders export gauges `commit_visibility_gap_entries` (count) and `commit_visibility_gap_ms` (time) and `alerts.commit_visibility_gap_ms` fires after 5 s (default).
-- Client acknowledgements MUST satisfy §3.4 (ACK Contract) so that `wal_committed_index` reflects every ACKed write even when `CommitAllowsPreDurable` exposes Raft-only state to reads.
-- Leaders reconcile `wal_committed_index` with the durability ledger on election; lacking proof forces Strict mode with leases + Group-Fsync disabled until the ledger or peers confirm durability (§3.1).
-
-## 2  Definitions & Vocabulary
-
-### 2.1 Definitions & Conventions
-| Term | Meaning |
-| --- | --- |
-| `raft_commit_index` | Highest log index replicated on a majority; all references to `commit_index` imply this value unless qualified. |
-| `wal_committed_index` | Highest index quorum-fsynced per §6.2. |
-| `sm_durable_index` | Product-managed watermark indicating side effects are durably materialized (§7). |
-| `quorum_applied_index` | Minimum `applied_index` observed across the most recent quorum heartbeat bundle; used as a compaction floor (§9.1). |
-| `commit_visibility` | `DurableOnly` or `CommitAllowsPreDurable`; governs read exposure. |
-| `lease_gap_max` | Profile-specific cap on `(raft_commit_index - wal_committed_index)` when leases are enabled; 0 disables leases entirely (§3.3, App.B). |
-| `lease_epoch` | Monotone identifier on heartbeats; followers reject lease reads when epochs diverge. |
-| `routing_epoch` | Placement version from ControlPlaneRaft (§4, §11). |
-| `durability_mode` | `Strict` or `Group-Fsync`, with explicit `DurabilityTransition` fencing. |
-| `wal.fs_block_bytes` | Filesystem-reported block size; all WAL buffers align to this value. |
-| `wal.crypto_block_bytes` | Fixed AEAD block size (4 KiB, power-of-two) used for nonce counters; constant cluster-wide and recorded per segment (§9.2). |
-| Encoding | Unless noted, binary integers are little-endian; manifests use UUIDv7/ULID big-endian ordering. |
-| Epochs | Every `*_epoch` field is a monotone `u32` serialized little-endian in binary wires and as base-10 strings in JSON; regressions are treated as tampering (§9.2, §11.3). |
-| `StrictFallbackPriorityOrder` | Ordered list `{CacheExpired, NeededForReadIndex, ModeConflict(strict_fallback)}` that defines the canonical rejection precedence for strict-fallback and ControlPlaneRaft cache decisions. |
-[Normative] Time-unit convention: unless a clause explicitly cites hours/days for human readability, all configuration knobs and telemetry fields MUST be expressed in milliseconds and MUST carry the `_ms` suffix. Spec-lint’s `duration_unit_check` rejects identifiers that violate this rule or mix seconds/milliseconds for the same concept, ensuring generated schemas never disagree about units.
-
-### 2.2 Terminology Normalization
-| term_id | Canonical term | Synonyms in docs | Notes |
-| --- | --- | --- | --- |
-| `TERM-0001` | `Strict` | `Strict durability`, `Strict mode` | Means per-append `fdatasync` with no batching. |
-| `TERM-0002` | `Group-Fsync` | `Group` | Batching mode guarded by `DurabilityTransition`. |
-| `TERM-0003` | `DurabilityRecord` | `durability ledger entry`, `ledger watermark` | Always refers to `{term,index,segment_seq,io_writer_mode}` record in `wal/durability.log`. |
-| `TERM-0004` | `FollowerReadSnapshot` | `follower read endpoint` | Snapshot-style, never linearizable. |
-| `TERM-0005` | `LeaseEnable` | `lease gate`, `leader leases` | ControlPlaneRaft object that authorizes lease reads once `lease_gap_max > 0` and ControlPlaneRaft durability proofs are Fresh (§3.3). |
-| `TERM-0006` | `SnapshotDeltaEnable` | `incremental snapshots`, `snapshot_delta` | ControlPlaneRaft capability that allows delta snapshots after follower readiness and cache freshness checks (§8, §11). |
-| `TERM-0007` | `ControlPlaneRaft` | `control-plane cluster`, `control-plane Raft` | Dedicated Raft cluster that stores durable metadata (placements, durability proofs, feature gates, DR fences). |
-| `TERM-0008` | `ConsistencyProfile` | `Consistency-focused profile`, `CAP Consistency-partitioned profile` | The consistency-prioritized runtime profile: strict durability by default; linearizable reads via ReadIndex/leases when gated. |
-
-[Informative] This specification reserves the “CP” abbreviation solely for the Gilbert–Lynch CAP classification (Consistency-Partitioned) referenced by `ConsistencyProfile`; all other control-plane usages are spelled out as ControlPlaneRaft. Term IDs remain sorted numerically; the emitted `term_registry.json` provides an alphabetical index so tooling can diff additions without reordering this table.
-
-Spec-lint enforces the casing shown above for every runtime state and lifecycle noun (`StrictFallback`, `LocalOnly`, `ProofPublished`, `Quarantine`, `RepairMode`, `StrictFallbackState`, etc.) so auto-generated docs and telemetry remain mechanically comparable; new terms must be added to this table before appearing elsewhere in the spec. [Normative] Telemetry, Explain payloads, and generated docs that refer to a runtime noun MUST include the matching `term_id` so downstream automation can round-trip without relying on string comparisons; spec-lint rejects any new noun whose row omits a `term_id`. [Normative] The `term_registry_check` gate in spec-lint executes pre-commit and in CI; it immediately fails when a diff introduces a capitalized noun that is absent from this table (or when an existing row changes without updating the associated `term_id`). Contributors therefore cannot land terminology changes unless the vocabulary table reflects them in the same patch.
----
-
-
-## 3  Replication & Consistency Semantics
-Clustor follows Raft with explicit guardrails.
-
-### 3.1 Term/Index Invariants
-The Raft invariants, durability monotonicity, and snapshot ordering rules are defined once in §0.2. This section consumes those clauses as the operational contract: leaders, followers, and tooling MUST enforce every bullet in §0.2 (“Consensus Core (invariants)”) and reference them verbatim when emitting telemetry or Explain traces (e.g., “per §0.2: Raft log matching” or “per §0.2: durability fence”). Implementation guidance:
-
-- Persist `current_term` before AppendEntries; use §0.2’s Raft clause ID when logging compliance.
-- Keep `wal_committed_index` ≤ `raft_commit_index` and force equality whenever `commit_visibility=DurableOnly` (label telemetry `consensus_core_invariant=durability`).
-- Enforce the snapshot preconditions from §0.2 before deleting WAL bytes, surfacing the clause token in audit logs.
-- During elections or recoveries, refuse leadership until the ledger proof cited in §0.2 (“Durability”) is reconstructed; the rejection reason SHOULD call out `§0.2.Durability`.
-
-#### 3.1.1 Strict Fallback Gate Checklist
-`strict_fallback=true` whenever the leader lacks a ControlPlaneRaft-published `(last_durable_term, last_durable_index)` proof that covers its current `raft_commit_index`. The flag clears only after the leader republishes a fresh proof. While `strict_fallback=true`, the following operations MUST hard-fail even if operators attempt Break-Glass overrides, and the leader MUST emit `strict_fallback_gate_blocked{operation}` telemetry for every rejection:
-
-| Operation | Behavior while `strict_fallback=true` |
-| --- | --- |
-| `DurabilityTransition{to=Group}` (Group-Fsync enable) | Reject with `ModeConflict(strict_fallback)` and remain in Strict mode. |
-| Lease enablement or any attempt to serve lease reads | Reject with `ControlPlaneUnavailable{reason=NeededForReadIndex}`; `lease_gap_max` enforcement stays at 0. |
-| `follower_read_snapshot_capability` bit grant | ControlPlaneRaft MUST refuse the capability; follower endpoints stay disabled. |
-| Incremental snapshot enablement (`snapshot.delta_chain_max > 0` or `snapshot_delta` APIs) | Reject with `ControlPlaneUnavailable{reason=CacheExpired}` until a proof lands. |
-
-These failures are normative so every section (leases, durability, follower reads, snapshots) shares the same gate and drift is impossible. While `strict_fallback=true`, the runtime also forces `commit_visibility=DurableOnly` regardless of the prior profile setting so reads never race ahead of durability proofs.
-
-Leaders that possess a locally `fdatasync`'d `wal/durability.log` covering their current `raft_commit_index` but lack quorum proof operate as follows:
-- **Writes:** continue to accept appends in Strict mode (`strict_fallback_writes=Allowed`). Each append increments `strict_fallback_pending_entries`.
-- **ReadIndex:** remain blocked until ControlPlaneRaft mirrors a proof whose `(term,index)` ≥ the leader’s `raft_commit_index`. Telemetry emits `strict_fallback_blocking_read_index=true` and `strict_fallback_last_local_proof=index`.
-- **Telemetry transitions:** `strict_fallback_state ∈ {Healthy, LocalOnly, ProofPublished}`; transitions occur when (a) the leader loads its local ledger (`LocalOnly`) and (b) ControlPlaneRaft acknowledges the proof (`ProofPublished`, which clears the gate). Operators must page on `strict_fallback_state=LocalOnly` persisting beyond `strict_fallback_alert_ms` (default 30,000 ms).
-- **LocalOnly timeout:** `strict_fallback_state=LocalOnly` that lasts longer than `strict_fallback_local_only_demote_ms = 14,400,000` (4 h) forces the leader to self-demote, emit `StrictFallbackLocalOnlyTimeout`, and page operators so partitions never run indefinitely without ControlPlaneRaft visibility. Overrides may pause the demotion only while the timer is explicitly renewed (Break-Glass scope `DurabilityOverride`).
-- Profiles MAY tighten or loosen the timeout within App.B bounds by setting `strict_fallback_local_only_demote_ms_profile`; WAN/DR profiles typically raise the limit to 6 h so replicas with higher ControlPlaneRaft latency are not forced to demote prematurely, while the Latency/ConsistencyProfile profile keeps the 4 h default. Implementations MUST reject values outside their profile’s published window.
-App.C (“Strict Fallback Gate Truth Table”) restates the admissible operations per `strict_fallback_state` so conformance tests and Explain APIs can assert the same matrix. Every release documents which invariants are machine-checked: the model-checking suite proves §3.1 term/index monotonicity, §3.1.1 gate enforcement, and the §3.4 ACK contract for both 3- and 5-voter clusters using Loom/TLA+. The build manifest MUST list the specific proof artifacts consumed by CI so auditors can trace them to the shipped binary.
-[Normative] The `consensus_core_manifest.json` described in §0 SHALL embed `{proof_bundle_schema_version, proof_bundle_sha256, proof_bundle_signature}` referencing the exact Loom/TLA+ archive used for the release; binaries MUST refuse to start when either the schema version is unknown or the embedded hash/signature pair fails validation so formal proof provenance remains auditable.
-
-### 3.2 Elections & Leader Stickiness
-- Election timeout = uniform random `[150, 300] ms` (Throughput/Latency/ConsistencyProfile) or `[300, 600] ms` (WAN). Heartbeats every 50 ms. Randomness derives from independent ChaCha PRNG per partition.
-- Pre-vote is always enabled. `PreVoteResponse.high_rtt=true` instructs candidates to widen the next election window to WAN range for one term; leases recompute bounds immediately.
-- Followers set `high_rtt=true` only after `ema_heartbeat_rtt_ms >= pre_vote.high_rtt_threshold_ms(profile)` for `pre_vote.high_rtt_confirmations = 3` consecutive heartbeats (resets on any healthy heartbeat). This keeps widening opt-in to sustained latency spikes instead of transient pauses and makes the signal deterministic across vendors.
-
-| Profile | `pre_vote.high_rtt_threshold_ms` |
-| --- | --- |
-| Latency / ConsistencyProfile | 150 |
-| Throughput | 150 |
-| WAN | 350 |
-
-- Telemetry exports `clustor.raft.pre_vote_high_rtt_threshold_ms` (per partition) and `clustor.raft.pre_vote_high_rtt_trip_total` so operators and test harnesses can assert the same constants. App.C simulators cover both edges of the threshold.
-- High-RTT widening applies per follower: only the partition that observed `high_rtt` stretches its timeout, and it reverts to the profile default after one successful heartbeat or a completed election. Randomization for other partitions remains unchanged to avoid cross-cluster synchronization.
-- Leader stickiness: `min_leader_term_ms = 750 ms`. Forced step-down occurs on structural lag (§10.2), device latency overruns (`durability.max_device_latency_ms`), or ControlPlaneRaft `TransferLeader`. Device latency enforcement uses hysteresis: a leader must see `N=3` consecutive fsync samples above the threshold or a moving-average window (`durability.device_latency_window_ms = 500`) exceeding the bound before stepping down. Recovery requires `M=5` consecutive samples below 80% of the threshold to clear the `DeviceLatencyDegraded` flag and resume normal transfers, preventing flip-flop.
-- Backoff: failed elections multiply timeout by 1.5 up to 2 s; resets after a leader survives `min_leader_term_ms`.
-- AppendEntries RPC timers (per follower): `append.rpc_timeout_ms = clamp(2 × ema_heartbeat_rtt_ms, 100, 1000)` with up to 4 inflight batches. Timeouts double once (max 2×) until a response arrives.
-
-### 3.3 Read Paths
-- [Normative] Leader leases are a production feature in v0.1 and provide linearizable reads without issuing ReadIndex round trips when the lease predicate holds. A partition MAY enable leases only when (a) the inequality below evaluates true using the profile constants, (b) `strict_fallback=false`, (c) `commit_visibility=DurableOnly`, (d) `controlplane.cache_state=Fresh`, and (e) every voter reports `clock_guard_alarm=0`. Violating any clause immediately revokes leases and forces the partition back to ReadIndex.
-- [Normative] Profile defaults determine whether leases are active on boot: Throughput profiles ship with `lease_gap_max_profile=1024` and `lease_enable_default=true`, the Latency/ConsistencyProfile profile defaults to `lease_gap_max_profile=0` (leases off by default but fully supported once operators configure a non-zero gap), WAN profiles keep `lease_enable_default=false`, and ZFS profiles inherit their parent’s default but require `strict` durability. Admin APIs MAY adjust `lease_gap_max` within the bounds published in App.B, but the runtime only transitions `lease_gate_runtime_state` to `Enabled` when the inequality, ControlPlaneRaft freshness, and strict-fallback conditions are satisfied. Telemetry `leases_enabled`, `lease_epoch`, and `lease_gate_runtime_state ∈ {Enabled,Disabled,Revoked}` MUST be exported so tooling can correlate lease availability with the read gate and strict-fallback truth table.
-- ReadIndex is the default linearizable read path. Leaders that restarted must replay through `commit_index` before serving reads. Algorithmically: on start, block every read until `applied_index >= preserved_raft_commit_index_at_start`. Under `commit_visibility=DurableOnly`, further require `wal_committed_index == raft_commit_index` and satisfy the predicate in §3.3.1; otherwise respond with `ControlPlaneUnavailable{reason=NeededForReadIndex}`.
-- Canonical comparison above normalizes `updated_at` into RFC 3339 (UTC, millisecond precision) strings on both sides and encodes integers little-endian inside the proof blob; spec-lint replays the same canonicalization so JSON caches and binary ledgers remain comparable without lossy conversions.
-- `commit_visibility` determines crash semantics (§1.2.1). Leaders export `commit_visibility_gap_*` gauges. Under `DurableOnly`, a leader MAY NOT serve reads (even ReadIndex) until it reloads `wal/durability.log`, proves `wal_committed_index == raft_commit_index`, and the predicate in §3.3.1 evaluates to true; any transient divergence during elections is therefore masked from clients.
-- If ControlPlaneRaft is unreachable, freshly elected leaders still accept writes under Strict durability but MUST fail linearizable reads (ReadIndex, follower-read fallbacks) with `ControlPlaneUnavailable{reason=NeededForReadIndex}` until ControlPlaneRaft accepts the durability watermark and the §3.3.1 predicate succeeds.
-- Every `ControlPlaneUnavailable{reason=NeededForReadIndex}` response carries retry guidance so clients can fall back cleanly: HTTP surfaces `Retry-After` (minimum 250 ms, encoded as a base-10 integer milliseconds value per RFC 7231’s delta-seconds form) plus `X-Clustor-Last-ControlPlane-Durable: term:index` and `X-Clustor-Commit-Index: term:index`; gRPC mirrors emit metadata `{retry_after_ms, controlplane_last_durable_term, controlplane_last_durable_index, leader_commit_term, leader_commit_index}`. Clients MUST treat these responses as transient (HTTP 503 / gRPC `UNAVAILABLE`) and either retry with exponential backoff or downgrade to documented snapshot-style reads when their semantics allow it. Vendors MUST document any alternate behavior, but silent busy loops are prohibited.
-- [Operational] SDKs SHOULD implement a uniform decision tree when dealing with read failures: (1) on `ControlPlaneUnavailable{reason=NeededForReadIndex}`, retry with jittered backoff up to the provided `Retry-After`, then (2) if the product surface documents a snapshot fallback, retry once with `read_semantics=SnapshotOnly`, and (3) if the fallback returns `SnapshotOnlyUnavailable`, stop retrying and surface the failure because every replica is below the advertised readiness ratio. This ordering keeps retries bounded, ensures Snapshot-only reads are never issued without the explicit header, and makes telemetry (`snapshot_only_ready_state`) align with client-visible behavior.
-- This deliberate fail-closed behavior means **Strict-mode writes continue while linearizable reads block** any time ControlPlaneRaft cannot prove durability. Products MUST therefore ship snapshot or otherwise clearly-documented fallback read endpoints by default so customers retain diagnostic visibility during ControlPlaneRaft partitions; launching without such a fallback requires an explicit exception from the safety review board.
-- Followers NEVER service ReadIndex. They only expose reads via signed snapshot exports or `FollowerReadSnapshot` endpoints that stream `applied_index` checkpoints after a ControlPlaneRaft-granted capability bit is set; speculative apply buffers remain private. The capability stays revoked unless the partition runs in Strict durability (Group-Fsync disabled), advertises `commit_visibility=DurableOnly`, and the follower proves `applied_index >= advertised_checkpoint`. ControlPlaneRaft yanks the bit immediately when any guard fails.
-- Follower endpoints clamp every response to their current `applied_index`, never service linearizable RPCs, and must be documented to clients as “snapshot-style” reads that fall back to leader ReadIndex on version or epoch mismatch. Responses MUST carry `read_semantics = SnapshotOnly` (HTTP header or gRPC metadata) plus the exporting `routing_epoch`, otherwise clients MUST treat the reply as invalid. In-flight snapshot reads MUST fail closed with `FollowerCapabilityRevoked` if the capability bit is yanked during transmission (e.g., quarantine). Revocation is synchronous: within `follower_capability_revocation_grace_ms = 100` the runtime MUST abort every outstanding follower-read RPC and strip cached authorizations so clients never continue using a revoked capability.
-- Enforcement detail: each follower-read RPC carries a cancellable token that re-checks the capability bit on every heartbeat tick (`heartbeat_period_ms = 50`) and on ControlPlaneRaft/telemetry revocation interrupts; the transport closes the stream immediately when the token fires, ensuring the ≤100 ms grace even on slow clients and making the mechanism portable across runtimes.
-- Closed streams MUST surface a terminal status/code of `FollowerCapabilityRevoked` (never a generic transport error) so clients can distinguish capability yanks from network glitches and retry against the leader.
-- Lease reads remain disabled unless the inequality holds for two consecutive heartbeats:
-
-```
-lease_duration_ms + lease_rtt_margin_ms + clock_skew_bound_ms + heartbeat_period_ms < min_election_timeout_ms
-```
-
-| Profile | `min_election_timeout_ms` | `clock_skew_bound_ms` | `lease_rtt_margin_ms` | `heartbeat_period_ms` | `default_lease_duration_ms` | `max_allowed_lease_duration_ms` |
-| --- | --- | --- | --- | --- | --- | --- |
-| Latency / Base | 150 | 5 | 10 | 50 | 80 | 85 |
-| Throughput | 150 | 10 | 10 | 50 | 75 | 80 |
-| WAN (lease gate off) | 300 | 50 | 10 | 50 | 180 | 190 |
-
-- Clock skew bounds derive from the node’s `clock_guard` service: each replica samples its PHC/PTP clock (preferred) or chrony/NTP discipline every `clock_skew_sample_period_ms = 1000`, computes the absolute offset from the cluster’s monotonic fence (derived from ControlPlaneRaft heartbeats and a GPS/PTP reference), and raises a “skew alarm” when two consecutive samples exceed the profile’s `clock_skew_bound_ms`. Alarmed nodes immediately revoke leases (once enabled), mark `lease_gate_runtime_state=HardDisabled`, and surface `clock_guard_alarm{bound_ms, observed_ms, source}` telemetry so operators can trace the upstream time source.
-- [Normative] When a skew alarm fires while the node is leader, it MUST voluntarily step down within `clock_guard_alarm_stepdown_ms = 500` even if leases are disabled so that replicas with suspect clocks cannot continue issuing ReadIndex responses or acking writes without fresh elections. The voluntary step-down also cancels any in-flight pre-vote or election timer on that node to prevent rapid re-campaigning while the skew alarm remains asserted.
-- Clock discipline requirements: PHC/PTP sources MUST advertise `max_slew_ppm ≤ 20`, `clockClass ≤ 7`, and jitter `< 5 ms` over any 60 s window; chrony-based deployments MUST enable `makestep 1.0 -1` (step on any >1 ms jump during boot) and cap `maxslewrate 400 ppm`. Nodes log both the raw PHC offset and the chrony-supplied dispersion so operators can prove compliance during audits.
-- [Normative] Lab or test environments that lack PHC/PTP MUST declare `clock_guard_source = NtpOnly` at bootstrap. NTP-only nodes relax—but do not remove—the skew bounds to `{Latency/ConsistencyProfile: 15 ms, Throughput: 20 ms, WAN: 60 ms}` and continue sampling every 1,000 ms. In this mode leases remain hard-disabled, but ReadIndex MAY proceed so long as the observed skew stays below the relaxed bound; exceeding it still triggers the 500 ms leader step-down. Telemetry MUST publish `clock_guard_source`, `clock_guard_fallback_bound_ms`, and `ntp_only_mode=1` so auditors can distinguish production-grade clocks from test rigs, and spec-lint rejects builds that attempt to run NTP-only without setting the telemetry flag.
-
-- Regardless of profile, leases are hard-disabled whenever `commit_visibility=CommitAllowsPreDurable`; the inequality above is evaluated only once the partition returns to `DurableOnly`.
-- `lease_gap_max` (App.B) bounds `(raft_commit_index - wal_committed_index)` while leases are active; exceeding it immediately revokes leases and emits `LeaseGapExceeded`.
-- Followers invalidate leases on epoch changes, skew alarms, two missed heartbeats, Group-Fsync downgrades, or stickiness resets. Lease responses include `(lease_epoch, routing_epoch, durability_mode_epoch)` and clients must fall back to ReadIndex on mismatch.
-- Clients requiring read-your-write semantics under `CommitAllowsPreDurable` must wait for `last_quorum_fsynced_index >= ack_index`.
-
-#### 3.3.1 Read Gate and Strict-Fallback Interplay (Normative)
-[Normative] A leader MAY serve a linearizable ReadIndex request at time *t* only if all of the following clauses hold simultaneously:
-- `strict_fallback == false`.
-- `commit_visibility == DurableOnly`.
-- `controlplane.cache_state == Fresh`.
-- `controlplane.proof.term:index == wal.last_quorum_fsynced_term:index`.
-- `wal_committed_index == raft_commit_index`.
-If any clause fails, the node MUST fail closed with `ControlPlaneUnavailable{reason=NeededForReadIndex}` or `ControlPlaneUnavailable{reason=CacheExpired}` per `StrictFallbackPriorityOrder`.
-
-[Normative] Additional handling requirements:
-- `strict_fallback` always overrides ControlPlaneRaft durability proof freshness. Leaders MUST NOT serve reads while `strict_fallback == true`, even if a cached proof matches the ledger byte-for-byte. Cached proofs may only clear strict-fallback after being published into ControlPlaneRaft per §11.1.
-- `Fresh` means `(a)` `controlplane.cache_age_ms ≤ controlplane.cache_fresh_ms` **and** `(b)` the cached proof tuple `{term,index,segment_seq,io_writer_mode,updated_at,controlplane_signature}` matches the on-disk `wal/durability.log` entry byte-for-byte.
-- The runtime MUST abort in-flight reads within 50 ms whenever `controlplane.cache_state` transitions out of `Fresh` or `strict_fallback` flips to `true`.
-- Follower read capabilities are revoked whenever the predicate above evaluates to false and MAY be reinstated only after `strict_fallback == false` **and** the predicate evaluates to true again.
-- When multiple causes apply, the rejection reason priority remains the `StrictFallbackPriorityOrder`.
-- Implementations MUST export telemetry fields `read_gate.can_serve_readindex` (bool) and `read_gate.failed_clause ∈ {StrictFallback, CommitVisibility, ControlPlaneCacheNotFresh, ControlPlaneProofMismatch, IndexInequality}` so tooling can assert predicate outcomes.
-
-### 3.4 ACK Contract (Normative)
-Leaders may emit a client ACK only when every clause below is simultaneously satisfied for the `ack_index` being returned:
-1. **Raft commitment:** `ack_index <= raft_commit_index` and the entry is replicated on a quorum in the current term.
-2. **Quorum durability evidence:** The leader has received and persisted a quorum of `DurabilityAck{last_fsynced_index}` records showing `last_fsynced_index >= ack_index`. Followers must append the matching `DurabilityRecord` to `wal/durability.log` **and `fdatasync` that log** (see §6.5) before replying so that the leader can rebuild the proof after crashes.
-3. **Leader durability:** The leader has locally persisted through `ack_index`. Strict mode requires `fdatasync` completion for the entry itself; Group-Fsync requires the batch covering `ack_index` to have completed `fdatasync` and to have recorded the batch watermark in `wal/durability.log`.
-4. **Ledger alignment:** The leader advanced `wal_committed_index` to at least `ack_index` and recorded that watermark before sending the client response.
-
-These rules make equality of `raft_commit_index` and `wal_committed_index` a leader-side invariant under `DurableOnly` and prevent crash regressions when `CommitAllowsPreDurable` is enabled for reads. Violations must surface as `AppendDecision::Reject(Consistency)` and emit guardrail telemetry.
-
-Leader crashes after counting a follower’s `DurabilityAck` but before emitting the client response are safe: the new leader reconstructs the quorum proof from `wal/durability.log` and either (a) replays the same ACK once it revalidates the ledger, or (b) withholds the ACK if quorum evidence is missing. Client APIs MUST therefore carry an idempotency key (`AppendRequest.idempotency_key`, shared with the admin API header) so callers can distinguish “ACK lost in flight” from “not acknowledged”—servers repeat the same `ack_index` for duplicate keys once the contract is satisfied.
-
----
-
-## 4  Partitioning & Topology
-- Logical keys hash to Raft Partition Groups (RPG). Products choose the hash, but partition IDs must be stable with ≥128-bit entropy.
-- Default replica set: 3 voters; DR profile supports 5. Observers (telemetry-only) are supported in every profile and are always excluded from quorum, ReadIndex, durability, and compaction. Latency/ConsistencyProfile deployments may attach up to two observers per partition (same limit as Throughput/WAN) once ControlPlaneRaft authorizes the placements.
-- Observer streams consume a dedicated bandwidth pool capped at `observer.bandwidth_cap = 0.1 × snapshot.max_bytes_per_sec` per partition so they cannot starve snapshot or learner pipes; once the pool is exhausted, observers receive `ThrottleEnvelope{reason=ObserverBandwidth}` and leaders emit `observer_bandwidth_exhausted`.
-- [Normative] Observer admission participates in the strict-fallback truth table: while `strict_fallback=true` or `controlplane.cache_state ≠ Fresh`, ControlPlaneRaft refuses to grant or renew observer slots and leaders MUST revoke `observer_capability_state` from existing observers within 100 ms, surfacing `observer_capability_revoked_reason ∈ {StrictFallback, ControlPlaneCacheNotFresh}` via telemetry.
-- Leaders gate all writes and ReadIndex. Followers execute `on_commit` to stay hot for failover and snapshot export; speculative buffers never expose uncommitted state.
-- Clients target leaders discovered via ControlPlaneRaft placements. Requests MUST carry the latest `routing_epoch`; stale or missing epochs return `RoutingEpochMismatch{observed, expected, lease_epoch, durability_mode_epoch}` (HTTP 409 / gRPC `FAILED_PRECONDITION`).
-
-### 4.1 Membership & Resizing (Normative)
-1. **Preflight:** ControlPlaneRaft runs placement feasibility (≤70% budgets post-move) and deterministic quorum rehearsal (§4.2). Failures return reasons; optional overrides require audit records.
-2. **Catch-up:** New replicas join as `Learner` and must reach either `(commit_index - membership.catchup_slack_bytes)` with default 4 MiB (auto-scaled by throughput) **or** `(leader.last_log_index - membership.catchup_index_slack)` with default 1024 entries inside `membership.catchup_timeout = 120 s` (auto-scaled). Meeting either guard suffices; policy may demand both.
-3. **Joint consensus:** After catch-up, Raft enters joint config. `min_leader_term_ms` blocks voluntary transfers. Each `MembershipChange`/`MembershipRollback` records the rehearsal `placement_digest`.
-4. **Finalize:** After `joint_commit_count >= membership.finalize_window` (default 64) and no structural lag (§10.2), the leader commits the pure new set and mirrors the decision into ControlPlaneRaft.
-   - “No structural lag” is codified as `lag_bytes < 64 MiB` AND `lag_duration < 30 s` (i.e., still within the “Transient” class from §10.2). If either bound is exceeded, finalization MUST pause until the lag returns to the transient band or ControlPlaneRaft explicitly grants `flow.structural_override`.
-5. **Rollback triggers:** catch-up timeout, loss of ≥f voters for `membership.rollback_grace_ms = 3000 ms`, or survivability precheck failure. Rollback appends `MembershipRollback{reason, failing_nodes[]}`, commits under the joint quorum, persists the durability ledger watermark for that index, and only then does the leader step down so the next election increments term.
-
-### 4.2 Survivability Precheck
-- `quorum_survivability_precheck` enforces deterministic guardrails:
-  - `Q`: fraction of single fault-domain losses that retain quorum (voters only). Minimums: 3-voter `Q=1.0`, 5-voter `Q>=0.8` (profiles may raise, never lower).
-  - `H`: headroom ratio (post-move CPU/disk utilization vs budget). Default floor 0.2.
-  - Advisory `F`: fraction of voters on independent power/network; surfaced via Explain APIs.
-- Fault domains are hierarchical (`zone > rack > chassis`). ControlPlaneRaft snapshots labels when the move starts; label changes abort the move.
-- Overrides require `survivability.policy=Advisory`. Latency/ConsistencyProfile deployments default to `Strict` (no overrides). Throughput/WAN may override only `H` with signed justification.
-- Catch-up slack and timeout auto-scale with observed throughput and RTT (clamped 10–500 ms); dry-run APIs surface computed values (§13.2).
-
-### 4.3 Raft Transport Pooling & Multiplexing
-- [Normative] Raft traffic between two nodes is multiplexed over a node-scoped pool of long-lived mTLS channels (default size 1, `transport.pool_size_per_peer_max = 4`). TLS identity and trust remain the node-level SPIFFE material described in §12; PRG-specific certificates or identities are forbidden. Pool entries pre-warm as soon as placements are installed and are reused across every Raft Partition Group (RPG) hosted on the peer.
-- [Normative] Every Raft RPC envelope includes `{partition_id, prg_id, routing_epoch}` tags; `prg_id` is the stable RPG identifier (alias of `partition_id` when only one field is encoded). Servers demultiplex strictly on those tags into the matching Raft state machine; frames naming unknown RPGs or stale `routing_epoch` values fail closed with `RoutingEpochMismatch` instead of being delivered to another RPG.
-- [Normative] Multiplexing preserves routing and placement independence: RPGs may rebalance or transfer leadership independently while sharing the same peer pool. When ControlPlaneRaft bumps `routing_epoch` for any RPG, the runtime opens pool entries to the newly assigned peers, reroutes new RPCs immediately, drains inflight work to peers that lost the placement, and closes their pool entries once acknowledgements land so traffic migrates deterministically.
-- [Normative] Flow control remains per-RPG even on shared sockets: each `partition_id` retains its own credit buckets (§10) and queue; the send scheduler interleaves them on the socket with weighted fairness and enforces node-level caps per pool entry. Backpressure signals (PID throttles, snapshot import pauses, structural lag) are emitted per RPG and MUST NOT consume another RPG’s credits; the shared socket only contributes congestion and I/O health metrics.
-- [Operational] Telemetry exports `transport.pool_active{peer_node_id}`, `transport.pool_warm{peer_node_id}`, `transport.pool_refresh_total{reason∈{PlacementChange,Error,IdleTimeout}}`, `transport.pool_inflight_per_rpg{partition_id,peer_node_id}`, and per-RPG send/receive byte and throttle counters. Explain/Why* mirrors the currently selected peer per RPG and the last observed `routing_epoch` so operators can audit placement-driven migrations.
-
-#### 4.3.1 Rollout & Telemetry (Operational)
-- Rolling upgrade order matters: receivers that enforce strict demux reject frames without `prg_id`/`partition_id` tags as `RoutingEpochMismatch`/`MissingMetadata` instead of proxying them. Canaries must therefore start with senders so every RPC carries both tags; only then should stricter receivers be rolled out. There is no compatibility flag for this path—mixed-version clusters depend on bundle negotiation logs and `RoutingMismatch` telemetry to confirm legacy peers have fallen silent before widening blast radius.
-- Expected signals during placement churn: `transport.pool_refresh_total.PlacementChange` should tick as soon as ControlPlaneRaft publishes a new placement, `transport.pool_warm` should jump above zero for the new peers, and `transport.pool_active` for drained peers should fall to zero once the idle timeout elapses. `transport.pool_routing_epoch` gauges per RPG should advance in lockstep with placement publications.
-- Troubleshooting reconnect storms and skewed flow control: rising `transport.pool_refresh_total.Error` or `pool_error_total` paired with flat `pool_reuse_total` indicates backoff/reconnect churn; operators should check `transport.pool_queue_depth_per_rpg` and `transport.pool_throttle_total{partition_id,peer_node_id}` to see whether congestion is isolated to one RPG or node-wide. A single RPG throttling while others progress means per-RPG credits are working; simultaneous throttles plus `pool_send_bytes_total` stalls usually means the socket burst cap is saturating.
-- Pool sizing guardrails: default pool size 1 (cap 4) remains the safe baseline. Consider raising the limit only when `pool_queue_depth_per_rpg` and `pool_inflight_per_rpg` stay elevated while `pool_reuse_total` climbs, and plan to drop back to the default after the incident once `pool_active` returns to baseline. During rebalances, brief spikes in warm entries are expected; reconnect storms should be accompanied by `pool_refresh_total.Error` so SREs can correlate to upstream network issues.
-
----
-
-## 5  Log Entry Interfaces
-Clustor exposes a versioned framing layer; products extend payload semantics.
-
-```
-struct EntryFrameHeader {
-    u8  version;
-    u8  codec;
-    u16 flags;
-    u32 body_len;
-    u32 trailer_len;      // bytes following body (>=4 for crc32c)
-}
-
-struct EntryFrameTrailer {
-    u32 crc32c;            // header+body
-    [u8; 32] merkle_leaf;  // optional; SHA-256 or BLAKE3 per profile
-}
-```
-
-Key rules:
-- AEAD/MAC semantics referenced in this subsection defer to §9.2; the bullets below describe only the segment-level layout that consumes those primitives.
-- Integer fields are little-endian; manifests retain big-endian UUIDv7/ULID ordering.
-- `trailer_len` counts the exact bytes serialized after the body. Frames MUST store at least the 4-byte CRC (`trailer_len >= 4`). `trailer_len = 4` means the CRC is present without a Merkle leaf for that frame; `trailer_len = 36` includes both the CRC and the 32-byte `merkle_leaf`. Profiles that mandate Merkle trees MUST reject frames whose `trailer_len < 36`. `trailer_len = 0` is invalid for v0.1 and receivers treat it as corruption.
-- Hash primitives: CRC32C always covers `header || body`. `merkle_leaf = H(header || body || crc32c_le)` where `crc32c_le` is the 4-byte little-endian CRC value and `H` is the selected `integrity.hash_suite`.
-- Metadata extensions: required `trace_id`, `span_id`, `ingest_timestamp_ms`; bounded to `entry.metadata_budget_bytes` (default 256 B, up to 1 KiB via policy). Missing metadata yields `AppendDecision::Reject(MetadataMissing)`.
-- Frame sizing: `entry.max_frame_bytes = 1 MiB` for Latency/ConsistencyProfile, up to 4 MiB for Throughput/WAN (hard stop 4 MiB). Buffers must align to `wal.fs_block_bytes`; misaligned inputs route through `FrameStagingPool`, which throttles at 80% partition or node budgets (64 MiB per partition, 1 GiB per node) and emits `FrameAlignment` throttles.
-- Products register codec IDs globally and implement deterministic `encode_entry` / `decode_entry` functions.
-- Validation hooks may veto appends (`before_append`). Rejections must carry retry hints.
-- `integrity.hash_suite` is selected once per cluster generation (default CRC32C leaves + SHA-256 segment/manifests). Throughput and WAN profiles MAY opt into BLAKE3 leaves once every voter advertises support and ControlPlaneRaft records the `integrity.hash_suite=blake3` epoch; Latency/ConsistencyProfile and ZFS profiles remain on SHA-256. Switching suites requires draining segments that reference the prior hash, `strict_fallback=false`, `controlplane.cache_state=Fresh`, and a matching entry in `feature_manifest.json`; violating any clause immediately revokes `integrity.hash_suite=blake3` and forces the cluster back to SHA-256.
-
-#### 5.1 Segment Integrity MAC (Mandatory)
-- Every WAL segment ends with `segment_mac_trailer{version:u8, mac_suite_id:u8, segment_seq:u64, first_index:u64, last_index:u64, entry_count:u32, entries_crc32c:u128, offsets_crc32c:u128, mac:[u8;32]}`.
-- `entries_crc32c` is derived by splitting the concatenated entry `{header || body}` stream into 32-bit words, interleaving them across four lanes (`word_index mod 4`), computing CRC32C per lane, then packing the little-endian lane CRCs into a 128-bit value (`lane0` least significant, `lane3` most). `offsets_crc32c` applies the same procedure to the sequence of 64-bit offsets (treated as two 32-bit words each). This binds both payload bytes and their positions, preventing “valid frame moved to a new offset” attacks even when Merkle leaves are disabled. JSON mirrors emit both fields as fixed-length `0x`-prefixed hex strings (32 hex characters, little-endian interpretation).
-- The packed `u128` values above are serialized little-endian (lane0 least significant byte, lane3 most significant byte) regardless of host architecture so tooling on big-endian systems must swap accordingly.
-- Worked example: suppose `lane0=0x89ABCDEF`, `lane1=0x01234567`, `lane2=0xFEDCBA98`, `lane3=0x76543210`. The packed byte stream is `[EF CD AB 89 | 67 45 23 01 | 98 BA DC FE | 10 32 54 76]` (lane0 first). The emitted JSON string is `0x1032547698badcfe67452301efcdab89` (32 hex digits after the prefix). Receivers MUST reject strings that are shorter/longer than 34 characters or whose hex payload does not match the packed little-endian value; App.C adds explicit acceptance/rejection tests (including mixed-case hex).
-- `mac_suite_id` selects the MAC algorithm. v0.1 fixes `mac_suite_id=1 = HMAC-SHA256` and readers MUST reject unknown IDs (`UnknownSegmentMacSuite`). Future suites require a new ID plus a ControlPlaneRaft-approved `integrity_mac_epoch` bump; segments MUST NOT mix multiple MAC suites even across re-encryptions.
-- `mac_suite_id=2` is reserved for `BLAKE3-MAC`. Nodes MUST treat the value as “unsupported but reserved” until ControlPlaneRaft explicitly raises `integrity_mac_epoch` to a build that implements it, preventing collisions with vendor experiments.
-- `mac` = HMAC-SHA256 keyed by the epoch-specific MAC key. The input bytes are the ASCII string `segment-mac-v1` (no terminator) followed by the little-endian encoding of `{segment_seq:u64 || first_index:u64 || last_index:u64 || entry_count:u32 || entries_crc32c:u128 || offsets_crc32c:u128}`. Implementations MUST preserve that order and width exactly; omitting the prefix or re-encoding the integers is a wire break. App.C (“Snapshot Manifest & Segment-MAC Test Fixtures”) publishes a reference vector using key `00..1f`, `segment_seq=7`, `first_index=42`, `last_index=121`, `entry_count=17`, `entries_crc32c=0x1032547698badcfe67452301efcdab89`, and `offsets_crc32c=0x0123456789abcdeffedcba9876543210`, which yields MAC `5c50cc7f43ef3c0127db59a3a8394ed16782e7997b53093c35bff32f8644b8f0`. Production keys MUST NOT reuse the test key.
-- [Normative] ControlPlaneRaft issues `segment_seq_allocator_epoch` leases in each partition manifest; replicas MUST persist `{segment_seq_head, segment_seq_allocator_epoch}` before allocating bytes for a new WAL segment and MUST advance the head monotonically. Detecting either duplicate `segment_seq` values or `segment_seq < segment_seq_head` (locally or via ControlPlaneRaft durability proofs) forces immediate Quarantine because ControlPlaneRaft relies on `segment_seq` monotonicity to prove replay ordering. Every durability proof therefore includes the `{segment_seq_allocator_epoch, segment_seq}` pair so auditors can diff ControlPlaneRaft state against the ledger.
-- The MAC suite is independent of `integrity.hash_suite`; v0.1 therefore mandates `mac_suite_id=1` for every trailer even when BLAKE3 leaves are enabled, and a segment MUST NOT mix multiple MAC suites.
-- The trailer is written only after all entries land on disk, then `fdatasync`'d alongside the `.log`. Replay refuses to trust a segment whose MAC fails, regardless of profile Merkle settings. `.idx` files remain MAC-protected but are now advisory helpers rather than the root of trust for entry placement.
-- When `integrity.hash_suite` disables Merkle leaves (Throughput profile default), the trailer MAC becomes the sole detection signal for relocation or bit-rot. Operators must rely on §6.4 scrub coverage to detect intra-segment corruption and should expect lower detection granularity than when Merkle trees are enabled.
-
----
-
-## 6  Durability & Write-Ahead Log
-
-### 6.1 Fsync Semantics
-- WAL segments are preallocated (default 1 GiB; ZFS ≥2 GiB) and written with aligned buffers. Each append uses `pwrite` followed by `fdatasync(data_fd)` in Strict mode; Group-Fsync defers `fdatasync` per batch but keeps ordering `data → index` and dir `fsync` only on rollover.
-- “Ordered filesystem” above refers to kernels that honor Linux’s `O_DSYNC`/`RWF_DSYNC` guarantees: write completion implies the corresponding journal transaction (if any) reached persistent media and all dependent metadata was durably recorded. Operators who cannot provide Linux 5.15+ with XFS/ext4 semantics MUST present an engineering note that shows equivalent ordering (e.g., vendor whitepaper for XFS on write-through NVMe); absent that, the stack is treated as “unordered” and quarantined at bootstrap.
-- Every segment closes with the mandatory `segment_mac_trailer` from §5.1; leaders flush the trailer, then `fdatasync` the `.log` and `.idx`, and finally `fsync` the directory entry before marking the segment deletable.
-- Directory `fsync` occurs only on file create/rename/rollover (explicitly including new `wal/durability.log` generations and ledger truncations) and manifest publication per §8.1. Platforms lacking direct I/O must still honor aligned writes and `fdatasync` ordering.
-- WAL writer prefers `io_uring` with fixed buffers, downgrading to registered buffers or blocking I/O transparently while emitting telemetry.
-- Downgrades enforce guardrails: moving from fixed buffers to registered buffers or blocking I/O clamps `group_fsync.max_batch_ms = min(2 ms, configured)` and `group_fsync.max_batch_bytes = min(32 KiB, configured)`, emits `PerformanceModeDegraded{from_mode,to_mode}`, and raises an incident if the condition persists for `io_writer_mode.downgrade_incident_ms_profile` (App.B; default 5,000 ms). SLO dashboards track the new baseline explicitly so degraded hardware cannot silently violate §10 targets.
-- Health samples are recorded once per durability flush completion (Strict `fdatasync` or Group-Fsync batch) and at least every `io_writer_mode.sample_period_ms = 200` via a watchdog so the `N`-sample gates below compare equivalent wall-clock windows across replicas.
-- `io_writer_mode ∈ {FixedUring(0), RegisteredUring(1), Blocking(2)}` and is included in `DurabilityAck` so leaders know which guardrails followers are honoring. Any node advertising `Blocking` is barred from Group-Fsync until it reports `RegisteredUring` or better for `io_writer_mode.recovery_window_ms = 60000`.
-- Leaders MUST keep the partition in Strict mode (no Group-Fsync batching) whenever any voter reports `io_writer_mode=Blocking`; observers/learners do not gate this decision. The gate lifts only after all voters return to `RegisteredUring` or better for an entire `io_writer_mode.recovery_window_ms` window.
-- To avoid perpetual lockout when a single replica remains degraded, the leader starts `io_writer_mode.degraded_grace_ms_profile` (App.B; default 300,000 ms) as soon as it observes a voter stuck in `Blocking`. When the grace elapses, the leader MUST either (a) demote the degraded replica to `Learner` via the membership workflow or (b) eject it from the voter set if demotion fails. After demotion, Group-Fsync eligibility is recalculated against the remaining voters, and the degraded replica may rejoin only after it sustains `RegisteredUring` (or better) for one full recovery window.
-- To avoid flap storms, a leader also requires `io_writer_mode.recovery_sample_count = 5` consecutive healthy samples from every voter before re-enabling Group-Fsync; any relapse to `Blocking` resets the timer and sample counter. Telemetry emits `io_writer_mode_gate_state ∈ {Open, BlockedByBlockingFollower, RecoveryTimer}` so operators can diagnose why batching is disabled.
-- `wal.segment_bytes` tunable: Latency/ConsistencyProfile/Throughput `[256 MiB, 2 GiB]`, WAN `[512 MiB, 2 GiB]`, ZFS `[2, 4] GiB`. All writes align to `wal.fs_block_bytes` and exported via metrics for Explain APIs.
-- Tooling that reasons about `entries_crc32c`/`offsets_crc32c` can assume at most `wal.segment_bytes / entry.max_frame_bytes(profile)` frames per segment (e.g., Latency/ConsistencyProfile ≤256 frames at 1 MiB caps for a 256 MiB segment, Throughput/WAN ≤512 frames at 4 MiB caps for a 2 GiB segment); exceeding those bounds requires first bumping the profile’s explicit `entry.max_frame_bytes`.
-
-### 6.2 Group-Fsync Guardrails
-| Parameter | Default | Behavior |
-| --- | --- | --- |
-| `group_fsync.max_batch_bytes` | ≤ profile ceiling (64 KiB default) | Exceeding forces immediate flush; runtimes MAY adapt downward based on telemetry but MUST never exceed the ceiling.
-| `group_fsync.max_batch_ms` | ≤ profile ceiling (5 ms default) | Timer flush; resets per batch; adaptive controllers MAY shorten the window when devices degrade but MUST never exceed the safety bound.
-| `group_fsync.max_inflight_bytes_per_partition` | 4 MiB | Breach parks the partition and forces flush.
-| `group_fsync.max_inflight_bytes_per_node` | 64 MiB | Node-level cap halts appends until catch-up.
-| `group_fsync.overrun_limit` | 2 | Consecutive overruns trigger Strict downgrade.
-| `group_fsync.backoff_factor` | 2× | Re-enable delay = `group_fsync.backoff_base_ms` (App.B; default 60,000 ms) × factor^downgrade_count (≤15 min).
-
-A partition’s controller MAY use telemetry (io_uring latencies, device class) to set tighter runtime limits, but the per-profile ceilings above remain hard safety bounds shipped in artifacts and gates like §0.2 keep them immutable without a spec update. Downgrade counters, hysteresis timers, and the exponential backoff are tracked **per partition**; node-level incidents MAY add additional throttles, but they never reuse another partition’s backoff state.
-[Normative] Implementations MUST drive re-enables from an identical predicate so controllers, telemetry, and Explain APIs agree:
-```
-fn can_enable_group_fsync(state: &PartitionState) -> bool {
-    if state.strict_fallback { return false; }
-    if state.controlplane_cache_state != CacheState::Fresh { return false; }
-    if state.downgrade_backoff_deadline > now() { return false; }
-    if state.voters.iter().any(|v| v.io_mode == Blocking) { return false; }
-    if state.device_latency_violations_in_window >= 3 { return false; }
-    if state.incident_flags.contains("GroupFsyncQuarantine") { return false; }
-    true
-}
-```
-`downgrade_backoff_deadline` is the exponential timer derived from `group_fsync.backoff_factor`. `device_latency_violations_in_window` is the same counter that triggers Strict downgrades in §6.1. Vendors MAY add stricter predicates, but they MUST evaluate the logic above verbatim and emit `group_fsync_eligibility=false` (with the first failing clause) whenever the predicate returns false so operators can reconcile automation with runtime decisions.
-
-Acknowledgements remain quorum-`fdatasync`; unacknowledged exposure is bounded by the inflight caps. Downgrades emit `DurabilityTransition{from=Group,to=Strict,effective_index}` after flushing entries ≤ `N` and immediately disable batching until the transition commits. Re-enables append the inverse transition only when ControlPlaneRaft is reachable and do not share batches across the fence. `DurabilityAck` records `{last_fsynced_index, segment_seq}` durably so leaders count quorum only after persisted acknowledgements.
-
-Re-enables remaining ControlPlaneRaft-gated is an intentional safety choice: batching without ControlPlaneRaft coordination risks asymmetric durability policies and audit gaps. During ControlPlaneRaft outages the cluster therefore stays in Strict mode (per-append `fdatasync`) even if the underlying I/O remains healthy; expect higher latency/throughput cost, document it in incidents, and re-enable Group-Fsync only after ControlPlaneRaft returns and logs the transition.
-[Operational] Recovery runbook: once ControlPlaneRaft connectivity is restored, leaders MUST (1) refresh `wal/durability.log` proofs, (2) confirm `controlplane.cache_state=Fresh`, (3) re-run device health checks, and only then (4) issue `DurabilityTransition{to=Group}`. If any step fails, partitions remain in Strict until the blocking condition clears, ensuring operators have a deterministic checklist after prolonged ControlPlaneRaft outages.
-
-### 6.3 Startup Scrub & Repair
-
-#### 6.3.1 Preconditions
-- [Normative] Startup scrub executes before a replica advertises readiness or participates in quorum, and it MAY NOT be skipped even when nodes boot in repair mode.
-- [Normative] The scrub engine operates solely on on-disk bytes; RAM caches and speculative buffers are ignored so that the scrub outcome is reproducible.
-
-#### 6.3.2 Procedure
-1. Scan tail segments, authenticating AEAD per block and validating `segment_mac_trailer` before CRC/Merkle checks.
-2. Rebuild `.idx` files when missing/corrupt using deterministic metadata `{term, index, offset, body_len, crc32c}` plus optional Bloom filters.
-3. Verify `wal/durability.log` records and refuse to mount when gaps exceed WAL tails.
-4. Truncate partial tail entries deterministically; AEAD or MAC failures quarantine the partition.
-5. Record `boot_record.json` with scrub status, durability watermark, WAL geometry, and `io_writer_mode`; replicate to ControlPlaneRaft.
-- CRC/Merkle failures with a valid MAC are treated as repairable corruption: the segment is marked `needs_repair`, scrubbed via snapshot import, and only escalates to quarantine if retries continue to fail or the MAC later disagrees (§6.4).
-
-Decision table (normative for scrub tooling and operator docs):
-
-| AEAD tag valid? | MAC valid? | CRC/Merkle valid? | Action |
-| --- | --- | --- | --- |
-| Yes | Yes | Yes | Healthy. |
-| Yes | Yes | No | Repair path: mark `needs_repair`, rehydrate via snapshot/import while keeping the replica online but alerting operators. |
-| Yes | No | * | Immediate Quarantine — MAC disagreement means integrity epoch cannot be trusted regardless of CRC result. |
-| No | * | * | Immediate Quarantine — ciphertext MUST NOT influence state when AEAD authentication fails. |
-
-`*` = don’t-care (ignored once a prior column dictates quarantine).
-
-- Repair loops MUST apply exponential backoff: after each `needs_repair` import attempt that fails integrity checks, the runtime waits `scrub.repair_backoff_ms = min(2^attempt * 1000, 60000)` before retrying and records `repair_attempt_count` plus `repair_in_progress=true` in `boot_record.json`. After `scrub.repair_attempt_limit = 3` consecutive failures (without a successful manifest re-validation) the replica MUST escalate to Quarantine even if the MAC remains valid, preventing infinite oscillation against a flaky object store.
-
-#### 6.3.3 Postconditions
-- [Normative] Successful scrub yields a monotone `boot_record.scrub_state=Healthy`, replays through the last durable index, and emits `startup_scrub_duration_ms`.
-- [Normative] Any scrub outcome other than Healthy MUST set `boot_record.scrub_state ∈ {NeedsRepair,Quarantine}` and cite the blocking clause so automation can fan out to the repair or quarantine workflows described below.
-
-### 6.4 Background Scrubbing & Quarantine
-#### 6.4.1 Background Scrub Loop
-- `scrub.interval = 6 h` sampling 1% of entries per segment (or full CRC when Merkle disabled). Coverage SLO: every WAL byte hashed at least once every 7 days; metric `scrub.coverage_age_days` enforces this.
-- Failure-injection conformance set: every vendor MUST exercise the following crash kill points at least once per release and prove the outcomes match App.C expectations: (a) kill after WAL `pwrite` but before `fdatasync`, (b) kill after `fdatasync` but before `wal/durability.log` append, (c) kill after ledger append but before client ACK, (d) kill during `.idx` rebuild, and (e) kill between `NonceReservationRange` flush and data write. The crash-consistency harness enumerates these five points explicitly so downstream implementations cannot silently skip a class of failures.
-
-#### 6.4.2 Repair Escalation State Machine
-- Any checksum, AEAD, or MAC anomaly triggers quarantine: block writes, request re-replication, emit incident log. Exit requires a full snapshot + WAL rebuild.
-
-### 6.5 Durability Ledger Ordering (Proof Obligation)
-- Each replica maintains `wal/durability.log` beside the WAL. Records are append-only `DurabilityRecord{term, index, segment_seq, io_writer_mode, record_crc32c}` entries; each record asserts that the local WAL bytes through `(term, index)` have completed the fsync described in §6.1 while the node was operating in `io_writer_mode`. `record_crc32c = crc32c(le(term) || le(index) || le(segment_seq) || io_writer_mode)` (Castagnoli polynomial) and MUST be verified before the record is trusted so partial-sector writes or torn headers are detected even when the surrounding CRC appears intact. Records never rewrite in place—monotonicity is enforced by rejecting regressions.
-- Followers persist the `DurabilityRecord` that covers the index they will advertise in the next `DurabilityAck{last_fsynced_index, segment_seq, io_writer_mode}` and MUST block the ack until the `durability.log` `fdatasync` from step 4 completes so leaders can reconstruct quorum proofs after crashes.
-- Leaders and followers therefore execute the identical sequence `pwrite → fdatasync(data_fd) → durability.log append → fdatasync(durability.log)` regardless of role. Spec-lint’s `ledger_ordering_test` replays the ordered steps on both sides and fails the build if either implementation attempts to reorder or coalesce them, preventing asymmetric crash recovery.
-- Before appending a `DurabilityRecord`, replicas MUST verify from the on-disk WAL (not process buffers) that the referenced `(term, index)` bytes are readable, that the header/body region matches the expected length, and that the frame-level CRC32C recalculated from those on-disk bytes matches the stored value. If the verification fails—even on allegedly “ordered” filesystems—the replica MUST retry the read after a randomized backoff (`durability.read_verify_retry_ms ∈ [5,20]`) to filter transient device stalls. After a single retry, if the bytes are still unreadable the replica MUST delay the ledger append, re-run startup scrub, and enter Quarantine if the mismatch persists; advertising durability evidence without readable bytes is forbidden.
-- **Ledger replay (§6.5):** on startup, replicas scan `wal/durability.log` sequentially and verify each record’s `{term,index,segment_seq,io_writer_mode}` against the WAL bytes. Encountering a hole or corrupted record forces deterministic truncation to the last verified entry; all trailing records are discarded (never skipped) and the replica enters Strict fallback until ControlPlaneRaft mirrors a fresh proof. Nodes MUST NOT attempt to “skip over” damaged records because that would fabricate durability evidence.
-- [Normative] `truncate_file_to(last_good_offset)` MUST call the platform’s synchronous primitive (`ftruncate` on POSIX, `SetEndOfFile` followed by `FlushFileBuffers` on Windows) and MUST immediately `fdatasync`/`FlushFileBuffers` the descriptor before replay advances. Lazy truncation helpers that defer the shrink to background threads are forbidden because ControlPlaneRaft durability proofs assume the discarded bytes are irrecoverable once `consensus_core_manifest.json` seals the bundle.
-- [Normative] Background scrubbers, log-rotation daemons, or compaction threads MUST NOT invoke `truncate_file_to` asynchronously or from worker threads that do not immediately wait for the synchronous `fdatasync` above; every caller routes through the replay thread so auditors can reason about a single serialization point for truncation.
-- [Normative] Clauses §6.5-(1)…(5b) define the linearizable prefix relied upon by `last_quorum_fsynced_index` and the ControlPlaneRaft durability ledger. Implementations therefore MUST record `{linearizable_prefix_term, linearizable_prefix_index, segment_seq}` alongside the local proof tuple they publish to ControlPlaneRaft, and spec-lint’s `ledger_prefix_proof_test` rejects binaries that attempt to ACK a client before that prefix is durable.
-- Leaders compute `last_quorum_fsynced_index` from the intersection of their local `DurabilityRecord` and the quorum of follower acknowledgements. Formally, let `A = {leader_local_index} ∪ {ack_i | ack_i reported by follower i}`. Sort `A` descending and select the highest index `n` such that at least `quorum_size = floor(voters/2)+1` elements of `A` satisfy `value >= n`. That `n` becomes `last_quorum_fsynced_index`, and it always refers to a ledger record (not an in-flight append). They mirror only the resulting `(last_durable_term, last_durable_index)` summary into the ControlPlaneRaft durability ledger (§11.1) once the ordering below reaches step 4; ControlPlaneRaft entries are rejected unless they advance that pair.
-- Ordering rule for every replicated entry (clauses §6.5-(1) … (5b)):
-  1. Append entry bytes to the WAL segment (`pwrite`).
-  2. Complete the WAL `fdatasync` (Strict) or batch flush (Group-Fsync). No ledger or ACK action may occur before this step finishes.
-  3. Append the new `DurabilityRecord` (and any coalesced `NonceReservation`, see §9.2) so that it covers `entry.index`.
-  4. `fdatasync(wal/durability.log)`.
-  5. After clause (4):
-     (5a) The leader MAY count follower `DurabilityAck`s toward quorum only if they cover indices ≤ the freshly `fdatasync`'d record.
-     (5b) The leader MAY emit the client ACK (§3.4) only after clause §6.5-(5a) succeeds.
-- Followers execute the exact same sequence locally and MUST complete steps (1)–(4) before emitting their `DurabilityAck{last_fsynced_index, ...}`. An ack that arrives before the follower `fdatasync`'s both the WAL bytes and the matching `DurabilityRecord` is a protocol violation and must be treated as missing evidence.
-- Nonce reservations are range-based. Writers append `NonceReservationRange{segment_seq, start_block_counter, reserved_blocks}` entries measured in units of `wal.crypto_block_bytes`. v0.1 fixes `wal.crypto_block_bytes = 4096 B`; the default reservation window therefore remains `nonce.reservation_max_blocks = 1024` (4 MiB), but profiles MAY raise it via `nonce.reservation_max_blocks_profile ∈ [1024, 8192]` (upper bound 32 MiB) when higher-latency devices benefit from larger amortization. `nonce.reservation_max_bytes = wal.crypto_block_bytes × nonce.reservation_max_blocks_profile` is emitted in the profile bundle and spec-lint rejects configs outside the range. Reservations MUST `fdatasync` no later than the smaller of `nonce.reservation_max_bytes_profile` bytes of newly reserved space or `nonce.reservation_flush_ms = 5` ms (tracked per partition, never coalesced). When a partition flushes a WAL batch for any reason, it MUST also flush any pending reservation entry before acknowledging the batch. On restart, the next block counter resumes at `max(start_block_counter + reserved_blocks)`; therefore the largest benign “hole” scrub may encounter equals the configured `nonce.reservation_max_bytes_profile`. The runtime tracks both `wal.nonce_reservation_gap_blocks` and `wal.nonce_reservation_gap_bytes` (largest contiguous reserved-but-unused window) plus `wal.nonce_reservation_gap_events_total`; exceeding the profile-tunable `nonce.reservation_gap_quarantine_threshold_bytes` (default 4 MiB, max 8 MiB under Break-Glass) raises `NonceReservationGapWarning`. The threshold compares strictly against the contiguous metric `wal.nonce_reservation_gap_bytes`; auxiliary counters such as `wal.nonce_reservation_gap_bytes_cumulative` remain observational only and MUST NOT page or quarantine on their own. Mandatory Quarantine only triggers when (a) the same gap exceeding the threshold is observed across two consecutive boots, or (b) the gap coincides with any scrub/integrity failure in the same segment, or (c) the implementation detects a reused `(dek_epoch, segment_seq, block_counter)` tuple (which remains immediate Quarantine). Hitting three threshold-crossing gap events within `nonce.reservation_gap_incident_window_ms = 86,400,000` also escalates to Quarantine unless the operator applied a Break-Glass exception before the third event. Operators who know a workload will create large benign gaps must raise the threshold explicitly (with ticket) before the workload runs.
-- Overflow is forbidden: `start_block_counter + reserved_blocks` MUST stay ≤ `u64::MAX`, and implementations SHALL reject (and page) any attempt to allocate a reservation that would wrap the counter space.
-- When a segment is rewritten or abandoned (e.g., re-encryption, repair), replicas MUST append `NonceReservationAbandon{segment_seq, abandon_reason}` to `wal/durability.log` after proving that every block in the reservation range was either written or explicitly zeroed. Compaction engines across the quorum MUST observe either (a) every reservation range for that `segment_seq` marked “fully spent” (i.e., `max_written_block >= start + reserved_blocks`) or (b) a committed `NonceReservationAbandon` before unlinking any WAL bytes tied to that `segment_seq`.
-- [Informative] The nonce lifecycle can therefore be viewed as a finite-state machine shared across §6.5 and §9.2:
-```
-Reserve --(blocks written)--> Spent
-Reserve --(scrub observes unused window ≤ 4 MiB)--> GapObserved
-GapObserved --(second boot or scrub failure)--> Quarantine
-Reserve --(segment rewrite/repair)--> Abandoned
-Abandoned --(ControlPlaneRaft acknowledges + compaction)--> Retired
-Spent --(compaction rule satisfied)--> Retired
-```
-Only the `GapObserved → Quarantine` edge is automatic; all other transitions require the ledger entries described above. Auditors can therefore inspect `NonceReservationRange`, `NonceReservationAbandon`, and scrub telemetry to prove every `(segment_seq, block_counter)` pair is either Spent or explicitly Retired before the WAL bytes disappear.
-- The happens-before chain is therefore:
-
-```
-AppendEntries payload
-  → WAL pwrite
-  → `fdatasync` WAL data file (or flush the current Group-Fsync batch) while keeping index/directory ordering
-  → durability.log append
-  → `fdatasync` `wal/durability.log`
-  → `fsync` the WAL directory entry when a new segment/ledger file is created or rotated
-  → quorum DurabilityAck counted (derives last_quorum_fsynced_index)
-  → client ACK (per §3.4)
-```
-
-Any crash between these edges preserves either (a) WAL data without a `DurabilityRecord` (forcing Strict fallback on replay) or (b) the `DurabilityRecord` without a client ACK, which remains safe because the ACK contract refuses to respond without step 5 completing. New leaders must load `wal/durability.log`, recompute `last_quorum_fsynced_index`, and publish the resulting `(last_durable_term, last_durable_index)` into ControlPlaneRaft before serving writes (§3.1, §11.1).
-
-### 6.6 Quarantine Lifecycle
-Quarantine is a named runtime state with a single purpose: halt new writes until integrity doubts are cleared. The state machine is:
-
-| Transition | Trigger | Allowed operations while quarantined | Exit requirements |
-| --- | --- | --- | --- |
-| Healthy → Quarantine | AEAD/MAC/CRC failure (§6.3/§6.4), repeated `ApplyOutcome::Fatal` (3 within 60 s), dropped `AckHandle`s (3 within window), partial re-encryption detected (§9.2), admin `AdminPausePartition`, disk policy violation (§15.1). | Read-only APIs (snapshot export, telemetry), Explain/Why*, `AdminResumePartition` (Break-Glass), snapshot import for repair. No appends, no membership changes, no durability transitions. | Complete snapshot import or WAL rebuild that replays through `wal_committed_index`, incident ticket referencing remediation, ControlPlaneRaft acknowledgement (`QuarantineCleared`) recorded, and supervisor restart. |
-| Quarantine → RepairMode | Operator sets `bootstrap.repair_mode=true` for offline work. | Same as above plus data-plane listeners stopped. | Successful repair and `AdminResumePartition`. |
-| Quarantine → Decommissioned | Operator deletes replica/partition. | None (partition removed). | N/A |
-
-Every entry/exit emits an audit log with `{partition_id, reason, ticket}`. While quarantined, Explain APIs must return `WhyQuarantined{reason, since_ms}` so clients understand the condition; observers cannot override it.
-[Normative] Quarantine reasons are typed so read-only allowances remain unambiguous: `Integrity` covers AEAD/MAC/CRC failures, re-encryption faults, and disk hygiene violations; `Administrative` covers `AdminPausePartition`; `ApplyFault` covers repeated `ApplyOutcome::Fatal` or AckHandle drops. Integrity quarantines MUST disable new snapshot exports and follower-read capabilities entirely until ControlPlaneRaft acknowledges `QuarantineCleared`; operators may only retrieve already-signed manifests via metadata APIs, never stream chunks. Administrative pauses MAY continue serving snapshot exports (always marked `Snapshot-Only: true`) so tenants can drain state, but these exports MUST advertise `quarantine_reason=Administrative`. ApplyFault quarantines inherit Integrity behavior for follower reads but MAY continue exporting the last verified snapshot when `snapshot_only_ready_state=Healthy`. Telemetry MUST expose `snapshot_exports_blocked_reason ∈ {Integrity, ApplyFault, None}` so automation can correlate API availability with the quarantine class.
-
-Commit-index monotonicity is logical (client-facing). Repair actions may truncate local WAL segments below the last advertised `commit_index`, but nodes MUST NOT report a lower `raft_commit_index`/`wal_committed_index` to clients after quarantine. Explain/Why* APIs, telemetry, and admin surfaces therefore continue to emit the pre-quarantine watermark until a fresh proof is republished. While quarantined, leaders serve reads **only** from the last verified snapshot/`applied_index` checkpoint that predates the quarantine event; they MUST NOT materialize new snapshots or follower-read checkpoints until the repair completes, preventing operators from accidentally exporting partially repaired state. Instead, the recovered replica remains paused (no writes, follower reads disabled) until it replays through the prior `commit_index` or imports a snapshot covering it and proves—via a fresh durability ledger record—that `wal_committed_index` continuity holds. Only after that proof is mirrored into ControlPlaneRaft may the replica rejoin quorum, preserving the monotone guarantee exposed to clients.
-
----
-
-## 7  Apply Pipeline & State Machine Hooks
-- Every committed entry executes `on_commit(batch: &[EntryView], ctx: ApplyContext)` on leaders and followers. `on_commit` returns `ApplyOutcome::{Ack, Retryable{reason}, Fatal}`. Fatal outcomes force leader step-down and quarantine the replica until replay succeeds.
-- `on_applied(last_applied)` publishes watermarks for upper layers. `sm_durable_index` must persist in product storage and never exceed `raft_commit_index`.
-- `ApplyContext` exposes async `AckHandle` so products can defer durability confirmation without stalling Raft.
-- Crash recovery replays from `wal_committed_index`, and products must reject duplicate side effects above their persisted `sm_durable_index`.
-
-### 7.1 Apply Budget SLA
-| Parameter | Default | Notes |
-| --- | --- | --- |
-| `apply.max_batch_ns` | 2 ms p99 | Leaky bucket increments per breach; drains at 2/s. |
-| `apply.budget_breach_threshold` | 5 | Crossing triggers `apply_budget_breach`, PID credit penalty ≤50%, and optional operator overrides. |
-| `apply.max_batch_entries` | 512 | Batches beyond this split automatically. |
-| `apply.handoff_queue_len` | 1024 | 90% utilization emits `ApplyQueueNearFull` and throttles credits. |
-| `ack_handle.max_defer_ms` | 250 ms | Upper bound for deferring `AckHandle::complete`; timer enforced even for products that opt out of crash-linearizable reads. |
-| Forbidden work | Blocking syscalls during `on_commit`; use `ApplyDeferredQueue` + `AckHandle`. |
-
-Profiles set per-partition ceilings for `ack_handle.max_defer_ms` via App.B: Latency/ConsistencyProfile partitions remain capped at 250 ms, Throughput partitions may raise the ceiling to 400 ms, and WAN partitions may raise it to 500 ms. Implementations MUST reject configs that exceed their profile’s ceiling even if the local default is lower.
-
-`ApplyOutcome::Fatal` trips a supervisor poison pill; 3 fatals within 60 s trigger a 5 s backoff before campaigning again. The `apply.max_batch_ns` limit is enforced as a sliding-window p99 over the most recent `apply.p99_window_batches = 10,000` batches per partition (windows <10 samples fall back to max), preventing jitter from tiny samples while still catching sustained regressions quickly.
-
-Profile overrides: App.B publishes the per-profile ceiling for `apply.max_batch_ns`. The Latency/ConsistencyProfile profile inherits the 2 ms p99 ceiling above; Throughput profiles may raise it to 4 ms (documented in the profile bundle) to accommodate larger codecs, while WAN profiles cap at 5 ms because RTT dominates. Implementations MUST enforce those ceilings per partition profile and reject configs that exceed them.
-
-### 7.2 Idempotency & Replay
-- Each `EntryView` carries `dedupe_token = (term, index)`; caches MUST evict entries `< snapshot_index` and bound themselves by `apply.dedupe_max_entries = 1M` or `apply.dedupe_max_bytes = 128 MiB`.
-- Cold-start replay blocks client reads/writes until `applied_index >= raft_commit_index_at_election`. `ApplyContext.random_seed` is reused on replay for determinism.
-- `ApplyOutcome::Retryable` requires explicit reason codes (`TransientIo`, `CodecMismatch`, `QuotaExceeded`, `Backpressure`).
-
-### 7.3 AckHandle Lifecycle
-- `AckHandle::complete()` (or `AckHandle::fail(reason)`) MUST be invoked before `ack_handle.max_defer_ms` elapses. The runtime arms a deadline per handle; exceeding it automatically converts the entry into `ApplyOutcome::Retryable{reason=AckTimeout}` and rolls the partition back to the last durable index before accepting more writes.
-- Dropping an `AckHandle` without resolving it triggers the same timeout behavior immediately and increments `apply.ack_handle_drop_total`. Three consecutive drops within `ack_handle.drop_window_ms = 1000` quarantine the partition until a supervisor clears the fault, preventing upper layers from silently starving `applied_index`.
-- Products that legitimately need longer work must explicitly opt into `ApplyDeferredQueue` with sharded handles and surface their own user-facing status; the runtime still enforces the global deadline to uphold visibility guarantees from §3.4.
-
-### 7.4 Aggregator Allowance Profile
-[Normative] Partitions that run quantile/top-k/distinct aggregations MAY opt into the `Aggregator` profile published in App.B. The profile raises select limits only after the partition’s profile record sets `apply.profile=Aggregator`, `apply.max_batch_ns_profile=6000000` (6 ms p99), `apply.max_batch_entries_profile=2048`, and `ack_handle.max_defer_ms_profile=750`, and spec-lint enforces that the profile references these exact values.
-
-| Parameter | Aggregator Profile | Guardrail / Telemetry |
-| --- | --- | --- |
-| `apply.max_batch_ns` | 6 ms p99 | Enforced via the existing leaky bucket and `apply.aggregator_budget_breach_total`. |
-| `apply.max_batch_entries` | 2,048 | Runtime splits batches above 2,048 entries and emits `ApplyAggregatorSplit`. |
-| `ack_handle.max_defer_ms` | 750 ms | Deadline is enforced plus `ack_handle.defer_guardrail_ms = 800` to page if exceeded. |
-
-[Normative] AP workloads MUST prove compliance by emitting `ApplyProfileReport{profile, p95_batch_ns, p99_batch_ns, max_batch_entries, max_ack_defer_ms}` every `profile.report_period_ms = 10000` and by responding to `ExplainApplyProfile(profile=Aggregator)` with the last report plus `decision_trace_id`. Operators MUST reject or roll back the profile if any report shows breaches beyond 5 consecutive intervals; Clustor enforces this automatically by demoting the partition to the default profile and logging `ApplyProfileAutoDemote`.
-[Operational] Instrumentation MUST capture `apply.aggregator_samples_total`, `apply.aggregator_guardrail_violations_total`, and `ack_handle.defer_guardrail_violation_total` so Explain APIs and dashboards can document whether AP workloads continue to respect the raised ceilings. The Explain API for throttling (`WhyCreditZero`) MUST cite the profile when aggregator allowances contribute to PID adjustments so downstream teams can reconcile telemetry with ingest hints.
----
-
-## 8  Snapshots & State Transfer
-- Triggers: log size (`snapshot.log_bytes_target = 512 MiB`), time (`snapshot.max_interval = 15 min`), or follower lag (`snapshot.catchup_threshold = 64 MiB`).
-- [Normative] Incremental snapshots are enabled for every partition (`snapshot.delta_chain_max ≥ 1`) and MUST follow the cadence, chain, and manifest requirements in §8.4 so that delta checkpoints remain interoperable with full snapshots and ControlPlaneRaft authorization.
-- Products implement `snapshot_export` and `snapshot_import`. Importers must accept at least `current_version-1`.
-
-### 8.1 Snapshot Manifest Format
-[Normative] Snapshot manifests MUST emit the fields below for both full and incremental checkpoints; producers treat every field as canonical and reject manifests that omit or reorder them.
-| Field | Description |
-| --- | --- |
-| `manifest_id` | UUIDv7/ULID, monotonic per partition. |
-| `version_id` | Incrementing integer; ControlPlaneRaft tracks `accepted_min/max`. |
-| `producer_version` / `emit_version` | Emitter build + ControlPlaneRaft-selected emit version. |
-| `base_term`, `base_index` | Last included log entry. |
-| `content_hash` | SHA-256 of canonical manifest. |
-| `chunks[]` | `{chunk_id, offset, len, digest}` (SHA-256). |
-| `logical_markers` | Product-defined (tenant IDs, ranges). |
-| `signature` | Ed25519 (or gated P256) over canonical body. |
-| `encryption` | `{dek_epoch, iv_salt}` for AEAD decrypt. |
-| `snapshot_kind` | Enum `Full` or `Delta`; `Delta` manifests also expose the parent below. |
-| `delta_parent_manifest_id` | Parent manifest ID for delta chains; null for full snapshots. |
-| `delta_chain_length` | Number of chained incrementals since the last full snapshot (1–3 inclusive). |
-| `ap_pane_digest` | SHA-256 over deterministic AP pane state serialization (pane ID order). |
-| `dedup_shards[]` | Ordered `{shard_id, ledger_epoch, shard_digest}` vector for dedup workloads. |
-| `commit_epoch_vector[]` | Monotone `{dimension, epoch, checksum}` list proving commit-epoch metadata parity. |
-
-[Normative] `ap_pane_digest`, `dedup_shards[]`, and `commit_epoch_vector[]` MUST be computed from the exact bytes replay would hydrate, using lexicographic ordering on pane/shard IDs and zero-padding absent shards so manifests from different emitters remain byte-for-byte comparable; any attempt to elide or reorder those collections invalidates the manifest (`SnapshotDeterminismViolation`) before authorization. Importers MUST verify that every `commit_epoch_vector` entry matches the ControlPlaneRaft-advertised epoch for the corresponding dimension and refuse to mount the snapshot otherwise to preserve Invariant C3.
-
-Manifests MUST be emitted as RFC 8785 Canonical JSON: UTF-8 encoding, no insignificant whitespace, deterministic object member ordering (lexicographic by UTF-16 code unit), and minimal numeric representations. Producers first populate every field except `content_hash`/`signature`, canonicalize the JSON, compute `content_hash = sha256(canonical_bytes)` as a lowercase `0x`-prefixed hex string, inject that field, re-canonicalize (still omitting the `signature` field), and finally sign that canonical byte stream. App.C (“Snapshot Manifest & Segment-MAC Test Fixtures”) provides a worked manifest plus signer key so implementations can validate hashing and signature coverage end-to-end; spec-lint replays that vector to prevent drift.
-
-ControlPlaneRaft manages ManifestSigner keys with anti-rollback counters. Nodes refuse manifests from unknown or superseded epochs unless a time-boxed override is applied (§13.2).
-`manifest.json` and its directory entry MUST be `fsync`'d immediately after emission; the producer re-lists the manifest (stat + checksum) before advertising it as deletion-authorizing so §9.1 can rely on the manifest being durably discoverable. After the re-list succeeds, the producer appends `SnapshotAuthorizationRecord{manifest_id, base_index, auth_seq, manifest_hash}` to `snapshot/manifest_authorizations.log` (monotone `auth_seq` per partition) and `fdatasync`s the log. Compactors consume that log, re-stat the manifest, and persist `CompactionAuthAck{manifest_id, auth_seq}` in `metadata.json` before unlinking any WAL segment. Missing acks abort deletion, enforcing a two-phase handshake.
-[Normative] Each `CompactionAuthAck` extends a hash chain `compaction_auth_chain = sha256(prev_chain || manifest_id || auth_seq || manifest_hash)` stored alongside the ack and `fdatasync`'d with it (the initial `prev_chain` is 32 zero bytes). Spec-lint replays the same derivation, and auditors can therefore prove that deletion authority itself has not been tampered with even if metadata files are copied offline.
-
-### 8.2 Snapshot Import Flow
-1. Canonicalize JSON (RFC 8785) and verify signature + DEK epoch via cached trust roots. Importers may continue reading with the last trusted roots until `controlplane.cache_grace_ms` elapses even if ControlPlaneRaft is unreachable.
-2. Validate `version_id` is within `[accepted_min, accepted_max]`.
-3. Stream chunks: authenticate AEAD, decrypt, then verify digest before applying. [Normative] If either the AEAD tag or chunk digest fails, the importer MUST zeroize the staging buffer, roll `applied_index` back to the last fully verified entry, emit `SnapshotChunkAuthFailure`, and retry the chunk up to `snapshot.import_chunk_retry_limit = 3` times with bounded exponential backoff (`retry_delay_ms = min(2^attempt × 1000, 10000)` with ±25% jitter). The total retry window for a chunk MAY NOT exceed 60 s wall-clock; exceeding either the attempt count or the time budget forces Quarantine for that partition. Under no circumstance may partially authenticated data advance `applied_index` or mutate product state; failures MUST also raise `snapshot.import_fail_reason="ChunkAuth"` telemetry so operators can correlate the rollback.
-4. Apply entries `(base_index + 1 .. latest)` via normal AppendEntries; handle conflicts via truncate-and-replay. AppendEntries arrivals are buffered until `applied_index >= base_index` to avoid interleaving, and MUST NOT be applied (or expose `applied_index > base_index`) until the manifest signature + version checks from steps 1–2 succeed. If the manifest is rejected, buffered RPCs MUST be dropped and the leader notified via `ThrottleEnvelope{reason=SnapshotRejected}` to prevent partially-applied state.
-  - The buffer is bounded to `snapshot.import_append_buffer_max_entries = 8192` per partition by default; profiles MAY raise it (≤65,536) via `snapshot.import_buffer_multiplier` when sustained throughput would otherwise starve replication. To cap resident memory, the product of `buffered_entries × entry.max_frame_bytes(profile)` MUST remain ≤ `snapshot.import_buffer_max_bytes_abs = 8 GiB`. Profiles MAY only tune the cap downward (`snapshot.import_buffer_max_bytes <= 8 GiB`); attempts to raise it above 8 GiB are rejected at config-parse time and in spec-lint. Every change MUST appear in the profile bundle so both sides agree on the cap. Hitting either bound stalls new AppendEntries by emitting `ThrottleEnvelope{reason=SnapshotImport}` so leaders back-pressure until import catches up.
-  - Node-level protection: the runtime also enforces `snapshot.import_node_buffer_max_bytes = min(snapshot.import_node_buffer_hard_cap_bytes, max(8 GiB, floor(node_ram_bytes × snapshot.import_node_buffer_ram_fraction)))` across all concurrent imports on a node. The default fraction is `0.15`; profile bundles MAY tune it within `[0.05, 0.25]`. `snapshot.import_node_buffer_hard_cap_bytes` defaults to 32 GiB and MAY be increased (with ticket) up to 64 GiB on 1 TB+ hosts; spec-lint rejects values outside `[32 GiB, 64 GiB]`. When aggregate usage would exceed the computed cap, new imports block at the manifest-authorization step and emit `SnapshotImportNodePressure`; telemetry `snapshot.import_node_buffer_usage_bytes` exposes the headroom so operators can stage imports safely on high-density nodes.
-  - [Informative] The proportional formula above keeps recovery throughput predictable as hardware footprints grow (e.g., a 1 TB RAM host yields a 32 GiB cap, while a 64 GiB host settles at ~9.6 GiB). This avoids new spec revisions each time hardware generations change while retaining the absolute 32 GiB safety guardrail.
-  - Once the importer finishes applying the snapshot (or discards it on failure), the buffer automatically drains in FIFO order and the transport replays any deferred AppendEntries without requiring the leader to re-probe; leaders simply resume their normal heartbeat-based catch-up loop and the throttle clears itself when the buffer drops below 80%.
-5. If trust caches expire, imports fail with `snapshot_full_invalidated(reason)` or `snapshot_delta_invalidated(reason)`; operators may issue a time-limited override (`snapshot_full_override`).
-
-### 8.3 Snapshot I/O Budgeting
-- Per-peer budget `snapshot.max_bytes_per_sec = 128 MiB/s` with classes `CatchUp`, `Bootstrap`, `DR`. Meters resume only after utilization <90% (10% hysteresis).
-- Node-level cap `snapshot.node_max_bytes_per_sec = min(0.7 * detected_nic_capacity, 1 GiB/s)`; exceeding demotes all snapshot traffic until the rolling meter drops below 60%.
-- AppendEntries replication always preempts snapshot traffic via weighted fair queuing; heavy snapshot traffic emits `WhySnapshotBlocked` hints.
-
-### 8.4 Incremental Snapshot Cadence & Restore Guarantees
-[Normative] Enabling `snapshot.delta_chain_max > 0` requires configuring `snapshot.delta_emit_period_ms <= 10000` (10 s cadence) and `snapshot.full_emit_period_ms <= 30000`; the runtime enforces both by auto-triggering a full snapshot whenever either bound would be exceeded. `delta_chain_length` counts only the incremental snapshots emitted since the last full checkpoint (the full snapshot itself is never included). Chains MUST cap at three incrementals between full snapshots; emitters automatically roll a full snapshot once `delta_chain_length` would grow past 3 or when the parent manifest ages past 30 s, whichever occurs first.
-[Normative] `SnapshotAuthorizationRecord` entries for incremental manifests MUST include `{manifest_id, delta_parent_manifest_id, snapshot_kind}` and the elapsed time since the last full snapshot. ControlPlaneRaft rejects authorizations whose `full_age_ms > 30000` or whose `delta_emit_age_ms > 10000`, ensuring the authorization handshake guarantees the “30 s full + 10 s incremental” checkpoint envelope even when ControlPlaneRaft momentarily lags (§11.1 mirrors the same timers).
-[Normative] AP (analytics-pane) workloads MUST hydrate their pane/dedup state exclusively from the deterministically recorded `ap_pane_digest` and `dedup_shards[]` vectors. Importers replay the serialized AP pane stream prior to replaying entries above `base_index`, refuse activation if recomputed digests differ, and write `ap_pane_restore_state=Complete` into `metadata.json` before acknowledging readiness. This rule preserves dedup shard ordering and eliminates cross-replica divergence for AP pane state.
-[Normative] Restore flows MUST enforce Invariant C3 (commit-epoch monotonicity) by comparing each `commit_epoch_vector` entry with ControlPlaneRaft’s `commit_epoch` for the same dimension before admitting client writes; failures quarantine the partition with `InvariantC3RestoreFailed` until a compliant manifest arrives. Activation remains blocked until `shadow_apply_checkpoint_index` and `commit_epoch_vector` jointly prove that commit-epoch metadata never regressed relative to the last ControlPlaneRaft-published epoch.
-[Normative] Crash/outage hygiene: when either the emitter or ControlPlaneRaft outage leaves an incomplete delta chain (missing parent manifest, `delta_chain_length` gap, or parent older than 30 s), partitions MUST mark the chain `delta_chain_state=Orphaned`, delete the orphaned manifests from the authorization log, and trigger an immediate full snapshot before delta replication resumes. Importers encountering an orphan MUST refuse to apply it and report `SnapshotDeltaRetired` so automation can track successful retirement. This guarantees that every surviving delta chain is rooted in an authorized full snapshot even after disruptions.
-[Operational] Emitters and importers MUST publish `snapshot.delta_emit_skew_ms`, `snapshot.delta_chain_length`, and `snapshot.snapshot_only_ready_ratio` telemetry so Explain/WhySnapshotBlocked tooling can prove compliance and surface impending violations before the guardrail forces a full snapshot.
-
----
-
-## 9  Storage Layout, Encryption & Recovery
-
-```
-/state/<partition_id>/
-  wal/
-    segment-0000000001.log
-    segment-0000000001.idx
-  snapshot/
-    snap-<term>-<index>/manifest.json
-    chunks/
-  metadata.json
-  boot_record.json
-```
-
-### 9.1 Compaction Safety Gates
-- Delete WAL below the latest snapshot only when:
-  - ≥ `compaction.quorum_ack_count` replicas (2 for 3-node, 3 for 5-node) report `sm_durable_index >= snapshot.index`.
-  - Hard floor: never delete below `min(quorum_applied_index, base_index)` where `quorum_applied_index` is the smallest `applied_index` observed across the latest quorum heartbeat bundle, even if `sm_durable_index` advances faster.
-  - `checkpoint.quorum_guard_bytes` (default 256 MiB) and learner slack requirements are satisfied. Learners within `membership.catchup_slack_bytes` retain their needed WAL range regardless of guard consumption.
-  - The snapshot authorizing deletion remains the latest manifest.
-  - The authorizing snapshot manifest and directory entries were `fsync`'d post-rotate, re-listed (stat + checksum), and covered by a `SnapshotAuthorizationRecord` + matching `CompactionAuthAck{manifest_id, auth_seq}` (§8.1) before any WAL unlink occurs to prevent TOCTOU between manifest publication and persistence.
-  - If a re-listed manifest later fails signature or hash verification (object-store bitrot), compaction aborts with `CompactionAuthAbort{manifest_id, reason=ManifestSignatureMismatch}` and the manifest is quarantined until a new snapshot replaces it.
-  - Re-encryption jobs mark segments `rewrite_inflight`; compaction skips them until `rewrite_complete` is fsync'd.
-- All gates above are conjunctive; compaction MUST satisfy both the `sm_durable_index` quorum clause and the `min(quorum_applied_index, base_index)` floor (plus the remaining bullets) before any WAL bytes are unlinked.
-- When both a learner slack requirement and the `min(quorum_applied_index, base_index)` floor apply, compaction uses `max(learner_slack_floor, min(quorum_applied_index, base_index))` as the effective floor so that learners retain their guarded range even if `base_index` lags.
-- Putting it together: the WAL deletion guard is `floor_effective = max(learner_slack_floor, min(quorum_applied_index, base_index))`, and bytes below `floor_effective` leave disk only after the quorum-level `sm_durable_index` test is satisfied. *Example:* in a 3-replica set with `base_index=1,200`, `quorum_applied_index=1,300`, and a learner that must retain the most recent 100 entries (`learner_slack_floor=1,250`), we compute `min(quorum_applied_index, base_index)=1,200`, so `floor_effective = max(1,250, 1,200) = 1,250`. Even if two replicas report `sm_durable_index=1,500`, compaction MUST keep WAL bytes below 1,250 until the learner catches up and the snapshot manifest authorizes deletion.
-- [Normative] Implementations MUST calculate the effective floor using the pseudocode below (i.e., `max(learner_slack_floor, min(quorum_applied_index, base_index))`). Validators MUST NOT re-arrange the inequalities—doing so can silently flip the guardrail direction when learners lag—and spec-lint asserts identical results against the reference function.
-- Learner retirement guardrail: when a `MembershipChange` (§4.1) removes or decommissions a learner, compaction MUST continue honoring the most recent `learner_slack_floor` until the retiring replica either (a) acknowledges `applied_index >= learner_slack_floor` or (b) both `learner_retirement_delay_entries = 65,536` and `learner_retirement_delay_ms = 300000` elapse after the joint consensus commit that removed it. ControlPlaneRaft records `membership.learner_retire_index` when finalization occurs; compaction MUST surface `compaction.learner_retirement_pending=true` and cite that index in Explain APIs until the guard clears so operators cannot accidentally drop WAL needed by a “dangling” learner that is still replaying offline.
-- Compactors MUST also confirm that every `segment_seq` whose bytes would be unlinked either (a) has no outstanding `NonceReservationRange` entries (all are fully spent) or (b) carries a committed `NonceReservationAbandon{segment_seq}` record (§6.5, §9.2). Deletion that races ahead of nonce accounting is forbidden.
-- Disk pressure: `disk.soft_usage_percent = 80%` halves credits and triggers snapshots if gates allow; `disk.hard_usage_percent = 90%` rejects appends with `AppendDecision::Reject(DiskFull)` but still serves reads.
-[Normative] Compaction MUST remain suspended while `quarantine_reason=Integrity` so that no bytes are deleted while integrity is in doubt. Administrative or ApplyFault quarantines MAY continue compaction once all guardrails above are satisfied, but they still honor the SnapshotAuthorization/CompactionAck handshake and record their quarantine class in the audit trail before unlinking any WAL bytes.
-
-Reference pseudocode (`compaction_floor.rs`) ensures every implementation computes the same floor:
+| Leader ReadIndex / lease | Allowed when predicate above holds | Rejected (`ControlPlaneUnavailable{reason=NeededForReadIndex}`) |
+| Leader snapshot-only reads (explicit SnapshotOnly flag) | Allowed; reads clamp to `applied_index` | Allowed; still clamped to last verified `applied_index`, never linearizable |
+| Follower snapshot-only reads | Allowed only when `follower_read_snapshot_capability` bit is set | Capability revoked within 100 ms; outstanding RPCs fail with `FollowerCapabilityRevoked` |
+| Observer streams | Allowed while cache is Fresh and strict fallback is false | Revoked; observers must reconnect after proof publication |
+
+10.3.1 `commit_visibility` Modes
+- `commit_visibility=DurableOnly` is the v0.1 default for every profile and is required whenever linearizable reads, follower-read capabilities, or observers are enabled.
+- `commit_visibility=CommitAllowsPreDurable` is an optional Throughput-profile feature that MAY be enabled only when:
+  - Group-Fsync is active and healthy.
+  - The product surface explicitly marks all resulting reads as `read_semantics=SnapshotOnly`.
+  - Clients that require read-after-write guarantees pin their writes by waiting for `last_quorum_fsynced_index ≥ ack_index`.
+- Under `CommitAllowsPreDurable`, leaders MAY expose `raft_commit_index` ahead of `wal_committed_index` to snapshot-only reads, but leaders MUST continue enforcing the ACK contract and MUST clear the mode immediately when strict fallback, cache staleness, or any read gate clause fails. Linearizable reads (ReadIndex or leases) remain forbidden in this mode, so no predicate ever requires `wal_committed_index == raft_commit_index` while `CommitAllowsPreDurable` is active; follower-read capabilities stay disabled. If a deployment does not implement these guardrails, `CommitAllowsPreDurable` MUST remain disabled.
+
+10.4 ACK Contract
+- Client ACK prerequisites:
+  1. Entry is Raft-committed in the current term.
+  2. Leader has persisted local WAL bytes and `DurabilityRecord`.
+  3. Leader has quorum `DurabilityAck` evidence (followers persisted the same record plus `fdatasync`).
+  4. `wal_committed_index` advanced to the ack index and is recorded before responding.
+- Idempotency requires `AppendRequest.idempotency_key`; servers repeat the same ack index when reprocessing duplicates.
+- Because of prerequisite (1), a freshly elected leader MUST wait until it commits at least one entry from its own term before acknowledging any client writes—even if those writes became committed due to earlier-term majority replication—matching the standard Raft current-term rule.
+
+10.4.1 Durable Watermarks
+- Every replica maintains `local_wal_durable_index`, equal to the highest log index whose WAL bytes completed §10.5 step (2) and whose `DurabilityRecord` completed §10.5 step (4). Followers advertise this value inside `DurabilityAck` only after clause §7.1 (DurabilityAck attestation) is satisfied.
+- Leaders additionally compute `wal_committed_index` by intersecting their own `local_wal_durable_index` with the quorum of `DurabilityAck` attestations gathered for the current term:
+  1. Raft establishes `raft_commit_index` via the standard majority rule with the current-term requirement.
+  2. Once steps (1)–(4) in §10.5 complete for index *n*, the leader updates `local_wal_durable_index = n`. This durability progression is independent of Raft commit timing, but entries cannot contribute to `wal_committed_index` until they are Raft-committed in the current term.
+  3. The leader recomputes `wal_committed_index = max{m | at least quorum_size attestations (including the leader) report `local_wal_durable_index ≥ m`, the log entry at index *m* exists locally with `term(m) == current_term`, and `m ≤ raft_commit_index` }`.
+- Leaders MUST NOT advance `wal_committed_index` ahead of `raft_commit_index`, even if durability acknowledgements arrive early. Followers MUST NOT advertise a `local_wal_durable_index` that exceeds the smaller of their locally known last-appended (or last-written) log index and their last synced `DurabilityRecord`.
+- Strict equality for linearizable reads therefore reduces to checking `wal_committed_index == raft_commit_index` on the leader; followers enforce the snapshot-only predicate by requiring `local_wal_durable_index ≥ applied_index_floor`.
+- The “current term” constraint in Raft applies to both indices: an entry can contribute to `wal_committed_index` only after it is committed in the current term. Followers that notice a leader advertising durability for an entry from an older term MUST continue processing the AppendEntries but treat the resulting durability claim as unusable when comparing ControlPlaneRaft proofs (and SHOULD log `ControlPlaneProofMismatch`) so the leader cannot clear the read gate via stale terms.
+
+10.5 Ledger Ordering and Replay
+- Ordered steps (identical for leaders and followers):
+  1. Append the entry bytes to the WAL segment (`pwrite`).
+  2. Complete the WAL durability step: in Strict mode `fdatasync` the WAL file; in Group-Fsync flush the batch covering the entry, ensuring the entry bytes are on stable storage.
+  3. Append the corresponding `DurabilityRecord` (and any coalesced reservation metadata) to `wal/durability.log`.
+  4. `fdatasync(wal/durability.log)` to make the ledger record durable.
+  5. After step (4), leaders count quorum `DurabilityAck`s toward `wal_committed_index` and may emit the client ACK once §10.4 succeeds.
+Followers MUST execute steps (1)–(4) before sending their `DurabilityAck`. Replay pseudo:
+  ```
+  fn replay_durability_log(log_path, wal_index) -> ReplayResult {
+      let mut last_good_offset = 0;
+      let mut last_good_record = None;
+      for record in read_records_in_order(log_path) {
+          if !record.verify_crc() { break; }
+          if !wal_index.contains(record.term, record.index, record.segment_seq) { break; }
+          enforce_step_order(record);
+          last_good_offset = record.file_end_offset;
+          last_good_record = Some(record);
+      }
+      truncate_file_to(last_good_offset);
+      fdatasync(log_path);
+      ReplayResult { proof: last_good_record, strict_fallback: last_good_record.is_none(), truncated_bytes }
+  }
+  ```
+  Truncation uses synchronous primitives and immediately `fdatasync`s descriptors; background threads may not truncate asynchronously.
+
+10.6 Flow Control
+- Dual-token PID controller with sample period 100 ms, default gains per profile (Latency: `Kp=0.60, Ki=0.20, Kd=0.10`; Throughput: `0.50/0.15/0.08`; WAN: `0.40/0.10/0.05`). Guardrail `Ki × sample_period_s ≤ 1.0`.
+- Credits: `entry_credit_max=4096`, `byte_credit_max=64 MiB`, with minimum quantum admitting one ≤16 KiB frame each tick even when byte credits exhaust. PID auto-tuner runs on Throughput/WAN when `io_writer_mode=FixedUring` and caches are Fresh; it reverts to last stable gains on oscillation and reports `flow.pid_auto_tune_state`.
+- Structural lag classification: Transient (`lag_bytes ≤64 MiB` and `lag_duration <30 s`) halves credits; Structural (beyond thresholds or ≥256 MiB) forces Strict durability, reduces credits to 25%, triggers snapshots, alerts ControlPlaneRaft, and steps down after `flow.structural_stepdown_ms = 15,000` ms unless `flow.structural_override` is active. Manual `flow.structural_hard_block` halts writes entirely.
+
+10.7 Snapshot Import/Export; Incremental Cadence
+- Import procedure enumerated in §9.5. Retry policy: exponential backoff `min(2^attempt × 1000, 10,000)` ms with ±25% jitter, ≤3 attempts, ≤60 s.
+- Incremental snapshots SHOULD meet the profile SLO targets (`snapshot.delta_emit_period_ms_target`, `snapshot.full_emit_period_ms_target`) but MUST enforce the operator/profile hard bounds (`snapshot.delta_emit_period_ms_operator` if set, otherwise `snapshot.delta_emit_period_ms_hard_profile`; same for full). `delta_chain_length` counts only incrementals since the last full snapshot and MUST stay ≤ `snapshot.delta_chain_max_profile`. Authorization logs include parent info and elapsed time since the last full snapshot; ControlPlaneRaft only retires a chain when the operator/hard bound is exceeded, not merely because an SLO target was missed.
+- AP workloads restore `ap_pane_digest` and `dedup_shards[]` before applying entries beyond `base_index`; mismatches cause `SnapshotDeterminismViolation`.
+
+10.8 Compaction Floor
 ```
 fn compute_compaction_floor(state: CompactionState) -> u64 {
     let learner_floor = state.learner_slack_floor.unwrap_or(0);
-    let quorum_floor = state.quorum_applied_index.min(state.snapshot_base_index);
-    let floor_effective = learner_floor.max(quorum_floor);
-
+    let quorum_floor = state.quorum_applied_index;
+    let floor_effective = learner_floor.max(quorum_floor).max(state.snapshot_base_index);
     if state.quorum_sm_durable_index < state.snapshot_base_index {
-        return state.snapshot_base_index; // snapshot not yet safe
+        return state.snapshot_base_index;
     }
-
     floor_effective
 }
 ```
-Callers delete WAL bytes `< compute_compaction_floor(...)` only after the SnapshotAuthorization + CompactionAck handshake succeeds and nonce reservations are cleared.
+- Delete bytes `< floor_effective` only after manifest authorization, learner retirement guards, and nonce reservation clearance succeed.
 
-### 9.2 Encryption & Key Epoching
-- `wal.crypto_block_bytes = 4096 (2^12)` is a fixed crypto constant independent of `wal.fs_block_bytes`. Every WAL segment begins with a `segment_header{wal_format_version:u8, segment_seq:u64, crypto_block_bytes:u16, dek_epoch:u32, reserved:u16, ...}` that records both the nonce geometry **and** the encryption epoch. ControlPlaneRaft enforces a single `wal.crypto_block_bytes` per cluster generation; allocating a `segment_seq` therefore captures that value, and readers MUST reject (`SegmentCryptoBlockMismatch`) any segment whose header disagrees with the configured constant or changes mid-segment. Mirroring `dek_epoch` into the header lets scrub detect cross-epoch reuse before decrypting bytes. The header is `fdatasync`'d at allocation so crash recovery can verify it before decrypting the first block. Telemetry exports `clustor.wal.crypto_block_bytes` so operators can confirm uniformity, and App.C tests assert mixed values are rejected.
-- AEAD (AES-256-GCM default) encrypts WAL segments and snapshot chunks. Tags are fixed at 16 bytes for the GCM suite, matching the constant-time comparison helpers in App.C; future suites that emit 32-byte tags MUST update both the macros and this clause before landing. To stay on the well-tested 96-bit IV path, every `wal.crypto_block_bytes` chunk derives `iv96 = Truncate96(H(dek_epoch || segment_seq || block_counter || b"WAL-Block-IV v1"))`, where `H` is SHA-256 or BLAKE3 and the concatenated fields are encoded big-endian. `{aad_version:u8=1, partition_id, dek_epoch, segment_seq}` remain the AAD so future field order changes cannot be replayed against older binaries. Raising the AAD version requires a ControlPlaneRaft-approved upgrade plan and keeps old nodes failing-closed. [Normative] Implementations MUST follow the explicit byte-ordering pseudocode in App.C (`aead_nonce_derivation`) when generating IVs; swapping endianness in any field invalidates compliance even if the resulting values appear unique.
-- The big-endian encoding above is intentional even though the ledger and manifests serialize fields little-endian; repeat the exact byte order to keep nonce derivation stable across vendors and avoid replaying ciphertext with mixed endianness.
-  - MAC suite selection is orthogonal to `integrity.hash_suite`; even when `H=BLAKE3` for IV derivation or leaf hashing, segment trailers continue using the cluster-wide MAC (HMAC-SHA256 in v0.1) until ControlPlaneRaft bumps `integrity_mac_epoch`. Segments MUST NOT mix MAC suites.
-  - **Nonce domain:** For every DEK, `(segment_seq, block_counter)` MUST be globally unique. `block_counter` monotonically increments per `wal.crypto_block_bytes` chunk inside a segment and resets only after a new `segment_seq` is allocated.
-  - **Segment identifiers:** `segment_seq` values are reserved from a monotone counter that is stored in ControlPlaneRaft and in `wal/durability.log`; WAL rotation, re-encryption, and post-crash rewrites must allocate a fresh `segment_seq` before emitting the first block so rewrites never reuse the prior nonce space.
-    Reusing an old `segment_seq` for any content—regardless of offsets or data—is forbidden even if the previous segment was deleted.
-  - **Crash-safe reservations:** Writers reserve nonce ranges in chunks of ≤`nonce.reservation_max_blocks_profile` `wal.crypto_block_bytes` blocks (default 1024, max 8192). Before writing block `n`, the runtime ensures a `NonceReservationRange` covering `[n, n + range_len)` is present in `wal/durability.log`; new ranges are `fdatasync`'d whenever either the configured byte window (`nonce.reservation_max_bytes_profile`) is consumed or 5 ms elapses (step 4 of §6.5). Blocks within a reserved window may be written without additional ledger traffic, and restarts resume at `max(start + reserved_blocks)`. Crashes can therefore create benign gaps up to `nonce.reservation_max_bytes_profile`; larger gaps imply tampering and trigger quarantine.
-    Reservations NEVER span multiple `segment_seq` values; rotating the segment or re-encrypting it forces a fresh reservation anchored to the new `segment_seq`, and any leftover reservation tied to the old `segment_seq` is invalidated once the rewrite finishes.
-    [Normative] Reservation ranges for a given `segment_seq` MUST be contiguous and non-overlapping: while a segment is writable, `next.start_block_counter == prev.start_block_counter + prev.reserved_blocks`. Writers MAY open the next range only after the prior one has been exhausted or abandoned; leaving holes larger than `nonce.reservation_max_bytes_profile` between contiguous ranges is forbidden and treated as nonce tampering. Segments therefore contain at most the single bounded “gap” created by a crash inside the active reservation; new ranges never skip forward arbitrarily, and rotation to a new `segment_seq` resets the counter to zero with the same contiguity requirement.
-  - **Out-of-order `io_uring` completions:** Completion events may arrive out of order, but nonce retirement is serialized. Writers MUST stage completions in a per-segment commit queue keyed by `block_counter` and only advance the reservation tail when every counter ≤ the candidate has durably landed. Dropping an out-of-order completion on the floor is forbidden; instead, the runtime parks it until all earlier counters commit, guaranteeing the `(segment_seq, block_counter)` pairs consume reservations monotonically even when the kernel signals completion early. Telemetry `wal.nonce_out_of_order_total` counts how often completions had to be parked so operators can spot devices that routinely reorder DMA writes.
-  - **Reservation retirement:** Re-encryption, repair, or compaction that abandons a `segment_seq` MUST append `NonceReservationAbandon{segment_seq, abandon_reason}` after proving the referenced bytes cannot be replayed. If a re-encryption rewrite is interrupted (operator abort or crash) before ControlPlaneRaft acknowledges the new `segment_seq`, the node MUST immediately mark the old `segment_seq` abandoned, zero any partially rewritten bytes, and log the abandonment to ControlPlaneRaft so a restart cannot reuse the pending reservation. ControlPlaneRaft tracks abandon records so compaction logic can prove no nonce window is left dangling.
-  - **Gap accounting:** Scrub jobs distinguish `NonceReservation` gaps (reserved-but-unused, ≤4 MiB) from corruption by exporting `wal.nonce_reservation_gap_bytes` vs `wal.nonce_corruption_bytes`. Nodes raise `wal.nonce_reservation_gap_alarm` once the gauge exceeds 2 MiB; exceeding `wal.nonce_reservation_max_gap_bytes = 4 MiB` triggers an exponential backoff policy before quarantine: the first violation emits only telemetry, the second within `nonce.reservation_gap_backoff_ms = 600000` forces `OverrideStrictOnlyBackpressure`, and the third within the same window escalates to Quarantine. Gaps that persist across two reboots or coincide with scrub failures bypass the backoff and quarantine immediately. Reservation gaps do not block compaction; they only influence telemetry and scrub sampling priorities.
-- Key provider tracks `{kek_version, dek_epoch, integrity_mac_epoch}`. Rotations occur time-based (24h for DEK, 30d for KEK), on membership change, or via admin `RotateKeys` (Break-Glass).
-- `wal/durability.log`, `.idx`, and manifest footers include MACs keyed by `integrity_mac_epoch`. Nodes refuse to mount when epochs drift by >1; the only override is `AdminOverrideKeyEpoch` (Break-Glass) which temporarily allows a +2/-2 window while raising `KeyEpochOverrideActive` telemetry and forcing Strict mode until the mismatch is cleared.
-- Re-encryption streams rewrite segments with new `segment_seq` reservations recorded in ControlPlaneRaft; partial rewrites quarantine until resumed. Resuming a rewrite allocates a fresh `segment_seq`, appends `NonceReservationAbandon` for the superseded one, and continues only after ControlPlaneRaft acknowledges the new reservation range so nonce space never overlaps.
-- ControlPlaneRaft persists every epoch as a monotone `u32`; any attempt to replay a lower `{kek_version, dek_epoch, integrity_mac_epoch}` value—whether due to ControlPlaneRaft rollback or malicious injection—is rejected with `KeyEpochReplay` and forces Strict fallback until operators investigate. Data-plane caches mirror the same invariant and MUST refuse to consume a proof whose epoch regresses.
+11. Error Handling
 
-### 9.3 Compatibility Contracts
-- WAL segments declare `wal_format_version`; nodes advertise `[wal_min, wal_max]` and refuse unsupported ranges.
-- `.idx` files carry `index_format_version` and MAC metadata. Rebuilds emit the highest version readable by every replica in the voter set; incompatible disks require snapshot+restore.
-- Snapshot `emit_version` equals `min(max_schema across quorum)`; ControlPlaneRaft raises it only after all replicas advertise support. Admin tooling surfaces `clustor.compat.emit_version_blocked{feature}` when features wait on emit-version bumps.
-- Recovery flow: validate manifests, replay WAL to `commit_index`, rebuild apply caches, reconcile durability ledger, and require Strict mode until proof exists.
+11.1 Wire Rejections
+- `RoutingEpochMismatch`: stale or missing epoch on writes/admin calls; includes observed/expected epochs, lease/durability epochs.
+- `ModeConflict`: stale durability mode epoch when toggling Strict/Group.
+- `ControlPlaneUnavailable`: `reason ∈ {CacheExpired, CacheNotFresh, NeededForReadIndex}` with retry metadata (HTTP 503 / gRPC `UNAVAILABLE`); read gates emit `CacheExpired` when caches have aged into `Expired`, `CacheNotFresh` when caches are `Stale`, and `NeededForReadIndex` when proof equality/strict-fallback clauses fail. Clients must honor `Retry-After ≥ 250 ms` and fall back to snapshot-only reads when supported.
+- `snapshot_full_invalidated` / `snapshot_delta_invalidated`: invalid trust cache, schema bump, emit version change, DEK epoch rollover, or delta chain violation.
+- `ThrottleEnvelope`: `reason ∈ {ApplyBudget, WALDevice, FollowerLag, DiskSoft, DiskHard, TenantQuota, FrameAlignment, SnapshotImport}`, includes backlog, credits, durations, `credit_hint ∈ {Recover, Hold, Shed}`, ingest/durability status codes.
+- `FollowerCapabilityRevoked`, `SnapshotChunkAuthFailure`, `SnapshotDeltaRetired`, `NonceReservationGapWarning`, `OverrideStrictOnlyBackpressure`, `WhyCreditZero`, `WhyNotLeader`, `WhySnapshotBlocked`, `WhyQuarantined` share schema header and truncation rules.
 
----
+11.2 Gate Failures
+- Read gate predicate failures emit `ControlPlaneUnavailable` with prioritized reasons.
+- Group-Fsync gating returns `ModeConflict(strict_fallback)` or the telemetry incident `GroupFsyncQuarantine` (the identifier omits the hyphen even though the feature name remains “Group-Fsync”).
+- Lease revocation produces `LeaseGapExceeded`, `clock_guard_alarm`, or `LeaseRevokedDueToStrictFallback`.
+- Snapshot import/authorization errors: `SnapshotDeterminismViolation`, `SnapshotChunkAuthFailure`, `SnapshotImportNodePressure`.
+- Quarantine entry reasons are typed (`Integrity`, `Administrative`, `ApplyFault`), controlling whether snapshot exports/follower reads stay enabled.
 
-## 10  Flow Control & Backpressure
+12. Security Considerations
 
-### 10.1 Credit Controller Model
-- PID loop samples every `flow.sample_period_ms = 100` with error `e = target_backlog - observed_backlog`.
-- Baseline gains (manual mode):
+12.1 Transport Security
+- Node-to-node traffic uses mTLS with SPIFFE identities. Revocation order: OCSP stapling cache, CRL fetch, break-glass waiver. If revocation data exceeds `revocation.max_staleness_ms = 300,000` or both feeds unavailable for `revocation.fail_closed_ms = 600,000`, peers must tear down mTLS connections and enter Quarantine until fresh material or waiver (≤300,000 ms extension) arrives. Short-lived certs (≤86,400,000 ms) require fresh revocation feeds. All timers referenced in revocation logic use the local monotonic clock; operators must ensure wall-clock discipline stays within 5 s (via the same `clock_guard` service used for leases) while safety gates evaluate monotonic timers to avoid skew-induced bypasses.
+- Revocation-induced quarantine is scoped to the node that failed validation: connections initiated by healthy peers stay up so long as their revocation caches are fresh. Clusters MUST NOT propagate a revocation-triggered shutdown automatically; instead, every node independently evaluates revocation freshness and only quarantines itself if its local timers expire. Cross-node automation may page operators, but it MUST NOT mass-quarantine healthy nodes.
 
-| Profile | Kp | Ki | Kd |
-| --- | --- | --- | --- |
-| Latency / ConsistencyProfile | 0.60 | 0.20 | 0.10 |
-| Throughput | 0.50 | 0.15 | 0.08 |
-| WAN | 0.40 | 0.10 | 0.05 |
+12.2 AEAD and Storage Encryption
+- WAL segments use AES-256-GCM with 96-bit IV derived from `Truncate96(H(dek_epoch || segment_seq || block_counter || "WAL-Block-IV v1"))`, where `H` is SHA-256 by default. Switching the IV hash function (e.g., to BLAKE3) is only legal when a cluster-wide `crypto.iv_hash_suite` gate is enabled, a durability fence commits the new suite, and every partition rotates `dek_epoch` after the fence so ciphertext never mixes suites for the same `(partition_id, dek_epoch)` tuple. The concatenation order is canonical: `dek_epoch` encoded as big-endian `u32`, `segment_seq` as big-endian `u64`, `block_counter` as big-endian `u64`, followed by the ASCII literal (with no terminating NUL). `Truncate96` takes the first 12 bytes of the hash output. Implementations MUST serialize exactly those byte widths before hashing or the IV space diverges. **Note:** This big-endian encoding applies only to the hash preimage used for IV derivation; all on-wire fields and AAD remain little-endian per protocol conventions, and every other section referencing IV derivation inherits this big-endian preimage requirement from §12.2.
+- Snapshot chunks reuse AES-256-GCM but derive IVs with the manifest-provided salt: `Truncate96(H(dek_epoch || iv_salt || chunk_offset || chunk_block_counter || "Snapshot-Chunk-IV v1"))`, where `iv_salt` is the 16-byte value published in the manifest, `chunk_offset` is the chunk’s starting logical byte offset encoded as big-endian `u64`, and `chunk_block_counter` is a big-endian `u64` that increments per `wal.crypto_block_bytes` (4096-byte) block within the chunk. This derivation ensures each `(manifest_id, chunk_offset, block_counter)` pair produces a unique IV even when snapshots are re-emitted with the same `dek_epoch`; `iv_salt` MUST change whenever a new manifest is emitted. The literal string again has no terminating NUL.
+- AAD includes `{aad_version=1, partition_id, dek_epoch, segment_seq}` encoded as little-endian integers; version bumps require explicit upgrade plans. Tags are 16 bytes; verification must be constant time (e.g., via a `ct_equal_16` helper).
+- `wal.crypto_block_bytes=4096`, `nonce.reservation_max_blocks_profile ∈ [1024, 8192]`, `nonce.reservation_gap_quarantine_threshold_bytes` default 4 MiB. Writers queue reservation flush attempts every ≤5 ms (or sooner when a window is consumed), but ciphertext MUST still wait for the reservation record + `fdatasync` completion before using the counters. Implementations synthesize `NonceReservationAbandon` before compaction and track `wal.nonce_reservation_gap_bytes` vs `wal.nonce_corruption_bytes`.
+- A block counter MUST NOT be used for encryption until its reservation has been durably recorded: writers append `NonceReservationRange`, `fdatasync` `wal/durability.log`, and only then emit ciphertext using the reserved `(segment_seq, block_counter)` window. Reboots therefore resume from the last reservation head without reusing counters.
+- `block_counter` starts at 0 for each freshly allocated `segment_seq` and increments by one per `wal.crypto_block_bytes` chunk. `segment_seq` values are monotonically increasing per partition and are never reused, even after compaction or rewrite; partial rewrites allocate a new `segment_seq` and bump `dek_epoch` if necessary. Combined with the reservation rule above, the tuple `(partition_id, dek_epoch, segment_seq, block_counter)` is therefore globally unique for every encrypted block.
+- Key epochs: ControlPlaneRaft tracks `{kek_version, dek_epoch, integrity_mac_epoch}`. Nodes fetch new DEKs every 604,800,000 ms (weekly, stated in ms), retain previous DEK for decrypt-only 172,800,000 ms (48 h), then zeroize hardware/software contexts (`crypto.zeroize_context`) and emit `crypto.zeroization_digest`. Epoch regression (`KeyEpochReplay`) forces Strict fallback; overrides are recorded via Break-Glass tokens.
 
-- Numeric stability guardrail: for every profile, `Ki × (flow.sample_period_ms / 1000)` MUST remain ≤ 1.0; config validators clamp or reject values that would violate this condition to prevent integrator blow-up.
-- Integral windup clamp ±2048 entries; derivative term uses EMA (`flow.pid_derivative_tau_ms = 300` Latency/Throughput, 450 WAN).
-- Targets: `target_latency_ms=25`, `target_backlog_entries=512` (scaled per tenant quotas). Credits are bounded `credit_min = 1 batch`, `credit_max = 4096 entries`.
-- Dual-token bucket: every partition tracks `entry_credits` and `byte_credits`. Large frames burn both counters; the leader pauses admission whenever either hits zero. Defaults: `entry_credit_max = 4096`, `byte_credit_max = 64 MiB`, `byte_credit_refill_rate = target_backlog_bytes / flow.sample_period`. PID error now consumes a weighted sum of the two deficits so jumbo frames cannot starve small ones. Explain APIs expose both balances.
-- Minimum service quantum: even when byte credits are exhausted by jumbo frames, the scheduler admits at least one frame ≤`flow.min_small_frame_bytes = 16 KiB` per `flow.sample_period_ms` so small requests continue making progress.
-- Operator ergonomics: profiles ship with pre-tuned gains and bucket sizes so most clusters run the controller in “standard” mode (no custom knobs). Advanced tuning is optional and requires a documented change ticket; otherwise operators can treat the flow controller as a black box and rely on Explain APIs + throttle envelopes for visibility.
-- [Informative] App.A/App.B SLOs assume the steady-state PID solution `credits_ss = target_backlog_entries` with `throughput ≈ credits_ss / flow.sample_period_ms`. Keeping `Kp × target_backlog_entries` within ±10% of the profile’s `ingest_ops_target` ensures the closed-loop bandwidth matches the published SLO; simulator tooling therefore exports `flow.pid_expected_throughput = (target_backlog_entries / flow.sample_period_ms) × 1000` so operators can compare predicted vs observed throughput before altering gains.
-- Tenant quotas enforce weighted-fair sharing; `OverrideCredit` is Break-Glass with TTL ≤10 min.
-- [Normative] The PID auto-tuner is enabled for Throughput and WAN profiles whenever `io_writer_mode=FixedUring`, `strict_fallback=false`, and `controlplane.cache_state=Fresh`. The tuner samples backlog variance every `flow.pid_auto_tune_window_ms = 5000`, adjusts `{Kp,Ki,Kd}` within the bounds in App.B, and records each change in `flow.pid_auto_tune_last_profile`. Latency/ConsistencyProfile and ZFS profiles keep the auto-tuner disabled unless explicitly set to the Aggregator profile. If the tuner detects oscillation (`Ki × (flow.sample_period_ms / 1000) > 1.0` or variance exploding), it MUST revert to the last known-stable gains, mark `flow.pid_auto_tune_state=Revoked`, and page operators. Telemetry `flow.pid_auto_tune_state ∈ {Enabled,Disabled,Revoked}` and `flow.pid_auto_tune_adjust_total` track behavior for `/readyz` and Explain APIs.
-- Leadership changes reset the controller’s integrator/derivative state to zero and clamp both credit buckets to `credit_min` until the new leader observes `flow.pid_state_checkpoint` replicated in the current term. This avoids inheriting stale windup from the prior leader and makes `TransferLeader` deterministic: the handoff copies the last checkpoint only when `strict_fallback=false`, otherwise the new leader performs a cold start and emits `flow.pid_reset_reason=StrictFallbackOrElection`.
+12.3 RBAC and Break-Glass
+- Roles: Operator (lifecycle, durability, transfers, snapshots), TenantAdmin (telemetry, tenant quotas), Observer (read-only), BreakGlass (durability overrides, survivability overrides, credit overrides, snapshot overrides, quarantine overrides).
+- RBAC manifests refresh every 30 s; missing two refreshes causes `RBACUnavailable` for mutating APIs while reads continue for `rbac.grace_ms = 60,000`.
+- Break-Glass tokens are SPIFFE SVIDs containing `urn:clustor:breakglass:<scope>`, TTL ≤300,000 ms, non-renewable. Validation allows ±5,000 ms skew, enforces cluster ID and scope-specific API coverage, and requires audit logging of `{scope, actor_id, ticket_url}` plus zeroization of token private material/resident credentials immediately after the first successful use. Scopes are enumerated in Appendix D’s map.
+- Audit logs (`security/breakglass_audit.log`) store Canonical JSONL entries (each line serialized via the `CanonicalJson` rules) with Ed25519 signatures, batched per 1,000 lines, retained ≥400 days.
 
-### 10.2 Lag Classification & Mitigation
-| Lag Class | Definition | Action |
+12.4 Key Purpose Registry
+| Key | Use | Rotation |
 | --- | --- | --- |
-| Transient | `lag_bytes <= 64 MiB` and `lag_duration < 30 s` | Cut credits 50%, boost snapshot priority, log `FollowerTransientLag`. |
-| Structural | Beyond thresholds above or bytes ≥256 MiB | Force Strict durability, cut credits to 25%, trigger snapshot rebuild, alert ControlPlaneRaft, optionally step down leader. |
-| Manual kill-switch | `flow.structural_hard_block` (default false) | Operators may block writes entirely while retaining reads. |
+| ReleaseAutomationKey (Ed25519) | Signs release manifests | Rotates every 180 days; hardware-backed HSM. |
+| CPReleaseKey (Ed25519) | Signs feature manifests, overrides, and other ControlPlaneRaft-issued durability records | Rotates with ControlPlaneRaft minors. |
+| ControlPlaneProofKey (Ed25519) | Signs `DurabilityProofTupleV1` records | Rotates with ControlPlaneRaft minors (staged with overlap). |
+| SnapshotManifestKey (Ed25519) | Signs runtime snapshot manifests exported by partitions (canonical JSON hashed per §7.1) | Rotates every 90 days with ControlPlaneRaft-supervised rollover. |
+| AuditLogKey (Ed25519) | Signs audit log segments | Rotates annually with overlap. |
+| BreakGlassTokenCA | Issues SPIFFE SVIDs for break-glass | Dedicated 45-day intermediates with ≥7 day overlap. |
 
-Leaders MUST step down when structural lag persists for `flow.structural_stepdown_ms = 15000 ms` unless ControlPlaneRaft approves `flow.structural_override` (Break-Glass). Overrides expire automatically after `flow.structural_override_ttl_ms = 120000` unless renewed, and they are cleared as soon as lag returns to the Transient band for three consecutive sampling windows to avoid oscillation. The “optional” action above therefore only refers to whether operators step down earlier than the hard limit.
+12.5 Additional Controls
+- Hardware accelerators must expose deterministic zeroization hooks; failures raise `CryptoZeroizationFailed` and quarantine the partition.
+- Key rotations track `wal_kms_block_seconds` / `snapshot_kms_block_seconds`; >300 s growth per hour pages operators and blocks ControlPlaneRaft from finalizing rotations unless overrides cite ticket IDs.
 
-### 10.3 Client-Facing Throttling
-Canonical throttle envelope (HTTP 429 / gRPC `RESOURCE_EXHAUSTED`):
+13. Observability
+
+13.1 Metrics and Telemetry
+- Metric namespaces: `clustor.raft.*`, `clustor.wal.*`, `clustor.snapshot.*`, `clustor.flow.*`, `clustor.controlplane.*`, `clustor.security.*`. Export `metrics.schema_version` and `metrics.build_git_sha`.
+- Histogram buckets (inclusive upper bounds; implicit `+Inf` bucket) are fixed as follows:
+  - `clustor.wal.fsync_latency_ms`: `[0.25, 0.5, 1, 2, 4, 6, 8, 10, 15, 20, 30, 40, 60, 80, 100]` milliseconds.
+  - `clustor.raft.commit_latency_ms`: `[0.5, 1, 2, 4, 6, 8, 10, 15, 20, 30, 40, 60, 80, 100]` milliseconds.
+  - `clustor.flow.apply_batch_latency_ms`: `[0.25, 0.5, 1, 2, 4, 6, 8, 10]` milliseconds.
+  - `clustor.snapshot.transfer_seconds`: `[1, 2, 4, 8, 16, 32, 64, 128, 256]` seconds.
+Deployments outside profile SLOs still alert even if they saturate the top bucket.
+- Required telemetry fields: `strict_fallback_state`, `strict_fallback_blocking_read_index`, `strict_fallback_pending_entries`, `read_gate.*`, `io_writer_mode_gate_state`, `lease_gate_runtime_state`, `clock_guard_alarm*`, `observer_capability_state`, `snapshot.delta_chain_length`, `snapshot.delta_emit_skew_ms`, `snapshot_only_ready_ratio`, `flow.pid_auto_tune_state`, `flow.pid_auto_tune_adjust_total`, `transport.pool_*`, `feature.<name>_gate_state`, `feature.<name>_predicate_digest`, `controlplane.cache_state`, `controlplane.cache_age_ms`, `controlplane.cache_warning`, `controlplane.cache_expiry_total`, `strict_only_runtime_ms`, `ingest_status_code`, `credit_hint`, `durability_status_code`.
+- `/readyz` surfaces readiness ratios, definition bundle state, activation barriers, warmup readiness, fixture bundle version/age, ingest status, credit hints, and feature gates so deployment controllers can gate activations identically to the data plane.
+- Incident logging: alerts from App.A feed correlated incidents with storm guard `incident_max_per_window = max(5, ceil(active_partitions_on_node / 250))` per 10 min except for safety-critical classes. Cooldown 300,000 ms between duplicate incidents.
+
+13.2 Throttling and Explain APIs
+- Throttle envelopes must remain ≤32 KiB JSON, list ≤32 IDs per array, sort lexicographically, and include continuation tokens when truncated.
+- Explain endpoints (`WhyNotLeader`, `WhyCreditZero`, `WhySnapshotBlocked`, `WhyDiskBlocked`, `WhyQuarantined`, `WhyCreditHint`) share the schema header, surface decision trace IDs, guardrail deltas, and truncated lists metadata.
+- Admin dry-run endpoints (`DryRunMovePartition`, `DryRunSnapshot`, `DryRunFailover`) report computed guardrails (catch-up slack/timeout, predicted credit impact).
+
+14. Compatibility and Versioning
+
+14.1 Wire and Schema Stability
+- Wire catalog and system log entry IDs are frozen for v0.1.x; additive fields append at the tail. Field names/casing in JSON/gRPC mirrors are stable. Clients must tolerate additive optional fields but reject missing required fields.
+- Nodes MUST NOT raise frame/body caps without negotiating `WireExtension::WideFrame`. `body_len` must remain ≤4 MiB (RPCs) or ≤32 KiB (Explain/Why*, throttle) unless the extension is mutually set.
+- Enumerations treat unknown discriminants as hard failures; best-effort parsing is forbidden. JSON mirrors accept recognized numeric enum values but emit canonical strings.
+- Large lists must chunk via ChunkedList until `WireExtension::WideCount` is mutually enabled.
+
+14.2 Version Negotiation and Feature Gates
+- Peers record handshake tuples in `bundle_negotiation_log`; mismatched catalogs close connections immediately.
+- Feature enablement (leader leases, incremental snapshots, observer admission, BLAKE3 leaves, PID auto-tuner, Group-Fsync) requires uniform support across a voter set, ControlPlaneRaft gate flips, strict fallback cleared, and published predicates. Capability telemetry (`feature.<name>_gate_state`, predicate digest) must match ControlPlaneRaft’s feature manifest.
+- ControlPlaneRaft caches follow a deterministic retry hierarchy. A background watcher continuously calls `attempt_refresh()` on the cadence implied below; even when `cache_state=Fresh` the watcher still wakes every 5,000 ms to confirm freshness.
+  ```
+  loop {
+      match controlplane.cache_state {
+          Fresh => sleep(5_000);
+          Cached => attempt_refresh(); sleep(min(5_000, remaining_grace/4));
+          Stale => attempt_refresh(); sleep(min(2_500, remaining_grace/8));
+          Expired => attempt_refresh(); sleep(1_000);
+      }
+  }
+  ```
+  `remaining_grace = max(0, controlplane.cache_grace_ms - controlplane.cache_age_ms)`. All timers use 64-bit monotone math; additions saturate at `u64::MAX`. Every transition to `Expired` increments `controlplane.cache_expiry_total`.
+- Cache states are defined as:
+| State | Age condition | Allowed operations |
+| --- | --- | --- |
+| `Fresh` | `cache_age_ms ≤ controlplane.cache_fresh_ms` (default 60,000) | Normal writes, reads, capability grants. |
+| `Cached` | `controlplane.cache_fresh_ms < age ≤ 0.5 × cache_grace_ms` | Writes and reads continue, but telemetry raises `controlplane.cache_warning`. |
+| `Stale` | `0.5 × cache_grace_ms < age < cache_grace_ms` | Writes continue but are forced to Strict durability; the effective `commit_visibility` behaves as `DurableOnly`; incremental snapshots pause; follower-read/observer capabilities are revoked. |
+| `Expired` | `age ≥ cache_grace_ms` | Mutating admin/control APIs fail closed, Group-Fsync/leases stay disabled, read gate forces `ControlPlaneUnavailable{reason=CacheExpired}`; data-plane writes MAY continue only in Strict durability with effective `commit_visibility=DurableOnly`. |
+- Entering `Stale` or `Expired` also forces `strict_fallback=true` until a fresh proof clears the gate.
+
+- Mode truth table:
+  | Cache state | Writes | ReadIndex / leases | Leader snapshot-only reads |
+  | --- | --- | --- | --- |
+  | Fresh | Allowed (configured durability mode) | Allowed when read-gate predicate passes | Allowed; clamped to `applied_index` |
+  | Cached | Allowed (configured durability mode) | Allowed when read-gate predicate passes | Allowed; clamped |
+| Stale | Allowed but auto-clamped to Strict; effective `commit_visibility` behaves as `DurableOnly` | Rejected with `ControlPlaneUnavailable{reason=CacheNotFresh}` | Allowed; clamped |
+| Expired | Allowed only in Strict durability; admin/control APIs disabled; effective `commit_visibility=DurableOnly` | Rejected with `ControlPlaneUnavailable{reason=CacheExpired}` | Allowed; clamped to last verified snapshot before expiry |
+
+- Durability proofs expire after the profile’s `controlplane.durability_proof_ttl_ms_profile` (43,200,000–86,400,000 ms). Stale proofs force strict fallback until refreshed.
+- DefinitionBundle readiness requires `warmup_ready_ratio ≥ readiness_threshold`; `DefineActivate` logs include readiness digests hashed over sorted readiness records.
+
+14.3 Readiness and Deployment
+- Graceful shutdown recommends `TransferLeader`, wait `commit_quiescence_ms=200`, ensure `apply_queue_depth < 10%`, flush WAL/snapshots, respect `graceful_shutdown_timeout_ms = 10,000`.
+- Kubernetes guidance: StatefulSets with `maxUnavailable=1`, anti-affinity (≤1 voter per node/zone), cgroup v2 with `io.max`, `terminationGracePeriodSeconds ≥ 10`, read-write `/state`, read-only elsewhere. Unsupported mounts or stacked devices lacking explicit overrides cause bootstrap rejection.
+- Repair mode (`bootstrap.repair_mode=true`) mounts partitions read-only, runs scrub, allows snapshot download/upload, and requires Break-Glass `AdminResumePartition` to exit.
+
+Appendix A: Project Tooling and Artifacts (Non-Normative)
+- Specification automation regenerates machine-readable bundles (`wire_catalog.json`, `chunked_list_schema.json`, `system_log_catalog.json`, `wide_int_catalog.json`, `spec_fixtures.bundle.json`, `consensus_core_manifest.json`, `proof_artifacts.json`, `term_registry.json`, `metrics_buckets.json`) from the source tree. Builds compare bundles byte-for-byte and block releases on drift.
+- Each bundle entry carries SHA-256 digests, schema versions, manifest hashes, and Ed25519 signatures (ReleaseAutomationKey, CPReleaseKey) so downstream auditors can correlate prose and artifacts. Editors regenerate bundles when headings, entries, or fixtures change; the manifest maps section IDs to digests plus a Merkle tree root (`spec_hash_format="SpecHashV1"`).
+- Proof provenance: releases publish `proof_bundle_schema_version`, `proof_bundle_sha256`, and detached signatures binding Loom/TLA+ archives, fixture suites, and feature manifests. Auditors recompute digests to validate artifacts without CI access.
+- Fixture catalog: App.C’s clause-to-fixture map and wide-int registry feed deterministic `spec_fixtures.bundle.json`. Automation enforces coverage and rejects mismatched fixtures. Vendors add private fixtures but must retain canonical vectors (PreVoteResponse, ChunkedList, lease inequality, snapshot manifest, segment MAC, AEAD constant-time tests, crash-consistency harness, Jepsen/Jepsen-like scenarios).
+- Startup spec self-tests rerun encoding fixtures, catalog regeneration, lease inequalities, incremental cadence, BLAKE3 vectors, and other checks before mounting partitions. Failures quarantine nodes and require operator override.
+- Release evidence (`bundle_version`, `bundle_sha256`, `fixture_suite_ts`) is exposed via `/readyz` (`fixtures.bundle_version`, `fixtures.bundle_age_ms`). CI blocks release artifacts if bundle timestamp vs git tag differs by >86,400,000 ms (24 h).
+- Runtime correctness MUST NOT depend on reading files from `/artifacts` or `/manifests`; binaries embed the necessary catalogs and expose them via APIs (`/.well-known/wide-int-registry`, `/readyz`). Artifact files only serve validation, audit, or tooling workflows outside the hot path. When `/artifacts` is absent (e.g., production images that strip optional bundles), nodes default to skipping startup validation by exporting `CLUSTOR_SKIP_ARTIFACT_VALIDATION=1`; operators who need the original fail-closed behavior instead set `CLUSTOR_REQUIRE_ARTIFACT_VALIDATION=1`, which forces bootstrap to error until the artifacts are restored.
+
+Appendix B: Examples (Non-Normative)
+
+B.1 PreVoteResponse Frames
+- Frames serialize as `<u32 body_len little-endian> || body`. For `PreVoteResponse{term=42, vote_granted=1, has_high_rtt=1, high_rtt=1}` the body is `2a00000000000000010101` (12 bytes) and the full frame begins `0c0000002a00000000000000010101`. Legacy peers send only `term` and `vote_granted`, so their body is `2a0000000000000001` (9 bytes) and the full frame begins `090000002a0000000000000001`. Receivers treat missing extension bytes as “no `has_high_rtt` field present.” Frames that promise 12 body bytes but deliver only 9 (e.g., `0c0000002a0000000000000001`) must raise `WireBodyTooShort`.
+
+B.2 Snapshot Manifest Sample
 ```
 {
-  "reason": "ApplyBudget|WALDevice|FollowerLag|DiskSoft|DiskHard|TenantQuota|FrameAlignment|SnapshotImport",
-  "retry_after_ms": <ms>,
-  "observed_backlog_entries": <n>,
-  "observed_backlog_bytes": <bytes>,
-  "entry_credits_available": <n>,
-  "byte_credits_available_bytes": <bytes>,
-  "estimated_drain_ms": <ms>,
-  "durability_mode": "Strict|Group",
-  "durability_mode_epoch": <id>,
-  "lease_epoch": <id>,
-  "routing_epoch": <id>,
-  "ack_term": <term>,
-  "ack_index": <index>,
-  "last_quorum_fsynced_index": <index>,
-  "decision_trace_id": <uuid>,
-  "credit_hint": "Recover|Hold|Shed",
-  "ingest_status_code": "HEALTHY|TRANSIENT_BACKPRESSURE|PERMANENT_DURABILITY",
-  "durability_status_code": "HEALTHY|PERMANENT_DURABILITY"
+  "base_index": 4096,
+  "base_term": 7,
+  "chunks": [{
+    "chunk_id": "00000000-0000-0000-0000-000000000001",
+    "digest": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "len": 1048576,
+    "offset": 0
+  }],
+  "content_hash": "0xb1caf4297447b97c418f5c52ac1b922c3c32022f61d59f73c462931b89d6ad86",
+  "emit_version": 1,
+  "encryption": {
+    "dek_epoch": 3,
+    "iv_salt": "0x000102030405060708090a0b0c0d0e0f"
+  },
+  "logical_markers": [],
+  "manifest_id": "018c0d6c-9c11-7e9d-8000-86f5bb8c0001",
+  "producer_version": "clustor-test",
+  "version_id": 12,
+  "snapshot_kind": "Full",
+  "ap_pane_digest": "0x...",
+  "dedup_shards": [],
+  "commit_epoch_vector": []
 }
 ```
-Clients must ignore unknown `reason` values. `entry_credits_available`/`byte_credits_available_bytes` summarize the dual-bucket state so clients understand whether large frames or entry counts triggered throttling. `last_quorum_fsynced_index` reflects the quorum proof derived from §6.5’s ledger ordering. `decision_trace_id` feeds Explain APIs (`WhyCreditZero`, `WhyDiskBlocked`). To prevent oversized replies, throttle/Why* envelopes MUST remain ≤32 KiB JSON and MAY list at most 32 IDs per array field; beyond that, servers MUST summarize with counters and set the shared field `truncated_ids_count` to the number of elided IDs (0 omits the field). Lists MUST be sorted lexicographically by their primary key (e.g., `(partition_id, shard, reason)`), and when truncation occurs the payload MUST also include `continuation_token` so clients can request the next page deterministically. Every Why* schema inherits these fields so clients can programmatically detect truncation and resume pagination.
+Removing `content_hash` and `signature` before hashing yields the listed hash; signing the canonical encoding with the cluster’s `SnapshotManifestKey` produces `0xe6559247…ae d01`.
 
-[Normative] The ingest/throttle mapping layer populates `ingest_status_code` using existing PID/throttle inputs: `TRANSIENT_BACKPRESSURE` whenever throttle reasons are limited to flow-control sources (`ApplyBudget`, `FollowerLag`, PID-derived credit depletion), `PERMANENT_DURABILITY` whenever Strict fallback, durability overrides, or AEAD violations force sustained throttling, and `HEALTHY` otherwise. `durability_status_code` mirrors whether the throttled request is blocked by durability proofs (`PERMANENT_DURABILITY`) or not; data-plane nodes MUST reject attempts to map other reasons into these codes so consuming services observe the same contract as the downstream ingest pipeline without a bespoke shim.
-[Normative] `credit_hint` communicates how clients should adjust ingest without overriding the PID controller: `Recover` requires `entry_credits_available ≥ 0.75 × entry_credit_max` **and** `byte_credits_available_bytes ≥ 0.75 × byte_credit_max`; `Hold` is emitted only when both buckets satisfy `0.25 × max ≤ available < 0.75 × max` and `ingest_status_code != PERMANENT_DURABILITY`; `Shed` fires when either bucket drops below `0.25 × max`, when `/readyz` reports readiness ratios below §11.5’s activation barrier, or when `ingest_status_code=PERMANENT_DURABILITY`. The mapping layer is read-only: it MUST NOT mutate PID gains, buckets, or throttle envelopes, and PID enforcement continues to be authoritative even if clients ignore the hint. Leaders log `credit_hint_transition{from,to,reason}` and Explain APIs expose `WhyCreditHint` so operators can verify compliance.
-[Operational] `/readyz` and the streaming readiness feed add `{ingest_status_code, credit_hint, durability_status_code, partition_ready_ratio}` so DEFINE_ACTIVATE workflows and dashboards can gate deploys on the same readiness ratios as the ingest contract. Telemetry MUST include `ingest_status_publish_ms` to surface missed publications and retain parity with the downstream hot-reload pipeline.
+B.3 Segment MAC Vector
+- MAC key bytes `00…1f`, `segment_seq=7`, `first_index=42`, `last_index=121`, `entry_count=17`, `entries_crc32c_lanes_bytes=0x1032547698badcfe67452301efcdab89`, `offsets_crc32c_lanes_bytes=0x0123456789abcdeffedcba9876543210` → `mac=5c50cc7f43ef3c0127db59a3a8394ed16782e7997b53093c35bff32f8644b8f0`.
 
----
-
-## 11  Control Plane – ControlPlaneRaft
-Dedicated Raft cluster managing durable metadata.
-
-### 11.1 Durable Objects & Feature Gates
-| Object | Purpose |
-| --- | --- |
-| Tenant descriptors | Auth, quotas, regional placement policy |
-| Partition manifests | Replica placements, durability modes, key epochs |
-| Session descriptors | Lease metadata, sequencing constraints |
-| DR fences | Failover epochs, manifest hashes |
-| Feature gates | Versioned toggles |
-| Override ledger | Signed operator overrides |
-| Durability ledger | `{partition_id, last_durable_term, last_durable_index, updated_at}` |
-| QuarantineCleared records | `{partition_id, cleared_at_ms, ticket_url, controlplane_signature}` acknowledgements that the quarantine exit handshake from §6.6 completed |
-| DefinitionBundle objects | `{bundle_id, version, sha256, definition_blob, warmup_recipe}` hot-reload payloads staged ahead of activation |
-| ActivationBarrier objects | `{barrier_id, bundle_id, readiness_threshold, warmup_deadline_ms}` guards gating DEFINE_ACTIVATE entries until readiness telemetry matches |
-| WarmupReadiness records | `{partition_id, bundle_id, shadow_apply_checkpoint_index, partition_ready_ratio}` telemetry mirrored into `/readyz` |
-| Feature manifest | `{feature_name, predicate_digest, gate_state}` records for `{incremental_snapshots, leader_leases, observers, blake3_leaves, pid_auto_tuner}` signed so `/readyz` and auditors share the same capability matrix |
-
-#### Feature Manifest (FutureGates)
-| Feature | Slug | ControlPlaneRaft object | Predicate |
-| --- | --- | --- | --- |
-| Leader leases | `leader_leases` | `LeaseEnable` | All voters advertise `lease_gap_max > 0`, the ControlPlaneRaft cache is Fresh, and a durability proof covering the leader’s `raft_commit_index` is published. |
-| PID auto-tuner | `pid_auto_tune` | `FlowPidAutoTune` | Partition profile is `Throughput` or `WAN`, and `io_writer_mode=FixedUring`. |
-| Incremental snapshots | `snapshot_delta` | `SnapshotDeltaEnable` | `snapshot.delta_chain_max > 0`, the ControlPlaneRaft cache is Fresh, and the follower capability bit is granted. |
-| BLAKE3 Merkle leaves | `blake3_merkle` | `IntegrityHashSuite` | Every replica advertises BLAKE3 support and `integrity_mac_epoch >= 2`. |
-
-[Normative] ControlPlaneRaft publishes these rows verbatim in `feature_manifest.json` and spec-lint’s future-gate coverage check fails any build where telemetry omits a listed feature or invents a gate not present in this table. Operators therefore have a single canonical list to compare against `/readyz`, incident reports, and release artifacts.
-
-- The data-plane ledger lives in `wal/durability.log` (same filesystem as the WAL) and emits append-only `DurabilityRecord{term, index, segment_seq, io_writer_mode}` entries per §6.5. Leaders publish only the summarized `(last_durable_term, last_durable_index, updated_at)` into the ControlPlaneRaft durability ledger once the local record is `fdatasync`'d and they hold a quorum proof; ControlPlaneRaft entries are rejected unless they advance that pair monotonically.
-- Ledger appenders also record `NonceReservationRange` and `NonceReservationAbandon{segment_seq, abandon_reason}` entries so ControlPlaneRaft can prove nonce ranges were either spent or explicitly retired before WAL compaction (§6.5, §9.1, §9.2).
-- ControlPlaneRaft signs each durability-ledger update. Nodes MUST retain `{term,index,segment_seq,io_writer_mode,updated_at,controlplane_signature}` so cached proofs can be compared byte-for-byte against local `wal/durability.log` records when enforcing the read gate in §3.3; mismatches suppress reads even if the numbers align.
-- During elections, candidates must supply their latest `wal/durability.log` watermark (or a ControlPlaneRaft-provided proof with equal/greater values) before they may leave Strict mode or re-enable leases/Group-Fsync (§3.1). [Normative] Strict fallback therefore clears only after ControlPlaneRaft durably appends the leader-supplied `(last_durable_term, last_durable_index)` proof; possessing a byte-equal cached proof without the ControlPlaneRaft append is insufficient.
-[Normative] Each release ships a signed `feature_manifest.json` (Ed25519, ControlPlaneRaft release key) enumerating `{feature_name, predicate_digest, gate_state}` for incremental snapshots, leader leases, observer admission, BLAKE3 leaves, and the PID auto-tuner. Data-plane binaries MUST refuse to advertise a capability whose digest mismatches the manifest so `/readyz`, telemetry, and auditors consume the same capability matrix.
-- ControlPlaneRaft also tracks the `follower_read_snapshot_capability` bit per partition; it refuses to set the bit unless the partition is in Strict durability, `commit_visibility=DurableOnly`, and the follower proved its `applied_index` watermark. Only then may a node advertise follower read-only endpoints (§3.3).
-- Feature enablement requires dry-run validation, audit entry, deterministic simulator coverage, and homogeneous gate state across a voter set.
-- ControlPlaneRaft supports `N/N+1` upgrades. Nodes emit snapshots up to version `N` until every replica upgrades, then ControlPlaneRaft raises `emit_version`.
-- Durability proofs stored in ControlPlaneRaft expire automatically after the profile-published `controlplane.durability_proof_ttl_ms_profile`. Latency/ConsistencyProfile and ZFS set the TTL to 12 h, WAN sets 18 h, and Throughput keeps 24 h to match its batching window. Profiles MUST keep the TTL within `[21,600,000 ms (6 h), 86,400,000 ms (24 h)]`; spec-lint fails configuration bundles that diverge from that range or omit the per-profile value. A background janitor GC deletes proofs older than the active TTL once every `controlplane.durability_gc_period_ms = 600000`. Nodes MUST refresh their proofs proactively before expiry; stale proofs falling out of the ledger force Strict fallback until a fresh `(last_durable_term, last_durable_index)` lands. Any temporary TTL increase (e.g., maintenance windows) MUST be recorded in the override ledger with `{override_id, ttl_ms, ticket_url}` so auditors can trace the justification.
-- During ControlPlaneRaft outages, data-plane nodes continue serving traffic using cached routing epochs, RBAC, durability ledger, and key epochs for up to `controlplane.cache_grace_ms = 300000`. Mutating admin APIs return `ControlPlaneUnavailable`. Safety downgrades (Strict fallback, lease revoke, Group-Fsync lockout, key quarantines) continue without ControlPlaneRaft, and §3.3 clarifies that client appends are still accepted under Strict durability while linearizable reads fail with `ControlPlaneUnavailable{reason=NeededForReadIndex}` until the predicate in §3.3.1 succeeds again. When caches expire, nodes remain in Strict mode, pause incremental snapshot emission (full snapshots only), and keep leases revoked until ControlPlaneRaft returns.
-- The Strict-only fallback above typically increases per-partition latency by 40–60% on Throughput hardware; App.A tracks this via `controlplane.outage_strict_mode_active`. Nodes also expose `strict_only_runtime_ms` (monotone while ControlPlaneRaft is unreachable). Profiles define `controlplane.strict_only_backpressure_ms` (default: Latency/ConsistencyProfile=120000, Throughput=300000, WAN=600000); once `strict_only_runtime_ms` exceeds that bound, leaders MUST halve `entry_credits`/`byte_credits` (bounded floor = 1 batch), emit `ControlPlaneOutageBackpressure` incidents, and recommend load shedding. Operators MAY keep serving if they acknowledge the incident, but the runtime will continue to clamp credits until ControlPlaneRaft returns or the operator explicitly overrides via Break-Glass (`OverrideStrictOnlyBackpressure`, TTL ≤ 5 min).
-- Once `controlplane.cache_age_ms > controlplane.cache_grace_ms`, the following operations hard-fail with `ControlPlaneUnavailable{reason=CacheExpired}` regardless of operator overrides: (a) membership changes (`MembershipChange`, `MembershipRollback`), (b) durability transitions, (c) key rotations/epoch bumps, and (d) DR fencing (`FenceCommit`, `FenceAbort`). Read-only APIs still work using the frozen cache snapshot; writes continue only under Strict durability.
-- Nodes export `controlplane.cache_state ∈ {Fresh, Cached, Stale, Expired}` to keep dashboards and admission code in sync: `Fresh` (age ≤ `controlplane.cache_fresh_ms = 60,000`), `Cached` (`controlplane.cache_fresh_ms < age ≤ 0.5 × controlplane.cache_grace_ms`), `Stale` (`0.5 × controlplane.cache_grace_ms < age < controlplane.cache_grace_ms`), and `Expired` (age ≥ `controlplane.cache_grace_ms`, which forces the hard failures listed above). Admin APIs and incidents MUST source their decision from this metric rather than reimplementing the thresholds.
-- [Normative] All cache timers (`controlplane.cache_*`) are stored and compared as unsigned 64-bit integers; implementations MUST saturate additions/subtractions at `u64::MAX` and MUST promote intermediate math to 128-bit (or an equivalent arbitrary-precision type) on 32-bit architectures so that values exceeding `2^31 ms` remain deterministic across the fleet.
-- [Normative] Cache refresh follows a single retry hierarchy so partitions behave identically under partial network partitions:
-```
-loop {
-    match controlplane.cache_state {
-        Fresh => sleep(controlplane.cache_refresh_interval_ms = 5_000),
-        Cached => attempt_refresh(); sleep(min(5_000, remaining_grace()/4)),
-        Stale => attempt_refresh(); sleep(min(2_500, remaining_grace()/8)),
-        Expired => attempt_refresh(); sleep(controlplane.cache_expired_retry_ms = 1_000),
-    }
-}
-```
-`remaining_grace()` returns `max(0, controlplane.cache_grace_ms - controlplane.cache_age_ms)`. `attempt_refresh()` performs a quorum read of `{routing_epoch, durability_ledger, rbac_manifest, feature_manifest}` from ControlPlaneRaft; if the fetch succeeds, the node atomically installs the snapshot and resets `controlplane.cache_age_ms`. If the fetch fails with a transport error, the node logs `controlplane.cache_refresh_failure{error}` and continues the loop without backoff. Implementations MUST NOT invent alternate timers or exponential backoffs: every partition shares the retry cadence above so auditors can reason about worst-case recovery during partial outages.
-- Every transition into `controlplane.cache_state=Expired` increments the monotonic counter `controlplane.cache_expiry_total{partition_id}` so SLO tooling can correlate cache lapses with user-visible incidents.
-- Early warning: nodes derive `controlplane.cache_warn_ms = max((3 × controlplane.cache_grace_ms) / 4, controlplane.cache_grace_ms - 60000)` using integer math (no floating-point rounding differences) and flip `controlplane.cache_warning=1` telemetry plus a `ControlPlaneCacheWarning` incident as soon as `controlplane.cache_age_ms ≥ controlplane.cache_warn_ms`. While the warning bit is set, leaders MUST attach `cache_warning_ms_remaining = controlplane.cache_grace_ms - controlplane.cache_age_ms` to every `ControlPlaneUnavailable{reason=NeededForReadIndex}` response so clients and operators have at least one minute of lead time before hard failures trigger.
-- Mixed-version guardrails: capabilities that require parity (leases, incremental snapshots, observer admission, PID auto-tuner, BLAKE3 leaves, Group-Fsync) remain disabled until every replica advertises support. ControlPlaneRaft logs `FeatureResume` once reenabling succeeds so auditors can correlate the feature matrix with the upgrade.
-
-### 11.2 DR Fencing Enforcement
-1. ControlPlaneRaft writes `(fence_epoch, manifest_id)` and lists participating partitions.
-2. Each partition appends `FenceCommit{fence_epoch, manifest_id, dr_cluster_id}` and reports `fence_committed_index` once `wal_committed_index` covers it.
-3. ControlPlaneRaft flips tenant/placement state only after all partitions acknowledge. Aborts append `FenceAbort{fence_epoch}` and require a fresh epoch for retries.
-4. Any mismatched fence forces immediate step-down and `fence_reject_reason` in `boot_record`.
-
-### 11.3 Key Material Epochs
-- ControlPlaneRaft tracks `{kek_version, dek_epoch, integrity_mac_epoch}` per partition. Nodes fetch keys via the KeyProvider; grace to retrieve updates: `key_fetch.grace_ms = 30000`. Expiry quarantines the replica (`KeyEpochMismatch`).
-- During rotations, nodes keep the previous KEK available for decryption until the new epoch is fully distributed; encryption and proof publication always use the newest ControlPlaneRaft-issued epoch once it is locally available so fresh ciphertext never regresses to an older key.
-- ControlPlaneRaft persists every epoch update in the durability ledger with a strictly monotone `{epoch, updated_at}` pair. Replicas MUST reject any ControlPlaneRaft snapshot or log replay that attempts to decrease an epoch, and the override ledger MUST record the ticket/TTL whenever operators temporarily widen the acceptance window.
-
-### 11.4 System Log Entry Catalog
-| Entry | Wire ID | Fields |
-| --- | --- | --- |
-| `MembershipChange` | 0x01 | `{old_members[], new_members[], routing_epoch}` |
-| `MembershipRollback` | 0x02 | `{reason, failing_nodes[], override_ref}` |
-| `DurabilityTransition` | 0x03 | `{from_mode, to_mode, effective_index, durability_mode_epoch}` |
-| `FenceCommit` | 0x04 | `{fence_epoch, manifest_id, dr_cluster_id}` |
-| `DefineActivate` | 0x05 | `{bundle_id, barrier_id, partitions[], readiness_digest}` |
-
-[Normative] This catalog is emitted verbatim as `system_log_catalog.json` alongside `wire_catalog.json`; spec-lint fails the build if §11.4 drifts from §0.3’s system-entry list or if either table diverges from the generated artifact. Editors therefore MUST edit the generator and regenerate the bundles instead of hand-editing the Markdown when assigning IDs.
-
-`DurabilityAck` messages persist `{last_fsynced_index, segment_seq, io_writer_mode}` before replying.
-
-Encoding contract: every system log entry packs its fields in the listed order using the frozen binary rules from §0.3 (`u8` enums, little-endian fixed widths, `u16` array counts, `u32` byte lengths). Senders append new optional fields only at the tail with a preceding `u8 has_field` flag; receivers MUST ignore recognized tail fields they don't understand while rejecting unknown mandatory slots. gRPC mirrors expose numeric enums, while JSON shadows return the canonical enum string and accept both string and numeric inputs for upgrades.
-
-### 11.5 Definition Bundles, Activation Barriers & Readiness Telemetry
-[Normative] `DefinitionBundle` objects are ControlPlaneRaft-authored records `{bundle_id, version, sha256, definition_blob, warmup_recipe, emitted_at_ms}`. Leaders MUST verify the `sha256` prior to staging, persist the bundle under `state/<partition_id>/definitions/<bundle_id>.blob`, and refuse the bundle if either the digest mismatches or the referenced emit-version differs from the current `emit_version`. ControlPlaneRaft retains at least two historical bundles per partition so rollback tooling can compare digests byte-for-byte.
-[Normative] Each `ActivationBarrier` references one `bundle_id`, embeds `{barrier_id, readiness_threshold (0–1], warmup_deadline_ms, readiness_window_ms}`, and lists the partitions that must report readiness. ControlPlaneRaft declines to append `DefineActivate` unless every listed partition publishes `partition_ready_ratio >= readiness_threshold` within the deadline window and signs the `WarmupReadiness` record; missing ratios or expired deadlines automatically cancel the barrier with `ActivationBarrierExpired`.
-[Normative] Data-plane replicas MUST maintain `shadow_apply_state ∈ {Pending, Replaying, Ready, Expired}`, `shadow_apply_checkpoint_index`, `shadow_apply_lag_ms`, and `warmup_ready_ratio` metrics per bundle. These metrics feed the replicated `WarmupReadiness` objects and `/readyz`; `shadow_apply_state=Ready` requires replaying the staged bundle through a shadow apply queue, verifying AP pane/dedup digests (§8.4), and persisting `shadow_apply_checkpoint_index >= activation_checkpoint_index`. ControlPlaneRaft refuses to transition the barrier if any replica still reports `shadow_apply_state ∈ {Pending, Replaying}`.
-[Normative] `/readyz` responses MUST surface `{definition_bundle_id, activation_barrier_id, shadow_apply_state, warmup_ready_ratio, partition_ready_ratio, readiness_digest}` so that upstream controllers can gate DEFINE_ACTIVATE submissions using the same schema expected by the downstream hot-reload pipeline. `readiness_digest = sha256(sorted(WarmupReadiness.records))` and is echoed inside the `DefineActivate` log entry; nodes reject the entry unless the digest matches the values they most recently published. `/readyz` also reports `feature.<name>_gate_state`, `feature.<name>_predicate_digest`, and `feature.<name>_gate_state_digest` for `{incremental_snapshots, leader_leases, observers, blake3_leaves, pid_auto_tuner}` so control planes can confirm the active capability set.
-[Operational] Nodes publish `readiness.publish_period_ms` (default 1000 ms) and `readiness.skipped_publications_total` so dashboards alert when readiness data goes stale. Explain APIs (`WhyNotReady`, `/readyz`) MUST quote the bundle/barrier IDs plus the blocking ratios to keep the DefinitionBundle contract debuggable without sampling ControlPlaneRaft directly.
-
----
-
-## 12  Security & Isolation
-
-### 12.1 mTLS & SPIFFE Rotation
-- All node-to-node RPCs use mTLS with SPIFFE identities. Rotation: upload the new trust bundle, confirm every peer has adopted it, then drop the previous bundle. Short-lived certs (≤24 h) require fresh CRL/OCSP material; nodes fail closed if revocation data exceeds `revocation.max_staleness_ms = 300000`, and the absence of either feed is treated as “stale” immediately rather than waiting for the timer to elapse. Break-glass tokens can bypass revocation temporarily with audit reason.
-- [Normative] Trust-domain hygiene: nodes MUST attempt revocation refresh in the following order—(1) OCSP stapling cache, (2) CRL fetch, (3) out-of-band break-glass waiver. If both OCSP and CRL material remain older than `revocation.fail_closed_ms = 600000` **or** if both feeds are simultaneously unavailable, peers MUST tear down every mTLS connection and enter Quarantine until fresh material arrives or a signed waiver is deployed. Break-glass waivers MAY extend the deadline by at most `revocation.waiver_extension_ms = 300000` and MUST cite a ticket ID mirrored in the override ledger so the boundary between ControlPlaneRaft and data plane stays auditable.
-
-### 12.2 AEAD Usage & Re-Encryption
-- WAL segments and snapshot chunks use AEAD with 64-bit `segment_seq` and `block_counter` fields forming the nonce, where `block_counter` advances in `wal.crypto_block_bytes` increments. Tags and MAC epochs bind ciphertext to `{partition_id, dek_epoch, segment_seq}`. `.idx` files remain plaintext but carry HMAC footers keyed by `integrity_mac_epoch`.
-- Re-encryption jobs stream data through an AEAD rewriter, allocate fresh `segment_seq` ranges via ControlPlaneRaft, and mark segments `rewrite_inflight` until `rewrite_complete` is fsync'd. Partial rewrites quarantine partitions until resumed; resumption MUST allocate a brand-new `segment_seq`, append `NonceReservationAbandon{segment_seq_old, abandon_reason=Rewrite}`, and only then continue emitting ciphertext under the latest `dek_epoch`. Encrypting new blocks always uses the newest epoch/key; replicas may continue decrypting older ciphertext with prior keys until rewrites complete.
-[Normative] WAL segments, checkpoint manifests, and snapshot chunks are pinned to AES-256-GCM (`crypto.wal_aead_suite = AES_256_GCM`, `crypto.snapshot_aead_suite = AES_256_GCM`). Cipher-suite changes are forbidden in v0.1; attempting to configure any other AEAD results in `CryptoSuiteRejected`. ControlPlaneRaft records the selected suite per cluster generation so forensic tooling can re-verify ciphertext with the exact algorithm.
-[Normative] AES-256-GCM, SHA-256, and HMAC-SHA256 implementations MUST be sourced from FIPS 140-3 validated modules recorded as `{module_id, validation_cert_sha256}` inside ControlPlaneRaft. spec-self-test verifies that the loaded crypto provider digest matches the recorded certificate before a node mounts any partition; mismatches or unverifiable modules force bootstrap to fail with `FipsModuleMismatch` so audits can prove every deployed primitive passed independent validation.
-[Normative] Cryptographic agility follows a three-step governance process: (1) the proposed AEAD suite is documented with interoperability predicates and simulator coverage, (2) §0 (Consensus Core) is amended to list the suite and its negotiation bits, and (3) a new `integrity_mac_epoch`/`crypto.*_aead_suite` pair is ratified via `consensus_core_manifest.json`. No binary may enable a new suite until all three steps land in the same release, ensuring auditors can trace the proposal → specification update → manifest entry without relying on tribal knowledge.
-[Normative] Hardware accelerators or kernel providers that cache DEKs/KEKs (e.g., AES-NI wrappers, QAT cards, TLS NICs) MUST expose deterministic zeroization hooks. After every DEK rotation, reencryption abort, or accelerator reset, nodes invoke `crypto.zeroize_context` and emit `crypto.zeroization_digest = sha256(last_zeroize_result)`; accelerators MUST confirm that all cached material has been overwritten with zeros (or a fixed poison pattern) before acknowledging. Failure to observe the zeroization completion bit or digest mismatch places the partition in Quarantine and raises `CryptoZeroizationFailed`, preventing hardware caches from leaking historical keys.
-[Normative] ControlPlaneRaft issues a fresh DEK every `crypto.dek_rotation_period_ms = 604800000` (weekly). Nodes MUST fetch and begin encrypting with the new DEK immediately, retain the prior DEK for decryption-only use for `crypto.dual_read_window_ms = 172800000` (48 h), then zeroize it. The dual-read window is measured against the ControlPlaneRaft timestamp embedded in the signed `dek_epoch` record; data-plane nodes MAY apply at most ±5,000 ms correction for local clock skew (derived from the same `clock_guard` service) before declaring the window expired. Operators therefore have a precise 48 h wall-clock overlap regardless of leap seconds or NTP adjustments. The rotation schedule is shared across data and checkpoints so snapshot emitters never lag more than the 48 h window; partitions that miss the window self-quarantine with `DekRotationMissed`.
-[Normative] Every WAL append and snapshot emission records the blocking time spent waiting on the Key Management Service in `wal_kms_block_seconds` (monotone) and `snapshot_kms_block_seconds`. Nodes MUST page when either counter grows by >300 s within an hour, and Explain APIs MUST surface the counters so operators can diagnose KMS stalls. ControlPlaneRaft refuses to finalize a rotation if any replica reports `wal_kms_block_seconds_delta > 300` without an acknowledged `KeyRotationOverride`.
-[Operational] Rotation deferrals require an override ledger entry `KeyRotationOverride{reason, ticket_url, expires_at_ms}` approved by ControlPlaneRaft; overrides grant at most one additional rotation period and MUST cite the impacted partitions. Telemetry `crypto.rotation_override_active=1` plus the override ID is included in `/readyz` and audit logs so downstream services understand why the shared rotation schedule drifted.
-
-### 12.3 RBAC & Break-Glass Controls
-| Role | Capabilities |
-| --- | --- |
-| Operator | Partition lifecycle, durability changes, `TransferLeader`, snapshot triggers/imports. |
-| TenantAdmin | Read telemetry, per-tenant flow overrides within quotas. |
-| Observer | Read-only metrics and Explain APIs. |
-| BreakGlass | Required for destructive/risk-expanding APIs (survivability overrides, Group-Fsync re-enables, key rotations, `AdminResumePartition` from quarantine, throttle overrides beyond quota). |
-
-RBAC manifests replicate via ControlPlaneRaft; caches refresh every 30 s. Failure to refresh twice enters fail-secure mode: admin APIs reject with `RBACUnavailable`, data plane continues for `rbac.grace_ms = 60000` using last known manifest, and telemetry surfaces `rbac_cache_stale`.
-
-**Break-Glass token issuance (normative):**
-- Tokens are minted only by ControlPlaneRaft via `IssueBreakGlassToken{scope, ticket_url, expires_at}` after a dual-approval workflow that records the request in the override ledger. Operators never self-mint tokens from data-plane nodes.
-- Tokens MUST be encoded as SPIFFE X.509 SVIDs that carry the extension `urn:clustor:breakglass:<scope>` plus the ticket URL in `subjectAltName`. The SVID lifetime is capped at `breakglass.max_ttl_ms = 300000` (5 min) and cannot be renewed; clients must request a fresh token after expiry.
-- Scopes enumerate the concrete API set (`DurabilityOverride`, `SurvivabilityOverride`, `ThrottleOverride`, etc.). Nodes MUST reject a token whose scope does not match the attempted API, whose TTL has elapsed, or whose SPIFFE trust domain differs from the cluster’s configured domain.
-- [Normative] Token validity calculations use the local monotonic clock with ±5,000 ms allowance for skew; nodes therefore reject tokens whose `not_before` is more than 5 s in the future or whose `not_after` passed more than 5 s ago, preventing disputes during leap seconds or NTP step events while still honoring the 5 min TTL.
-- Every token is bound to `{cluster_id, partition_or_global_scope, actor_id}` and logged in the override ledger with `used_at` timestamps and the exact SPIFFE ID that exercised it (`used_by_spiffe_id`). Data-plane components MUST emit `breakglass_token_used{scope, actor_id, ticket_url}` telemetry on first use and MUST zeroize the SVID immediately afterward so it cannot be replayed.
-[Normative] Each BreakGlassTokenCA rotation MUST publish `breakglass_revocation_manifest.json`, a CPReleaseKey-signed document that lists the retiring intermediates’ serial numbers, validity windows, and rotation ticket IDs. Data-plane nodes fetch and apply the manifest (revoking every listed intermediate) before trusting the new CA, and spec-lint refuses builds whose manifest is missing or unsigned so short-lived certs cannot linger in caches.
-[Normative] Break-Glass usage is also persisted in `security/breakglass_audit.log`, a Canonical JSONL stream whose entries are
-```
-{
-  "log_version": 1,
-  "cluster_id": "<uuid>",
-  "partition_scope": "<partition_id|global>",
-  "scope": "<DurabilityOverride|...>",
-  "token_id": "<uuidv7>",
-  "ticket_url": "<https://...>",
-  "issued_at_ms": "<string wide-int>",
-  "used_at_ms": "<string wide-int>",
-  "actor_spiffe_id": "spiffe://...",
-  "api": "<API invoked>",
-  "result": "Success|Rejected",
-  "signature": "<Ed25519 signature over the canonical entry>"
-}
-```
-Entries are batched into 1,000-line segments; each segment’s SHA-256 is signed by the same Ed25519 key used for the audit stream in §14.1 and retained for ≥400 days. `SubscribeAuditLog` returns the raw entries plus the segment signature so downstream tooling can verify scope usage without scraping `App.D`.
-
-### 12.4 Key Purpose Registry
-| Key name | Signing scope | Artifacts covered | Rotation / storage requirements |
-| --- | --- | --- | --- |
-| `ReleaseAutomationKey` (Ed25519) | Build pipeline | `consensus_core_manifest.json`, `wire_catalog.json`, `chunked_list_schema.json`, `proof_bundle_signature` | Hardware-backed HSM in CI; rotates every 180 days or on personnel change; public half ships with release bundles so data-plane binaries can pin it. |
-| `CPReleaseKey` (Ed25519) | Control-plane Raft | `feature_manifest.json`, override-ledger objects, durability-ledger acknowledgements | Stored in ControlPlaneRaft’s KMS-backed secret store with dual-control release; rotation coupled to ControlPlaneRaft minor upgrades and recorded in the override ledger. |
-| `AuditLogKey` (Ed25519) | Security/audit plane | `security/breakglass_audit.log` segment digests, `/SubscribeAuditLog` stream signatures | Lives in a dedicated audit HSM; rotates annually with overlap so historical logs remain verifiable for ≥400 days. |
-| `BreakGlassTokenCA` (SPIFFE CA) | Short-lived SVIDs | Break-Glass token certificates (`urn:clustor:breakglass:*`) | Uses the same mTLS CA infrastructure but with a 45-day rolling intermediate dedicated to tokens; every rotation overlaps the prior intermediate by ≥7 days and is recorded in ControlPlaneRaft so data-plane nodes can reject stale or non-overlapping intermediates immediately. |
-
-[Normative] Implementations MUST keep these keys disjoint; no key may sign artifacts outside its row. Telemetry MUST expose `{release_automation_pubkey_id, controlplane_release_pubkey_id, audit_log_pubkey_id, breakglass_ca_id}` so auditors can confirm that every node trusts the expected hierarchy, and spec-lint fails the build if any artifact references an unknown key ID.
-
----
-
-## 13  Admin & Lifecycle APIs
-All admin APIs are gRPC/JSON dual surfaces; every mutating request requires `Idempotency-Key` (retained 24 h by default, up to 7 days per policy).
-
-| Category | Endpoints (sample) | Notes |
-| --- | --- | --- |
-| Partition lifecycle | `CreatePartition`, `DeletePartition`, `MovePartition`, `DryRunMovePartition` | Idempotent ControlPlaneRaft transactions. |
-| Replica management | `CreateReplica`, `AdminPausePartition`, `AdminResumePartition` | Resume while quarantined is Break-Glass. |
-| Durability | `SetDurabilityMode`, `GetDurabilityMode` | Mode changes append `DurabilityTransition{from,to,effective_index}`; stale callers receive `ModeConflict` (HTTP 409). |
-| Snapshots | `TriggerSnapshot`, `ListSnapshots`, `DownloadSnapshot`, `UploadSnapshot`, `DryRunSnapshot`, `SnapshotFullOverride` | Overrides are time-boxed and audited. |
-| Flow control | `GetPartitionBacklog`, `OverrideCredit`, `WhyCreditZero` | Overrides require TTL + justification. |
-| DR ops | `BeginFailover`, `CompleteFailover`, `AbortFailover`, `DryRunFailover` | Align with §11.2 fencing. |
-| Telemetry | `SetMetricsLevel`, `SubscribeAuditLog`, `WhyNotLeader`, `WhyDiskBlocked`, `WhySnapshotBlocked` | Shared schema header (`schema_version`, `generated_at`). |
-
-Dry-run endpoints report guardrails and computed parameters (e.g., auto-scaled catch-up slack/timeout, predicted credit impact). Explain APIs always include `routing_epoch`, `durability_mode_epoch`, observed vs expected guardrail, and `decision_trace_id` when relevant.
-
-Runbook snippets (normative summaries only):
-1. **Disk replacement:** pause partition, verify latest snapshot, replace disk, rerun startup scrub, rejoin via `CreateReplica`.
-2. **Hot partition rebalance:** require `Q`/`H` healthy, lag below thresholds; run `DryRunMovePartition`, execute move, confirm `WhyNotLeader` reflects new placement.
-3. **Leadership transfer:** ensure Group-Fsync healthy, no structural lag, `apply_queue_depth < 10%`; issue `TransferLeader`, wait `commit_quiescence_ms = 200`, then drain.
-4. **DR failover:** require ControlPlaneRaft reachable, fence mismatch clear, lag ≤128 KiB; `BeginFailover`, verify first entry includes `(fence_epoch, manifest_id)`, `CompleteFailover` once lag=0.
-5. **Snapshot seeding:** ensure delta chain < cap or plan full snapshot, NIC utilization <70%; run `DryRunSnapshot`, then transfer and verify signature.
-6. **Certificate rotation:** upload bundle, confirm adoption, drop the previous bundle once every node reports success.
-
-### 13.1 ControlPlaneRaft Outage Behavior (Runbook Tile)
-- **Detection:** Page when `controlplane.cache_state ∈ {Stale, Expired}` or when `strict_only_runtime_ms` exceeds `controlplane.strict_only_backpressure_ms` (§11.1). Expect `strict_fallback_state=LocalOnly`, `ControlPlaneUnavailable` incidents, and throttle envelopes that cite `ControlPlaneUnavailable{reason=NeededForReadIndex}`.
-- **Client error mapping:** Leaders continue to accept writes (Strict only) but every linearizable read returns HTTP 503 / gRPC `UNAVAILABLE` with `ControlPlaneUnavailable{reason=NeededForReadIndex}`, `Retry-After ≥ 250 ms`, and the `{controlplane_last_durable_*, leader_commit_*}` metadata from §3.3. Admin mutations fail with `ControlPlaneUnavailable{reason=CacheExpired}` once caches exceed `controlplane.cache_grace_ms`. These codes are normative; custom surfaces MUST NOT remap them.
-- **Retry/backoff:** Clients MUST honor the provided `Retry-After` or, when absent, back off exponentially starting at ≥250 ms with full jitter, capping at 5 s. Busy-loop retries are forbidden and treated as misbehaving tenants via throttles.
-- **Fallback reads:** Products that require availability during outages MUST pre-wire snapshot-style fallbacks (`FollowerReadSnapshot` or exported snapshots). Responses MUST continue to carry `read_semantics=SnapshotOnly`, epoch headers, and capability checks so clients cannot accidentally treat them as linearizable results. Document any dataset-specific caveats (e.g., “metadata may lag up to N seconds”) in the product SLO.
-- **SLO impact:** While ControlPlaneRaft is unreachable the cluster remains in Strict durability and halves credits after `controlplane.strict_only_backpressure_ms`; §11.1 notes that write latency typically regresses by 40–60% and throughput drops accordingly. Operators SHOULD communicate the degraded SLO externally and track recovery in incident tooling.
-- **Product-team expectations:** Every product surface that embeds Clustor MUST document (a) how `ControlPlaneUnavailable` propagates to customers, (b) the supported snapshot/read fallback, and (c) operational steps to revalidate data once ControlPlaneRaft returns. Launch reviews fail if these artifacts are missing.
-
----
-
-## 14  Telemetry & Observability
-- Metric namespaces: `clustor.raft.*`, `clustor.wal.*`, `clustor.snapshot.*`, `clustor.flow.*`, `clustor.controlplane.*`, `clustor.security.*`. In this document, the `controlplane.*` metric and field prefix refers exclusively to ControlPlaneRaft.
-- Every exporter MUST emit `metrics.schema_version` (u32) and `metrics.build_git_sha` in both `/readyz` and the metrics stream; the value is baked at build time and bumps whenever metric names or bucket definitions change so dashboards can detect incompatible renames automatically.
-- Naming convention: metrics MUST use dotted Prometheus-style names rooted at `clustor.*` (e.g., `clustor.raft.commit_latency_ms`), incidents MUST use the same namespace suffixed with `.incident.*`, and JSON payload fields remain snake_case (matching the API schema and the canonical field list emitted from §0.3’s wide-int catalog). Spec-lint validates new metric names against this pattern so exporters never need per-signal translation layers.
-- Canonical histogram buckets (latency in ms unless noted):
-  - `clustor.wal.fsync_latency_ms`: `[0.25, 0.5, 1, 2, 4, 6, 8, 10, 15, 20, 30, 40, 60, 80, 100]`
-  - `clustor.raft.commit_latency_ms`: `[0.5, 1, 2, 4, 6, 8, 10, 15, 20, 30, 40, 60, 80, 100]`
-- `clustor.snapshot.transfer_seconds`: `[1, 2, 4, 8, 16, 32, 64, 128, 256]`
-- `flow.apply_batch_latency_ms`: `[0.25, 0.5, 1, 2, 4, 6, 8, 10]`
-- [Normative] These bucket edges are generated from `metrics_buckets.json` inside the telemetry bundle; spec-lint compares App.A and §14 against that artifact every build, so editors MUST regenerate the bundle (never hand-edit Markdown) when tuning SLO buckets.
-- Out-of-profile systems (e.g., WAN, ZFS-on-HDD) are expected to saturate the top bucket; alerts still fire if the p99 exceeds the App.A bands even when measurements clamp at the bucket ceiling.
-- ControlPlaneRaft metrics expose `controlplane.ledger_status ∈ {Fresh, Cached, Stale}` and `controlplane.cache_age_ms` so leaders can explain Strict fallbacks.
-- Operators running ≥2,000 partitions per node SHOULD enable the optional aggregation layer described in App.A: per-partition histograms may be down-sampled to 0.2 Hz or aggregated into cohort-level histograms so long as the SLO guardrails in App.A continue to evaluate against the reconstructed percentiles. Implementations MUST expose the sampling rate via `metrics.sample_rate` so observability tooling can rescale alerts.
-
-### 14.1 Golden Signals & Incident Logging
-- Alerts from App.A feed correlated incident logs once breached for `alerts.incident_correlation_window = 120 s`. Incidents bundle durability mode, credit levels, leader term, recent admin actions, and remediation hints. Cooldown: `alerts.incident_emit_cooldown_ms = 300000`; the storm guard cap scales with node density as `incident_max_per_window = max(5, ceil(active_partitions_on_node / 250))` per 10 min, while `SafetyCritical` classes (durability regression, key epoch lag, fence mismatch) remain exempt so cascading failures still surface immediately.
-- Audit logs are signed JSON batches (Ed25519) with 400-day retention; AEAD AAD = `{cluster_id, controlplane_epoch, wall_clock_bucket}`.
-- Metrics cardinality guardrails cap active `partition_id` series at 2048 per node; high-cardinality labels sample at `metrics.high_cardinality_sample_rate = 0.1`. Evictions emit `metrics_cardinality_dropped`.
-- [Normative] Every dynamic capability—incremental snapshots, leader leases, observer admission, BLAKE3 Merkle leaves, and the PID auto-tuner—MUST export `feature.<name>_gate_state ∈ {Enabled,Disabled,Revoked}` and `feature.<name>_predicate_digest` (sha256 over the enabling predicate inputs). `/readyz` exposes the same values plus `feature.<name>_gate_state_digest` so automation can prove the feature matrix matches the running binary. Spec-lint cross-checks the telemetry bundle against this list to ensure no capability ships without the matching metrics.
-
-### 14.2 Startup Spec Self-Tests
-- Before a partition advertises readiness (and again after every binary upgrade), the node MUST execute `spec_self_test` while still in bootstrap: the procedure recalculates the local `wire_catalog.json`, `chunked_list_schema.json`, and wide-int catalog from the shipping code, compares them byte-for-byte with the artifacts generated at build time (§0.3), and refuses to mount the partition if any diff is observed.
-- The same self-test replays the canonical `PreVoteResponse`, `ChunkedList`, and JSON fixtures from App.C plus the snapshot-manifest and segment-MAC vectors (§8.1, §5.1). It also executes the lease inequality suite (§3.3), the incremental snapshot authorization cadence (§8.4), and the BLAKE3 leaf vectors (App.C) so binaries cannot ship without verifying the active feature set. Failures raise `SpecSelfTestFailed{fixture}` telemetry, mark the node Quarantined, and require an operator override to proceed.
-- Nodes persist the most recent `spec_self_test` result (timestamp, git hash, fixture version) in `boot_record.json` and emit `clustor.spec.self_test_duration_ms`/`clustor.spec.self_test_fail_total` metrics so fleet automation can confirm the checks ran on every restart. CI MUST reject releases whose binaries omit the self-test hook.
-
----
-
-## 15  Deployment & Bootstrap
-
-### 15.1 Bootstrap & Disk Hygiene
-1. Start ControlPlaneRaft (3 or 5 nodes) and load tenant/partition manifests.
-2. Launch data-plane nodes referencing ControlPlaneRaft endpoints; bootstrap refuses unassigned partitions or stale disks.
-3. Nodes run startup scrub (§6.3) before joining quorum.
-- Disk policy verification (blocking, per §1.2.1 table):
-  - Read `/proc/mounts` and `/sys/block/<dev>/queue/write_cache` to ensure the cache mode matches the table (write through or write back with FUA). Violations raise `DiskPolicyViolation{reason=WriteCache}`.
-  - Inspect `/sys/block/<dev>/queue/fua` and `/sys/block/<dev>/queue/flush` to confirm barrier support; failures quarantine the node even if mount options look correct.
-  - Validate ext4 mounts use `data=ordered`, `commit<=5`, and keep `auto_da_alloc` enabled; warn (but do not block) when `journal_async_commit` is absent if latency SLOs require it. Reject XFS mounts that attempt to disable barriers even if the option is deprecated, and confirm ZFS datasets advertise `sync=always` + `logbias=throughput`.
-  - For dm-crypt/mdraid stacks, validate the effective `/sys/block/<stacked>/queue/*` flags as well as the underlying physical devices; mismatches between layers trigger `DiskPolicyViolation{reason=StackedDeviceInconclusive}` until operators provide an explicit allow-list. The allow-list is a ControlPlaneRaft object (`disk_override`) that records the exact device paths, attested `queue/*` capabilities, author, TTL, and ticket; nodes remain quarantined until such an entry exists and matches the observed topology.
-  - Reconcile detected filesystem UUIDs with prior boot records to ensure disks were not hot-swapped without operator intent.
-  - CI environments that rely on loopback devices or ephemeral cloud volumes MUST register an explicit `disk_override` describing the synthetic topology (including TTL) before tests run; otherwise bootstrap halts to avoid silently accepting lossy backing stores.
-
-### 15.2 Graceful Shutdown
-- Prefer `TransferLeader`, wait `commit_quiescence_ms = 200`, ensure `apply_queue_depth < 10%`, flush WAL/checkpoints, then stop listeners. Force shutdown after `graceful_shutdown_timeout_ms = 10000` with telemetry explaining the reason.
-
-### 15.3 Kubernetes & Host Guidance
-- Run as StatefulSets with PDB `maxUnavailable=1`, anti-affinity (≤1 voter per node/zone). In single-AZ clusters this degenerates to “one voter per node” while still using topologySpreadConstraints for rack/zonal labels so the requirement remains meaningful. Pods expose `/state` with read-write volume; other paths read-only.
-- Set `terminationGracePeriodSeconds ≥ graceful_shutdown_timeout_ms` (10 s default) so `TransferLeader` + WAL flush finish before the kubelet SIGKILLs the pod; shorter windows are rejected by admission webhooks.
-- Require cgroup v2 with `io.max`, Linux ≥5.15 with `io_uring`, and dedicated storage (NVMe preferred). Unsupported mounts (no barriers, unsafe write cache, missing `sync=always` on ZFS) are rejected during bootstrap.
-- Sidecars (snapshot service, log shipper) run with least privilege; pods needing encrypted WALs require `CAP_IPC_LOCK` to pin keys.
-
-### 15.4 Configuration Profiles
-Profiles are declarative bundles that gate hard limits and defaults (details in App.B). Validators reject configs exceeding profile bounds; feature gates must be homogeneous per voter set.
-
-### 15.5 Repair-Mode Bootstrap
-- `bootstrap.repair_mode=true` mounts partitions read-only, runs scrub, and blocks quorum participation.
-- Operators can download/upload snapshots for offline repair.
-- `AdminResumePartition` (Break-Glass) remounts read-write, forces snapshot import to refresh dedupe state, clears quarantine, and rejoins quorum.
-
----
-
-## 16  Summary of Guarantees
-| Area | Guarantee |
-| --- | --- |
-| Ordering | Raft total order per partition enforced by §0/§3 invariants. |
-| Durability | Strict or Group-Fsync with `DurabilityTransition` fencing and automatic downgrade. |
-| Recovery | Crash-safe WAL replay + scrub reports + boot records. |
-| Control Plane | ControlPlaneRaft manages placements, durability ledger, DR fences, and feature gates. |
-| Extensibility | Codec hooks, apply callbacks, snapshot plugins with mandatory tracing metadata. |
-| Observability | Golden signals, Explain APIs, signed audits, throttle envelopes. |
-| Security | AEAD everywhere, SPIFFE/mTLS, RBAC with break-glass audit. |
-| Read Availability | Linearizable reads depend on ControlPlaneRaft durability proofs; during ControlPlaneRaft outages only Strict-mode writes and snapshot-style reads continue (§3.3). |
-| Operations | Documented runbooks, dry-run tooling, Kubernetes-ready defaults. |
-
----
-
-## Appendix A App.A – SLOs & Alerts
-| Signal | Target | Alert Threshold | Notes |
-| --- | --- | --- | --- |
-| `clustor.raft.commit_latency_ms` (p99) | ≤15 ms | ≥25 ms for 2 min | Drives `commit_latency_breach`. |
-| `clustor.wal.fsync_latency_ms` (p99) | ≤10 ms | ≥20 ms for 3 batches | Forces Strict downgrade. |
-| `clustor.flow.ingest_ops_per_sec` (per profile) | ≥ profile target (App.B) | < profile alert floor for 5 min | Ensures throughput SLOs are enforced alongside latency/durability. |
-| `clustor.flow.zero_credit_duration_ms` | 0 | ≥500 ms | Triggers throttle envelopes. |
-| `clustor.snapshot.staleness_seconds` | ≤120 | ≥300 | Signals snapshot backlog. |
-| `clustor.controlplane.epoch_drift` | 0 | >0 | Indicates ControlPlaneRaft/Data desync. |
-| `clustor.security.key_epoch_lag` | 0 | >1 epoch | Blocks new leaders. |
-| `clustor.raft.commit_visibility_gap_ms` | 0 | >0 for `alerts.commit_visibility_gap_ms=5000` | Warns reads running ahead of durability. |
-| `clustor.controlplane.ledger_status` | `Fresh` | `Stale` for >`controlplane.cache_grace_ms` | Forces Strict fallback. |
-
-Default `alerts.commit_visibility_gap_ms` values: Latency/ConsistencyProfile = 0 (alert immediately), Throughput = 5000 ms, WAN = 10000 ms. Profiles that deviate MUST document the new bound in their runbooks.
-[Normative] To prevent metrics-store saturation, every profile now publishes `metrics.partition_histogram_sample_period_ms` in App.A. The default sample period remains 1000 ms; large fleets (≥2,000 active partitions per node) MAY relax it up to 5000 ms but MUST record the chosen value and resulting `metrics.sample_rate = 1000 / sample_period_ms` in telemetry. Sampling below 1000 ms (e.g., 200 ms high-resolution mode) is still permitted but MUST likewise be documented. spec-lint fails configuration bundles where the published sample period is missing or exceeds the 5 s ceiling, and `/readyz` plus Explain APIs MUST surface the same sampling interval so SLO tooling can compensate for down-sampled percentiles.
-
----
-
-## Appendix B App.B – Operational Profiles (Highlights)
-| Profile | Defaults | Hard Limits |
-| --- | --- | --- |
-| Latency / ConsistencyProfile | Strict durability, `target_latency_ms=10`, `target_backlog_entries=128`, incremental snapshots enabled (10 s delta / 30 s full cadence), leases supported but default `lease_gap_max=0`, Merkle enabled, observers allowed (≤2) with dedicated bandwidth pool, PID auto-tuner disabled, `ingest_ops_target=50k/s`, `strict_fallback_local_only_demote_ms_profile=14,400,000`, `controlplane.durability_proof_ttl_ms_profile=43,200,000` (12 h). | Rejects `batch_bytes > 64 KiB` or `sample_period_ms > 100`; leases may only be enabled when the inequality holds; `apply.max_batch_ns` hard ceiling 2 ms; `ack_handle.max_defer_ms` hard ceiling 250 ms; throughput alert floor 40k/s; BLAKE3 leaves and PID auto-tuner forbidden. |
-| Throughput | Group-Fsync on, `target_latency_ms=40`, `target_backlog_entries=1024`, incremental snapshots enabled, leases enabled by default (`lease_gap_max=1024`), observers allowed (≤2), PID auto-tuner enabled when `io_writer_mode=FixedUring`, BLAKE3 leaves optional, `CommitAllowsPreDurable` available, `ingest_ops_target=120k/s`, `strict_fallback_local_only_demote_ms_profile=14,400,000`, `controlplane.durability_proof_ttl_ms_profile=86,400,000` (24 h). | `group_fsync.max_inflight_bytes_per_partition ≤ 8 MiB`; `apply.max_batch_ns` ceiling 4 ms; `ack_handle.max_defer_ms` ceiling 400 ms; throughput alert floor 100k/s. |
-| WAN | Election timeout `[300,600]`, `pre_vote.max_rtt_ms=500`, incremental snapshots enabled, leases disabled (`lease_gap_max=0`), observers allowed (≤2) subject to WAN bandwidth accounting, PID auto-tuner enabled when `io_writer_mode=FixedUring`, BLAKE3 leaves optional, `ingest_ops_target=25k/s`, `strict_fallback_local_only_demote_ms_profile=21,600,000`, `controlplane.durability_proof_ttl_ms_profile=64,800,000` (18 h). | Requires healthy PTP/GPS; `clock_skew_bound_ms ≤ 50`; `apply.max_batch_ns` ceiling 5 ms; `ack_handle.max_defer_ms` ceiling 500 ms; throughput alert floor 20k/s. |
-| ZFS | `wal.segment_bytes ≥ 2 GiB`, `durability.max_device_latency_ms=40`, incremental snapshots enabled with Strict durability, Merkle mandatory, observers optional (≤2) when ControlPlaneRaft authorizes, leases/auto-tuner/BLAKE3 leaves disabled, `controlplane.durability_proof_ttl_ms_profile=43,200,000` (12 h). | Requires `sync=always`; Group-Fsync disabled unless devices prove <20 ms fsync; `apply.max_batch_ns` ceiling 2 ms. |
-
-Profile layer controls optional integrity features (`segment.merkle_tree`) and hash suites. Only Throughput/WAN may enable `integrity.hash_suite=blake3` once all replicas agree.
-
-### Appendix B.1 Profile Capability Matrix
-[Normative] The table below is the single source of truth for which runtime gates each profile may exercise. Sections §0.5, §3.1.1, and §6.2 MUST defer to this matrix; adding a new capability requires updating this annex plus the referenced sections in the same change.
-
-| Capability | Latency/ConsistencyProfile | Throughput | WAN | ZFS |
-| --- | --- | --- | --- | --- |
-| Group-Fsync eligible | ✗ | ✓ (per §6.2 predicate) | ✓ (per §6.2 predicate and WAN storage proof) | ✗ |
-| Incremental snapshots (10 s / 30 s cadence) | ✓ (per §8.4) | ✓ (per §8.4) | ✓ (per §8.4) | ✓ (Strict durability only, per §8.4) |
-| Observers supported | ✓ (≤2, dedicated bandwidth per §4.1) | ✓ (≤2, per §4.1) | ✓ (≤2, per §4.1) | ✓ (≤2, per §4.1) |
-| Leader leases | Supported but default `lease_gap_max=0` (per §3.3) | ✓ (default on per §3.3) | ✗ | ✗ |
-| `CommitAllowsPreDurable` reads | ✗ | ✓ (per §3.3) | ✗ | ✗ |
-| PID auto-tuner | ✗ | ✓ (when `io_writer_mode=FixedUring`, per §10.1) | ✓ (when `io_writer_mode=FixedUring`, per §10.1) | ✗ |
-| Aggregator profile allowed | ✓ (per §7.4) | ✓ (per §7.4) | ✓ (per §7.4) | ✓ (per §7.4) |
-| `integrity.hash_suite=blake3` | ✗ | ✓ (once all replicas agree, per §5.1/§9.2) | ✓ (once all replicas agree, per §5.1/§9.2) | ✗ |
-| Strict-fallback demote window | 4 h (per §3.1.1) | 4 h (per §3.1.1) | 6 h (per §3.1.1) | 4 h (per §3.1.1) |
-
-Legend: ✓ = allowed when the capability’s local guardrails pass, ✗ = forbidden regardless of overrides. Where “ControlPlaneRaft-gated” appears, ControlPlaneRaft must record an explicit gate flip before the capability may activate.
-
----
-
-## Appendix C App.C – Test Matrix (Representative)
-
-### C.1 Wire Fixture Catalog (Normative)
-Normative JSON string fields (servers MUST emit them as base-10 strings; clients MUST accept strings and MAY accept numerics for backwards compatibility): `$.ack_term`, `$.ack_index`, `$.append.decisions[*].index`, `$.durability_mode_epoch`, `$.routing_epoch`, `$.wal_committed_index`, `$.raft_commit_index`, `$.sm_durable_index`, `$.quorum_applied_index`, `$.last_quorum_fsynced_index`, `$.ledger.last_durable_index`, any `$.snapshot.*.version_id`, every `$.segment_seq`, and all `clustor.*` histogram bucket boundaries and `*_bytes`/`*_entries` counters surfaced via Explain/Admin APIs. This appendix is the sole authoritative catalog; §0.3 defers to it and spec-lint (`json_wide_int_catalog_test`) fails if generators or docs drift. New wide-int fields MUST update this list before landing code. CI emits the same material in a machine-readable bundle (`spec_fixtures.bundle.json` + signature) so downstream generators can diff artifacts without scraping prose.
-
-`json_numeric_exception_list` (the only integers that MAY remain numeric in JSON because they are enums or constrained IDs) is frozen as follows:
-
-| JSONPath | Rationale |
-| --- | --- |
-| `$.error_code` | Matches the wire-level numeric registry so tooling can compare IDs without string parsing. |
-| `$.throttle.reason_id` (when present alongside the string `reason`) | Optional numeric mirror for histogram bucketing; never exceeds `u8`. |
-| `$.wire_enum_id` fields emitted by Explain/Why* payloads | Mirrors the numeric discriminant already sent on the binary transport. |
-
-A proposal to add a new exception MUST update this table, the machine-readable bundle, and spec-lint’s `json_numeric_exception_test`.
-
-### C.2 Behavioral Harness Matrix (Operational)
-The scenarios below describe required harnesses and expected outcomes. They complement—but do not replace—the normative wire fixtures above; vendors MAY extend the behavioral catalog so long as the required rows continue to pass.
-| Scenario | Coverage | Acceptance | Quarantine expectation |
-| --- | --- | --- | --- |
-| Deterministic Raft simulator | Membership changes, durability transitions, ReadIndex vs lease reads | No invariant violations; divergence <1 entry. | No |
-| Fault injection harness | I/O delays, EINTR/EIO, partial writes | Strict downgrade within 2 batches; zero acknowledged loss. | No |
-| Model checking (TLA+/Loom) | Log matching, fencing, lease inequality | Proofs required for 3/5-node configs per release. | N/A (formal proof only) |
-| Jepsen-style suites | (a) Partition + clock skew during joint consensus (b) Tail corruption (c) DR failover w/ stale fence (d) Leader transfer + SYN storm (e) Compaction vs slow learner (f) Snapshot delta exhaustion | (a) Safe rollback (b) Quarantine within 5 min (c) Followers refuse mismatched fence (d) No dual leaders beyond lease bound (e) Learner protected (f) Forces full snapshot). | Case (b) explicitly quarantines; others remain Healthy |
-| Frame fuzzing + allocator alignment fuzz | Codec limits, truncated frames, misaligned buffers | No panics; rejects malformed frames; alignment path only when needed. | No |
-| Crash-consistency harness | Kill points at `pwrite`, `fdatasync`, dir `fsync` | Startup scrub always recovers last committed index. | No |
-| Out-of-order persistence probe | Followers forced to fsync `wal/durability.log` before WAL bytes land (buggy layered stack simulation) | Replica detects unreadable entries, refuses to append `DurabilityRecord`, and enters Quarantine if the mismatch persists. | Conditional (Quarantine only if unreadable bytes persist) |
-| Power-loss mid-block | Kill between `NonceReservation` flush and WAL block completion | No nonce reuse; AEAD rejects partial tail; partition quarantines until scrub + rewrite succeed. | Yes |
-| Crypto drift tests | Epoch skew >1, nonce reuse attempts | Nodes quarantine; `(key, nonce)` never reused. | Yes |
-| Group-Fsync durability | Crash combinations of leader/follower ack timing | `wal_committed_index` monotone; no acknowledged loss; transitions fenced. | No |
-| Blocking follower downgrade | Followers stuck in `io_writer_mode=Blocking` while leader stays `RegisteredUring` | Group-Fsync automatically disabled; throughput drops gracefully (<40% regression) without violating ACK contract. | No |
-| Background replay gating | Cold restart while serving writes | Writes admit only after replay; reads blocked until `applied_index >= raft_commit_index`. | No |
-| JSON & ChunkedList conformance | Wide integers serialized as decimal strings; the normative JSONPath list (App.C) MUST always emit strings; the auto-generated “wide-int catalog” golden file is diffed in CI; `entries_crc32c`/`offsets_crc32c` strings left-pad to 32 hex nibbles (case-insensitive read) and match the worked example packing; ChunkedList reassembly enforces size caps, overlap/gap detection, out-of-order delivery, total_count=0, `chunk_crc32c` rules, and rejects `has_crc=0` whenever the catalog marks the field as order-significant. | Tests inject values ≥`2^63`, verify servers still emit strings when the value < `2^53`, reject shorter/longer hex strings and case-flipped mismatches, ensure receivers reject overlapping chunks, missing CRCs, illegal `has_crc=0` usages, or zero-count lists with stray chunks, and fail fast if §0.3 drifts from the golden catalog (or if the server emits a numeric wide int, which now returns `WireWideIntNotString`). | No |
-| Snapshot bandwidth hysteresis | Throttle/resume near NIC limits | Hysteresis respected (90%/60%). | No |
-| ControlPlaneRaft-outage snapshot import | ControlPlaneRaft offline beyond grace | Deltas fail with `snapshot_delta_invalidated`; full snapshots succeed while trust caches valid. | No |
-| Re-encryption vs compaction | Concurrent operations | `rewrite_inflight` prevents deletion; no data loss. | No |
-| Metrics + incident plumbing | Golden signals, throttle envelopes | Alerts feed incidents with dedup + storm guard. | No |
-| Performance baselines | Strict ≥50k appends/s @ p99 ≤12 ms; Group-Fsync ≥120k @ p99 ≤20 ms (reference HW) | Regressions >10% block releases unless waived. | No |
-| Key-epoch rollback | `{kek_version, dek_epoch, integrity_mac_epoch}` replay attempts | Nodes reject any proof/log entry whose epochs regress; emits `KeyEpochReplay` and enters Strict fallback. | No (remains in Strict fallback) |
-
-Reference HW = dual-socket x86, PCIe Gen4 NVMe, Linux ≥5.15 with `io_uring`. Profiles running on different storage or after `io_writer_mode` downgrades should treat the numbers as directional only; publish their own baselines before enforcing App.A SLOs.
-
-### Binary Schema & `has_*` Pattern Vectors
-§0.3’s encoding contract is enforced via deterministic fixtures. The length-prefixed format is `LenPrefixedBytes(payload) = <u32 little-endian byte_len> || payload`. Optional tail fields always use a leading `u8 has_field` byte (0 = absent, 1 = present) immediately before the optional value; older parsers can therefore skip the value when `has_field=0` or when the bytes are truncated. Spec-lint replays the following hex vectors and refuses releases that drift:
-
-| Vector | Bytes (hex, little-endian) | Notes |
-| --- | --- | --- |
-| `LenPrefixedString("OK")` | `020000004f4b` | Demonstrates 32-bit length prefix and tight packing. |
-| `PreVoteResponse{term=42, vote_granted=1, has_high_rtt=1, high_rtt=1}` | `2a00000000000000010101` | Total length 11 bytes (≥10 floor). |
-| `PreVoteResponse{term=42, vote_granted=0}` (legacy peers omitting `has_high_rtt`) | `2a0000000000000000` | 9-byte legacy floor; receivers MUST treat missing bytes as `has_high_rtt=0`. |
-| `FrameDeclares12ButSends8` | `0c0000002a00000000000000` | Length prefix advertises 12 payload bytes but the fixture intentionally truncates after the 8-byte `{term}` field plus the 1-byte `vote_granted`, proving receivers MUST raise `WireBodyTooShort` when the stream ends before the mandatory 10-byte floor even if `body_len` promised more. |
-
-Vendors MAY add their own fixtures but MUST keep the §0.3 vectors byte-identical; CI compares hex dumps verbatim.
-
-### Ledger Replay Pseudocode (§6.5)
-The deterministic truncation rule is expressed as reference pseudocode so every implementation rebuilds proofs identically:
-```
-fn replay_durability_log(log_path, wal_index) -> ReplayResult {
-    let last_good_offset = 0
-    let last_good_record = None
-    for record in read_records_in_order(log_path) {
-        if !record.verify_crc() { break }
-        if !wal_index.contains(record.term, record.index, record.segment_seq) {
-            break  // hole or corruption; stop immediately
-        }
-        enforce_step_order(record)  // §6.5-(1)…(5b)
-        last_good_offset = record.file_end_offset
-        last_good_record = record
-    }
-    truncate_file_to(last_good_offset)
-    fdatasync(log_path)
-    return ReplayResult {
-        proof: last_good_record,
-        strict_fallback: last_good_record.is_none(),
-        truncated_bytes: file_size_before - last_good_offset
-    }
-}
-```
-Every implementation MUST (1) stop scanning on the first failed CRC/MAC, (2) truncate the log to the last verified record (never “skip ahead”), (3) zeroize unreadable tails before replaying WAL bytes, and (4) enter Quarantine + `strict_fallback_state=LocalOnly` until ControlPlaneRaft mirrors a proof ≥ the last good record. Spec-lint runs this pseudocode against synthetic logs (good, corrupt, reordered, and missing `NonceReservationRange`) to prove identical truncation behavior.
-
-### Strict Fallback Gate Truth Table
-The normative table now lives in §0.5 so Consensus Core updates require an explicit diff. This appendix references §0.5 for tooling but continues to house telemetry fields and conformance fixtures.
-
-### Strict Fallback Telemetry Fields
-The following metric/trace fields are normative and frozen for interoperability dashboards and tests:
-
-| Field | Meaning |
-| --- | --- |
-| `strict_fallback_state` | Enum `Healthy|LocalOnly|ProofPublished` exported per partition. |
-| `strict_fallback_gate_blocked{operation}` | Counter labeled by `operation` (e.g., `DurabilityTransitionToGroup`, `LeaseEnable`, `FollowerCapabilityGrant`, `SnapshotDeltaEnable`) incremented every time §3.1.1 rejects the call. |
-| `strict_fallback_blocking_read_index` | Boolean gauge indicating whether ReadIndex is currently suppressed. |
-| `strict_fallback_last_local_proof` | Last `(term,index)` from the local ledger that justified the current state; emitted as two wide integers listed in App.C’s JSON catalog. |
-| `strict_fallback_pending_entries` | Count of appends accepted since entering strict fallback but not yet covered by a ControlPlaneRaft durability proof. |
-| `strict_fallback_blocking_reason` | Enum reflecting the prioritized rejection reason defined by `StrictFallbackPriorityOrder` when §0.5/§11.1 gates overlap. |
-| `strict_fallback_decision_epoch` | Monotone `u64` incremented every time the gate predicate changes; all rejection telemetry must include this epoch so overlapping denials are correlated deterministically. |
-
-Explain/Why* APIs MUST surface these exact field names (or their JSON equivalents) so tooling can rely on them without additional schema negotiation.
-
-### Clause-to-Fixture Map
-[Normative] The authoritative clause/fixture mapping ships inside `spec_fixtures.bundle.json` as `fixtures.clause_map.json`; spec-lint compares the JSON artifact to this appendix and fails the build if the files diverge. Contributors MUST update the generator and regenerate the bundle before editing the table so downstream auditors can diff prose and machine-readable evidence together.
-
-To cut cross-referencing overhead, the table below lists representative clauses and the conformance fixture (from `spec_fixtures.bundle.json`) that enforces them:
-
-| Clause | Fixture ID | Notes |
-| --- | --- | --- |
-| §0.3 PreVoteResponse layout | `wire.prevote_response_v1` | Hex dump verifies the 10-byte mandatory floor and optional tail byte. |
-| §3.3 ReadIndex proof equality | `consistency.read_index_proof_match` | Simulator asserts byte-for-byte equality between cached ControlPlaneRaft durability proof and `wal/durability.log`. |
-| §6.5 Ledger replay truncation | `durability.ledger_replay_strict` | Synthetic log with mid-file corruption; harness ensures truncation stops at the last good record. |
-| §9.2 Segment MAC derivation | `integrity.segment_mac_v1` | Matches the worked example MAC bytes and rejects byte-order drift. |
-
-Spec-lint fails the build if any clause loses its fixture mapping or if a fixture claims coverage for a clause not listed here.
-
-### Snapshot Manifest & Segment-MAC Test Fixtures
-- **Manifest canonical bytes:**  
-  `{"base_index":4096,"base_term":7,"chunks":[{"chunk_id":"00000000-0000-0000-0000-000000000001","digest":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","len":1048576,"offset":0}],"content_hash":"0xb1caf4297447b97c418f5c52ac1b922c3c32022f61d59f73c462931b89d6ad86","emit_version":1,"encryption":{"dek_epoch":3,"iv_salt":"0x000102030405060708090a0b0c0d0e0f"},"logical_markers":[],"manifest_id":"018c0d6c-9c11-7e9d-8000-86f5bb8c0001","producer_version":"clustor-test","version_id":12}`  
-  Removing the `content_hash` and `signature` fields before hashing yields `content_hash = 0xb1caf4297447b97c418f5c52ac1b922c3c32022f61d59f73c462931b89d6ad86`. Signing the canonical string above with the Ed25519 private key whose public half is `MCowBQYDK2VwAyEArsd58cxPIL53CzjGSfRe7x3whwv0yhjWEXS2rSTAqAI=` produces signature `0xe655924767bf28bca3ff9e59ad0fde247564fbd4aac11d9e98adcd56bf69b747b7ea6215046978369f29dc80760b708a34c365c94f6a50122f7e35293caaed01`. Implementations MUST verify both the hash and the signature before importing manifests.
-- **Segment MAC vector:** using MAC key bytes `00 01 … 1f`, `segment_seq=7`, `first_index=42`, `last_index=121`, `entry_count=17`, `entries_crc32c=0x1032547698badcfe67452301efcdab89`, and `offsets_crc32c=0x0123456789abcdeffedcba9876543210` MUST yield `mac = 5c50cc7f43ef3c0127db59a3a8394ed16782e7997b53093c35bff32f8644b8f0`. Tooling SHOULD treat this as a self-test.
-
-### Read Semantics Proof Artifacts
-The “Model checking (TLA+/Loom)” row now requires explicit artifacts for the read-path gate: every release MUST ship (a) a TLA+ fragment that models `strict_fallback_state`, ReadIndex blocking, and `ControlPlaneUnavailable` propagation, and (b) a Loom/Jepsen scenario that demonstrates the truth-table transitions above (writes admitted, reads blocked, follower capability revoked) under ControlPlaneRaft outage. CI fails unless both artifacts cover the current parameter set referenced in §§3.1.1 and 3.3, preventing future drafts from drifting from the documented behavior.
-
-### Lease Inequality Fixture (Normative)
-Leases ship in v0.1 with profile-specific gating, and conformance tooling already exercises the inequality from §3.3 so even profiles that default `lease_gap_max=0` continue to prove the guard. The canonical vector below MUST be replayed verbatim; implementations that change any operand MUST update the table and spec-lint simultaneously.
-
-| Profile | `min_election_timeout_ms` | `clock_skew_bound_ms` | `lease_rtt_margin_ms` | `heartbeat_period_ms` | `default_lease_duration_ms` | LHS Sum | Result |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Latency / Base | 150 | 5 | 10 | 50 | 80 | 145 | `145 < 150` ✓ |
-| Throughput | 150 | 10 | 10 | 50 | 75 | 145 | `145 < 150` ✓ |
-| WAN (default gate off) | 300 | 50 | 10 | 50 | 180 | 290 | `290 < 300` ✓ (profile default keeps leases off) |
-
-Spec-lint’s `lease_inequality_test` recomputes `lease_duration_ms + lease_rtt_margin_ms + clock_skew_bound_ms + heartbeat_period_ms` for each profile and fails if the sum is ≥ the declared `min_election_timeout_ms`.
-
-### AEAD Tag Comparison Guidance
-§0.2 and §6.3 already mandate constant-time AEAD verification; this appendix makes the requirement executable. All implementations MUST use the reference macros below (or byte-for-byte equivalents) when comparing authentication tags. The helpers are defined for 16-byte (GCM) and 32-byte (future suites) tags and are evaluated in spec-lint to ensure no early-exit paths remain:
+B.4 AEAD Constant-Time Comparison
 ```
 fn ct_equal_16(a: &[u8; 16], b: &[u8; 16]) -> bool {
     let mut diff: u8 = 0;
-    for i in 0..16 {
-        diff |= a[i] ^ b[i];
-    }
-    // Convert to bool without branches.
-    (diff == 0)
-}
-
-fn ct_equal_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let mut diff: u8 = 0;
-    for i in 0..32 {
-        diff |= a[i] ^ b[i];
-    }
-    (diff == 0)
+    for i in 0..16 { diff |= a[i] ^ b[i]; }
+    diff == 0
 }
 ```
-Guidelines:
-- Tag verification MUST run before any plaintext influences state. Nodes should zeroize `a/b` buffers immediately after the comparison, regardless of outcome.
-- Implementations MAY wrap hardware instructions (e.g., `vaes`/`vpclmulqdq`) but MUST retain a software fallback that is byte-identical to the macros above for conformance testing.
-- App.C conformance now includes `aead_constant_time_test`, which feeds mismatching tags that share long identical prefixes to ensure runtimes never shortcut the comparison.
+Implementations may wrap hardware intrinsics but must preserve this logic for conformance tests.
 
-### C.3 Release Evidence (Normative)
-[Normative] Every public release MUST re-execute the full fixture bundle (`spec_fixtures.bundle.json`) and stamp `bundle_version = <git tag>` before cutting artifacts. spec-lint compares the bundle version, git commit, and manifest hash; releases fail if any of the three disagree or if the fixture signatures predate the tag by more than 24 hours. CI pipelines MUST persist the tuple `{bundle_version, bundle_sha256, fixture_suite_ts}` and surface it via `/readyz` (`fixtures.bundle_version`, `fixtures.bundle_age_ms`) so downstream consumers can prove that the running binary executed the exact test matrix associated with the published build.
-
----
-
-## Appendix D App.D – Wire Envelopes (Shared Schema)
-Every envelope returns JSON/gRPC with `{schema_version, generated_at, partition_id, routing_epoch, durability_mode_epoch}`. Binary encodings follow §0.3 (little-endian lengths, `u8` enums); JSON surfaces enums as strings but accepts numeric IDs for forward compatibility. Receivers MUST ignore unknown optional fields and reject envelopes that omit required ones. All `Why*` payload names use PascalCase (e.g., `WhyNotLeader`, `WhySnapshotBlocked`) and the casing is normative for telemetry filters.
-| Envelope | Status | Notes |
-| --- | --- | --- |
-| `RoutingEpochMismatch` | HTTP 409 / gRPC `FAILED_PRECONDITION` | Includes `{observed_epoch, expected_epoch, lease_epoch, durability_mode_epoch}`. |
-| `ModeConflict` | HTTP 409 | Returned by `SetDurabilityMode` when stale. |
-| `ControlPlaneUnavailable` | HTTP 503 | `{observed_epoch, cache_age_ms, reason ∈ {CacheExpired, NeededForReadIndex}}`; admin-only except `NeededForReadIndex`, which surfaces on client reads. |
-| `snapshot_full_invalidated` | HTTP 409 | Reasons: `{GraceWindowExpired, SchemaBump, EmitVersionChange, DekEpochRollover}`. |
-| `snapshot_delta_invalidated` | HTTP 409 | Reasons: above plus `DeltaChainLength`. |
-| `ThrottleEnvelope` | HTTP 429 / gRPC `RESOURCE_EXHAUSTED` | Payload per §10.3 (includes dual credit counters). |
-| `Why*` payloads | HTTP 200 | `WhyNotLeader`, `WhyDiskBlocked`, `WhySnapshotBlocked`, etc. share schema header and MUST include `truncated_ids_count` (absent/0 when no truncation) whenever an ID list is shortened per §10.3; when truncated they MUST also include `continuation_token` so clients can resume from the exact lexicographic position. Lists are always sorted by their primary key before transmission. |
-| `OverrideLedgerEntry` | HTTP 200 | `{override_id, reason, ticket_url?, expires_at}` for audits. |
-
-### Break-Glass Scope Map
-Scopes embedded in Break-Glass tokens (§12.3) are frozen as follows:
-
-| Scope string | Authorized APIs |
-| --- | --- |
-| `DurabilityOverride` | `SetDurabilityMode`, `OverrideStrictOnlyBackpressure`, `AdminOverrideKeyEpoch` |
-| `SurvivabilityOverride` | `flow.structural_override`, `DryRunMovePartition` force-execute, `MembershipChange` with override flag |
-| `ThrottleOverride` | `OverrideCredit`, `flow.structural_hard_block`, `WhyCreditZero` override actions |
-| `SnapshotOverride` | `SnapshotFullOverride`, `snapshot_full_invalidated` overrides, repair-mode resume |
-| `QuarantineOverride` | `AdminResumePartition`, `AdminPausePartition` while quarantined, `OverrideStrictOnlyBackpressure` when reason=`Quarantine` |
-
-Tokens that present an unknown scope or call an API outside the table MUST be rejected and logged as `BreakGlassScopeMismatch`.
-
----
-
-## Appendix E App.E – ChunkedList Specification
-1. **Framing (`ChunkedListFrame`)**  
-   `total_count:u32, chunk_offset:u32, chunk_len:u16, chunk_flags:u8, items[chunk_len], [chunk_crc32c:u32 when chunk_flags.has_crc=1]`. `chunk_offset`/`chunk_len` are counted in elements, never bytes.
-2. **Chunk flags**  
-   Bit0 = `has_crc`. When set, senders append `chunk_crc32c:u32` over the serialized `items[]` payload and receivers MUST validate it (`WireChunkCrcMismatch` on failure). The CRC is CRC-32C (Castagnoli polynomial `0x1EDC6F41`) emitted little-endian so tooling can share the same implementation as WAL CRC32Cs. `has_crc=0` is permitted **only** for set-semantics fields whose elements are fixed-width POD scalars with a unique little-endian encoding (e.g., `u32` IDs). All order-sensitive fields and every set that encodes variable-width elements MUST keep `has_crc=1`. Receivers MUST reject order-sensitive fields that arrive with `has_crc=0` (`WireChunkMissingCrc`).
-3. **Element serialization**  
-   Items follow the host field’s binary encoding rules: fixed-width integers pack tightly; structs serialize fields in catalog order with no padding; strings/bytes emit a 32-bit length prefix followed by raw bytes. This canonical form prevents padding-based ambiguity and defines the CRC input.
-4. **Size limits**  
-   `chunk_len ≤ 1024`, serialized `items[] ≤ 64 KiB` pre-CRC, and `total_count ≤ 1,000,000`. Senders MUST split larger lists across multiple chunks. Receivers reject `total_count=0` when chunks exist and fail payloads where `∑ chunk_len > total_count`.
-5. **Receiver obligations**  
-   - Deduplicate by `chunk_offset` and reject overlaps/gaps (`WireChunkOverlap`).  
-   - Enforce `∑ chunk_len == total_count`; abort reassembly when cumulative byte limits (`≤8 MiB`) or `chunk_reassembly_timeout_ms = 5000` expire (`WireChunkReassemblyAborted`).  
-   - Emit `WireChunkMissing` when the stream terminates before all offsets arrive.  
-   - Perform strict offset accounting even when CRCs are omitted (allowed cases only).
-6. **Set semantics**  
-   Fields explicitly labeled “set semantics” MUST enforce uniqueness by serialized-byte representation; duplicates trigger `WireChunkDuplicateItem`. JSON mirrors of set lists MUST sort elements lexicographically by their canonical key and use a single canonical stringification per element so clients can deterministically merge pages.
-7. **Catalog usage**  
-   Fields using `ChunkedList` (e.g., `MembershipChange.old_members[]`, `MembershipChange.new_members[]`, `MembershipRollback.failing_nodes[]`, `RoutingEpochMismatch.expected[]`, `Explain/Why*` enumerations that exceed `u16::MAX`) MUST cite this appendix so auditors know the framing contracts being enforced.
-
----
+- B.5 CRC Lane Packing Example
+  - Consider two entries:
+    1. Entry A header/body bytes (hex): `01000000000010000000000000000000aa`.
+    2. Entry B header/body bytes (hex): `01000000000008000000000000000000bb`.
+  Concatenate headers and bodies to form the canonical stream `01000000000010000000000000000000aa01000000000008000000000000000000bb`. Splitting into 32-bit little-endian words and distributing across four lanes can, for illustration, use lane CRCs `{lane0=0x89ABCDEF, lane1=0x01234567, lane2=0xFEDCBA98, lane3=0x76543210}`. Packed little-endian bytes therefore equal `ef cd ab 89 67 45 23 01 98 ba dc fe 10 32 54 76`, which matches the illustrative value in §7.1. Offsets for the two entries (0 and 0x0000000000000010) serialized as contiguous little-endian u64 values `0000000000000000 1000000000000000` produce the same packed CRC `0x1032547698badcfe67452301efcdab89`. Tooling SHOULD replay this vector when validating lane implementations, but the CRC constants above are illustrative placeholders rather than computed CRC32C outputs for the example bytes.

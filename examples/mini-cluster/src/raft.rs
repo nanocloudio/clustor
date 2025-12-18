@@ -684,7 +684,7 @@ pub async fn replicate_to_peers(
         return Ok(());
     }
 
-    let required = (state.peers.len() + 1).div_ceil(2);
+    let required = (state.peers.len() + 1) / 2;
     if required == 0 {
         return Ok(());
     }

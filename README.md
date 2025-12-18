@@ -135,7 +135,4 @@ make feature-matrix
 
 1. **Read the Spec** – `docs/specification.md` is the single source of truth for invariants, wire formats, and operational guardrails.
 2. **Implement or Embed** – Use the Rust library crate plus sidecar utilities described in the spec; enforce the same `strict_fallback_state` and ledger ordering rules in your runtime.
-3. **Run Spec-Lint** – Every change must regenerate the machine-readable bundles; CI should fail on mismatches between prose and artifacts.
-4. **Operate with Guardrails** – Follow the documented runbooks (e.g., CP outage behavior, disk hygiene, quarantine lifecycle) to keep durability proofs and telemetry aligned.
-
-The Clustor spec is intentionally dense so downstream implementations can be verified mechanically. This README gives a quick landing-page overview; dive into the spec for the full normative details.
+3. **Operate with Guardrails** – Follow the documented runbooks (e.g., CP outage behavior, disk hygiene, quarantine lifecycle) to keep durability proofs and telemetry aligned.
