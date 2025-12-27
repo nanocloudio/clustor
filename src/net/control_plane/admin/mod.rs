@@ -11,6 +11,7 @@ use crate::net::tls::{
 };
 use crate::net::{CertificateError, NetError};
 use crate::security::{BreakGlassToken, Certificate, SecurityError, SpiffeId};
+use crate::timeouts::{ADMIN_REQUEST_TIMEOUT, SERVER_SHUTDOWN_GRACE};
 use log::{error, info, warn};
 use rustls::{ServerConfig, ServerConnection, Stream};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -22,7 +23,6 @@ use tokio::task;
 use url::form_urlencoded;
 
 const MAX_CONCURRENT_ADMIN_CONNECTIONS: usize = 32;
-pub(crate) const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct AdminHttpServerConfig {
     pub bind: SocketAddr,
@@ -36,7 +36,7 @@ pub struct AdminHttpServerHandle {
 
 impl AdminHttpServerHandle {
     pub fn shutdown(&mut self) {
-        if let Err(err) = self.try_shutdown(Duration::from_secs(5)) {
+        if let Err(err) = self.try_shutdown(SERVER_SHUTDOWN_GRACE) {
             warn!("event=admin_http_shutdown_error error={err}");
         }
     }
@@ -48,7 +48,7 @@ impl AdminHttpServerHandle {
 
 impl Drop for AdminHttpServerHandle {
     fn drop(&mut self) {
-        let _ = self.try_shutdown(Duration::from_secs(5));
+        let _ = self.try_shutdown(SERVER_SHUTDOWN_GRACE);
     }
 }
 
@@ -132,7 +132,7 @@ pub struct AsyncAdminHttpServerHandle {
 #[cfg(feature = "async-net")]
 impl AsyncAdminHttpServerHandle {
     pub async fn shutdown(&mut self) {
-        if let Err(err) = self.try_shutdown(Duration::from_secs(5)).await {
+        if let Err(err) = self.try_shutdown(SERVER_SHUTDOWN_GRACE).await {
             warn!("event=admin_http_async_shutdown_error error={err}");
         }
     }
@@ -151,7 +151,7 @@ impl AsyncAdminHttpServerHandle {
 impl Drop for AsyncAdminHttpServerHandle {
     fn drop(&mut self) {
         if let Some(mut handle) = self.inner.take() {
-            let _ = handle.try_shutdown(Duration::from_secs(5));
+            let _ = handle.try_shutdown(SERVER_SHUTDOWN_GRACE);
         }
     }
 }
@@ -498,198 +498,5 @@ pub(crate) fn map_admin_handler_error(err: HttpHandlerError) -> Result<(), NetEr
             warn!("event=admin_http_handler_error stage={stage} error={error}");
             Err(error)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{handle_admin_request, ADMIN_REQUEST_TIMEOUT};
-    use crate::control_plane::admin::{AdminHandler, AdminService};
-    use crate::control_plane::core::{CpPlacementClient, CpProofCoordinator, PlacementRecord};
-    use crate::net::http::{HttpRequestContext, RequestDeadline, SimpleHttpRequest};
-    use crate::replication::consensus::{ConsensusCore, ConsensusCoreConfig};
-    use crate::security::{Certificate, SerialNumber, SpiffeId};
-    use crate::{IdempotencyLedger, RbacManifest, RbacManifestCache, RbacPrincipal, RbacRole};
-    use serde_json::json;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    fn request_context(spiffe: &str) -> HttpRequestContext {
-        let spiffe = SpiffeId::parse(spiffe).expect("spiffe parses");
-        let cert = Certificate {
-            spiffe_id: spiffe,
-            serial: SerialNumber::from_u64(1),
-            valid_from: Instant::now(),
-            valid_until: Instant::now() + Duration::from_secs(60),
-        };
-        HttpRequestContext::new(cert, RequestDeadline::from_timeout(ADMIN_REQUEST_TIMEOUT))
-    }
-
-    fn build_admin_service(now: Instant, principal: &str) -> AdminService {
-        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
-        let cp_guard = CpProofCoordinator::new(kernel);
-        let placements = CpPlacementClient::new(Duration::from_secs(60));
-        let ledger = IdempotencyLedger::new(Duration::from_secs(60));
-        let handler = AdminHandler::new(cp_guard, placements, ledger);
-        let mut rbac = RbacManifestCache::new(Duration::from_secs(600));
-        rbac.load_manifest(
-            RbacManifest {
-                roles: vec![RbacRole {
-                    name: "operator".into(),
-                    capabilities: vec!["CreatePartition".into(), "ManageShrinkPlan".into()],
-                }],
-                principals: vec![RbacPrincipal {
-                    spiffe_id: principal.into(),
-                    role: "operator".into(),
-                }],
-            },
-            now,
-        )
-        .expect("rbac manifest loads");
-        AdminService::new(handler, rbac)
-    }
-
-    fn create_partition_request() -> SimpleHttpRequest {
-        let body = json!({
-            "idempotency_key": "op-1",
-            "partition": {
-                "partition_id": "partition-a",
-                "replicas": ["replica-a"],
-                "routing_epoch": 0
-            },
-            "replicas": [{
-                "replica_id": "replica-a",
-                "az": "zone-a"
-            }]
-        })
-        .to_string()
-        .into_bytes();
-        SimpleHttpRequest {
-            method: "POST".into(),
-            path: "/admin/create-partition".into(),
-            query: None,
-            headers: vec![("content-type".into(), "application/json".into())],
-            body,
-        }
-    }
-
-    #[test]
-    fn handler_accepts_authorized_request() {
-        let now = Instant::now();
-        let principal = "spiffe://test.example/ns/default/sa/admin";
-        let service = Arc::new(Mutex::new(build_admin_service(now, principal)));
-        let ctx = request_context(principal);
-        let request = create_partition_request();
-        let mut buffer = Vec::new();
-
-        handle_admin_request(&ctx, request, &service, &mut buffer, now).expect("handler succeeds");
-
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(
-            response.contains("\"partition_id\":\"partition-a\""),
-            "expected partition id in response"
-        );
-    }
-
-    #[test]
-    fn handler_rejects_unauthorized_principal() {
-        let now = Instant::now();
-        let service = Arc::new(Mutex::new(build_admin_service(
-            now,
-            "spiffe://test.example/ns/default/sa/admin",
-        )));
-        let ctx = request_context("spiffe://test.example/ns/default/sa/other");
-        let request = create_partition_request();
-        let mut buffer = Vec::new();
-
-        handle_admin_request(&ctx, request, &service, &mut buffer, now)
-            .expect("handler writes error response");
-
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 403 Forbidden"));
-        assert!(response.contains("unauthorized"));
-    }
-
-    #[test]
-    fn handler_routes_shrink_plan_requests() {
-        let now = Instant::now();
-        let principal = "spiffe://test.example/ns/default/sa/admin";
-        let service = Arc::new(Mutex::new(build_admin_service(now, principal)));
-        {
-            let mut guard = service.lock().expect("service lock");
-            guard.handler_mut().placements_mut().update(
-                PlacementRecord {
-                    partition_id: "p-shrink".into(),
-                    routing_epoch: 1,
-                    lease_epoch: 1,
-                    members: vec!["a".into(), "b".into(), "c".into()],
-                },
-                now,
-            );
-        }
-        let ctx = request_context(principal);
-        let create_body = json!({
-            "plan_id": "plan-http",
-            "target_placements": [{
-                "prg_id": "p-shrink",
-                "target_members": ["a", "b"],
-                "target_routing_epoch": 2
-            }]
-        })
-        .to_string()
-        .into_bytes();
-        let create = SimpleHttpRequest {
-            method: "POST".into(),
-            path: "/admin/shrink-plan".into(),
-            query: None,
-            headers: vec![("content-type".into(), "application/json".into())],
-            body: create_body,
-        };
-        let mut buffer = Vec::new();
-        handle_admin_request(&ctx, create, &service, &mut buffer, now).expect("create plan");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.contains("\"plan_id\":\"plan-http\""));
-
-        let arm_body = json!({ "plan_id": "plan-http" }).to_string().into_bytes();
-        let arm = SimpleHttpRequest {
-            method: "POST".into(),
-            path: "/admin/shrink-plan/arm".into(),
-            query: None,
-            headers: vec![("content-type".into(), "application/json".into())],
-            body: arm_body,
-        };
-        let mut buffer = Vec::new();
-        handle_admin_request(
-            &ctx,
-            arm,
-            &service,
-            &mut buffer,
-            now + Duration::from_millis(1),
-        )
-        .expect("arm plan");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.contains("\"state\":\"Armed\""));
-
-        let list = SimpleHttpRequest {
-            method: "GET".into(),
-            path: "/admin/shrink-plan".into(),
-            query: None,
-            headers: Vec::new(),
-            body: Vec::new(),
-        };
-        let mut buffer = Vec::new();
-        handle_admin_request(
-            &ctx,
-            list,
-            &service,
-            &mut buffer,
-            now + Duration::from_millis(2),
-        )
-        .expect("list plans");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.contains("\"plans\""));
-        assert!(response.contains("\"plan-http\""));
     }
 }

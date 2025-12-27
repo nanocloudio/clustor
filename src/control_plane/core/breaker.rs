@@ -51,22 +51,3 @@ impl CpCircuitBreaker {
             .map(|duration| duration.as_millis() as u64)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn breaker_opens_and_clears_after_cooldown() {
-        let mut breaker = CpCircuitBreaker::new(2, Duration::from_millis(10));
-        let now = Instant::now();
-        assert!(!breaker.is_open(now));
-        breaker.record_failure(now);
-        breaker.record_failure(now);
-        assert!(breaker.is_open(now));
-        let later = now + Duration::from_millis(20);
-        assert!(!breaker.is_open(later));
-        breaker.record_success();
-        assert!(!breaker.is_open(later));
-    }
-}

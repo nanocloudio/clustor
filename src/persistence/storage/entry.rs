@@ -209,19 +209,3 @@ pub enum EntryFrameError {
     #[error("corrupt frame data")]
     Corrupt,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encode_decode_round_trip() {
-        let frame = EntryFrameBuilder::new(7, 42)
-            .metadata(vec![1, 2, 3])
-            .payload(b"hello".to_vec())
-            .build();
-        let bytes = frame.encode();
-        let decoded = EntryFrame::decode(&bytes).unwrap();
-        assert_eq!(frame, decoded);
-    }
-}

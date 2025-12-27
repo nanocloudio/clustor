@@ -1,19 +1,23 @@
 //! Core library entrypoint for the Clustor consensus core.
 //! Currently exposes the strict-fallback state machine described in
 //! `docs/specification.md` §0.5 and §2.1.1.
+#![forbid(unused_imports, dead_code)]
 #![deny(unreachable_pub)]
 #![deny(unused_must_use)]
 #![cfg_attr(docsrs, warn(missing_docs))]
 
 pub mod control_plane;
+mod internal;
 pub mod lifecycle;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod observability;
 pub mod persistence;
+pub mod prelude;
 pub mod replication;
 pub mod security;
 pub mod spec;
+pub mod timeouts;
 pub mod util;
 
 // Re-export reorganized modules for API stability.
@@ -103,7 +107,7 @@ pub use control_plane::*;
 
 pub use dr::{DrFenceError, DrFenceManager, FenceState};
 pub use system_log::{SystemLogEntry, SystemLogError};
-pub use util::error::{ClustorError, GuardError, SerializationError};
+pub use util::error::{ClustorError, GuardError, Result as ClustorResult, SerializationError};
 
 pub use durability::{
     AckHandle, AckRecord, DurabilityAckMessage, DurabilityLedger, DurabilityMetricsPublisher,
@@ -172,7 +176,7 @@ pub use snapshot::{
     ManifestError, ManifestSignature, ManifestSigner, ManifestVerification,
     ManifestVerificationError, SignedSnapshotManifest, SnapshotAppendEntriesCoordinator,
     SnapshotAuthorizationError, SnapshotAuthorizer, SnapshotCadenceTelemetry, SnapshotChunk,
-    SnapshotChunkExporter, SnapshotChunkPayload, SnapshotDeltaChainState,
+    SnapshotChunkExporter, SnapshotChunkImporter, SnapshotChunkPayload, SnapshotDeltaChainState,
     SnapshotDeltaChainTelemetry, SnapshotDeltaPolicy, SnapshotDeltaPolicyError, SnapshotExportCaps,
     SnapshotExportController, SnapshotExportError, SnapshotExportProfile, SnapshotExportTelemetry,
     SnapshotFallbackController, SnapshotFallbackTelemetry, SnapshotImportConfig,
@@ -180,9 +184,11 @@ pub use snapshot::{
     SnapshotImportRetryPolicy, SnapshotImportTelemetrySnapshot, SnapshotImportValidationError,
     SnapshotImportValidator, SnapshotKind, SnapshotManifest, SnapshotManifestBuilder,
     SnapshotManifestVerifier, SnapshotOnlyReadyState, SnapshotReadError, SnapshotReadHeaders,
-    SnapshotReadRequest, SnapshotReadResponse, SnapshotReadiness, SnapshotThrottleEnvelope,
-    SnapshotThrottleReason, SnapshotThrottleState, SnapshotTrigger, SnapshotTriggerConfig,
-    SnapshotTriggerDecision, SnapshotTriggerReason,
+    SnapshotReadRequest, SnapshotReadResponse, SnapshotReadiness, SnapshotStagingStore,
+    SnapshotThrottleEnvelope, SnapshotThrottleReason, SnapshotThrottleState, SnapshotTrigger,
+    SnapshotTriggerConfig, SnapshotTriggerDecision, SnapshotTriggerReason,
+    SNAPSHOT_CATCHUP_THRESHOLD_BYTES, SNAPSHOT_IMPORT_NODE_FLOOR_BYTES, SNAPSHOT_LOG_BYTES_TARGET,
+    SNAPSHOT_MAX_INTERVAL_MS,
 };
 pub use spec::fixtures::{
     FixtureBundle, FixtureBundleGenerator, FixtureEntry, FixtureError, SpecLint,

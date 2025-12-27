@@ -35,6 +35,16 @@ graph TD
 
 ---
 
+## Repo Layout
+
+- `src/` – library source (control_plane, replication, persistence, observability).
+- `tests/` – integration suites grouped by domain plus shared helpers in `tests/support/`.
+- `.context/` – backlog, audit snapshots, and design notes consumed by the Codex agents.
+- `docs/` – specification, architecture, and dependency references.
+- `tools/` – local gates (`ci.sh`, `forbid_src_tests.sh`, `inventory.sh`, `audit.sh`) that mirror CI behavior.
+
+---
+
 ## End-to-End Append Flow
 
 ```mermaid
@@ -128,6 +138,14 @@ make feature-matrix
 3. `cargo test --no-default-features --features net,admin-http`
 4. `cargo test --no-default-features --features net,snapshot-crypto`
 5. `cargo test --all-features`
+
+---
+
+## Lint & Testing Policy
+
+- `make ci` runs `tools/ci.sh`, which enforces `cargo fmt --all -- --check`, `RUSTFLAGS=-Dwarnings cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`, the `tools/forbid_src_tests.sh` gate, and the async-runtime check (`tools/check_async_runtime.sh`) to ensure only Tokio APIs are used.
+- `clippy.toml` enables `warn-on-all-wildcard-imports` and disallows `dbg!` / `println!` in tests, keeping lint behavior reproducible across workstations.
+- Local `#[allow(...)]` attributes are reserved for unavoidable cases (`clippy::too_many_arguments` on builder APIs, deprecated crypto traits, etc.); new allowances should come with comments explaining the tradeoff.
 
 ---
 

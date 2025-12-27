@@ -2,5 +2,6 @@
 
 mod core;
 
-#[cfg_attr(not(feature = "admin-http"), allow(unused_imports))]
-pub(crate) use core::{lock_or_poison, spawn_listener, ServerHandle};
+#[cfg(feature = "admin-http")]
+pub(crate) use core::lock_or_poison;
+pub(crate) use core::{spawn_listener, ServerHandle};

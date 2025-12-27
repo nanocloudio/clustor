@@ -13,8 +13,8 @@ pub(super) use deadline::RequestDeadline;
 #[cfg(feature = "http-fuzz")]
 pub(super) use fuzz::fuzz_http_request;
 pub(super) use handler::{HttpHandlerError, HttpRequestContext};
-pub(super) use parser::read_request;
-pub(super) use parser::SimpleHttpRequest;
+pub use parser::read_request;
+pub use parser::SimpleHttpRequest;
 pub(super) use response::write_json_response;
 #[cfg(feature = "management")]
 pub(super) use server::spawn_tls_http_server;

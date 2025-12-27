@@ -82,7 +82,7 @@ impl Default for SnapshotImportRetryPolicy {
 }
 
 impl SnapshotImportRetryPolicy {
-    fn to_retry_policy(self) -> RetryPolicy {
+    pub fn to_retry_policy(self) -> RetryPolicy {
         RetryPolicy::exponential((self.max_retries + 1) as usize, self.base_delay)
             .with_max_delay(self.max_delay)
             .with_time_budget(Some(self.time_budget))
@@ -328,7 +328,18 @@ impl SnapshotChunkExporter {
         key: &DataEncryptionKey,
         iv_salt: impl Into<String>,
     ) -> Self {
-        let caps = profile.caps();
+        Self::with_caps(profile.caps(), key, iv_salt)
+    }
+
+    /// Builds an exporter with explicitly provided limits.
+    ///
+    /// This is primarily intended for tests that need to exercise the exporter
+    /// without writing hundreds of megabytes.
+    pub fn with_caps(
+        caps: SnapshotExportCaps,
+        key: &DataEncryptionKey,
+        iv_salt: impl Into<String>,
+    ) -> Self {
         let iv_salt = iv_salt.into();
         let cipher = Aes256Gcm::new(key_ref(&key.bytes));
         Self {
@@ -526,73 +537,7 @@ fn nonce_ref(bytes: &[u8; 12]) -> &GenericArray<u8, <Aes256Gcm as AeadCore>::Non
     GenericArray::from_slice(bytes)
 }
 
-#[allow(deprecated, dead_code)]
+#[allow(deprecated)]
 fn tag_ref(bytes: &[u8]) -> &GenericArray<u8, <Aes256Gcm as AeadCore>::TagSize> {
     GenericArray::from_slice(bytes)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn importer_respects_retry_policy() {
-        let key = DataEncryptionKey::new(1, [7u8; 32]);
-        let policy = SnapshotImportRetryPolicy {
-            max_retries: 0,
-            base_delay: Duration::from_millis(0),
-            max_delay: Duration::from_millis(0),
-            time_budget: Duration::from_millis(0),
-            jitter_fraction: 0.0,
-        };
-        let importer = SnapshotChunkImporter::with_retry_policy(&key, "salt", policy);
-        let payload = SnapshotChunkPayload {
-            chunk: SnapshotChunk {
-                chunk_id: "chunk-1".into(),
-                offset: 0,
-                len: 16,
-                digest: "deadbeef".into(),
-            },
-            ciphertext: vec![0u8; 8],
-        };
-        let err = importer
-            .import_chunk("snap-1", &payload)
-            .expect_err("import should fail for invalid ciphertext");
-        assert!(matches!(err, SnapshotImportError::Decrypt { .. }));
-    }
-
-    #[test]
-    fn retry_policy_honors_time_budget_deadline() {
-        let policy = SnapshotImportRetryPolicy {
-            max_retries: 3,
-            base_delay: Duration::from_millis(50),
-            max_delay: Duration::from_millis(50),
-            time_budget: Duration::from_millis(10),
-            jitter_fraction: 0.0,
-        };
-        let retry = policy.to_retry_policy();
-        let mut handle = retry.handle_from(Instant::now());
-        assert!(handle.next_delay().is_none());
-    }
-
-    #[test]
-    fn retry_policy_applies_jitter_fraction_bounds() {
-        let policy = SnapshotImportRetryPolicy {
-            max_retries: 3,
-            base_delay: Duration::from_millis(100),
-            max_delay: Duration::from_millis(100),
-            time_budget: Duration::from_secs(1),
-            jitter_fraction: 0.2,
-        };
-        let retry = policy.to_retry_policy();
-        for _ in 0..8 {
-            let mut handle = retry.handle();
-            let delay = handle.next_delay().expect("delay");
-            assert!(
-                delay >= Duration::from_millis(80) && delay <= Duration::from_millis(120),
-                "delay {:?} outside jitter bounds",
-                delay
-            );
-        }
-    }
 }

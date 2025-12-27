@@ -7,6 +7,7 @@ use crate::replication::raft::{
     AppendEntriesRequest, AppendEntriesResponse, RequestVoteRequest, RequestVoteResponse,
 };
 use crate::replication::transport::raft::{RaftRpcHandler, RaftRpcServer};
+use crate::timeouts::SERVER_SHUTDOWN_GRACE;
 use log::warn;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -88,7 +89,7 @@ pub struct AsyncRaftNetworkServerHandle {
 
 impl AsyncRaftNetworkServerHandle {
     pub async fn shutdown(&mut self) {
-        if let Err(err) = self.try_shutdown(Duration::from_secs(5)).await {
+        if let Err(err) = self.try_shutdown(SERVER_SHUTDOWN_GRACE).await {
             warn!("event=async_raft_server_shutdown_error error={err}");
         }
     }

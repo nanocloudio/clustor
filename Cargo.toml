@@ -49,3 +49,8 @@ parking_lot = "0.12"
 [dev-dependencies]
 tempfile = "3.23.0"
 rcgen = { version = "0.13", features = ["pem"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

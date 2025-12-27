@@ -1,6 +1,7 @@
 #![cfg(feature = "net")]
 
 use crate::net::{NetError, ProtocolError};
+use crate::timeouts::SERVER_SHUTDOWN_GRACE;
 use log::{error, warn};
 use std::io;
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -10,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(25);
-const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_SHUTDOWN_TIMEOUT: Duration = SERVER_SHUTDOWN_GRACE;
 
 struct AcceptLoopState {
     done: Mutex<bool>,

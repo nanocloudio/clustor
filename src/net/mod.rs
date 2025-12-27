@@ -2,7 +2,7 @@ use crate::control_plane::core::CpGuardError;
 use thiserror::Error;
 
 pub mod control_plane;
-mod http;
+pub mod http;
 #[cfg(feature = "management")]
 pub mod management;
 #[cfg(feature = "net")]
@@ -12,11 +12,14 @@ pub mod replication;
 mod server;
 pub mod tls;
 
+#[cfg(feature = "net")]
+pub type RequestDeadline = http::RequestDeadline;
+
 #[cfg(feature = "admin-http")]
 pub use control_plane::admin::{AdminHttpServer, AdminHttpServerConfig, AdminHttpServerHandle};
 #[cfg(all(feature = "admin-http", feature = "async-net"))]
 pub use control_plane::admin::{AsyncAdminHttpServer, AsyncAdminHttpServerHandle};
-pub use control_plane::cp::{HttpCpTransport, HttpCpTransportBuilder};
+pub use control_plane::client::{HttpCpTransport, HttpCpTransportBuilder};
 #[cfg(feature = "snapshot-crypto")]
 pub use control_plane::why::WhySnapshotBlocked;
 #[cfg(feature = "async-net")]

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 /// Each connection stores a deadline so higher level handlers can short-circuit
 /// expensive work and map timeouts into `HttpError::RequestTimeout`.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RequestDeadline {
+pub struct RequestDeadline {
     expires_at: Instant,
 }
 
@@ -25,8 +25,8 @@ impl RequestDeadline {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_deadline(expires_at: Instant) -> Self {
+    /// Builds a deadline using an absolute expiration instant.
+    pub fn from_deadline(expires_at: Instant) -> Self {
         Self { expires_at }
     }
 
@@ -41,7 +41,7 @@ impl RequestDeadline {
         }
     }
 
-    pub(crate) fn enforce(&self) -> Result<(), NetError> {
+    pub fn enforce(&self) -> Result<(), NetError> {
         if self.is_expired() {
             Err(NetError::from(HttpError::RequestTimeout))
         } else {
@@ -49,7 +49,7 @@ impl RequestDeadline {
         }
     }
 
-    pub(crate) fn respond_if_expired(
+    pub fn respond_if_expired(
         &self,
         stream: &mut (impl std::io::Write + ?Sized),
     ) -> Result<bool, NetError> {
@@ -58,34 +58,5 @@ impl RequestDeadline {
             return Ok(false);
         }
         Ok(true)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::RequestDeadline;
-    use crate::net::{HttpError, NetError};
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn expired_deadline_writes_timeout() {
-        let deadline = RequestDeadline::with_deadline(Instant::now() - Duration::from_secs(1));
-        let mut buffer = Vec::new();
-        let expired = deadline
-            .respond_if_expired(&mut buffer)
-            .expect("writes response");
-        assert!(!expired);
-        let resp = String::from_utf8(buffer).expect("utf8");
-        assert!(resp.contains("408"));
-    }
-
-    #[test]
-    fn enforce_returns_error_when_expired() {
-        let deadline = RequestDeadline::with_deadline(Instant::now() - Duration::from_secs(1));
-        let err = deadline.enforce().expect_err("should error");
-        match err {
-            NetError::Http(HttpError::RequestTimeout) => {}
-            other => panic!("unexpected error: {other}"),
-        }
     }
 }

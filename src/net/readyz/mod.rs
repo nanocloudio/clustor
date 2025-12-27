@@ -8,6 +8,7 @@ use super::server;
 use super::tls::{complete_server_handshake, decode_peer_certificate, TlsIdentity, TlsTrustStore};
 use super::{CertificateError, NetError};
 use crate::readyz::{ReadyExplain, ReadyzSnapshot};
+use crate::timeouts::{READYZ_REQUEST_TIMEOUT, SERVER_SHUTDOWN_GRACE};
 use log::warn;
 use rustls::{ServerConfig, ServerConnection, Stream};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -64,7 +65,7 @@ pub struct ReadyzHttpServerHandle {
 
 impl ReadyzHttpServerHandle {
     pub fn shutdown(&mut self) {
-        if let Err(err) = self.try_shutdown(Duration::from_secs(5)) {
+        if let Err(err) = self.try_shutdown(SERVER_SHUTDOWN_GRACE) {
             warn!("event=readyz_shutdown_error error={err}");
         }
     }
@@ -76,13 +77,11 @@ impl ReadyzHttpServerHandle {
 
 impl Drop for ReadyzHttpServerHandle {
     fn drop(&mut self) {
-        let _ = self.try_shutdown(Duration::from_secs(5));
+        let _ = self.try_shutdown(SERVER_SHUTDOWN_GRACE);
     }
 }
 
 pub struct ReadyzHttpServer;
-
-pub(crate) const READYZ_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl ReadyzHttpServer {
     pub fn spawn(
@@ -215,7 +214,7 @@ pub struct AsyncReadyzHttpServerHandle {
 #[cfg(feature = "async-net")]
 impl AsyncReadyzHttpServerHandle {
     pub async fn shutdown(&mut self) {
-        if let Err(err) = self.try_shutdown(Duration::from_secs(5)).await {
+        if let Err(err) = self.try_shutdown(SERVER_SHUTDOWN_GRACE).await {
             warn!("event=readyz_async_shutdown_error error={err}");
         }
     }
@@ -234,7 +233,7 @@ impl AsyncReadyzHttpServerHandle {
 impl Drop for AsyncReadyzHttpServerHandle {
     fn drop(&mut self) {
         if let Some(mut handle) = self.inner.take() {
-            let _ = handle.try_shutdown(Duration::from_secs(5));
+            let _ = handle.try_shutdown(SERVER_SHUTDOWN_GRACE);
         }
     }
 }
@@ -285,117 +284,5 @@ pub(crate) fn map_readyz_handler_error(err: HttpHandlerError) -> Result<(), NetE
             warn!("event=readyz_http_handler_error stage={stage} error={error}");
             Err(error)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{handle_readyz_request, ReadyzPublisher};
-    use crate::feature_guard::{FeatureGateState, FeatureManifestBuilder};
-    use crate::lifecycle::activation::{ShadowApplyState, WarmupReadinessRecord};
-    use crate::net::http::{HttpRequestContext, RequestDeadline, SimpleHttpRequest};
-    use crate::readyz::{ReadyStateProbe, ReadyzSnapshot};
-    use crate::security::{Certificate, SerialNumber, SpiffeId};
-    use ed25519_dalek::SigningKey;
-    use std::time::{Duration, Instant};
-
-    fn request_context() -> HttpRequestContext {
-        let spiffe = SpiffeId::parse("spiffe://test.example/ns/default/sa/readyz").expect("spiffe");
-        let cert = Certificate {
-            spiffe_id: spiffe,
-            serial: SerialNumber::from_u64(1),
-            valid_from: Instant::now(),
-            valid_until: Instant::now() + Duration::from_secs(60),
-        };
-        HttpRequestContext::new(cert, RequestDeadline::from_timeout(Duration::from_secs(5)))
-    }
-
-    fn publisher() -> ReadyzPublisher {
-        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
-        let manifest = FeatureManifestBuilder::new()
-            .with_gate_state("leader_leases", FeatureGateState::Enabled)
-            .build(&signing_key)
-            .expect("manifest");
-        let matrix = manifest.capability_matrix().expect("matrix");
-        let readiness = WarmupReadinessRecord {
-            partition_id: "partition-a".into(),
-            bundle_id: "bundle-a".into(),
-            shadow_apply_state: ShadowApplyState::Ready,
-            shadow_apply_checkpoint_index: 1,
-            warmup_ready_ratio: 1.0,
-            updated_at_ms: 0,
-        };
-        let probe = ReadyStateProbe {
-            readiness,
-            activation_barrier_id: None,
-            partition_ready_ratio: 1.0,
-        };
-        let snapshot = ReadyzSnapshot::new(
-            vec![probe],
-            1_000,
-            0,
-            &matrix,
-            manifest.digest().expect("digest"),
-            Vec::new(),
-        )
-        .expect("snapshot");
-        ReadyzPublisher::new(snapshot)
-    }
-
-    fn request_for(path: &str) -> SimpleHttpRequest {
-        SimpleHttpRequest {
-            method: "GET".into(),
-            path: path.into(),
-            query: None,
-            headers: Vec::new(),
-            body: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn serves_readyz_snapshot() {
-        let ctx = request_context();
-        let publisher = publisher();
-        let mut buffer = Vec::new();
-        handle_readyz_request(&ctx, request_for("/readyz"), &publisher, &mut buffer)
-            .expect("handler succeeds");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(
-            response.contains("\"partition_id\":\"partition-a\""),
-            "response body should include partition data"
-        );
-    }
-
-    #[test]
-    fn reports_missing_partition_id() {
-        let ctx = request_context();
-        let publisher = publisher();
-        let mut buffer = Vec::new();
-        handle_readyz_request(&ctx, request_for("/readyz/why"), &publisher, &mut buffer)
-            .expect("handler succeeds");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
-        assert!(
-            response.contains("partition id missing"),
-            "expected missing partition error"
-        );
-    }
-
-    #[test]
-    fn reports_unknown_path() {
-        let ctx = request_context();
-        let publisher = publisher();
-        let mut buffer = Vec::new();
-        handle_readyz_request(
-            &ctx,
-            request_for("/readyz/unknown"),
-            &publisher,
-            &mut buffer,
-        )
-        .expect("handler succeeds");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(response.contains("not found"));
     }
 }

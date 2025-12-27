@@ -1,0 +1,11 @@
+mod admin_audit_it;
+mod admin_checkpoint;
+mod admin_workflows_it;
+mod capabilities_feature_guard_it;
+mod capabilities_profile_it;
+mod core_client_it;
+mod core_coordinator_it;
+mod core_placement_it;
+mod core_read_index_it;
+mod cp_checkpoint;
+mod profile_checkpoint;

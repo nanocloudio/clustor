@@ -8,7 +8,6 @@ use std::io::Write;
 /// Shared metadata for handling a single HTTP request over an established TLS stream.
 #[derive(Clone)]
 pub(crate) struct HttpRequestContext {
-    #[cfg_attr(not(feature = "admin-http"), allow(dead_code))]
     pub peer_certificate: Certificate,
     pub deadline: RequestDeadline,
 }
@@ -26,6 +25,7 @@ impl HttpRequestContext {
         stream: &mut (impl Write + ?Sized),
         stage: &'static str,
     ) -> Result<(), HttpHandlerError> {
+        let _ = &self.peer_certificate;
         let alive = self
             .deadline
             .respond_if_expired(stream)

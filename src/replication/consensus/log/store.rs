@@ -37,14 +37,6 @@ impl RaftLogStore {
         Self::open_internal(path.into(), None)
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_with_encoding(
-        path: impl Into<PathBuf>,
-        encoding: LogEncoding,
-    ) -> Result<Self, RaftLogError> {
-        Self::open_internal(path.into(), Some(encoding))
-    }
-
     fn open_internal(
         base_path: PathBuf,
         forced: Option<LogEncoding>,
@@ -1092,98 +1084,4 @@ pub enum RaftLogError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::TempDir;
-
-    fn store_with_encoding(encoding: LogEncoding) -> (TempDir, RaftLogStore) {
-        let tmp = TempDir::new().unwrap();
-        let log_path = tmp.path().join("raft.log");
-        let store = RaftLogStore::open_with_encoding(&log_path, encoding).unwrap();
-        (tmp, store)
-    }
-
-    #[test]
-    fn append_and_reload_persists_entries() {
-        let (tmp, mut store) = store_with_encoding(LogEncoding::Json);
-        store
-            .append(RaftLogEntry::new(1, 1, b"cmd1".to_vec()))
-            .unwrap();
-        store
-            .append(RaftLogEntry::new(1, 2, b"cmd2".to_vec()))
-            .unwrap();
-        drop(store);
-        let reopened = RaftLogStore::open(tmp.path().join("raft.log")).unwrap();
-        assert_eq!(reopened.len(), 2);
-        assert_eq!(reopened.last_term_index().unwrap().index, 2);
-    }
-
-    #[test]
-    fn rotates_segments_when_exceeding_threshold() {
-        let (tmp, mut store) = store_with_encoding(LogEncoding::Json);
-        store.segment_bytes = 64;
-        for i in 1..=10 {
-            let payload = vec![0u8; 8];
-            store.append(RaftLogEntry::new(1, i, payload)).unwrap();
-        }
-        assert!(store.segments.len() > 1);
-        drop(store);
-        let reopened = RaftLogStore::open(tmp.path().join("raft.log")).unwrap();
-        assert_eq!(reopened.len(), 10);
-    }
-
-    #[test]
-    fn truncate_and_discard_drop_segments() {
-        let (tmp, mut store) = store_with_encoding(LogEncoding::Json);
-        for i in 1..=5 {
-            store
-                .append(RaftLogEntry::new(1, i, vec![i as u8]))
-                .unwrap();
-        }
-        store.truncate_from(4).unwrap();
-        assert_eq!(store.last_index(), 3);
-        store.discard_through(2).unwrap();
-        assert_eq!(store.first_index(), 3);
-        drop(store);
-        let reopened = RaftLogStore::open(tmp.path().join("raft.log")).unwrap();
-        assert_eq!(reopened.first_index(), 3);
-        assert_eq!(reopened.last_index(), 3);
-    }
-
-    #[test]
-    fn stream_iterator_reads_entries() {
-        let (tmp, mut store) = store_with_encoding(LogEncoding::Json);
-        for i in 1..=6 {
-            store
-                .append(RaftLogEntry::new(1, i, vec![i as u8]))
-                .unwrap();
-        }
-        drop(store);
-        let reopened = RaftLogStore::open(tmp.path().join("raft.log")).unwrap();
-        let stream = reopened.stream_from(2).unwrap();
-        let mut collected = Vec::new();
-        for entry in stream {
-            let entry = entry.unwrap();
-            collected.push(entry.index);
-        }
-        assert_eq!(collected, vec![2, 3, 4, 5, 6]);
-    }
-
-    #[test]
-    fn binary_encoding_round_trip() {
-        let (tmp, mut store) = store_with_encoding(LogEncoding::Binary);
-        store
-            .append(RaftLogEntry::new(1, 1, b"alpha".to_vec()))
-            .unwrap();
-        store
-            .append(RaftLogEntry::new(1, 2, b"beta".to_vec()))
-            .unwrap();
-        drop(store);
-        let reopened = RaftLogStore::open(tmp.path().join("raft.log")).unwrap();
-        assert_eq!(reopened.len(), 2);
-        assert_eq!(reopened.last_term_index().unwrap().index, 2);
-    }
 }

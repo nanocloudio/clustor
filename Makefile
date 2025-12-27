@@ -1,4 +1,4 @@
-.PHONY: help fmt fmt-check clippy lint build build-release test bench feature-matrix verify clean
+.PHONY: help fmt fmt-check clippy lint build build-release test bench feature-matrix verify ci clean
 
 CARGO ?= cargo
 CLIPPY_ARGS ?= -D warnings
@@ -13,6 +13,7 @@ help:
 	@echo "  make clippy|lint    # clippy with warnings-as-errors"
 	@echo "  make bench          # run cargo bench (configure BENCH_TARGET)"
 	@echo "  make verify         # run fmt-check + clippy + tests"
+	@echo "  make ci             # run formatting, tests, clippy, and policy checks"
 	@echo "  make clean          # remove target artifacts"
 
 fmt:
@@ -46,6 +47,9 @@ feature-matrix:
 	$(CARGO) test --all-features
 
 verify: fmt-check clippy test
+
+ci:
+	sh tools/ci.sh
 
 clean:
 	$(CARGO) clean

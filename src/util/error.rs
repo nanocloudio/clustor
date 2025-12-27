@@ -57,3 +57,6 @@ pub enum ClustorError {
     #[error("{0}")]
     Other(String),
 }
+
+/// Standard result type for fallible clustor operations.
+pub type Result<T> = std::result::Result<T, ClustorError>;

@@ -11,6 +11,7 @@ use crate::net::tls::{
     complete_server_handshake, decode_peer_certificate, TlsIdentity, TlsTrustStore,
 };
 use crate::net::{CertificateError, NetError};
+use crate::timeouts::{SERVER_SHUTDOWN_GRACE, WHY_REQUEST_TIMEOUT};
 use log::{error, warn};
 use rustls::{ServerConfig, ServerConnection, Stream};
 use std::collections::HashMap;
@@ -113,7 +114,7 @@ pub struct WhyHttpServerHandle {
 
 impl WhyHttpServerHandle {
     pub fn shutdown(&mut self) {
-        if let Err(err) = self.try_shutdown(Duration::from_secs(5)) {
+        if let Err(err) = self.try_shutdown(SERVER_SHUTDOWN_GRACE) {
             warn!("event=why_shutdown_error error={err}");
         }
     }
@@ -125,13 +126,11 @@ impl WhyHttpServerHandle {
 
 impl Drop for WhyHttpServerHandle {
     fn drop(&mut self) {
-        let _ = self.try_shutdown(Duration::from_secs(5));
+        let _ = self.try_shutdown(SERVER_SHUTDOWN_GRACE);
     }
 }
 
 pub struct WhyHttpServer;
-
-pub(crate) const WHY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl WhyHttpServer {
     pub fn spawn(
@@ -256,7 +255,7 @@ pub struct AsyncWhyHttpServerHandle {
 #[cfg(feature = "async-net")]
 impl AsyncWhyHttpServerHandle {
     pub async fn shutdown(&mut self) {
-        if let Err(err) = self.try_shutdown(Duration::from_secs(5)).await {
+        if let Err(err) = self.try_shutdown(SERVER_SHUTDOWN_GRACE).await {
             warn!("event=why_async_shutdown_error error={err}");
         }
     }
@@ -275,7 +274,7 @@ impl AsyncWhyHttpServerHandle {
 impl Drop for AsyncWhyHttpServerHandle {
     fn drop(&mut self) {
         if let Some(mut handle) = self.inner.take() {
-            let _ = handle.try_shutdown(Duration::from_secs(5));
+            let _ = handle.try_shutdown(SERVER_SHUTDOWN_GRACE);
         }
     }
 }
@@ -326,142 +325,5 @@ pub(crate) fn map_why_handler_error(err: HttpHandlerError) -> Result<(), NetErro
             warn!("event=why_http_handler_error stage={stage} error={error}");
             Err(error)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{handle_why_request, WhyPublisher};
-    use crate::control_plane::core::CpCacheState;
-    use crate::net::control_plane::why::{LocalRole, WhyNotLeader, WhySchemaHeader};
-    use crate::net::http::{HttpRequestContext, RequestDeadline, SimpleHttpRequest};
-    use crate::replication::consensus::StrictFallbackState;
-    use crate::replication::raft::PartitionQuorumStatus;
-    use crate::security::{Certificate, SerialNumber, SpiffeId};
-    use crate::terminology::TERM_STRICT;
-    use std::time::{Duration, Instant};
-
-    fn request_context() -> HttpRequestContext {
-        let spiffe =
-            SpiffeId::parse("spiffe://test.example/ns/default/sa/why").expect("spiffe parses");
-        let cert = Certificate {
-            spiffe_id: spiffe,
-            serial: SerialNumber::from_u64(1),
-            valid_from: Instant::now(),
-            valid_until: Instant::now() + Duration::from_secs(60),
-        };
-        HttpRequestContext::new(cert, RequestDeadline::from_timeout(Duration::from_secs(5)))
-    }
-
-    fn request_for(path: &str) -> SimpleHttpRequest {
-        SimpleHttpRequest {
-            method: "GET".into(),
-            path: path.into(),
-            query: None,
-            headers: Vec::new(),
-            body: Vec::new(),
-        }
-    }
-
-    fn publisher_with_partition() -> WhyPublisher {
-        let publisher = WhyPublisher::default();
-        let report = WhyNotLeader {
-            header: WhySchemaHeader::new("partition-a", 1, 1, 0),
-            leader_id: Some("leader-a".into()),
-            local_role: LocalRole::Follower,
-            strict_state: StrictFallbackState::LocalOnly,
-            cp_cache_state: CpCacheState::Fresh,
-            quorum_status: PartitionQuorumStatus {
-                committed_index: 1,
-                committed_term: 1,
-                quorum_size: 1,
-            },
-            pending_entries: 0,
-            runtime_terms: vec![TERM_STRICT],
-            strict_fallback_why: None,
-            truncated_ids_count: None,
-            continuation_token: None,
-        };
-        publisher.update_not_leader("partition-a", report);
-        publisher
-    }
-
-    #[test]
-    fn returns_not_leader_report() {
-        let ctx = request_context();
-        let publisher = publisher_with_partition();
-        let mut buffer = Vec::new();
-        handle_why_request(
-            &ctx,
-            request_for("/why/not-leader/partition-a"),
-            &publisher,
-            &mut buffer,
-        )
-        .expect("handler succeeds");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(
-            response.contains("\"partition_id\":\"partition-a\""),
-            "expected partition data in response"
-        );
-    }
-
-    #[test]
-    fn returns_not_found_for_missing_partition() {
-        let ctx = request_context();
-        let publisher = publisher_with_partition();
-        let mut buffer = Vec::new();
-        handle_why_request(
-            &ctx,
-            request_for("/why/not-leader/missing"),
-            &publisher,
-            &mut buffer,
-        )
-        .expect("handler succeeds");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
-        assert!(response.contains("partition not found"));
-    }
-
-    #[cfg(feature = "snapshot-crypto")]
-    #[test]
-    fn returns_snapshot_blocked_report() {
-        use crate::net::control_plane::why::WhySnapshotBlocked;
-        use crate::snapshot::SnapshotFallbackTelemetry;
-        use crate::snapshot::SnapshotOnlyReadyState;
-
-        let ctx = request_context();
-        let publisher = {
-            let publisher = WhyPublisher::default();
-            let report = WhySnapshotBlocked::new(
-                WhySchemaHeader::new("partition-b", 1, 1, 0),
-                "manifest-1",
-                SnapshotFallbackTelemetry {
-                    partition_ready_ratio_snapshot: 0.5,
-                    snapshot_manifest_age_ms: 10,
-                    snapshot_only_ready_state: SnapshotOnlyReadyState::Degraded,
-                    snapshot_only_min_ready_ratio: 0.8,
-                    snapshot_only_slo_breach_total: 1,
-                },
-                None,
-                crate::snapshot::SnapshotReadError::SnapshotOnlyUnavailable,
-            );
-            publisher.update_snapshot_blocked("partition-b", report);
-            publisher
-        };
-        let mut buffer = Vec::new();
-        handle_why_request(
-            &ctx,
-            request_for("/why/snapshot-blocked/partition-b"),
-            &publisher,
-            &mut buffer,
-        )
-        .expect("handler succeeds");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(
-            response.contains("\"manifest_id\":\"manifest-1\""),
-            "expected snapshot-blocked payload"
-        );
     }
 }

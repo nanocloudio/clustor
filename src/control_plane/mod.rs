@@ -11,7 +11,7 @@ pub use capabilities::*;
 pub use core::*;
 
 #[cfg(feature = "net")]
-pub use crate::net::control_plane::cp::{HttpCpTransport, HttpCpTransportBuilder};
+pub use crate::net::control_plane::client::{HttpCpTransport, HttpCpTransportBuilder};
 #[cfg(all(feature = "net", feature = "snapshot-crypto"))]
 pub use crate::net::control_plane::why::WhySnapshotBlocked;
 #[cfg(feature = "net")]

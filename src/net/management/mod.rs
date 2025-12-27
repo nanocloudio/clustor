@@ -2,12 +2,15 @@ use super::http::{
     spawn_tls_http_server, write_json_response, HttpHandlerError, HttpRequestContext,
     RequestDeadline, SimpleHttpRequest,
 };
-use super::readyz::{handle_readyz_request, ReadyzPublisher, READYZ_REQUEST_TIMEOUT};
+use super::readyz::{handle_readyz_request, ReadyzPublisher};
 use super::tls::{TlsIdentity, TlsTrustStore};
 use super::NetError;
 use crate::control_plane::AdminService;
-use crate::net::control_plane::admin::{handle_admin_request, ADMIN_REQUEST_TIMEOUT};
-use crate::net::control_plane::why::{handle_why_request, WhyPublisher, WHY_REQUEST_TIMEOUT};
+use crate::net::control_plane::admin::handle_admin_request;
+use crate::net::control_plane::why::{handle_why_request, WhyPublisher};
+use crate::timeouts::{
+    ADMIN_REQUEST_TIMEOUT, READYZ_REQUEST_TIMEOUT, SERVER_SHUTDOWN_GRACE, WHY_REQUEST_TIMEOUT,
+};
 use log::{info, warn};
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
@@ -15,7 +18,6 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "async-net")]
 use tokio::task;
 
-const MANAGEMENT_REQUEST_TIMEOUT: Duration = ADMIN_REQUEST_TIMEOUT;
 const MANAGEMENT_MAX_CONNECTIONS: usize = 64;
 
 pub struct ManagementHttpServerConfig {
@@ -31,7 +33,7 @@ pub struct ManagementHttpServerHandle {
 
 impl ManagementHttpServerHandle {
     pub fn shutdown(&mut self) {
-        if let Err(err) = self.try_shutdown(Duration::from_secs(5)) {
+        if let Err(err) = self.try_shutdown(SERVER_SHUTDOWN_GRACE) {
             warn!("event=management_http_shutdown_error error={err}");
         }
     }
@@ -43,7 +45,7 @@ impl ManagementHttpServerHandle {
 
 impl Drop for ManagementHttpServerHandle {
     fn drop(&mut self) {
-        let _ = self.try_shutdown(Duration::from_secs(5));
+        let _ = self.try_shutdown(SERVER_SHUTDOWN_GRACE);
     }
 }
 
@@ -69,7 +71,7 @@ impl ManagementHttpServer {
             listener,
             max_connections,
             tls_config,
-            MANAGEMENT_REQUEST_TIMEOUT,
+            ADMIN_REQUEST_TIMEOUT,
             ManagementRoute::deadline_for_request,
             move |ctx, request, stream, now| {
                 let route = ManagementRoute::from_request(&request);
@@ -131,7 +133,7 @@ pub struct AsyncManagementHttpServerHandle {
 #[cfg(feature = "async-net")]
 impl AsyncManagementHttpServerHandle {
     pub async fn shutdown(&mut self) {
-        if let Err(err) = self.try_shutdown(Duration::from_secs(5)).await {
+        if let Err(err) = self.try_shutdown(SERVER_SHUTDOWN_GRACE).await {
             warn!("event=management_http_async_shutdown_error error={err}");
         }
     }
@@ -150,7 +152,7 @@ impl AsyncManagementHttpServerHandle {
 impl Drop for AsyncManagementHttpServerHandle {
     fn drop(&mut self) {
         if let Some(mut handle) = self.inner.take() {
-            let _ = handle.try_shutdown(Duration::from_secs(5));
+            let _ = handle.try_shutdown(SERVER_SHUTDOWN_GRACE);
         }
     }
 }
@@ -211,7 +213,7 @@ impl ManagementRoute {
             Self::Readyz => READYZ_REQUEST_TIMEOUT,
             Self::Why => WHY_REQUEST_TIMEOUT,
             Self::Admin => ADMIN_REQUEST_TIMEOUT,
-            Self::Unknown => MANAGEMENT_REQUEST_TIMEOUT,
+            Self::Unknown => ADMIN_REQUEST_TIMEOUT,
         }
     }
 
@@ -249,237 +251,5 @@ fn map_management_handler_error(
             );
             Err(error)
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{handle_management_request, ManagementRoute};
-    use crate::control_plane::admin::{AdminHandler, AdminService};
-    use crate::control_plane::core::{CpPlacementClient, CpProofCoordinator};
-    use crate::feature_guard::{FeatureGateState, FeatureManifestBuilder};
-    use crate::lifecycle::activation::WarmupReadinessRecord;
-    use crate::net::control_plane::why::{LocalRole, WhyNotLeader, WhyPublisher, WhySchemaHeader};
-    use crate::net::http::{HttpRequestContext, RequestDeadline, SimpleHttpRequest};
-    use crate::readyz::{ReadyStateProbe, ReadyzSnapshot};
-    use crate::replication::consensus::{ConsensusCore, ConsensusCoreConfig, StrictFallbackState};
-    use crate::replication::raft::PartitionQuorumStatus;
-    use crate::security::{Certificate, SerialNumber, SpiffeId};
-    use crate::terminology::TERM_STRICT;
-    use crate::{
-        IdempotencyLedger, RbacManifest, RbacManifestCache, RbacPrincipal, RbacRole,
-        ReadyzPublisher,
-    };
-    use serde_json::json;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    fn request_context(spiffe: &str, timeout: Duration) -> HttpRequestContext {
-        let spiffe = SpiffeId::parse(spiffe).expect("spiffe parses");
-        let cert = Certificate {
-            spiffe_id: spiffe,
-            serial: SerialNumber::from_u64(1),
-            valid_from: Instant::now(),
-            valid_until: Instant::now() + Duration::from_secs(60),
-        };
-        HttpRequestContext::new(cert, RequestDeadline::from_timeout(timeout))
-    }
-
-    fn readyz_publisher() -> ReadyzPublisher {
-        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
-        let manifest = FeatureManifestBuilder::new()
-            .with_gate_state("leader_leases", FeatureGateState::Enabled)
-            .build(&signing_key)
-            .expect("manifest");
-        let matrix = manifest.capability_matrix().expect("matrix");
-        let readiness = WarmupReadinessRecord {
-            partition_id: "partition-a".into(),
-            bundle_id: "bundle-a".into(),
-            shadow_apply_state: crate::lifecycle::activation::ShadowApplyState::Ready,
-            shadow_apply_checkpoint_index: 1,
-            warmup_ready_ratio: 1.0,
-            updated_at_ms: 0,
-        };
-        let probe = ReadyStateProbe {
-            readiness,
-            activation_barrier_id: None,
-            partition_ready_ratio: 1.0,
-        };
-        let snapshot = ReadyzSnapshot::new(
-            vec![probe],
-            1_000,
-            0,
-            &matrix,
-            manifest.digest().expect("digest"),
-            Vec::new(),
-        )
-        .expect("snapshot");
-        ReadyzPublisher::new(snapshot)
-    }
-
-    fn why_publisher() -> WhyPublisher {
-        let publisher = WhyPublisher::default();
-        let report = WhyNotLeader {
-            header: WhySchemaHeader::new("partition-a", 1, 1, 0),
-            leader_id: Some("leader-a".into()),
-            local_role: LocalRole::Follower,
-            strict_state: StrictFallbackState::LocalOnly,
-            cp_cache_state: crate::control_plane::core::CpCacheState::Fresh,
-            quorum_status: PartitionQuorumStatus {
-                committed_index: 1,
-                committed_term: 1,
-                quorum_size: 1,
-            },
-            pending_entries: 0,
-            runtime_terms: vec![TERM_STRICT],
-            strict_fallback_why: None,
-            truncated_ids_count: None,
-            continuation_token: None,
-        };
-        publisher.update_not_leader("partition-a", report);
-        publisher
-    }
-
-    fn admin_service(now: Instant, principal: &str) -> AdminService {
-        let kernel = ConsensusCore::new(ConsensusCoreConfig::default());
-        let cp_guard = CpProofCoordinator::new(kernel);
-        let placements = CpPlacementClient::new(Duration::from_secs(60));
-        let ledger = IdempotencyLedger::new(Duration::from_secs(60));
-        let handler = AdminHandler::new(cp_guard, placements, ledger);
-        let mut rbac = RbacManifestCache::new(Duration::from_secs(600));
-        rbac.load_manifest(
-            RbacManifest {
-                roles: vec![RbacRole {
-                    name: "operator".into(),
-                    capabilities: vec!["CreatePartition".into()],
-                }],
-                principals: vec![RbacPrincipal {
-                    spiffe_id: principal.into(),
-                    role: "operator".into(),
-                }],
-            },
-            now,
-        )
-        .expect("rbac manifest loads");
-        AdminService::new(handler, rbac)
-    }
-
-    fn readyz_request() -> SimpleHttpRequest {
-        SimpleHttpRequest {
-            method: "GET".into(),
-            path: "/readyz".into(),
-            query: None,
-            headers: Vec::new(),
-            body: Vec::new(),
-        }
-    }
-
-    fn admin_request() -> SimpleHttpRequest {
-        let body = json!({
-            "idempotency_key": "op-1",
-            "partition": {
-                "partition_id": "partition-a",
-                "replicas": ["replica-a"],
-                "routing_epoch": 0
-            },
-            "replicas": [{
-                "replica_id": "replica-a",
-                "az": "zone-a"
-            }]
-        })
-        .to_string()
-        .into_bytes();
-        SimpleHttpRequest {
-            method: "POST".into(),
-            path: "/admin/create-partition".into(),
-            query: None,
-            headers: vec![("content-type".into(), "application/json".into())],
-            body,
-        }
-    }
-
-    #[test]
-    fn routes_readyz_requests() {
-        let route = ManagementRoute::Readyz;
-        let principal = "spiffe://test.example/ns/default/sa/admin";
-        let ctx = request_context(principal, route.timeout());
-        let readyz = readyz_publisher();
-        let why = why_publisher();
-        let admin = Arc::new(Mutex::new(admin_service(Instant::now(), principal)));
-        let mut buffer = Vec::new();
-        handle_management_request(
-            &ctx,
-            route,
-            readyz_request(),
-            &readyz,
-            &why,
-            &admin,
-            &mut buffer,
-            Instant::now(),
-        )
-        .expect("handler succeeds");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.contains("\"partition_id\":\"partition-a\""));
-    }
-
-    #[test]
-    fn routes_admin_requests() {
-        let route = ManagementRoute::Admin;
-        let principal = "spiffe://test.example/ns/default/sa/admin";
-        let ctx = request_context(principal, route.timeout());
-        let readyz = readyz_publisher();
-        let why = why_publisher();
-        let admin = Arc::new(Mutex::new(admin_service(Instant::now(), principal)));
-        let mut buffer = Vec::new();
-        handle_management_request(
-            &ctx,
-            route,
-            admin_request(),
-            &readyz,
-            &why,
-            &admin,
-            &mut buffer,
-            Instant::now(),
-        )
-        .expect("handler succeeds");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
-        assert!(response.contains("\"partition_id\":\"partition-a\""));
-    }
-
-    #[test]
-    fn responds_not_found_for_unknown_routes() {
-        let route = ManagementRoute::Unknown;
-        let ctx = request_context(
-            "spiffe://test.example/ns/default/sa/unknown",
-            route.timeout(),
-        );
-        let readyz = readyz_publisher();
-        let why = why_publisher();
-        let admin = Arc::new(Mutex::new(admin_service(
-            Instant::now(),
-            "spiffe://test.example/ns/default/sa/admin",
-        )));
-        let mut buffer = Vec::new();
-        handle_management_request(
-            &ctx,
-            route,
-            SimpleHttpRequest {
-                method: "GET".into(),
-                path: "/not-real".into(),
-                query: None,
-                headers: Vec::new(),
-                body: Vec::new(),
-            },
-            &readyz,
-            &why,
-            &admin,
-            &mut buffer,
-            Instant::now(),
-        )
-        .expect("handler writes response");
-        let response = String::from_utf8(buffer).expect("utf8");
-        assert!(response.starts_with("HTTP/1.1 404 Not Found"));
     }
 }

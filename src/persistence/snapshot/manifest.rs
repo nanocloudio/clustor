@@ -348,7 +348,7 @@ pub(crate) fn compute_hash(bytes: &[u8]) -> String {
     format!("0x{}", hex::encode(digest))
 }
 
-pub(super) fn canonicalize_without_signature(
+pub fn canonicalize_without_signature(
     manifest: &SnapshotManifest,
 ) -> Result<Vec<u8>, ManifestError> {
     let mut value = serde_json::to_value(manifest)?;
