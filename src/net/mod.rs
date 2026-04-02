@@ -86,6 +86,8 @@ pub enum CertificateError {
     TrustBundleEmpty,
     #[error("trust bundle does not contain parsable certificates")]
     TrustBundleUnparsable,
+    #[error("failed to build TLS verifier: {details}")]
+    VerifierBuild { details: String },
     #[error("peer sent empty certificate chain")]
     EmptyPeerChain,
     #[error("invalid DNS name `{host}` for certificate")]

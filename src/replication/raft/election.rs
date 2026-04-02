@@ -1,7 +1,7 @@
 use crate::profile::PartitionProfile;
 use crate::replication::raft::rpc::PreVoteResponse;
 use crate::replication::raft::{PartitionQuorum, ReplicaId};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha20Rng;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -182,7 +182,7 @@ fn random_between(rng: &mut ChaCha20Rng, min: Duration, max: Duration) -> Durati
         return min;
     }
     let delta = max - min;
-    let jitter = rng.gen_range(0..=delta.as_millis() as u64);
+    let jitter = rng.random_range(0..=delta.as_millis() as u64);
     min + Duration::from_millis(jitter)
 }
 

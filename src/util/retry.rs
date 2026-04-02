@@ -1,4 +1,4 @@
-use rand::{thread_rng, Rng};
+use rand::RngExt;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug)]
@@ -103,7 +103,7 @@ impl RetryPolicy {
             let jitter = self.jitter_fraction.min(1.0);
             let min = (1.0 - jitter).max(0.0);
             let max = 1.0 + jitter;
-            let factor = thread_rng().gen_range(min..=max);
+            let factor = rand::rng().random_range(min..=max);
             let millis = bounded.as_millis() as f64;
             let jittered = (millis * factor).round().max(0.0);
             Duration::from_millis(jittered.min(u128::from(u64::MAX) as f64) as u64)

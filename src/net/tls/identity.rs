@@ -1,10 +1,12 @@
 #![cfg(feature = "net")]
 
-use super::trust::{SpiffeServerVerifier, TlsTrustStore};
+use super::trust::TlsTrustStore;
 use super::{CertificateError, NetError};
 use crate::security::{Certificate, SerialNumber, SpiffeId};
-use rustls::server::AllowAnyAuthenticatedClient;
-use rustls::{Certificate as RustlsCertificate, ClientConfig, PrivateKey, ServerConfig};
+use rustls::client::WebPkiServerVerifier;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::{ClientConfig, ServerConfig};
 use rustls_pemfile::{certs, ec_private_keys, pkcs8_private_keys, rsa_private_keys};
 use std::fs::File;
 use std::io::{BufReader, Cursor};
@@ -15,30 +17,45 @@ use x509_parser::certificate::X509Certificate;
 use x509_parser::extensions::{GeneralName, ParsedExtension, SubjectAlternativeName};
 use x509_parser::prelude::FromDer;
 
-#[derive(Clone)]
 pub struct TlsIdentity {
-    pub chain: Vec<RustlsCertificate>,
-    pub private_key: PrivateKey,
+    pub chain: Vec<CertificateDer<'static>>,
+    pub private_key: PrivateKeyDer<'static>,
     pub certificate: Certificate,
+}
+
+impl Clone for TlsIdentity {
+    fn clone(&self) -> Self {
+        Self {
+            chain: self.chain.clone(),
+            private_key: self.private_key.clone_key(),
+            certificate: self.certificate.clone(),
+        }
+    }
 }
 
 impl TlsIdentity {
     pub fn client_config(&self, trust: &TlsTrustStore) -> Result<ClientConfig, NetError> {
+        let verifier = WebPkiServerVerifier::builder(Arc::new(trust.roots.clone()))
+            .build()
+            .map_err(|err| CertificateError::VerifierBuild {
+                details: err.to_string(),
+            })?;
         ClientConfig::builder()
-            .with_safe_defaults()
-            .with_custom_certificate_verifier(Arc::new(SpiffeServerVerifier::new(
-                trust.roots.clone(),
-            )))
-            .with_client_auth_cert(self.chain.clone(), self.private_key.clone())
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(self.chain.clone(), self.private_key.clone_key())
             .map_err(NetError::from)
     }
 
     pub fn server_config(&self, trust: &TlsTrustStore) -> Result<ServerConfig, NetError> {
-        let verifier = Arc::new(AllowAnyAuthenticatedClient::new(trust.roots.clone()));
+        let verifier = WebPkiClientVerifier::builder(Arc::new(trust.roots.clone()))
+            .build()
+            .map_err(|err| CertificateError::VerifierBuild {
+                details: err.to_string(),
+            })?;
         ServerConfig::builder()
-            .with_safe_defaults()
             .with_client_cert_verifier(verifier)
-            .with_single_cert(self.chain.clone(), self.private_key.clone())
+            .with_single_cert(self.chain.clone(), self.private_key.clone_key())
             .map_err(NetError::from)
     }
 }
@@ -53,7 +70,7 @@ pub fn load_identity_from_pem(
         return Err(NetError::from(CertificateError::IdentityChainEmpty));
     }
     let private_key = load_private_key(key_path)?;
-    let certificate = parse_certificate_metadata(&chain[0].0, now)?;
+    let certificate = parse_certificate_metadata(chain[0].as_ref(), now)?;
     Ok(TlsIdentity {
         chain,
         private_key,
@@ -61,36 +78,40 @@ pub fn load_identity_from_pem(
     })
 }
 
-fn load_cert_chain(path: impl AsRef<Path>) -> Result<Vec<RustlsCertificate>, NetError> {
+fn load_cert_chain(path: impl AsRef<Path>) -> Result<Vec<CertificateDer<'static>>, NetError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
-    let mut chain = Vec::new();
-    for cert in certs(&mut reader).map_err(|_| CertificateError::InvalidCertificateChain)? {
-        chain.push(RustlsCertificate(cert));
-    }
-    Ok(chain)
+    certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| NetError::from(CertificateError::InvalidCertificateChain))
 }
 
-fn load_private_key(path: impl AsRef<Path>) -> Result<PrivateKey, NetError> {
+fn load_private_key(path: impl AsRef<Path>) -> Result<PrivateKeyDer<'static>, NetError> {
     let path = path.as_ref();
     let pem = std::fs::read(path)?;
 
     let mut reader = Cursor::new(&pem);
-    let keys = pkcs8_private_keys(&mut reader).map_err(|_| CertificateError::InvalidPkcs8Key)?;
-    if let Some(key) = keys.into_iter().next() {
-        return Ok(PrivateKey(key));
+    let mut keys = pkcs8_private_keys(&mut reader);
+    if let Some(key) = keys.next() {
+        return key
+            .map(Into::into)
+            .map_err(|_| NetError::from(CertificateError::InvalidPkcs8Key));
     }
 
     let mut reader = Cursor::new(&pem);
-    let keys = rsa_private_keys(&mut reader).map_err(|_| CertificateError::InvalidRsaKey)?;
-    if let Some(key) = keys.into_iter().next() {
-        return Ok(PrivateKey(key));
+    let mut keys = rsa_private_keys(&mut reader);
+    if let Some(key) = keys.next() {
+        return key
+            .map(Into::into)
+            .map_err(|_| NetError::from(CertificateError::InvalidRsaKey));
     }
 
     let mut reader = Cursor::new(&pem);
-    let keys = ec_private_keys(&mut reader).map_err(|_| CertificateError::InvalidEcKey)?;
-    if let Some(key) = keys.into_iter().next() {
-        return Ok(PrivateKey(key));
+    let mut keys = ec_private_keys(&mut reader);
+    if let Some(key) = keys.next() {
+        return key
+            .map(Into::into)
+            .map_err(|_| NetError::from(CertificateError::InvalidEcKey));
     }
 
     Err(NetError::from(CertificateError::MissingPrivateKey))

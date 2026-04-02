@@ -20,7 +20,7 @@ use crate::telemetry::SharedMetricsRegistry;
 use crate::timeouts::with_timeout;
 use log::{debug, info, warn};
 use parking_lot::Mutex as ParkingMutex;
-use rustls::client::ServerName;
+use rustls::pki_types::ServerName;
 use rustls::ClientConfig;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -45,7 +45,7 @@ pub struct AsyncSessionPoolConfig {
     pub host: String,
     pub port: u16,
     pub tls_config: Arc<ClientConfig>,
-    pub server_name: ServerName,
+    pub server_name: ServerName<'static>,
     pub mtls: Arc<ParkingMutex<MtlsIdentityManager>>,
     pub connect_timeout: Duration,
     pub io_timeout: Duration,

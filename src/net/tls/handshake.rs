@@ -2,8 +2,8 @@
 
 use super::{CertificateError, NetError};
 use crate::security::Certificate;
-use rustls::client::ServerName;
-use rustls::{Certificate as RustlsCertificate, ClientConnection, ServerConnection};
+use rustls::pki_types::{CertificateDer, ServerName};
+use rustls::{ClientConnection, ServerConnection};
 use std::convert::TryFrom;
 use std::net::TcpStream;
 use std::time::Instant;
@@ -31,15 +31,15 @@ pub fn complete_server_handshake(
 }
 
 pub fn decode_peer_certificate(
-    chain: &[RustlsCertificate],
+    chain: &[CertificateDer<'_>],
     now: Instant,
 ) -> Result<Certificate, NetError> {
     let leaf = chain.first().ok_or(CertificateError::EmptyPeerChain)?;
-    parse_certificate_metadata(&leaf.0, now)
+    parse_certificate_metadata(leaf.as_ref(), now)
 }
 
-pub fn server_name(host: &str) -> Result<ServerName, NetError> {
-    ServerName::try_from(host).map_err(|_| {
+pub fn server_name(host: &str) -> Result<ServerName<'static>, NetError> {
+    ServerName::try_from(host.to_string()).map_err(|_| {
         NetError::from(CertificateError::InvalidDnsName {
             host: host.to_string(),
         })

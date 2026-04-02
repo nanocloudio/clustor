@@ -8,8 +8,8 @@ use crate::net::tls::{decode_peer_certificate, server_name, TlsIdentity, TlsTrus
 use crate::net::{CertificateError, HttpError, NetError};
 use crate::retry::RetryPolicy;
 use httparse::Status;
-use rustls::client::{ClientConfig, ClientConnection, ServerName};
-use rustls::Stream;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection, Stream};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
@@ -37,7 +37,7 @@ pub struct HttpCpTransport {
     port: u16,
     base: Url,
     tls_config: Arc<ClientConfig>,
-    server_name: ServerName,
+    server_name: ServerName<'static>,
     socket_timeout: Duration,
     retry_policy: RetryPolicy,
     pool: Option<Arc<ConnectionPool>>,

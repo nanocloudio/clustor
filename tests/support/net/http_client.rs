@@ -1,5 +1,5 @@
 use clustor::net::{TlsIdentity, TlsTrustStore};
-use rustls::client::ServerName;
+use rustls::pki_types::ServerName;
 use rustls::{ClientConnection, StreamOwned};
 use std::error::Error;
 use std::io::{self, Read, Write};
@@ -23,7 +23,7 @@ pub fn https_request(
     let config = identity.client_config(trust)?;
     let conn = ClientConnection::new(
         Arc::new(config),
-        ServerName::try_from(host).map_err(|_| "invalid host")?,
+        ServerName::try_from(host.to_string()).map_err(|_| "invalid host")?,
     )?;
     let stream = TcpStream::connect(addr)?;
     let mut tls = StreamOwned::new(conn, stream);
