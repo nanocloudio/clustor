@@ -1,0 +1,11 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+refresh_fresh_ms = { type = "u16", default = 5000, doc = "Refresh interval when cache is fresh" }
+refresh_stale_ms = { type = "u16", default = 600, doc = "Refresh interval when cache is stale" }
+
+[[ports]]
+name = "proof"
+direction = "output"
+content_type = "OctetStream"

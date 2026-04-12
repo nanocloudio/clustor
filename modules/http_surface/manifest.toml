@@ -1,0 +1,60 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+bind_port = { type = "u16", default = 9100, doc = "Management HTTP port" }
+
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "throttle_status"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "client_responses"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_responses"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "readyz_data"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "why_data"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics_data"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "raft_rpc"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "client_req"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_req"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "responses_out"
+direction = "output"
+content_type = "OctetStream"

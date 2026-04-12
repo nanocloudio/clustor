@@ -1,0 +1,25 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+max_request_bytes = { type = "u32", default = 4194304, doc = "Max client request size (4 MiB)" }
+
+[[ports]]
+name = "raw_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "responses"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "placement"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "parsed"
+direction = "output"
+content_type = "OctetStream"

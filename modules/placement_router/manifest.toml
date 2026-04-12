@@ -1,0 +1,10 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+max_partitions = { type = "u16", default = 4096, doc = "Maximum partition slots" }
+
+[[ports]]
+name = "routing"
+direction = "output"
+content_type = "OctetStream"

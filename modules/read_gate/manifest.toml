@@ -1,0 +1,15 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+strict_fallback = { type = "u8", default = 1, doc = "1=enable strict fallback on CP expiry" }
+
+[[ports]]
+name = "cache_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "permits"
+direction = "output"
+content_type = "OctetStream"

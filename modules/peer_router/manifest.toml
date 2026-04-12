@@ -1,0 +1,47 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+self_id = { type = "u8", default = 0, doc = "This node's replica slot (0..6)" }
+peer_count = { type = "u8", default = 0, doc = "Number of nodes in cluster" }
+listen_port = { type = "u16", default = 9090, doc = "TCP listen port for peer/client traffic" }
+peer0_port = { type = "u16", default = 0, doc = "Peer 0 port (localhost, 0=disabled)" }
+peer1_port = { type = "u16", default = 0, doc = "Peer 1 port (localhost, 0=disabled)" }
+peer2_port = { type = "u16", default = 0, doc = "Peer 2 port (localhost, 0=disabled)" }
+peer3_port = { type = "u16", default = 0, doc = "Peer 3 port (localhost, 0=disabled)" }
+peer4_port = { type = "u16", default = 0, doc = "Peer 4 port (localhost, 0=disabled)" }
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "peer_tx"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "repl_tx"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "client_resp"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cleartext"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "peer_rx"
+direction = "output"
+content_type = "OctetStream"

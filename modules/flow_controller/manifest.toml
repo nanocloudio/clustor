@@ -1,0 +1,27 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+entry_credit_max = { type = "u16", default = 4096, doc = "Max entry credits" }
+byte_credit_max_kb = { type = "u16", default = 64, doc = "Max byte credits in KiB" }
+sample_period_ms = { type = "u16", default = 100, doc = "PID sample interval" }
+
+[[ports]]
+name = "lag_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "credits"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "envelope"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"

@@ -1,0 +1,37 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+full_interval_bytes = { type = "u32", default = 536870912, doc = "Log growth before full snapshot (512 MiB)" }
+delta_chain_max = { type = "u8", default = 8, doc = "Max incremental snapshots before forced full" }
+chunk_bytes = { type = "u32", default = 1048576, doc = "Snapshot chunk size (1 MiB)" }
+
+[[ports]]
+name = "import_chunks"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "trigger"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "key_update"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "export_chunks"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "manifest_auth"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"

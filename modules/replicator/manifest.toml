@@ -1,0 +1,48 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+self_id = { type = "u8", default = 0, doc = "This node's replica slot" }
+peer_count = { type = "u8", default = 0, doc = "Number of peers (including self)" }
+pipeline_depth = { type = "u8", default = 8, doc = "Max pipelined RPCs per peer" }
+structural_lag_bytes = { type = "u32", default = 268435456, doc = "Lag threshold for snapshot trigger (256 MiB)" }
+
+[[ports]]
+name = "entries_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ack_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "snapshot_rx"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "match_indices"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "lag_signal"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "snapshot_import"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"

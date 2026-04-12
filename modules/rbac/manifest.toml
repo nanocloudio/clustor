@@ -1,0 +1,26 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+default_role = { type = "u8", default = 1, doc = "1=operator, 2=tenant_admin, 4=observer" }
+manifest_refresh_s = { type = "u16", default = 30, doc = "Role manifest refresh interval" }
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "authorized"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "denied"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "audit_events"
+direction = "output"
+content_type = "OctetStream"

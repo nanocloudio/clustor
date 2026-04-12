@@ -1,0 +1,26 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+fresh_threshold_s = { type = "u16", default = 60, doc = "Seconds before cache transitions from Fresh" }
+grace_period_s = { type = "u16", default = 120, doc = "Seconds before cache expires" }
+
+[[ports]]
+name = "proof_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cache_state"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "strict_fallback"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"

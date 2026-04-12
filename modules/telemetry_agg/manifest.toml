@@ -1,0 +1,26 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+emit_interval_ms = { type = "u16", default = 1000, doc = "Readyz/why/export emission interval" }
+warmup_ms = { type = "u16", default = 5000, doc = "Time before reporting ready" }
+
+[[ports]]
+name = "ingest"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "readyz"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "why"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "export"
+direction = "output"
+content_type = "OctetStream"

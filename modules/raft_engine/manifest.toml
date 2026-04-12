@@ -1,0 +1,50 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+self_id = { type = "u8", default = 0, doc = "This node's replica slot (0..6)" }
+voter_count = { type = "u8", default = 1, doc = "Total voters in cluster" }
+election_timeout_ms = { type = "u16", default = 1000, doc = "Base election timeout" }
+heartbeat_interval_ms = { type = "u16", default = 150, doc = "Leader heartbeat interval" }
+proposal_batch_max = { type = "u16", default = 64, doc = "Max proposals per batch" }
+proposal_batch_timeout_ms = { type = "u16", default = 10, doc = "Batch flush timeout" }
+
+[[ports]]
+name = "rpc_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_proposals"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "fallback_signal"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "append_entries"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "rpc_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "log_append"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"

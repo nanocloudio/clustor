@@ -1,0 +1,26 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+initial_entry_credits = { type = "u16", default = 4096, doc = "Starting entry credits" }
+initial_byte_credits_kb = { type = "u16", default = 64, doc = "Starting byte credits in KiB" }
+
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "credit_supply"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admitted"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "rejected"
+direction = "output"
+content_type = "OctetStream"

@@ -1,0 +1,16 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+batch_window_ms = { type = "u16", default = 2, doc = "Group fsync batch window" }
+max_pending = { type = "u16", default = 64, doc = "Max pending entries before forced flush" }
+
+[[ports]]
+name = "pending"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "synced"
+direction = "output"
+content_type = "OctetStream"

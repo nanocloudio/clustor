@@ -1,0 +1,27 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+self_id = { type = "u8", default = 0, doc = "This node's replica slot" }
+voter_count = { type = "u8", default = 1, doc = "Total voters in cluster" }
+durability_mode = { type = "u8", default = 1, doc = "0=strict, 1=group_fsync, 2=relaxed" }
+
+[[ports]]
+name = "match_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "durable_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cp_state"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "committed"
+direction = "output"
+content_type = "OctetStream"

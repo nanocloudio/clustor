@@ -1,0 +1,15 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+rotation_interval_h = { type = "u16", default = 168, doc = "DEK rotation interval (hours, 168=weekly)" }
+
+[[ports]]
+name = "dek_epoch"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cert_refresh"
+direction = "output"
+content_type = "OctetStream"

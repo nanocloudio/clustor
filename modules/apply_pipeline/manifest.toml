@@ -1,0 +1,20 @@
+version = "0.1.0"
+hardware_targets = ["bcm2712"]
+
+[params]
+dedup_shard_count = { type = "u8", default = 16, doc = "Number of deduplication shards" }
+
+[[ports]]
+name = "entries"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "read_permits"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "applied"
+direction = "output"
+content_type = "OctetStream"
