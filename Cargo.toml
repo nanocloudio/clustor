@@ -1,53 +1,201 @@
+[workspace]
+members = ["."]
+
+# Workspace lint policy, per standards/lints.md §1. Every member
+# (only `clustor` today) opts in via `[lints] workspace = true`
+# below. The `priority = -1` on group enables makes the
+# per-lint overrides apply after the group, not be silently overridden
+# by it.
+[workspace.lints.rust]
+unsafe_code               = "forbid"
+unused_must_use           = "deny"
+elided_lifetimes_in_paths = "warn"
+
+[workspace.lints.clippy]
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "warn",  priority = -1 }
+
+allow_attributes                = "deny"
+allow_attributes_without_reason = "deny"
+
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+unwrap_used   = "deny"
+expect_used   = "warn"
+panic         = "warn"
+print_stdout  = "deny"
+print_stderr  = "deny"
+
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+missing_const_for_fn    = "allow"
+too_many_lines          = "allow"
+
 [package]
 name = "clustor"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = []
-full = ["net", "admin-http", "snapshot-crypto", "async-net"]
-net = [
-    "httparse",
-    "rustls",
-    "rustls-pemfile",
-    "url",
-    "x509-parser",
-]
-snapshot-crypto = []
-admin-http = []
-async-net = ["net", "tokio", "tokio-rustls"]
-management = ["net", "admin-http"]
-http-fuzz = ["net"]
+# Clustor is built as a set of fluxor-native PIC modules (see
+# `modules/app/` and `make modules`). The cargo package no longer
+# ships a `src/lib.rs` library. Cargo retains the package shell so
+# the host-side test/bench targets that pull
+# `modules/sdk/replica_facade.rs` via `#[path = ...]` can still be
+# compiled and exercised on the host toolchain. The actual on-target
+# module ELFs are produced by `make modules TARGET=<board>`.
+autobins = false
+autoexamples = false
+autobenches = false
+autotests = false
+
+# Per-package lint set. Cargo doesn't allow mixing
+# `lints.workspace = true` with per-lint overrides in the same
+# `[lints]` block, and this package is effectively all test/bench
+# code around an empty `lib_stub.rs` — the strict lib-grade lints in
+# `[workspace.lints]` (unwrap_used = "deny", etc.) don't fit. The
+# package is exempted from the workspace-lint opt-in audit via
+# `[[ci.lints.exemption]]` in `fluxor.toml`; the block below mirrors
+# the workspace baseline minus the lints that conflict with the
+# test/bench shape.
+[lints.rust]
+# `tests/support/cluster.rs` uses libc::setpgid in an unsafe pre_exec
+# closure to put spawned fluxor children into a fresh process group.
+# That single call site keeps us at `deny` instead of `forbid` here;
+# the host package never grows other unsafe.
+unsafe_code               = "deny"
+unused_must_use           = "deny"
+elided_lifetimes_in_paths = "warn"
+
+[lints.clippy]
+# Group enables (priority = -1 so per-lint overrides below win).
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "allow", priority = -1 }   # relaxed for this test/bench-shaped package; lib crates should re-tighten to "warn"
+
+# `#[allow]` discipline.
+allow_attributes                = "deny"
+allow_attributes_without_reason = "deny"
+
+# Strict hygiene that survives the pedantic relaxation.
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+
+# Lib-grade lints that don't fit a test/bench package.
+unwrap_used        = "allow"
+expect_used        = "allow"
+panic              = "allow"
+print_stdout       = "allow"
+print_stderr       = "allow"
+disallowed_macros  = "allow"   # println diagnostics in tests/benches
+
+# Pedantic carve-outs left in case pedantic is ever re-tightened here.
+module_name_repetitions = "allow"
+must_use_candidate      = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+missing_const_for_fn    = "allow"
+too_many_lines          = "allow"
+
+[lib]
+# No library target. Tests under `tests/` are integration crates and
+# do not need a `clustor` library to link against — they pull module
+# source files directly with `#[path = "../modules/.../..."]`.
+path = "lib_stub.rs"
 
 [dependencies]
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-thiserror = "2.0.18"
-rand = "0.10.0"
-rand_chacha = "0.10.0"
-crc32fast = "1.5.0"
-sha2 = { version = "0.10.9", default-features = false, features = ["std"] }
-aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "std"] }
-hmac = "0.12.1"
-hex = "0.4.3"
-ed25519-dalek = { version = "2.1.1", default-features = false, features = ["rand_core", "std", "zeroize"] }
-memmap2 = "0.9"
-httparse = { version = "1.9.4", optional = true }
-log = "0.4.28"
-rustls = { version = "0.23.35", optional = true, default-features = false, features = ["tls12"] }
-rustls-pemfile = { version = "2.2.0", optional = true }
-url = { version = "2.5.8", optional = true }
-x509-parser = { version = "0.17", default-features = false, optional = true }
-zeroize = "1.8.2"
-tokio = { version = "1.50.0", optional = true, features = ["rt", "rt-multi-thread", "time", "macros", "sync", "net", "io-util"] }
-tokio-rustls = { version = "0.26.4", optional = true }
-parking_lot = "0.12"
 
 [dev-dependencies]
 tempfile = "3.23.0"
-rcgen = { version = "0.13", features = ["pem"] }
+criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
+# Used by the cluster harness (`tests/support/cluster.rs`) to put
+# spawned `fluxor` parent + `fluxor-linux` grandchild into a fresh
+# process group so SIGTERM reaches the whole tree. Without it,
+# killed fluxor parents leave orphaned fluxor-linux processes that
+# hold listen ports and break subsequent test runs.
+libc = "0.2"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Host-side integration tests. The modules themselves are compiled
+# to PIC ELF artefacts by `make modules`; the entries below are the
+# cargo-driven host harness:
+#
+#   facade           — facade contract unit/integration coverage
+#   facade_stress    — facade structures under thread stress
+#   config_validate  — renders every configs/*.yaml with fluxor.toml
+#                      defaults and runs `fluxor validate` against
+#                      `target: linux`. Always runs (no E2E deps).
+#   cluster          — multi-node fluxor-linux harness smoke tests.
+#                      Runtime-skips when fluxor-linux or the .fmod
+#                      artefacts under target/fluxor/<silicon>/modules/
+#                      are absent — i.e. a green `cargo test cluster`
+#                      WITHOUT those prereqs means the tests skipped,
+#                      not that they exercised the cluster path. Set
+#                      `CLUSTOR_REQUIRE_E2E=1` to make missing prereqs
+#                      a hard failure (see `tests/support/cluster.rs`).
+#   partition        — 2-node 2-partition coverage via the
+#                      multi-2node-2p template (same skip semantics).
+#   chaos            — fault injection on top of the cluster harness
+#                      (same skip semantics).
+#   sandbox          — self-test for `tests/support/sandbox.rs`
+[[test]]
+name = "facade"
+path = "tests/facade.rs"
+
+[[test]]
+name = "facade_stress"
+path = "tests/facade_stress.rs"
+
+[[test]]
+name = "cluster"
+path = "tests/cluster.rs"
+
+[[test]]
+name = "partition"
+path = "tests/partition.rs"
+
+[[test]]
+name = "chaos"
+path = "tests/chaos.rs"
+
+[[test]]
+name = "sandbox"
+path = "tests/sandbox.rs"
+
+[[test]]
+name = "config_validate"
+path = "tests/config_validate.rs"
+
+[[test]]
+name = "http_admin"
+path = "tests/http_admin.rs"
+
+[[test]]
+name = "sdk_primitives"
+path = "tests/sdk_primitives.rs"
+
+# Criterion benches. Each uses `harness = false` so criterion's own
+# main runs instead of the default libtest harness. Run with
+# `cargo bench` or `cargo bench --bench <name> -- --quick`. All
+# benches pull `modules/sdk/replica_facade.rs` directly via
+# `#[path]` — no library link is required.
+[[bench]]
+name = "wire_codec"
+path = "benches/wire_codec.rs"
+harness = false
+
+[[bench]]
+name = "inflight_table"
+path = "benches/inflight_table.rs"
+harness = false
+
+[[bench]]
+name = "committed_subscriber"
+path = "benches/committed_subscriber.rs"
+harness = false

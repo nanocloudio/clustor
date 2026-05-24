@@ -1,0 +1,83 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "entries"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ack"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "snapshot_rx"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "wal_reply"
+direction = "input"
+content_type = "OctetStream"
+
+# Voter-set updates from raft_engine.voter_set (RFC §1.2). The
+# replicator uses this to activate new voters in non-voting state
+# (so their match_index doesn't enter the quorum median until they've
+# caught up) and to drop removed voters cleanly. Optional — graphs
+# without dynamic membership leave this unwired.
+[[ports]]
+name = "voter_set"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "match_indices"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "lag_signal"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "snapshot_import"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "wal_request"
+direction = "output"
+content_type = "OctetStream"
+
+# On-demand snapshot install request to snapshot_engine. Payload:
+# `[target:u8]` (0xFF = broadcast). Replicator emits this when WAL
+# read-back returns NOT_FOUND for the index a lagging follower needs.
+# See RFC §4.2.
+[[ports]]
+name = "snapshot_request"
+direction = "output"
+content_type = "OctetStream"
+
+# Synthesized MSG_FSYNC_ACK frames extracted from AppendEntriesResponse
+# envelopes (spec §10.4.1). The leader's `durability_ledger` consumes
+# this fan-in alongside local `wal.flushed` so its per-replica
+# progress array reflects every voter's `local_wal_durable_index`,
+# enabling quorum-fsync `wal_committed_index` computation.
+[[ports]]
+name = "cross_durability_ack"
+direction = "output"
+content_type = "OctetStream"

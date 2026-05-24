@@ -1,0 +1,21 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "proof"
+direction = "output"
+content_type = "OctetStream"
+
+# Quantum enhancement: tenant records and capability manifests.
+# Optional — Clustor-only graphs leave these unwired.
+[[ports]]
+name = "tenant_records"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "capabilities"
+direction = "output"
+content_type = "OctetStream"

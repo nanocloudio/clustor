@@ -1,0 +1,53 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# http_ingress — clustor-side HTTP/1.1 listener that feeds the
+# `http_adapter` diagnostic surface.
+#
+# Sits between a second `linux_net` instance (bound to a dedicated
+# HTTP port — by convention `LISTEN_PORT + 10000`) and
+# `http_adapter`. Parses the GET request line, frames a
+# `MSG_HTTP_REQUEST` envelope for the adapter, and writes the
+# adapter's `MSG_HTTP_RESPONSE` back to the wire as an HTTP/1.1
+# `Connection: close` response.
+#
+# Wire shape:
+#   net_in   (in[0]):  net_proto events from linux_net.net_out
+#                      (NMSG_ACCEPT / NMSG_DATA / NMSG_CLOSED)
+#   response (in[1]):  MSG_HTTP_RESPONSE from http_adapter.response
+#                      `[conn_id:u8][status:u16 LE][body_len:u16 LE][body]`
+#   net_out  (out[0]): net_proto commands to linux_net.net_in
+#                      (NCMD_BIND on startup, NCMD_SEND per response,
+#                      NCMD_CLOSE on completion)
+#   request  (out[1]): MSG_HTTP_REQUEST to http_adapter.request
+#                      `[conn_id:u8][method:u8][path_len:u8][path][body]`
+#
+# Why a clustor-side parser rather than fluxor's `foundation/http`:
+# clustor's `MSG_HTTP_REQUEST` / `MSG_HTTP_RESPONSE` envelopes (msg
+# types 0x74 / 0x75) are a private protocol between this module and
+# http_adapter. Keeping the parser here means the foundation HTTP
+# module stays app-agnostic and clustor owns its own diagnostic
+# request/response framing end to end.
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "response"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "request"
+direction = "output"
+content_type = "OctetStream"
+

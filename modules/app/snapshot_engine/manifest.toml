@@ -1,0 +1,61 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Per-partition snapshot manifest persistence (see mod.rs). Multi-Raft
+# graphs instantiate one snapshot_engine per partition; each writes to
+# a disjoint subtree (`wal/p<id>/snap_*.bin`), so `write` (not
+# `exclusive`) is correct.
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[[ports]]
+name = "import_chunks"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "trigger"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "key_update"
+direction = "input"
+content_type = "OctetStream"
+
+# On-demand install request from replicator (§4.2). Payload: `[target:u8]`
+# (0xFF = broadcast). Fires when a follower has fallen below the WAL
+# retention floor and the replicator can no longer satisfy it through
+# AE conflict-repair retry alone.
+[[ports]]
+name = "install_request"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "export_chunks"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "manifest_auth"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# Snapshot install completion signal to raft_engine. When a complete
+# `MSG_INSTALL_SNAPSHOT` sequence arrives on `import_chunks` (via
+# replicator) and the `done` flag is set, we emit
+# `MSG_SNAPSHOT_INSTALLED` here so raft_engine can fast-forward
+# `last_log_*` and `commit_index`. See RFC §5.13.
+[[ports]]
+name = "installed_local"
+direction = "output"
+content_type = "OctetStream"

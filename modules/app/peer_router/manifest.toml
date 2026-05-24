@@ -1,0 +1,54 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "peer_tx"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "repl_tx"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "client_resp"
+direction = "input"
+content_type = "OctetStream"
+
+# TLS-verified peer identity from foundation/tls (when wired). Carries
+# `MSG_PEER_IDENTITY` envelopes binding `conn_id → replica_id` after
+# the handshake completes. A non-empty SVID is preferred over the
+# legacy plaintext identity handshake; mismatches between the two
+# void the connection's Raft binding. See RFC §5.1.
+[[ports]]
+name = "tls_identity"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cleartext"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "peer_rx"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "raft_rpc"
+direction = "output"
+content_type = "OctetStream"

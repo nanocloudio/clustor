@@ -1,0 +1,24 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "lag"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "credits"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "envelope"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"

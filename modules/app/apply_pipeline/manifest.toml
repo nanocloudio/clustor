@@ -1,0 +1,83 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "entries"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "read_permits"
+direction = "input"
+content_type = "OctetStream"
+
+# Per-entry fan-out from raft_engine.log_observe. Same envelope as
+# `log_append` — MSG_WAL_ENTRY `[term:u64][index:u64][body...]`.
+# Optional; without it the apply_pipeline still emits commit-horizon
+# acks on `applied` but the per-entry `committed_entries` stream stays
+# silent.
+[[ports]]
+name = "log_entries"
+direction = "input"
+content_type = "OctetStream"
+
+# Linearizable read submissions from client_codec. Payload shape:
+# MSG_CLIENT_READ_REQUEST `[correlation_id:u64 LE][body...]`. The body
+# is opaque — apply_pipeline only blocks until the local apply_index
+# has caught up to the commit horizon observed at submission time, and
+# the CP read permit is Fresh/Cached. A response with the same
+# correlation_id is emitted on `applied` as MSG_CLIENT_READ_RESPONSE.
+# Optional; leave unwired in configs that have no read path.
+[[ports]]
+name = "read"
+direction = "input"
+content_type = "OctetStream"
+
+# Reply from raft_engine.read_probe_reply for an outstanding strict-
+# ReadIndex probe. Payload: `[correlation_id:u64 LE][confirmed_commit:u64
+# LE][confirmed:u8]`. Optional — when unwired the read path falls back
+# to using the submission-time commit horizon. See RFC §1.3.
+[[ports]]
+name = "read_probe_reply"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "applied"
+direction = "output"
+content_type = "OctetStream"
+# Internal client ack/reject stream to client_codec. Successful apply
+# responses use MSG_CLIENT_RESPONSE with payload
+# `[partition_id:u16 LE][term:u64 LE][index:u64 LE]`; client_codec
+# strips the partition id before writing the external client response.
+
+# Per-entry committed stream consumed by downstream replicated apps
+# (loam, lattice, example_consumer, ...). Envelope:
+# MSG_COMMITTED_ENTRY `[term:u64][index:u64][body...]`. Strict
+# commit-index order, fail-open on backpressure (consumer recovers
+# via snapshot install). See docs/architecture/consumer_facade.md.
+[[ports]]
+name = "committed_entries"
+direction = "output"
+content_type = "OctetStream"
+
+# Strict-ReadIndex probe request to raft_engine.read_probe_request.
+# Payload: `[correlation_id:u64 LE]`. Optional — when unwired the
+# read path falls back to using the submission-time commit horizon.
+# See RFC §1.3 of the phase-3 plan.
+[[ports]]
+name = "read_probe_request"
+direction = "output"
+content_type = "OctetStream"
+
+# Admin entries replicated through Raft (RFC §3.1). Fired when the
+# body of a committed entry starts with `ADMIN_MARKER`. Payload:
+# `[command_id:u32 LE][op_code:u8][op_body...]`. Wired to
+# raft_engine.admin_committed_in so the engine can apply the op
+# at commit time on every replica.
+[[ports]]
+name = "admin_committed"
+direction = "output"
+content_type = "OctetStream"

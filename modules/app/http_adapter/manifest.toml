@@ -1,0 +1,53 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# http_adapter — bridges Fluxor's foundation/http to clustor's diagnostic
+# surfaces (RFC §4.4). The adapter:
+#
+#   - Caches the latest readyz, why and metrics envelopes from
+#     `telemetry_agg`.
+#   - Receives `MSG_HTTP_REQUEST` frames from a downstream HTTP server
+#     module (Fluxor `foundation/http` or equivalent) on `request_in`.
+#   - Emits `MSG_HTTP_RESPONSE` frames on `response_out` for the
+#     `/readyz`, `/why`, `/metrics` paths. Unknown paths get a 404.
+#
+# Optional in single-node configs: leave `request_in` unwired and the
+# adapter still keeps the latest envelopes cached so a graph wired
+# later can pick them up.
+
+[[ports]]
+name = "readyz"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "why"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "request"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "response"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metric_sample"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_request"
+direction = "output"
+content_type = "OctetStream"

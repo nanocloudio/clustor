@@ -1,0 +1,24 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "credit_supply"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admitted"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "rejected"
+direction = "output"
+content_type = "OctetStream"

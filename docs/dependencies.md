@@ -1,25 +1,36 @@
-# Dependency Overview
+# Dependency Inventory
 
-Arguments for each direct dependency and the default feature stance. All crates are listed exactly as pinned in `Cargo.toml`.
+Clustor's `[dependencies]` table is empty. Every cryptographic
+primitive, codec, transport, and runtime piece the substrate needs is
+part of the fluxor SDK or implemented in `modules/sdk/`. The
+substrate has no `cargo install`-able dependency footprint at runtime;
+shipping a module just means packing its `.fmod` and dropping it into
+the graph.
 
-| Crate | Why it's needed | Feature stance |
-| --- | --- | --- |
-| `serde`, `serde_json` | Serialization glue for durability logs, management HTTP payloads, and audit artifacts. Only the `derive` feature on `serde` is enabled; no other defaults are pulled in. | Keep minimal `derive` feature. |
-| `thiserror` | Derive-based error ergonomics throughout the codebase (see `src/util/error.rs`). No local patches or vendored copies. | Upstream crate directly from crates.io. |
-| `rand`, `rand_chacha` | Generating entropy for tokens, key material, and fuzz-friendly tests. Uses explicit RNGs to avoid pulling in `getrandom` twice. | Default features only. |
-| `crc32fast`, `sha2`, `aes-gcm`, `hmac`, `hex`, `zeroize` | Storage integrity, crypto helpers for snapshot manifests, and key management. All crates run in `std` mode with the smallest surface that satisfies persistence requirements. | `sha2` is built without default features; `zeroize` only uses the core crate. |
-| `ed25519-dalek` | Signing snapshot manifests and verifying capabilities. Uses the `std` feature for deterministic builds. | `default-features = false` with a targeted feature list. |
-| `memmap2` | Efficient WAL access without copying entire segments into memory. | Default configuration. |
-| `httparse` | Minimal HTTP parser for the in-tree admin/readyz servers. | Optional under the `net` feature. |
-| `log` | Sole logging facade used everywhere (`docs/architecture.md` details the policy). | Default configuration. |
-| `rustls`, `rustls-pemfile`, `tokio-rustls` | TLS termination for admin/readyz/raft transports. `rustls` runs with `default-features = false` and the minimal TLS12 surface; async servers go through `tokio-rustls`. | Controlled via the `net` / `async-net` feature flags. |
-| `url`, `x509-parser` | Admin client parsing and SPIFFE certificate verification. Both are optional and only compiled when networking is enabled. | Optional (`net`). |
-| `tokio` | Unified async runtime for every async feature (see `tools/check_async_runtime.sh`). Only the features that the transports need (`rt`, `rt-multi-thread`, `time`, `macros`, `sync`, `net`, `io-util`) are enabled. | Behind the `async-net` feature. |
-| `parking_lot` | Faster mutexes for telemetry/state caches where poisoning semantics make sense. | Default configuration. |
-| `tempfile`, `rcgen` | Dev/test-only helpers for TLS fixtures and temporary on-disk datasets. | Under `[dev-dependencies]` only. |
+That leaves only the host-side build and test surface to account for.
 
-Every additional dependency must be accompanied by an entry in this file explaining why it is needed and how its features are constrained. This keeps Task 14’s “dependency minimisation” bar enforceable.
+## `[dev-dependencies]`
 
-## Auditing
+| Crate       | Why it's needed                                                                  | Feature stance |
+|-------------|----------------------------------------------------------------------------------|----------------|
+| `tempfile`  | Per-test scratch directories for the cluster / facade / sandbox suites under `target/test-sandboxes/`. | Default; `[dev-dependencies]` only. |
+| `criterion` | Microbenches against `replica_facade.rs` (`wire_codec`, `inflight_table`, `committed_subscriber`).    | `default-features = false`, plus `plotters` + `cargo_bench_support` for `cargo bench` output. |
+| `libc`      | `tests/support/cluster.rs` uses `libc::setpgid` via `Command::pre_exec` to put spawned `fluxor` children into their own process group so `kill -TERM -<pgid>` reaps the whole subtree. Without it, a crashed test orphans `fluxor-linux` onto init and the listen port stays bound for the next run. | Default; `[dev-dependencies]` only. |
 
-Run `tools/audit.sh` to dump the current dependency tree (both normal and feature-expanded) and, when available, run `cargo audit` for vulnerability checks. The script deliberately avoids adding runtime dependencies; install `cargo-audit` locally if you want the extra check.
+Adding any of these to runtime `[dependencies]` would land them in
+the `clustor` cargo package's compiled artefact (currently just the
+empty `lib_stub.rs`), not in any module ELF. The substrate's runtime
+footprint is unchanged.
+
+## Submodule: `deps/fluxor`
+
+Clustor pins the `fluxor` source tree as a submodule (in practice a
+local symlink during development; a real git submodule in CI). The
+pinned ABI lives in `fluxor.toml::[required].fluxor.abi`; `fluxor ci`'s
+version-skew phase fails if the installed CLI's ABI doesn't match.
+
+## Verifying
+
+There is no `cargo audit` step today — the empty dependency tree
+makes the standard audit a no-op. If runtime dependencies ever land,
+`fluxor ci` is the place to add a `cargo audit` phase.

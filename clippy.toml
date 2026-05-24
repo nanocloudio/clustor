@@ -1,4 +1,5 @@
-# Enforce a few additional lint behaviors without enabling every pedantic lint.
-warn-on-all-wildcard-imports = true
-allow-dbg-in-tests = false
-allow-print-in-tests = false
+disallowed-macros = [
+    { path = "std::println",  reason = "use the project's logger" },
+    { path = "std::eprintln", reason = "use the project's logger" },
+    { path = "std::dbg",      reason = "remove before commit" },
+]

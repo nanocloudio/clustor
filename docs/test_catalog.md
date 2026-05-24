@@ -1,37 +1,73 @@
 # Test Catalog
 
-This catalog tracks where the current regression coverage lives and which areas still rely on
-private-module unit tests.
+Where regression coverage lives today, what each surface asserts, and
+which prerequisites it depends on.
 
-## Unit Tests (`#[cfg(test)]`)
+## Host-side integration tests (`tests/*.rs`)
 
-| Module | Focus | Decision |
-| --- | --- | --- |
-| `src/snapshot/` (`mod.rs`, `manifest.rs`, `pipeline.rs`, `throttle.rs`, `telemetry.rs`) | Manifest building, chunk encryption, trigger cadence logic | These tests exercise internal helpers that are not exported publicly (e.g., canonicalization). Keeping them beside the implementation avoids making helper APIs `pub`. |
-| `src/security/` (cert lifecycle, RBAC cache, break-glass helpers) | mTLS rotation, key epoch tracking, RBAC cache, break-glass controls | The tests interact with private structs and `IncidentCorrelator`; moving them would require widening the API surface, so they remain in-place. |
-| `src/cp.rs` | Cache policy transitions, snapshot import guard, circuit breaker | These tests rely on direct `CpProofCoordinator` mutations that are not exposed publicly; they stay local. |
-| `src/readyz.rs` / `src/why.rs` | Presentation helpers that compose snapshot telemetry | Kept local because they validate private digest formatting and enum wiring. |
-| `src/transport/raft.rs` | Frame validation + negotiation bookkeeping | Depends on private violation hooks, so covered in-module. |
+These compile against the cargo host toolchain and run as part of
+`cargo test --workspace`.
 
-## Integration Tests (`tests/`)
+| File | Scope | Skip behaviour |
+|---|---|---|
+| `tests/facade.rs` | Encode/decode and bookkeeping for `modules/sdk/replica_facade.rs` — `build_tagged_proposal`, `InflightTable`, `CommittedSubscriber`, `SnapshotInstaller` / `SnapshotExporter`, `MembershipView`, `ReadGateInputs`. The full facade contract documented at `docs/architecture/consumer_facade.md`. | Never skips. |
+| `tests/facade_stress.rs` | Facade data structures under thread stress (correlation table + committed subscriber under heavy concurrent push/drain). | Never skips. |
+| `tests/sandbox.rs` | Self-test for the `TestSandbox` helper (`tests/support/sandbox.rs`): per-test scratch dir creation, cleanup on drop, and the `CLUSTOR_KEEP_TEST_SANDBOXES=1` override. | Never skips. |
+| `tests/config_validate.rs` | Renders every `configs/*.yaml` using the defaults in `fluxor.toml::[ci.templates].vars`, prepends `module_search_paths: [modules/app]`, and runs `fluxor validate --target linux` against the rendered config. Catches dangling-edge drift like the previous `replicator.cross_durability_ack` reference in `single-minimal.yaml` with no `replicator` module declared. | Skips with a note if `fluxor` is not on `PATH`. |
+| `tests/http_admin.rs` | Pure-logic coverage for the HTTP admin mapping shared between `http_adapter` and host tests (`modules/sdk/http_admin.rs`): path → op-code mapping, body-size cap, and a drift assertion against the canonical wire ABI bytes. | Never skips. |
 
-| File | Coverage |
-| --- | --- |
-| `tests/admin_checkpoint.rs` | Admin workflows, CP guard, throttle behaviour |
-| `tests/apply_checkpoint.rs`, `tests/flow_checkpoint.rs`, `tests/flow_checkpoint.rs` | Apply path, flow-control regression fixtures |
-| `tests/raft_checkpoint.rs`, `tests/cp_checkpoint.rs`, `tests/quorum_checkpoint.rs` | Consensus kernel invariants |
-| `tests/snapshot_checkpoint.rs`, `tests/snapshot_read_checkpoint.rs` | Snapshot delta policies and read RPCs |
-| `tests/security_checkpoint.rs` | mTLS + RBAC stories with synthetic manifests |
-| `tests/storage_checkpoint.rs`, `tests/storage_segment_header_forward.rs` | WAL header/crypto compatibility |
-| `tests/telemetry_checkpoint.rs`, `tests/spec_*` | Spec/telemetry conformance |
-| `tests/net_raft_integration.rs` | End-to-end TLS Raft server/client round-trips |
-| `tests/admin_http_integration.rs` | Admin HTTP server wiring over mutual TLS |
-| `tests/snapshot_flow.rs` | Snapshot export/import/authorization flow over a temp layout |
+## Cluster harness tests (`tests/cluster.rs`, `tests/chaos.rs`, `tests/partition.rs`)
 
-## Large-Test Placement Decisions
+These spawn real `fluxor-linux` processes via the harness at
+`tests/support/cluster.rs`. They have hard prerequisites and **runtime-skip** when
+prereqs are missing — a green `cargo test cluster` without those
+prereqs means the tests skipped, not that they exercised the
+multi-node path.
 
-- Snapshot authorizer/exporter tests remain inline because they lean on private chunk builders.
-- Security/RBAC/break-glass flows stay inline; externalizing them would require exposing
-  additional methods on `RbacManifestCache`.
-- With the new integration suites, networking (Raft + Admin HTTP) and snapshot file-system flows
-  now have black-box coverage and no longer rely solely on unit tests.
+Required prerequisites:
+
+- `fluxor` on `PATH` (defaults to `/usr/bin/fluxor`).
+- `fluxor-linux` at `deps/fluxor/target/aarch64-unknown-linux-gnu/release/fluxor-linux`.
+- Built clustor `.fmod` artefacts at `target/fluxor/<silicon>/modules/` (or the legacy `deps/fluxor/target/<silicon>/modules/` with a one-shot deprecation warning).
+
+To make a missing prereq a hard failure instead of a skip, set
+`CLUSTOR_REQUIRE_E2E=1`. CI surfaces that claim to gate on
+multi-node behaviour should set this.
+
+| File | Scope |
+|---|---|
+| `tests/cluster.rs` | End-to-end smoke and Raft correctness over 1- / 2- / 3-replica topologies: bring-up + tear-down hygiene, basic AppendEntries flow, propose-and-commit, leader-change cancellation, HTTP diagnostics (`/readyz`, `/why`, `/metrics`) and the admin POST path. |
+| `tests/chaos.rs` | Fault-injection on top of the cluster harness — `kill -STOP / -CONT` on individual nodes, asserts liveness recovery and apply-pipeline reconvergence. |
+| `tests/partition.rs` | 2-node × 2-partition (`multi-2node-2p*.yaml`) coverage. Asserts each partition maintains independent leadership and that durability ledgers don't cross-pollinate. |
+
+The full punch list of scenarios still gated on substrate or tooling
+work (POST `/propose`, joint-consensus admin ops, network-fault
+injection) lives at `.context/test_scenarios_pending.md`.
+
+## Inline module tests
+
+The fluxor hygiene scanner blocks `#[cfg(test)] mod tests` and
+`#[test]` under `modules/**` and `src/**` per
+`standards/tests.md`. The one structured exemption is
+`modules/sdk/replica_facade.rs`, which is dual-targeted (no_std
+module ELF + host `cargo test` via `#[path]`) and carries its
+exemption row in `fluxor.toml::[[ci.hygiene.exemption]]`.
+
+Everything else that wants test coverage either:
+
+- Lives as an integration test under `tests/` (see above), or
+- Has its pure-logic surface extracted to `modules/sdk/` so the
+  same `#[path]` mechanism works for both the no_std module and the
+  host test crate. `modules/sdk/http_admin.rs` is the canonical
+  example.
+
+## Benches (`benches/*.rs`)
+
+| Bench | Asserts |
+|---|---|
+| `benches/wire_codec.rs` | `MSG_TAGGED_PROPOSAL` encode and `MSG_PROPOSAL_ASSIGNED` decode microbench. |
+| `benches/inflight_table.rs` | Full register → assign → commit → take_committed lifecycle in `InflightTable`. |
+| `benches/committed_subscriber.rs` | Strict-order ingest path for batched `MSG_COMMITTED_BATCH` envelopes. |
+
+Each uses Criterion with `harness = false`. Run with `cargo bench`
+or `cargo bench --bench <name> -- --quick`.

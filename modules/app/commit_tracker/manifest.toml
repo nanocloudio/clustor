@@ -1,0 +1,44 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "match"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "durable"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cp_state"
+direction = "input"
+content_type = "OctetStream"
+
+# Voter-set updates from raft_engine.voter_set (RFC §1.2). Carries
+# `MSG_VOTER_SET_UPDATE` `[current:u8][joint:u8][joint_active:u8]`
+# every time membership changes. While the joint set is active, the
+# commit index advances only when an entry is replicated to a
+# majority of BOTH the current and joint voter sets.
+#
+# STATUS: this input is wired and the joint-aware quorum logic is
+# implemented, but none of the shipped configs route
+# `raft_engine.voter_set → commit_tracker.voter_set` today (admin
+# `ADD/REMOVE_VOTER` is `ADMIN_STATUS_UNSUPPORTED`, so no joint
+# transitions can fire). When membership changes land, every config
+# that runs joint consensus must also add this edge plus the matching
+# wiring into `durability_ledger` (which needs to grow its own
+# `voter_set` input first). See manifest comment on
+# `raft_engine.voter_set`.
+[[ports]]
+name = "voter_set"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "committed"
+direction = "output"
+content_type = "OctetStream"

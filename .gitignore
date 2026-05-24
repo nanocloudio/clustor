@@ -1,4 +1,20 @@
-.vscode
-Cargo.lock
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+
+# AI
+.claude/
 .context/
-target
+.codex
+
+# Build/test
+Cargo.lock
+/target/
+/tests/
+/benches/

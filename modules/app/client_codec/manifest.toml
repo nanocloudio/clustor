@@ -1,0 +1,58 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "raw"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "responses"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "placement"
+direction = "input"
+content_type = "OctetStream"
+
+# Per-proposal correlation feedback from raft_engine.proposal_assigned.
+# Carries `[correlation_id:u64][partition_id:u16][wal_index:u64]` so the
+# codec can join the correlation_id it stamped onto an outgoing proposal
+# with the wal_index that apply_pipeline will respond against (RFC §5.8).
+[[ports]]
+name = "proposal_assigned"
+direction = "input"
+content_type = "OctetStream"
+
+# Leader-state hint from raft_engine. Used to short-circuit proposals
+# arriving on a follower with `CLIENT_REJECT_NOT_LEADER` (leader_id is
+# stamped into the reject envelope's reserved byte). Optional — leaving
+# this unwired keeps the legacy behaviour (codec forwards every proposal).
+[[ports]]
+name = "leader_state"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "parsed"
+direction = "output"
+content_type = "OctetStream"
+
+# Framed responses heading back to client_surface (and from there back to
+# peer_router → the client). Carries both successful apply responses
+# (MSG_CLIENT_RESPONSE) and structured rejections (MSG_CLIENT_REJECT).
+[[ports]]
+name = "responses_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Tagged read submissions sent directly to apply_pipeline (bypassing
+# throttle_gate — reads don't consume credit). Payload shape:
+# `[correlation_id:u64 LE][body...]`. See RFC §4.3.
+[[ports]]
+name = "reads"
+direction = "output"
+content_type = "OctetStream"

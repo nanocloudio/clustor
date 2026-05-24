@@ -1,0 +1,53 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "entries"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "key_update"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "entry_request"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "compact_before"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "flushed"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "compaction_signal"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "entry_reply"
+direction = "output"
+content_type = "OctetStream"
+
+# Multi-Raft graphs instantiate one `wal` per partition; each writes
+# to a disjoint subtree (`wal/p<id>/`). `write` (not `exclusive`)
+# lets multiple instances coexist on the same FS contract; the
+# manifest-gate (required_caps bitmap) is what actually grants
+# access at runtime.
+[[resources]]
+requires_contract = "fs"
+access = "write"

@@ -1,0 +1,16 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "routing"
+direction = "output"
+content_type = "OctetStream"
+
+# Quantum enhancement: epoch-change events for session fencing.
+# Optional — Clustor-only graphs leave unwired.
+[[ports]]
+name = "epoch_events"
+direction = "output"
+content_type = "OctetStream"

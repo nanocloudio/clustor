@@ -1,0 +1,35 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "applied"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "raft_commands"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "responses"
+direction = "output"
+content_type = "OctetStream"
+
+# Replicable admin commands routed through the Raft proposal path
+# (RFC §3.1). Body shape is
+# `[ADMIN_MARKER:u8=0xAD][command_id:u32 LE][op_code:u8][op_body]`.
+# Wired to raft_engine.proposals (or .proposals_tagged for the tagged
+# path) on the leader. Optional — leave unwired in graphs that only
+# accept the local-only admin ops.
+[[ports]]
+name = "raft_proposal"
+direction = "output"
+content_type = "OctetStream"

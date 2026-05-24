@@ -1,0 +1,277 @@
+# Clustor — 2-replica 2-partition snapshot test cluster (template).
+#
+# This file is a TEMPLATE: substitute `__SELF_ID__` and
+# `__LISTEN_PORT__` per node before `fluxor run`. Render with:
+#
+#   fluxor up configs/multi-2node-2p-snap.yaml --replicas 2  # spawn both
+#   fluxor render-template configs/multi-2node-2p-snap.yaml \
+#       --var SELF_ID=0 --var LISTEN_PORT=9090 \
+#       --var PEER0_PORT=9090 --var PEER1_PORT=9091 \
+#       --var HTTP_PORT=19090 > /tmp/n0.yaml                  # one node
+#
+# Like `multi-2node-2p.yaml` but adds a per-partition
+# `snapshot_engine` and lowers `wal.segment_bytes` so a small handful
+# of proposals fills a segment, closes it, and emits
+# `MSG_SNAPSHOT_TRIGGER` to its sibling snapshot_engine — which then
+# persists a manifest at the partition path.
+#
+#   partition 0 → wal/seg_*.bin and wal/snap_*.bin
+#   partition 1 → wal/p0001/seg_*.bin and wal/p0001/snap_*.bin
+#
+# Snapshots are not yet wired to log compaction or follower
+# InstallSnapshot — the manifest file is durable proof that the
+# trigger fired and the partition reached the recorded term/index.
+
+target: linux
+tick_us: 1000
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+
+modules:
+  - name: peer_router
+    params:
+      self_id: __SELF_ID__
+      peer_count: 2
+      listen_port: __LISTEN_PORT__
+      peer0_port: __PEER0_PORT__
+      peer1_port: __PEER1_PORT__
+
+  - name: client_codec
+    params:
+      self_id: __SELF_ID__
+  - name: throttle_gate
+  - name: partition_router
+    params:
+      num_partitions: 2
+
+  # ── Partition 0 ───────────────────────────────────────────
+  - name: raft_engine_p0
+    type: raft_engine
+    params:
+      self_id: __SELF_ID__
+      voter_count: 2
+      heartbeat_interval_ms: 150
+      partition_id: 0
+
+  - name: replicator_p0
+    type: replicator
+    params:
+      self_id: __SELF_ID__
+      peer_count: 2
+      partition_id: 0
+
+  - name: wal_p0
+    type: wal
+    params:
+      partition_id: 0
+      segment_bytes: 4096   # tiny segments → easy snapshot triggers
+  - name: durability_ledger_p0
+    type: durability_ledger
+    params:
+      self_id: __SELF_ID__
+      voter_count: 2
+      partition_id: 0
+  - name: commit_tracker_p0
+    type: commit_tracker
+    params:
+      self_id: __SELF_ID__
+      voter_count: 2
+  - name: apply_pipeline_p0
+    type: apply_pipeline
+    params:
+      partition_id: 0
+  - name: snapshot_engine_p0
+    type: snapshot_engine
+    params:
+      partition_id: 0
+
+  # ── Partition 1 ───────────────────────────────────────────
+  - name: raft_engine_p1
+    type: raft_engine
+    params:
+      self_id: __SELF_ID__
+      voter_count: 2
+      heartbeat_interval_ms: 150
+      partition_id: 1
+
+  - name: replicator_p1
+    type: replicator
+    params:
+      self_id: __SELF_ID__
+      peer_count: 2
+      partition_id: 1
+
+  - name: wal_p1
+    type: wal
+    params:
+      partition_id: 1
+      segment_bytes: 4096
+  - name: durability_ledger_p1
+    type: durability_ledger
+    params:
+      self_id: __SELF_ID__
+      voter_count: 2
+      partition_id: 1
+  - name: commit_tracker_p1
+    type: commit_tracker
+    params:
+      self_id: __SELF_ID__
+      voter_count: 2
+  - name: apply_pipeline_p1
+    type: apply_pipeline
+    params:
+      partition_id: 1
+  - name: snapshot_engine_p1
+    type: snapshot_engine
+    params:
+      partition_id: 1
+
+  # ── Shared substrate ──────────────────────────────────────
+  - name: cp_bridge
+  - name: cp_proof_cache
+  - name: flow_controller
+  - name: telemetry_agg
+  - name: client_surface
+
+wiring:
+  - from: linux_net.net_out
+    to: peer_router.net_in
+  - from: peer_router.net_out
+    to: linux_net.net_in
+
+  - from: peer_router.peer_rx
+    to: replicator_p0.ack
+  - from: peer_router.peer_rx
+    to: replicator_p1.ack
+  - from: peer_router.raft_rpc
+    to: raft_engine_p0.rpc
+  - from: peer_router.raft_rpc
+    to: raft_engine_p1.rpc
+
+  - from: raft_engine_p0.rpc_out
+    to: peer_router.peer_tx
+  - from: raft_engine_p1.rpc_out
+    to: peer_router.peer_tx
+  - from: replicator_p0.net_out
+    to: peer_router.repl_tx
+  - from: replicator_p1.net_out
+    to: peer_router.repl_tx
+
+  - from: peer_router.cleartext
+    to: client_surface.requests
+  - from: client_surface.responses
+    to: peer_router.client_resp
+
+  - from: client_surface.client_req
+    to: client_codec.raw
+  - from: client_codec.parsed
+    to: throttle_gate.requests
+  - from: throttle_gate.rejected
+    to: client_codec.responses
+  - from: throttle_gate.admitted
+    to: partition_router.proposals_tagged
+  - from: partition_router.proposals_tagged_p0
+    to: raft_engine_p0.proposals_partitioned_tagged
+  - from: partition_router.proposals_tagged_p1
+    to: raft_engine_p1.proposals_partitioned_tagged
+  - from: raft_engine_p0.proposal_assigned
+    to: client_codec.proposal_assigned
+  - from: raft_engine_p1.proposal_assigned
+    to: client_codec.proposal_assigned
+  - from: client_codec.responses_out
+    to: client_surface.client_responses
+
+  # Per-partition pipelines (with snapshot trigger wiring).
+  - from: raft_engine_p0.append_entries
+    to: replicator_p0.entries
+  - from: replicator_p0.match_indices
+    to: commit_tracker_p0.match
+  - from: replicator_p0.lag_signal
+    to: flow_controller.lag
+  - from: raft_engine_p0.log_append
+    to: wal_p0.entries
+  - from: wal_p0.flushed
+    to: durability_ledger_p0.ack
+  - from: wal_p0.flushed
+    to: raft_engine_p0.wal_flushed
+  - from: replicator_p0.cross_durability_ack
+    to: durability_ledger_p0.ack
+  - from: wal_p0.compaction_signal
+    to: snapshot_engine_p0.trigger
+  - from: snapshot_engine_p0.installed_local
+    to: raft_engine_p0.snapshot_installed
+  - from: durability_ledger_p0.quorum_durable
+    to: commit_tracker_p0.durable
+  - from: commit_tracker_p0.committed
+    to: apply_pipeline_p0.entries
+  - from: commit_tracker_p0.committed
+    to: raft_engine_p0.commit
+  - from: raft_engine_p0.commit_advanced
+    to: apply_pipeline_p0.entries
+  - from: raft_engine_p0.log_observe
+    to: apply_pipeline_p0.log_entries
+  - from: apply_pipeline_p0.applied
+    to: client_codec.responses
+
+  - from: raft_engine_p1.append_entries
+    to: replicator_p1.entries
+  - from: replicator_p1.match_indices
+    to: commit_tracker_p1.match
+  - from: replicator_p1.lag_signal
+    to: flow_controller.lag
+  - from: raft_engine_p1.log_append
+    to: wal_p1.entries
+  - from: wal_p1.flushed
+    to: durability_ledger_p1.ack
+  - from: wal_p1.flushed
+    to: raft_engine_p1.wal_flushed
+  - from: replicator_p1.cross_durability_ack
+    to: durability_ledger_p1.ack
+  - from: wal_p1.compaction_signal
+    to: snapshot_engine_p1.trigger
+  - from: snapshot_engine_p1.installed_local
+    to: raft_engine_p1.snapshot_installed
+  - from: durability_ledger_p1.quorum_durable
+    to: commit_tracker_p1.durable
+  - from: commit_tracker_p1.committed
+    to: apply_pipeline_p1.entries
+  - from: commit_tracker_p1.committed
+    to: raft_engine_p1.commit
+  - from: raft_engine_p1.commit_advanced
+    to: apply_pipeline_p1.entries
+  - from: raft_engine_p1.log_observe
+    to: apply_pipeline_p1.log_entries
+  - from: apply_pipeline_p1.applied
+    to: client_codec.responses
+
+  - from: cp_bridge.proof
+    to: cp_proof_cache.proof
+  - from: cp_proof_cache.cache_state
+    to: commit_tracker_p0.cp_state
+  - from: cp_proof_cache.cache_state
+    to: commit_tracker_p1.cp_state
+  - from: cp_proof_cache.strict_fallback
+    to: raft_engine_p0.fallback_signal
+  - from: cp_proof_cache.strict_fallback
+    to: raft_engine_p1.fallback_signal
+
+  - from: raft_engine_p0.metrics
+    to: telemetry_agg.ingest
+  - from: raft_engine_p1.metrics
+    to: telemetry_agg.ingest
+  - from: wal_p0.metrics
+    to: telemetry_agg.ingest
+  - from: wal_p1.metrics
+    to: telemetry_agg.ingest
+  - from: replicator_p0.metrics
+    to: telemetry_agg.ingest
+  - from: replicator_p1.metrics
+    to: telemetry_agg.ingest
+  - from: telemetry_agg.readyz
+    to: client_surface.readyz_data
+  - from: telemetry_agg.export
+    to: client_surface.metrics_data

@@ -1,0 +1,34 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "request"
+direction = "input"
+content_type = "OctetStream"
+
+# Per-connection TLS-verified identity from peer_router (or directly
+# from foundation/tls when wired). Carries MSG_PEER_IDENTITY; the
+# `svid` body is matched against `admin_svid_prefix` and
+# `observer_svid_prefix` params to derive the role applied to
+# subsequent admin commands on that conn_id. See RFC §3.2.
+[[ports]]
+name = "identity"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "authorized"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "denied"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "audit_events"
+direction = "output"
+content_type = "OctetStream"

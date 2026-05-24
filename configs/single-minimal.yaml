@@ -1,0 +1,90 @@
+# Clustor: Minimal Linux test — just the commit pipeline + network
+target: linux
+tick_us: 1000
+
+platform:
+  net: {}
+
+modules:
+  - name: peer_router
+  - name: client_surface
+  - name: client_codec
+  - name: throttle_gate
+  - name: raft_engine
+  - name: wal
+  - name: durability_ledger
+  - name: commit_tracker
+  - name: apply_pipeline
+  # Downstream smoke consumer of the apply stream — exercises the
+  # `apply_pipeline.committed_entries → consumer.committed_entries` edge
+  # so validation covers the per-entry path end-to-end. Optional in
+  # production graphs; see modules/example_consumer/manifest.toml.
+  - name: example_consumer
+
+wiring:
+  # ── Network ──────────────────────────────────────────────
+  - from: linux_net.net_out
+    to: peer_router.net_in
+  - from: peer_router.net_out
+    to: linux_net.net_in
+  - from: peer_router.cleartext
+    to: client_surface.requests
+  - from: client_surface.responses
+    to: peer_router.client_resp
+
+  # ── Request routing ──────────────────────────────────────
+  - from: client_surface.client_req
+    to: client_codec.raw
+  - from: client_codec.parsed
+    to: throttle_gate.requests
+  - from: throttle_gate.admitted
+    to: raft_engine.proposals_tagged
+  # Correlation feedback so client_codec can map (correlation_id → wal_index)
+  # for response routing. See RFC §5.8.
+  - from: raft_engine.proposal_assigned
+    to: client_codec.proposal_assigned
+  - from: raft_engine.leader_state
+    to: client_codec.leader_state
+  # Throttled requests are surfaced as structured MSG_CLIENT_REJECT
+  # envelopes back through client_codec → client_surface → peer_router.
+  - from: throttle_gate.rejected
+    to: client_codec.responses
+
+  # ── Persistence ───────────────────────────────────────────
+  - from: raft_engine.log_append
+    to: wal.entries
+  - from: wal.flushed
+    to: durability_ledger.ack
+  # Spec §10.4.1: every replica feeds its own `local_wal_durable_index`
+  # into raft_engine so it can be stamped into outbound AE responses.
+  - from: wal.flushed
+    to: raft_engine.wal_flushed
+  # Single-replica graph: no `replicator` module, so no
+  # `cross_durability_ack` fan-in. `durability_ledger` reaches quorum
+  # the moment the local fsync completes. The multi-replica configs
+  # (configs/multi-*.yaml) carry the cross-node ack edge.
+  - from: durability_ledger.quorum_durable
+    to: commit_tracker.durable
+
+  # ── Commit → apply → response ────────────────────────────
+  - from: commit_tracker.committed
+    to: apply_pipeline.entries
+  - from: commit_tracker.committed
+    to: raft_engine.commit
+  - from: raft_engine.commit_advanced
+    to: apply_pipeline.entries
+  # Per-entry fan-out so apply_pipeline can join the commit horizon with
+  # the entry bodies and emit MSG_COMMITTED_ENTRY on `committed_entries`.
+  # Without this edge the per-entry stream stays silent.
+  - from: raft_engine.log_observe
+    to: apply_pipeline.log_entries
+  # Linearizable-read submissions (RFC §4.3): apply_pipeline
+  # holds reads until the ReadIndex point is reached.
+  - from: client_codec.reads
+    to: apply_pipeline.read
+  - from: apply_pipeline.committed_entries
+    to: example_consumer.committed_entries
+  - from: apply_pipeline.applied
+    to: client_codec.responses
+  - from: client_codec.responses_out
+    to: client_surface.client_responses

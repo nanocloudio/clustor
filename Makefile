@@ -1,55 +1,102 @@
-.PHONY: help fmt fmt-check clippy lint build build-release test bench feature-matrix verify ci clean
+# clustor Makefile — fluxor-based. See ~/Development/nanocloudio/standards/make.md.
 
-CARGO ?= cargo
-CLIPPY_ARGS ?= -D warnings
+.PHONY: help build test fmt fmt-check clippy lint ci verify \
+        modules modules-all modules-clean up up-cluster clean setup \
+        link-fluxor unlink-fluxor
+
+SHELL       := /bin/bash
+.SHELLFLAGS := -euo pipefail -c
+CARGO       ?= cargo
+FLUXOR      ?= fluxor
+TARGET      ?= bcm2712
+
+.DEFAULT_GOAL := build
 
 help:
 	@echo "clustor make targets"
-	@echo "  make build          # debug build for all targets"
-	@echo "  make build-release  # optimized build"
-	@echo "  make test           # run full test suite"
-	@echo "  make feature-matrix # run feature build/test combinations"
-	@echo "  make fmt/fmt-check  # rustfmt (check mode available)"
-	@echo "  make clippy|lint    # clippy with warnings-as-errors"
-	@echo "  make bench          # run cargo bench (configure BENCH_TARGET)"
-	@echo "  make verify         # run fmt-check + clippy + tests"
-	@echo "  make ci             # run formatting, tests, clippy, and policy checks"
-	@echo "  make clean          # remove target artifacts"
+	@echo "  make build          host build"
+	@echo "  make test           cargo test --workspace"
+	@echo "  make fmt|fmt-check  rustfmt"
+	@echo "  make clippy|lint    clippy + fmt-check"
+	@echo "  make modules        build PIC modules for TARGET=$(TARGET)"
+	@echo "  make modules-all    build modules for every target in fluxor.toml"
+	@echo "  make up             render+run a single replica (CONFIG=, NODE_ID=)"
+	@echo "  make up-cluster     spawn REPLICAS replicas (CONFIG=, REPLICAS=)"
+	@echo "  make ci             full CI gate (fluxor ci)"
+	@echo "  make clean          cargo clean + module artefacts"
+	@echo "  make setup          init submodules + install fluxor CLI onto PATH"
+	@echo "  make link-fluxor    swap deps/fluxor submodule for a symlink to FLUXOR_DEV_PATH (dev override)"
+	@echo "  make unlink-fluxor  restore deps/fluxor from the submodule pin"
 
-fmt:
-	$(CARGO) fmt --all
+setup:
+	git submodule update --init --recursive
+	cargo install --locked --path deps/fluxor/tools
 
-fmt-check:
-	$(CARGO) fmt --all -- --check
+# Dev override: replace the submodule checkout at deps/fluxor with a
+# symlink to a sibling working tree, so local fluxor edits flow into
+# clustor builds without a commit-and-bump round trip. The submodule
+# pin in the index doesn't move — `git status` shows the divergence
+# until `make unlink-fluxor` restores the submodule contents.
+#
+# `FLUXOR_DEV_PATH` is interpreted relative to the clustor repo root
+# (default `../fluxor`, i.e. a sibling checkout). The link itself is
+# stored relative to `deps/`, so the resolved target survives moving
+# the parent workspace, as long as the sibling layout is preserved.
+FLUXOR_DEV_PATH ?= ../fluxor
+link-fluxor:
+	@target_abs=$$(realpath -m $(FLUXOR_DEV_PATH)); \
+	if [ ! -d "$$target_abs" ]; then \
+		echo "FLUXOR_DEV_PATH=$$target_abs doesn't exist. Clone fluxor as a sibling or pass FLUXOR_DEV_PATH=<absolute-or-clustor-relative-path>."; \
+		exit 1; \
+	fi; \
+	if [ -L deps/fluxor ]; then \
+		echo "deps/fluxor is already a symlink ($$(readlink deps/fluxor) -> $$(readlink -f deps/fluxor)). Nothing to do."; \
+		exit 0; \
+	fi; \
+	rm -rf deps/fluxor; \
+	link_target=$$(case $(FLUXOR_DEV_PATH) in /*) echo $(FLUXOR_DEV_PATH);; *) echo ../$(FLUXOR_DEV_PATH);; esac); \
+	ln -s "$$link_target" deps/fluxor; \
+	echo "deps/fluxor -> $$link_target  (resolves to $$target_abs; submodule pin unchanged in index)"
 
-clippy:
-	$(CARGO) clippy --all-targets --all-features -- $(CLIPPY_ARGS)
+unlink-fluxor:
+	@if [ ! -L deps/fluxor ]; then \
+		echo "deps/fluxor is not a symlink; nothing to restore."; \
+		exit 0; \
+	fi; \
+	rm deps/fluxor; \
+	git submodule update --init deps/fluxor
+	@echo "deps/fluxor restored from submodule pin ($$(git -C deps/fluxor rev-parse --short HEAD))"
 
-lint: fmt-check clippy
+build:      ; $(CARGO) build --all-targets
+test:       ; $(CARGO) test --workspace
+fmt:        ; $(CARGO) fmt --all
+fmt-check:  ; $(CARGO) fmt --all -- --check
+clippy:     ; $(CARGO) clippy --all-targets --all-features -- -D warnings
+lint:       fmt-check clippy
 
-build:
-	$(CARGO) build --all-targets
+modules:
+	$(FLUXOR) modules build --target $(TARGET) --out target/fluxor
 
-build-release:
-	$(CARGO) build --all-targets --release
+modules-all:
+	$(FLUXOR) modules build --all --out target/fluxor
 
-test:
-	$(CARGO) test --all --all-features
+modules-clean:
+	$(FLUXOR) modules clean --out target/fluxor
 
-bench:
-	$(CARGO) bench --all
+CONFIG  ?= configs/single.yaml
+NODE_ID ?= 0
+up: modules
+	$(FLUXOR) run --template $(CONFIG) --node-id $(NODE_ID)
 
-feature-matrix:
-	$(CARGO) check --no-default-features
-	$(CARGO) test --no-default-features --features net
-	$(CARGO) test --no-default-features --features net,admin-http
-	$(CARGO) test --no-default-features --features net,snapshot-crypto
-	$(CARGO) test --all-features
-
-verify: fmt-check clippy test
+REPLICAS ?= 3
+up-cluster: modules
+	$(FLUXOR) up $(CONFIG) --replicas $(REPLICAS)
 
 ci:
-	sh tools/ci.sh
+	$(FLUXOR) ci
+
+verify: ci
 
 clean:
 	$(CARGO) clean
+	$(FLUXOR) modules clean --out target/fluxor

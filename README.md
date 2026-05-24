@@ -1,156 +1,192 @@
-# Clustor – Raft Replication Substrate
+# Clustor
 
-Clustor is a safety-first, Rust-based Raft substrate that ships as a reusable library crate plus sidecar utilities. It provides a normative, auditable replication kernel for products that need linearizable writes, crash-deterministic recovery, explainable throttling, and a hardened control plane. The specification in `docs/specification.md` defines every wire byte, durability invariant, and operational guardrail so that implementations stay provably correct.
+23 fluxor substrate modules plus `example_consumer`
+(24 buildable .fmods) implementing a Raft replication substrate.
+A drop-in consensus kernel for products like Quantum (MQTT broker)
+and Lattice (KV store): the modules ship as
+position-independent ELFs, run cooperatively on the fluxor
+runtime, and expose a typed consumer facade for replicated state
+machines.
 
----
+The architecture docs — every wire byte, durability invariant, and
+operational guardrail — live under
+[`docs/architecture/`](docs/architecture/), indexed by
+[`docs/overview.md`](docs/overview.md). The module-map and
+execution-domain rationale is at
+[`docs/architecture/modules.md`](docs/architecture/modules.md).
 
-## Why Clustor?
+## Setup
 
-- **Normative consensus core** – §0 of the spec defines the invariants (log matching, durability, linearizable reads) that every release must satisfy; spec-lint regenerates the machine-readable wire catalog and fails builds on drift.
-- **Deterministic durability** – WAL ordering, Group-Fsync guardrails, and a quorum durability ledger (`wal/durability.log`) keep acknowledged writes crash-proof and auditable.
-- **Explainable operations** – PID-based flow control, structured throttle envelopes, and Why*/CpUnavailable schemas make it easy to diagnose availability or credit issues.
-- **Snap-ready storage** – Signed, AEAD-protected snapshots with manifest authorization handshakes allow safe compaction and state transfer.
-- **Hardened control plane** – CP-Raft manages placements, durability proofs, key epochs, feature gates, and break-glass workflows with strict caches and telemetry.
+`deps/fluxor` is a git submodule, so clone with `--recurse-submodules`
+and then run `make setup`:
 
----
-
-## High-Level Architecture
-
-```mermaid
-graph TD
-    A[Clients / Product APIs] -->|Append / ReadIndex / Admin| B[Partition Leader]
-    B -->|Replicate entries| C{Followers / Learners}
-    B -->|DurabilityAck\nledger proofs| D[WAL & Durability Ledger]
-    C --> D
-    B -->|Telemetry / Flow state| E[Observers & Explain APIs]
-    B -->|Routing, keys, gates| F[CP-Raft Control Plane]
-    F -->|Placements / Proofs / Overrides| B
-    D -->|Snapshots & Scrub| G[Signed Snapshot Store]
+```sh
+git clone --recurse-submodules git@github.com:nanocloudio/clustor.git
+cd clustor
+make setup                # init submodules + install the fluxor CLI onto PATH
 ```
 
-- **Partition Leaders** accept writes, enforce `strict_fallback_state`, and serialize WAL → `fdatasync` → `wal/durability.log` ordering.
-- **Followers** mirror the same durability steps before replying with `DurabilityAck{last_fsynced_index,...}` so the leader can reconstruct quorum evidence.
-- **CP-Raft** distributes routing epochs, durability proofs, key epochs, and override ledgers; data-plane nodes fall back to Strict mode when caches go stale.
-- **Storage** combines segment MAC trailers, Merkle leaves (profile-controlled), AEAD encryption, and signed snapshots for repairable, explainable persistence.
+If you forgot `--recurse-submodules`, `make setup` will fix it
+(it runs `git submodule update --init --recursive` first).
 
----
+### Dev override against a sibling fluxor checkout
 
-## Repo Layout
+If you also have `nanocloudio/fluxor` checked out alongside clustor
+and want local fluxor edits to flow into clustor builds without a
+commit-and-bump round trip, swap the submodule checkout for a
+symlink to that sibling:
 
-- `src/` – library source (control_plane, replication, persistence, observability).
-- `tests/` – integration suites grouped by domain plus shared helpers in `tests/support/`.
-- `.context/` – backlog, audit snapshots, and design notes consumed by the Codex agents.
-- `docs/` – specification, architecture, and dependency references.
-- `tools/` – local gates (`ci.sh`, `forbid_src_tests.sh`, `inventory.sh`, `audit.sh`) that mirror CI behavior.
+```sh
+make link-fluxor          # deps/fluxor -> ../../fluxor (sibling)
+                          # submodule pin in the index is unchanged;
+                          # `git status` shows deps/fluxor as a typechange.
 
----
-
-## End-to-End Append Flow
-
-```mermaid
-sequenceDiagram
-    participant Client
-    participant Leader
-    participant Followers
-    participant WAL
-    participant Ledger
-    Client->>Leader: AppendRequest(idempotency_key)
-    Leader->>Followers: AppendEntries(batch)
-    Followers->>WAL: pwrite(data)
-    Followers->>WAL: fdatasync()
-    Followers->>Ledger: append DurabilityRecord
-    Followers->>Ledger: fdatasync()
-    Followers->>Leader: DurabilityAck(last_fsynced_index)
-    Leader->>WAL: pwrite + fdatasync (Strict or Group-Fsync batch)
-    Leader->>Ledger: append + fdatasync DurabilityRecord
-    Leader->>Leader: compute last_quorum_fsynced_index
-    Leader-->>Client: Ack(index) once §2.4 contract holds
+make unlink-fluxor        # restore deps/fluxor from the submodule pin
 ```
 
-This sequence highlights the §5.5 happens-before chain and ACK contract (§2.4): no acknowledgement leaves the leader until the WAL bytes, durability ledger, and quorum evidence are all durably recorded.
+Run `make unlink-fluxor` before committing if you want a clean
+`git status`. Override the sibling location with
+`FLUXOR_DEV_PATH=<path>` (relative to the clustor repo root or
+absolute). CI never touches the override — it always sees the
+submodule pin.
 
----
+### Bumping the fluxor pin
 
-## Key Capabilities
-
-- **Flow Control & Backpressure** – Dual-token buckets and PID loops per partition (with profile-specific gains) expose `WhyCreditZero` and throttle envelopes (<32 KiB JSON).
-- **Snapshots & State Transfer** – Canonical manifests (RFC 8785 JSON + Ed25519 signatures), AEAD-authenticated chunk streams, bounded import buffers, and manifest authorization logs prevent TOCTOU errors.
-- **Security & Isolation** – mTLS/SPIFFE for every RPC, AEAD-encrypted WAL/snapshots with nonce reservation accounting, and RBAC/Break-Glass workflows tied to CP-ledgered overrides.
-- **Telemetry & Spec Self-tests** – Golden signals (`clustor.*` metrics), incidents, and startup spec-self-tests that regenerate `wire_catalog.json`, `chunked_list_schema.json`, the wide-int catalog, and fixture bundles to catch drift.
-
----
-
-## Public API Surfaces
-
-The library crate re-exports the major surfaces described below so downstream users do not need to reach into internal modules.
-
-- **Snapshots (`snapshot-crypto`)** – `snapshot.rs` now fronts the manifest/pipeline/throttle/telemetry modules, re-exporting `SnapshotManifest*`, `SnapshotTrigger*`, `SnapshotChunk*`, `SnapshotExportController`, `SnapshotImport*` errors, and `SnapshotThrottle*` envelopes for state transfer and guardrails.
-- **Security & RBAC (`admin-http`)** – `security.rs` exposes `Certificate`, `SerialNumber`, `MtlsIdentityManager`, `KeyEpochWatcher`, plus RBAC/break-glass helpers (`RbacManifest*`, `BreakGlass*`, `SecurityError`) that remain feature-gated with Admin HTTP support.
-- **Admin Workflows (`admin-http`)** – `AdminService`, `AdminHandler`, and the structured request/response types (`SnapshotThrottleRequest`, `TransferLeaderRequest`, etc.) are exported so callers can wire the workflows without depending on private modules.
-- **Control-Plane Guarding** – `CpProofCoordinator`, `CpGuardError`, `ReadIndexPermit`, `CpUnavailableResponse`, and `StrictFallbackSnapshotImport*` records define the guard/circuit-breaker API that callers use to reason about CP connectivity and fallback states.
-- **Management HTTP (`management`)** – consolidated `/readyz`, `/why`, and `/admin` routing behind one mTLS listener; see `docs/management.md`.
-
----
-
-## Storage I/O Configuration
-
-Both the Raft log and the durability ledger are configurable so operators can pick the right encoding/IO pipeline for their environment:
-
-- `CLUSTOR_LOG_ENCODING` (default `json`) controls the **Raft log** segment encoding. `binary` enables the compact frame format persisted per segment; manifests track the chosen encoding so mixed-version clusters can reopen the same storage layout without manual migration.
-- `CLUSTOR_WAL_CODEC` (default `json`) controls the **durability ledger** (`wal/durability.log`). JSON is human-readable and backwards-compatible, while `binary` emits fixed-width frames (37 bytes each) that avoid parsing overhead on high-throughput quorum machines.
-- Both writers use the shared `SharedBufferedWriter` abstraction so `pwrite → flush → fdatasync` ordering remains deterministic regardless of encoding. Flush thresholds (`WAL_FLUSH_THRESHOLD`, `DURABILITY_LOG_FLUSH_THRESHOLD`) can be tuned at compile time if your platform needs different batching.
-
-If you flip either environment variable, make sure the nodes serving the same storage directories agree on the setting; otherwise they will reject the on-disk files during startup because the manifest/headers will not match the codec they expect.
-
----
-
-## Feature Flags
-
-The crate ships with **no default features enabled**. Enable only what you need:
-
-- `net` – pulls in the blocking HTTP parser/servers plus TLS (`rustls`). Required for CP transport, Raft networking, Readyz/Why servers, etc.
-- `admin-http` – builds the admin workflows, RBAC/break-glass helpers, and Admin HTTP server (requires `net` when you actually host the server).
-- `snapshot-crypto` – enables the full snapshot pipeline (AEAD chunking, manifest signing, fallback controllers, follower-only reads).
-- `async-net` – opt-in async shims (Tokio) layered on top of the blocking net stack.
-- `http-fuzz` – exposes the manual HTTP parser fuzz harness (implies `net`).
-- `full` – convenience umbrella for `net`, `admin-http`, `snapshot-crypto`, and `async-net`. Use `--features full` for the complete experience that CI exercises.
-
-Example builds:
-
-```bash
-# Minimal core (no net/admin/snapshot)
-cargo check --no-default-features
-
-# Full feature set
-cargo test --features full
-
-# Net + Readyz but no admin/snapshot
-cargo build --no-default-features --features net
-
-# CI feature matrix
-make feature-matrix
+```sh
+make unlink-fluxor
+cd deps/fluxor && git fetch && git checkout <new-sha>
+cd ../.. && git add deps/fluxor && git commit -m "Bump fluxor to <new-sha>"
+make link-fluxor          # back to dev workflow against the sibling
 ```
 
-`make feature-matrix` runs the combinations our CI cares about:
+## Quick start
 
-1. `cargo check --no-default-features`
-2. `cargo test --no-default-features --features net`
-3. `cargo test --no-default-features --features net,admin-http`
-4. `cargo test --no-default-features --features net,snapshot-crypto`
-5. `cargo test --all-features`
+```sh
+make modules              # build .fmod for bcm2712 (default target)
+make up                   # render+run configs/single.yaml
+make up CONFIG=configs/multi-3node.yaml NODE_ID=0  # node 0 of a 3-node cluster
+make test                 # host-side test suite (~20 s)
+make ci                   # full pipeline (fmt + test + clippy + modules)
+make help                 # everything else
+```
 
----
+The cluster harness needs `fluxor` on PATH (defaults to
+`/usr/bin/fluxor`) and `fluxor-linux` at
+`deps/fluxor/target/aarch64-unknown-linux-gnu/release/`. Missing
+prereqs cause `cluster.rs` / `chaos.rs` / `partition.rs` to
+**runtime-skip** with a one-line note rather than fail — so a green
+`cargo test` from a workstation without those prereqs proves only
+that the host-side tests (`facade.rs`, `facade_stress.rs`,
+`sandbox.rs`, `config_validate.rs`) and the unit suites passed, not
+that the cluster path was exercised. Set `CLUSTOR_REQUIRE_E2E=1`
+to make a missing prereq a hard test failure instead — the right
+default for any CI surface that claims to gate on multi-node
+behaviour.
 
-## Lint & Testing Policy
+## Repo layout
 
-- `make ci` runs `tools/ci.sh`, which enforces `cargo fmt --all -- --check`, `RUSTFLAGS=-Dwarnings cargo test --all-targets`, `cargo clippy --all-targets -- -D warnings`, the `tools/forbid_src_tests.sh` gate, and the async-runtime check (`tools/check_async_runtime.sh`) to ensure only Tokio APIs are used.
-- `clippy.toml` enables `warn-on-all-wildcard-imports` and disallows `dbg!` / `println!` in tests, keeping lint behavior reproducible across workstations.
-- Local `#[allow(...)]` attributes are reserved for unavoidable cases (`clippy::too_many_arguments` on builder APIs, deprecated crypto traits, etc.); new allowances should come with comments explaining the tradeoff.
+| Path           | Contents |
+|----------------|----------|
+| `modules/app/`    | 24 `no_std` PIC modules — 23 substrate modules (`raft_engine`, `wal`, …) plus `example_consumer`, the minimal downstream module that exercises the per-entry stream. `make modules` packs each `mod.rs` + `manifest.toml` into a `.fmod`. |
+| `modules/sdk/` | Shared types, wire constants, the consumer facade, and the HTTP admin mapping. Pulled into each app module via `#[path]` and into host tests via the same mechanism. |
+| `configs/`     | `fluxor run` graph templates. `single.yaml` (1 node), `multi-2node.yaml` (2 replicas), `multi-3node.yaml` (3 replicas, canonical Raft availability shape), `multi-2node-2p*.yaml` (partition-group experiments), `single-minimal.yaml` (commit-pipeline only). Each carries `__SELF_ID__` / `__LISTEN_PORT__` / `__PEER{0,1,2}_PORT__` placeholders that `fluxor render-template` (and the cluster harness) substitute per node. |
+| `tests/`       | Host-side integration tests: `facade.rs`, `facade_stress.rs`, `cluster.rs`, `chaos.rs`, `sandbox.rs`. The cluster harness at `tests/support/cluster.rs` spawns multi-node `fluxor-linux` processes. |
+| `benches/`     | Criterion microbenches against `replica_facade.rs`. |
+| `docs/`        | Stable reference: architecture (`docs/architecture/`), module map, subsystem deep-dives. |
+| `.context/`    | In-flight design work — RFCs, audits, plans, working notes. Not part of the stable reference surface. |
+| `fluxor.toml`  | Project config consumed by the `fluxor` CLI: CI targets, hygiene tier policy, structured exemptions, and the pinned fluxor SHA. See [`standards/`](../standards/). |
+| `Makefile`     | Thin alias layer over the `fluxor` CLI. `make help` lists every canonical target. |
 
----
+## Module map
 
-## Getting Started
+The 23 substrate modules (`example_consumer` is wired only into the
+minimal smoke graph) sit in four execution domains on a Pi 5 / CM5:
 
-1. **Read the Spec** – `docs/specification.md` is the single source of truth for invariants, wire formats, and operational guardrails.
-2. **Implement or Embed** – Use the Rust library crate plus sidecar utilities described in the spec; enforce the same `strict_fallback_state` and ledger ordering rules in your runtime.
-3. **Operate with Guardrails** – Follow the documented runbooks (e.g., CP outage behavior, disk hygiene, quarantine lifecycle) to keep durability proofs and telemetry aligned.
+| Domain     | Tick   | Modules                                                                                             |
+|------------|--------|------------------------------------------------------------------------------------------------------|
+| consensus  | poll   | `raft_engine`, `wal`, `durability_ledger`, `commit_tracker`                                          |
+| network    | poll   | `peer_router`, `replicator` (with platform `nic`/`ip`/`tls`)                                         |
+| apply      | 250 µs | `client_codec`, `throttle_gate`, `partition_router`, `flow_controller`, `read_gate`, `apply_pipeline`, `placement_router` |
+| ops        | 1 ms   | `client_surface`, `cp_bridge`, `cp_proof_cache`, `rbac`, `admin_handler`, `snapshot_engine`, `telemetry_agg`, `key_manager`, `http_ingress`, `http_adapter` |
+
+Cross-domain edges run over fluxor mailbox channels with SEV/WFE
+hardware wake (~200 ns on coherent L3). The full wiring graph is
+canonical in [`configs/single.yaml`](configs/single.yaml); see
+[`docs/architecture/modules.md`](docs/architecture/modules.md) for the rationale.
+
+## Consumer facade
+
+Replicated apps (Lattice, Loam, Quantum, …) integrate against the
+`no_std` helper at
+[`modules/sdk/replica_facade.rs`](modules/sdk/replica_facade.rs):
+
+```rust
+#[path = "../sdk/replica_facade.rs"]
+mod replica_facade;
+```
+
+It provides `build_tagged_proposal`, `InflightTable`,
+`CommittedSubscriber`, `SnapshotInstaller`/`SnapshotExporter`,
+`MembershipView`, and `ReadGateInputs`. The normative contract
+(`ReplicaGroup` trait, propose lifecycle, leader-change protocol,
+snapshot install layout, read-gate predicate) is
+[`docs/architecture/consumer_facade.md`](docs/architecture/consumer_facade.md).
+Host-side
+unit and integration coverage lives in
+[`tests/facade.rs`](tests/facade.rs); multi-node end-to-end is in
+[`tests/cluster.rs`](tests/cluster.rs).
+
+## Status
+
+| Surface              | State |
+|----------------------|-------|
+| `raft_engine`        | Leader election, AE, log matching, conflict-repair retry, joint consensus, leadership transfer — passing in `cluster.rs`. |
+| `wal` / `durability_ledger` | Per-partition WAL, fsync ack, quorum durability — passing. |
+| `apply_pipeline`     | Strict commit-order delivery, snapshot reset, per-entry fan-out — passing. |
+| `snapshot_engine`    | Manifest auth, chunked install/export, follower catch-up — passing. |
+| `read_gate` / `cp_proof_cache` | Fresh→Cached→Stale state machine, strict-fallback transitions — passing. |
+| `admin_handler`      | `FREEZE`, `THAW`, `TRANSFER_LEADER`, `DURABILITY_MODE`, `SNAPSHOT_TRIGGER` route through. `ADD/REMOVE_VOTER` returns `ADMIN_STATUS_UNSUPPORTED` — the `raft_engine` joint-consensus state machine (`CONFIG_CHANGE_OP_JOINT/_NEW`, voter-set overlay, auto-C_new on commit) exists and applies entries correctly, but `commit_tracker` and `durability_ledger` don't yet enforce *union* quorum during the joint phase. Accepting membership changes without that enforcement risks losing committed entries; the safe gate stays closed until learner + union-quorum lands (see [`docs/architecture/lifecycle.md#membership-changes-and-joint-consensus`](docs/architecture/lifecycle.md#membership-changes-and-joint-consensus)). |
+| `partition_router`   | FNV-1a partition routing, 2-partition smoke working ([configs/multi-2node-2p.yaml](configs/multi-2node-2p.yaml), exercised by [tests/partition.rs](tests/partition.rs)). N-partition + per-partition admin still in flight. |
+| `cp_bridge`          | HTTP fetcher polls a host control plane; production CP integration is the next milestone. |
+| Telemetry            | `GET /readyz` / `/why` / `/metrics` reachable on each node's `listen_port + 10000` HTTP socket via `http_ingress` + `http_adapter`; histograms and incidents in place; full Prometheus pull is pending. |
+
+## Performance
+
+Criterion microbenches on a Pi 5 / Pi-class ARM64:
+
+| Bench                                   | Time      | Throughput                  |
+|-----------------------------------------|-----------|-----------------------------|
+| `wire_codec` / `committed_entry/1024`   | 2.6 ns    | 372 GiB/s                   |
+| `wire_codec` / `proposal_assigned`      | 4.3 ns    | —                           |
+| `committed_subscriber/ingest/1024`      | 153 ns    | 6.3 GiB/s                   |
+| `inflight_table/full_lifecycle/32`      | 41 ns     | —                           |
+
+End-to-end cluster smoke (18 multi-node tests, default
+`cargo test`) finishes in ~21 s on a Pi 5.
+
+## Development conventions
+
+| Topic                          | Convention |
+|--------------------------------|-----------|
+| Tests                          | One file per concern: `cluster.rs`, `chaos.rs`, `facade.rs`, `facade_stress.rs`, `sandbox.rs`. No `_it`/`_smoke`/`_checkpoint` suffix salad. |
+| Sandboxes                      | Every disk-touching test goes through `tests/support/sandbox.rs::TestSandbox` (under `target/test-sandboxes/`). `CLUSTOR_KEEP_TEST_SANDBOXES=1` keeps them on drop for post-mortem. |
+| Cluster harness                | `tests/support/cluster.rs`. Each cluster gets a unique yaml stem so `fluxor run`'s outputs land in disjoint `deps/fluxor/target/linux/cluster-<pid>-c<seq>-n<i>/` dirs and are wiped on `Drop`. |
+| Module hygiene                 | `fluxor lint hygiene` (run as part of `fluxor ci`) blocks `#[cfg(test)]` / `mod tests` / `#[test]` under `modules/**` and `src/**` per [`standards/tests.md`](../standards/tests.md). The one exception is `modules/sdk/replica_facade.rs`, which is dual-targeted (`no_std` ELF + host `cargo test`) and carries a structured exemption in `fluxor.toml`. |
+| Cleanup                        | `make clean` runs `cargo clean` plus `fluxor modules clean`. |
+
+## Specification & docs
+
+- [`docs/architecture/`](docs/architecture/) — concepts, wire,
+  replication, lifecycle, security, observability, compatibility,
+  consumer facade. Indexed by
+  [`docs/overview.md`](docs/overview.md).
+- [`docs/architecture/modules.md`](docs/architecture/modules.md) — module map,
+  domain layout, design rationale.
+- [`docs/`](docs/) — subsystem deep-dives: proposal correlation,
+  substrate sharing, management, security posture, test catalog.
+- [`.context/`](.context/) — in-flight RFCs (partition groups,
+  security, phase-3 plan), audits, design notes.
+
+## License
+
+See [`LICENSE`](LICENSE).

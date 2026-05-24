@@ -1,0 +1,70 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Untagged proposals from session_processor / client_codec.
+[[ports]]
+name = "proposals"
+direction = "input"
+content_type = "OctetStream"
+
+# Tagged proposals (payload is `[correlation_id:u64 LE][body]`). The
+# router preserves the correlation prefix on the egress so each
+# raft_engine.proposals_partitioned_tagged drain sees the same
+# correlation_id the proposer assigned, regardless of which partition
+# accepted the proposal.
+[[ports]]
+name = "proposals_tagged"
+direction = "input"
+content_type = "OctetStream"
+
+# Per-partition outputs in two families:
+#
+#   out[0..N]  proposals_p<i>          → raft_engine_p<i>.proposals_partitioned
+#   out[N..2N] proposals_tagged_p<i>   → raft_engine_p<i>.proposals_partitioned_tagged
+#
+# Each carries the 5-byte partitioned envelope. Untagged outputs carry
+# the bare body; tagged outputs carry `[correlation_id:u64 LE][body]`.
+# MAX_LOCAL_PARTITIONS = 4 in mod.rs because the fluxor static graph
+# allows 8 outputs per direction (4 untagged + 4 tagged).
+
+[[ports]]
+name = "proposals_p0"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals_p1"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals_p2"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals_p3"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals_tagged_p0"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals_tagged_p1"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals_tagged_p2"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals_tagged_p3"
+direction = "output"
+content_type = "OctetStream"

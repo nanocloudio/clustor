@@ -1,0 +1,212 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+[[ports]]
+name = "rpc"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_proposals"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "fallback_signal"
+direction = "input"
+content_type = "OctetStream"
+
+# Tagged proposals carry an 8-byte correlation_id prefix so the leader can
+# emit MSG_PROPOSAL_ASSIGNED on the proposal_assigned port once a log index
+# is assigned. See modules/sdk/wire.rs::encode_tagged_proposal.
+[[ports]]
+name = "proposals_tagged"
+direction = "input"
+content_type = "OctetStream"
+
+# Partitioned proposals: 5-byte envelope `[partition_id:u16][msg_type:u8][len:u16]`
+# from partition_router. The leader rejects misrouted entries (partition_id
+# != self.partition_id) — partition_router's contract is one output port per
+# partition. See .context/rfc_partition_groups.md.
+[[ports]]
+name = "proposals_partitioned"
+direction = "input"
+content_type = "OctetStream"
+
+# Partitioned + tagged proposals: same 5-byte envelope as above, but the
+# payload is `[correlation_id:u64 LE][body]`. The leader emits
+# MSG_PROPOSAL_ASSIGNED back via `proposal_assigned` once the index is
+# allocated; the `partition_id` field of that response is `self.partition_id`,
+# letting cross-partition consumers (ack_tracker) key inflight by
+# `(partition_id, wal_index)`.
+[[ports]]
+name = "proposals_partitioned_tagged"
+direction = "input"
+content_type = "OctetStream"
+
+# Quorum-commit feedback from `commit_tracker.committed`. The leader
+# learns its own commit_index here so subsequent heartbeats and
+# AppendEntries carry the correct `leader_commit` for followers to
+# advance their own commit positions (RFC §5.1).
+[[ports]]
+name = "commit"
+direction = "input"
+content_type = "OctetStream"
+
+# Snapshot install completion signal from `snapshot_engine.installed_local`.
+# Carries `[term:u64][last_included_index:u64][last_included_term:u64]`.
+# raft_engine fast-forwards `last_log_*` and `commit_index` and emits
+# `commit_advanced` so apply_pipeline catches up. See RFC §5.13.
+[[ports]]
+name = "snapshot_installed"
+direction = "input"
+content_type = "OctetStream"
+
+# Strict-ReadIndex probe request from `apply_pipeline.read_probe_request`.
+# Payload: `[correlation_id:u64 LE]`. The leader broadcasts a network
+# probe and replies on `read_probe_reply` once it has majority. See
+# RFC §1.3 of the phase-3 plan.
+[[ports]]
+name = "read_probe_request"
+direction = "input"
+content_type = "OctetStream"
+
+# Raft-replicated admin entries from apply_pipeline.admin_committed
+# (RFC §3.1). Payload: `[command_id:u32 LE][op_code:u8][op_body...]`.
+# raft_engine applies the op locally at commit time on every replica.
+[[ports]]
+name = "admin_committed"
+direction = "input"
+content_type = "OctetStream"
+
+# Local MSG_FSYNC_ACK frames from `wal.flushed`. Followers stamp the
+# resulting `local_wal_durable_index` into every AppendEntriesResponse
+# so the leader's `durability_ledger` can compute quorum-fsync
+# durability across replicas (spec §10.4.1).
+[[ports]]
+name = "wal_flushed"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "append_entries"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "rpc_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "log_append"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# Per-proposal correlation feedback: emits MSG_PROPOSAL_ASSIGNED
+# `[correlation_id:u64 LE][wal_index:u64 LE]` once a tagged proposal has
+# been assigned a log index. Optional — leave unwired for graphs that
+# don't need ack-on-durability correlation.
+[[ports]]
+name = "proposal_assigned"
+direction = "output"
+content_type = "OctetStream"
+
+# Fanout copy of every appended log entry, intended for non-load-bearing
+# observers (apply_pipeline, downstream consumers). Same envelope as
+# `log_append` — MSG_WAL_ENTRY `[term:u64][index:u64][body...]` — but
+# the leader/follower writes fail-open: if the observer ring is full
+# the entry is dropped on this port only. WAL persistence and quorum
+# replication are not affected. Optional; leave unwired for graphs that
+# do not need a per-entry committed stream.
+[[ports]]
+name = "log_observe"
+direction = "output"
+content_type = "OctetStream"
+
+# Periodic MSG_LEADER_HINT emission so client_codec (and any other
+# consumer that needs to short-circuit non-leader proposals) can know
+# the current `(leader_id, term)`. Payload is 9 bytes:
+# `[leader_id:u8 (0xFF = unknown)][term:u64 LE]`. Emitted on state
+# changes; consumers must tolerate missed updates. See RFC §5.8.
+[[ports]]
+name = "leader_state"
+direction = "output"
+content_type = "OctetStream"
+
+# Apply-confirmation feedback for admin commands consumed on
+# `admin_proposals`. Carries `[command_id:u32][status:u8]` so
+# `admin_handler` can route the response back to the originating
+# conn_id. See RFC §14.
+[[ports]]
+name = "admin_applied"
+direction = "output"
+content_type = "OctetStream"
+
+# Follower commit-index advances. When this replica is a follower and
+# the leader's `leader_commit` in an AE moves our `commit_index`
+# forward, we emit MSG_COMMITTED_BATCH `[term:u64][index:u64]` here so
+# `apply_pipeline` can advance even though `commit_tracker` only runs
+# on the leader. Same envelope as `commit_tracker.committed` — wire
+# both into `apply_pipeline.entries`. See RFC §5.1.
+[[ports]]
+name = "commit_advanced"
+direction = "output"
+content_type = "OctetStream"
+
+# Reply to a strict-ReadIndex probe. Payload (17 bytes):
+# `[correlation_id:u64 LE][confirmed_commit:u64 LE][confirmed:u8]`.
+# confirmed=0 → fall back; confirmed=1 → use confirmed_commit as the
+# read's required_commit. See RFC §1.3 of the phase-3 plan.
+[[ports]]
+name = "read_probe_reply"
+direction = "output"
+content_type = "OctetStream"
+
+# Post-snapshot trim signal. After a snapshot install fast-forwards
+# `commit_index`, raft_engine emits MSG_WAL_COMPACT_BEFORE
+# `[before_index:u64 LE]` so the WAL can drop segments whose max-index
+# is strictly below `before_index`. See RFC §2.2.
+[[ports]]
+name = "wal_compact"
+direction = "output"
+content_type = "OctetStream"
+
+# Joint-consensus voter set updates (RFC §1.2). Fired every time the
+# current or joint voter set changes, with payload
+# `[current:u8][joint:u8][joint_active:u8]` (NodeSet bitmasks).
+#
+# STATUS: partial. `commit_tracker` exposes the matching `voter_set`
+# input and honours the joint-aware quorum logic. `durability_ledger`
+# does NOT yet consume voter-set updates — it still uses the
+# `voter_count` param for its quorum median. None of the shipped
+# configs in `configs/` wire this edge today. The downstream
+# completeness is gated on `admin_handler` re-enabling
+# `ADD_VOTER` / `REMOVE_VOTER` (currently `ADMIN_STATUS_UNSUPPORTED`),
+# which in turn requires the union-quorum implementation in
+# `durability_ledger`. See `docs/architecture/lifecycle.md` for the
+# membership-change story.
+[[ports]]
+name = "voter_set"
+direction = "output"
+content_type = "OctetStream"
+
+# raft_engine persists term + voted_for + last_log_{index,term} to
+# raft/meta via the FS contract (see load_metadata / save_metadata in
+# mod.rs). Without this declaration check_contract_grant returns ENOSYS
+# and the cluster silently degrades to non-persistent.
+[[resources]]
+requires_contract = "fs"
+access = "write"

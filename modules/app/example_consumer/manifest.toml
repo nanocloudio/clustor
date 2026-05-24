@@ -1,0 +1,45 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Example replicated consumer — demonstrates how a downstream application
+# wires into a Clustor replica group via `modules/sdk/replica_facade.rs`.
+# Non-essential: stripping this module from a deployment graph does not
+# affect cluster correctness. Exists as an integration smoke test of the
+# facade contract. See docs/architecture/consumer_facade.md.
+
+[[ports]]
+name = "committed_entries"
+direction = "input"
+content_type = "OctetStream"
+
+# State-machine snapshot install from snapshot_engine.snapshot_chunk_out.
+# Carries `MSG_APP_SNAPSHOT_CHUNK` and `MSG_APP_SNAPSHOT_RESET`. Optional;
+# leave unwired in graphs that don't run snapshot installs. See RFC §2.1.
+[[ports]]
+name = "snapshot_chunk"
+direction = "input"
+content_type = "OctetStream"
+
+# State-machine snapshot export trigger from snapshot_engine.app_snapshot_request.
+# Payload: `[term:u64 LE][last_included_index:u64 LE]`. Optional; unwired
+# in graphs that don't generate state-machine snapshots.
+[[ports]]
+name = "snapshot_request"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# State-machine snapshot export to snapshot_engine.app_snapshot_chunk_in.
+# Carries one or more `MSG_APP_SNAPSHOT_CHUNK` envelopes terminated by
+# `done = 1`. Emitted in response to a `MSG_APP_SNAPSHOT_REQUEST`. See
+# RFC §2.1.
+[[ports]]
+name = "snapshot_export"
+direction = "output"
+content_type = "OctetStream"
