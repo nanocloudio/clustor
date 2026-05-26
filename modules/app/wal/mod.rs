@@ -90,6 +90,20 @@ define_params! {
     // Must match raft_engine.self_id on the same node.
     5, self_id, u8, 0
         => |s, d, len| { s.self_id = p_u8(d, len, 0, 0); };
+
+    // 0 = per-entry fsync + ack (default, strict). 1 = group fsync:
+    // FS_WRITE per entry, but fsync + ack deferred until either
+    // `group_window_ms` elapses or `group_max_pending` entries accumulate,
+    // at which point one ack is emitted carrying the high-water
+    // (term, index). Replay-time re-ack stays per-entry in both modes.
+    6, fsync_mode, u8, 0
+        => |s, d, len| { s.fsync_mode = p_u8(d, len, 0, 0); };
+
+    7, group_window_ms, u16, 2
+        => |s, d, len| { s.group_window_ms = p_u16(d, len, 0, 2); };
+
+    8, group_max_pending, u16, 64
+        => |s, d, len| { s.group_max_pending = p_u16(d, len, 0, 64); };
 }
 
 // FS opcodes (from abi::dev_fs)
@@ -100,6 +114,11 @@ const FS_WRITE: u32 = 0x0906;
 const FS_FSYNC: u32 = 0x0905;
 const FS_CLOSE: u32 = 0x0903;
 const FS_STAT: u32 = 0x0904;
+/// Write-side opener. `FS_OPEN` is read-only-if-exists per the FS
+/// contract (see `deps/fluxor/modules/sdk/contracts/storage/fs.rs`),
+/// so a fresh WAL with no segment file on disk silently degrades to
+/// in-memory; segment creation needs the write tier.
+const FS_OPEN_CREATE: u32 = 0x0909;
 
 const WAL_PATH_MAX: usize = 48;
 
@@ -167,6 +186,16 @@ struct ModuleState {
     replay_fd: i32,         // fd for replay segment, -1 = none
     replay_file_size: u32,  // total bytes in replay segment
     replay_pos: u32,        // current read position
+
+    // Group-fsync batching (active iff fsync_mode == 1).
+    fsync_mode: u8,
+    group_window_ms: u16,
+    group_max_pending: u16,
+    batch_start_ms: u64,
+    pending_count: u16,
+    pending_max_index: Index,
+    pending_max_term: Term,
+    has_batch: bool,
 
     // Scratch buffer for reading messages
     msg_buf: [u8; 2048],
@@ -258,6 +287,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if s.phase == PHASE_REPLAY {
             // Replay existing WAL segments before accepting new entries
             return step_replay(s, sys);
+        }
+
+        // Time-based group flush: a quiescent writer drains its tail
+        // batch within group_window_ms even when no new entries arrive.
+        if s.has_batch {
+            let now = dev_millis(sys);
+            if now.wrapping_sub(s.batch_start_ms) >= s.group_window_ms as u64 {
+                flush_batch(s, sys);
+            }
         }
 
         // Normal operation
@@ -733,19 +771,22 @@ unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
     let (term, index) = wire::decode_term_index(&s.msg_buf);
     let payload_len = plen as usize;
 
-    // Write to disk: [entry_len: u32 LE] [entry_data]
-    // Track the file offset of `entry_data` (after the 4-byte length
-    // prefix) so the entry can be read back via MSG_WAL_ENTRY_REQUEST.
+    // [entry_len: u32 LE] [entry_data]. Track the payload offset
+    // (after the length prefix) so MSG_WAL_ENTRY_REQUEST can read it
+    // back. In group mode the FS_FSYNC is deferred to flush_batch —
+    // emitting the ack before that fsync would signal durability
+    // that doesn't yet hold on disk.
     let entry_payload_offset = s.cursor.saturating_add(4);
     ensure_segment_open(s, sys);
     if s.fd >= 0 {
         let len_bytes = (payload_len as u32).to_le_bytes();
         (sys.provider_call)(s.fd, FS_WRITE, len_bytes.as_ptr() as *mut u8, 4);
         (sys.provider_call)(s.fd, FS_WRITE, s.msg_buf.as_mut_ptr(), payload_len);
-        (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
+        if s.fsync_mode == 0 {
+            (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
+        }
     }
 
-    // Track state
     s.current_term = term;
     s.current_index = index;
     s.cursor += (4 + payload_len) as u32;
@@ -753,22 +794,37 @@ unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
     s.bytes_written += payload_len as u64;
     record_entry_loc(s, index, term, s.segment_seq, entry_payload_offset, payload_len as u32);
 
-    // Emit flushed ack — only if the output is actually wired.
-    // Unwired graphs (per-partition WALs without a downstream commit
-    // pipeline) get a "[wal] entry ok (no ack)" log instead so the
-    // disk-write is still observable.
-    if s.out_flushed >= 0 {
-        dev_log(sys, 3, b"[wal] entry ok".as_ptr(), 14);
-        let mut ack_buf = [0u8; 17];
-        wire::encode_fsync_ack(&mut ack_buf, term, index, s.self_id);
-        wire::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17]);
+    if s.fsync_mode == 0 {
+        if s.out_flushed >= 0 {
+            dev_log(sys, 3, b"[wal] entry ok".as_ptr(), 14);
+            let mut ack_buf = [0u8; 17];
+            wire::encode_fsync_ack(&mut ack_buf, term, index, s.self_id);
+            wire::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17]);
+        } else {
+            dev_log(sys, 3, b"[wal] entry ok (no ack)".as_ptr(), 23);
+        }
     } else {
-        dev_log(sys, 3, b"[wal] entry ok (no ack)".as_ptr(), 23);
+        if !s.has_batch {
+            s.batch_start_ms = dev_millis(sys);
+            s.has_batch = true;
+        }
+        if index >= s.pending_max_index {
+            s.pending_max_index = index;
+            s.pending_max_term = term;
+        }
+        s.pending_count = s.pending_count.saturating_add(1);
+        dev_log(sys, 3, b"[wal] entry queued".as_ptr(), 18);
+        if s.pending_count >= s.group_max_pending {
+            flush_batch(s, sys);
+        }
     }
 
-    // Check segment limit
+    // Segment rotation must flush any pending batch first so the ack
+    // is ordered relative to the close.
     if s.cursor >= s.segment_limit {
-        // Flush and fsync remaining data, then close
+        if s.has_batch {
+            flush_batch(s, sys);
+        }
         flush_block(s, sys);
         fsync_segment(s, sys);
         close_segment(s, sys);
@@ -784,18 +840,59 @@ unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
     }
 }
 
+/// Fsync the segment and emit one MSG_FSYNC_ACK for the batch
+/// high-water (term, index). No-op on an empty batch. If the channel
+/// is full we drop the ack rather than block — bytes are durable and
+/// durability_ledger consumes high-water marks, so the next ack
+/// subsumes any skipped one.
+///
 /// # Safety
 ///
-/// Caller must hold an exclusive `&mut ModuleState` (or shared
-/// `&ModuleState` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
-/// Open (or reopen) the current WAL segment file.
+/// Caller must hold an exclusive `&mut ModuleState` and supply a
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per `deps/fluxor/modules/sdk/abi.rs`.
+unsafe fn flush_batch(s: &mut ModuleState, sys: &SyscallTable) {
+    if !s.has_batch { return; }
+
+    fsync_segment(s, sys);
+
+    if s.out_flushed >= 0 {
+        let poll_out = (sys.channel_poll)(s.out_flushed, POLL_OUT);
+        if poll_out > 0 && (poll_out as u32 & POLL_OUT) != 0 {
+            let mut ack_buf = [0u8; 17];
+            wire::encode_fsync_ack(
+                &mut ack_buf, s.pending_max_term, s.pending_max_index, s.self_id,
+            );
+            wire::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17]);
+            dev_log(sys, 3, b"[wal] group fsync".as_ptr(), 17);
+        }
+    } else {
+        dev_log(sys, 3, b"[wal] group fsync (no ack)".as_ptr(), 26);
+    }
+
+    s.has_batch = false;
+    s.pending_count = 0;
+    s.pending_max_index = 0;
+    s.pending_max_term = 0;
+    s.batch_start_ms = 0;
+}
+
+/// Open or create the current WAL segment file. Replay (read-only)
+/// still uses `FS_OPEN` so it can detect "no more segments" via
+/// ENODEV; the write side needs the create tier.
+///
+/// fd < 0 means FS unavailable (e.g. bare-metal without a mounted
+/// filesystem) — module degrades to in-memory only.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per `deps/fluxor/modules/sdk/abi.rs`.
 unsafe fn ensure_segment_open(s: &mut ModuleState, sys: &SyscallTable) {
     if s.fd >= 0 { return; }
     build_segment_path(s, s.segment_seq);
-    s.fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), s.path_len as usize);
-    // fd < 0 means FS not available — module degrades to in-memory only.
+    s.fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), s.path_len as usize);
 }
 
 /// # Safety
@@ -852,10 +949,24 @@ unsafe fn close_segment(s: &mut ModuleState, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
 unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
-    if s.out_metrics < 0 { return; }
     let now = dev_millis(sys);
     if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
     s.last_metrics_ms = now;
+
+    // `[wal] hb` — steady-state liveness on the foundation-module
+    // heartbeat cadence. Survives log_net's history-skip (drain_net
+    // seeds TAIL_NET=HEAD on first call), which discards init-time
+    // one-shot markers. Fires regardless of out_metrics wiring.
+    let mut hb = [0u8; 96];
+    let mut pos = 0usize;
+    pos += emit_field(hb.as_mut_ptr(), pos, b"[wal] hb mode=", s.fsync_mode as u32);
+    pos += emit_field(hb.as_mut_ptr(), pos, b" seg=", s.segment_seq);
+    pos += emit_field(hb.as_mut_ptr(), pos, b" entries=", s.entries_written);
+    pos += emit_field(hb.as_mut_ptr(), pos, b" batch=", s.has_batch as u32);
+    pos += emit_field(hb.as_mut_ptr(), pos, b" pending=", s.pending_count as u32);
+    dev_log(sys, 3, hb.as_ptr(), pos);
+
+    if s.out_metrics < 0 { return; }
 
     let mut buf = [0u8; 16];
     buf[0..4].copy_from_slice(&s.entries_written.to_le_bytes());
@@ -866,4 +977,15 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
     if poll > 0 && (poll as u32 & 0x02) != 0 {
         wire::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf[..16]);
     }
+}
+
+/// Append `tag` followed by `val`'s decimal representation at
+/// `buf[start..]`. Returns the number of bytes written.
+///
+/// # Safety
+///
+/// `buf` must have room for `tag.len() + 10` bytes starting at `start`.
+unsafe fn emit_field(buf: *mut u8, start: usize, tag: &[u8], val: u32) -> usize {
+    core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.add(start), tag.len());
+    tag.len() + fmt_u32_raw(buf.add(start + tag.len()), val)
 }

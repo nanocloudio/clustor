@@ -1,12 +1,15 @@
 # Clustor
 
-23 fluxor substrate modules plus `example_consumer`
-(24 buildable .fmods) implementing a Raft replication substrate.
-A drop-in consensus kernel for products like Quantum (MQTT broker)
-and Lattice (KV store): the modules ship as
-position-independent ELFs, run cooperatively on the fluxor
-runtime, and expose a typed consumer facade for replicated state
-machines.
+Clustor is a Raft replication substrate for products like Quantum
+(MQTT broker) and Lattice (KV store). It provides a drop-in
+consensus kernel with durable log replication, quorum tracking,
+diagnostic surfaces, and a typed consumer facade for replicated
+state machines.
+
+The implementation is Fluxor-native: 23 substrate modules plus
+`example_consumer` (24 buildable `.fmod` artifacts) ship as
+position-independent ELFs and run cooperatively on the Fluxor
+runtime.
 
 The architecture docs — every wire byte, durability invariant, and
 operational guardrail — live under

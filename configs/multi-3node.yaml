@@ -92,12 +92,9 @@ modules:
   - name: snapshot_engine
   - name: placement_router
 
-  # Diagnostic HTTP surface — see `configs/single.yaml` for the
-  # dataflow rationale. `linux_net_http` is a second `linux_net`
-  # bound on `__HTTP_PORT__` (`LISTEN_PORT + 10000`).
+  # Diagnostic HTTP surface — see `configs/single.yaml`. Shares
+  # the platform-injected `linux_net` with `peer_router`.
   - name: http_adapter
-  - name: linux_net_http
-    type: linux_net
   - name: http_ingress
     params:
       listen_port: __HTTP_PORT__
@@ -277,10 +274,10 @@ wiring:
     to: client_surface.metrics_data
 
   # ── HTTP diagnostic surface ──────────────────────────────────
-  - from: linux_net_http.net_out
+  - from: linux_net.net_out
     to: http_ingress.net_in
   - from: http_ingress.net_out
-    to: linux_net_http.net_in
+    to: linux_net.net_in
   - from: http_ingress.request
     to: http_adapter.request
   - from: http_adapter.response

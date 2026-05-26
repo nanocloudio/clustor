@@ -180,22 +180,31 @@ path = "tests/http_admin.rs"
 name = "sdk_primitives"
 path = "tests/sdk_primitives.rs"
 
+[[test]]
+name = "wal_group_fsync"
+path = "tests/wal_group_fsync.rs"
+
 # Criterion benches. Each uses `harness = false` so criterion's own
 # main runs instead of the default libtest harness. Run with
 # `cargo bench` or `cargo bench --bench <name> -- --quick`. All
 # benches pull `modules/sdk/replica_facade.rs` directly via
 # `#[path]` — no library link is required.
-[[bench]]
-name = "wire_codec"
-path = "benches/wire_codec.rs"
-harness = false
-
-[[bench]]
-name = "inflight_table"
-path = "benches/inflight_table.rs"
-harness = false
-
-[[bench]]
-name = "committed_subscriber"
-path = "benches/committed_subscriber.rs"
-harness = false
+#
+# Commented out: `benches/` is `.gitignore`d (per the project
+# pattern that also covers `tests/`). Restore each entry when the
+# matching `benches/<name>.rs` lands on disk; `autobenches = false`
+# in [package] keeps cargo from autodiscovering in the meantime.
+# [[bench]]
+# name = "wire_codec"
+# path = "benches/wire_codec.rs"
+# harness = false
+#
+# [[bench]]
+# name = "inflight_table"
+# path = "benches/inflight_table.rs"
+# harness = false
+#
+# [[bench]]
+# name = "committed_subscriber"
+# path = "benches/committed_subscriber.rs"
+# harness = false
