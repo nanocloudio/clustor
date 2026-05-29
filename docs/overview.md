@@ -43,7 +43,8 @@ Subsystem deep-dives and operational guidance.
 - [proposal_correlation.md](proposal_correlation.md) — tagged-proposal correlation across the propose/commit boundary
 - [net_http.md](net_http.md) — diagnostic HTTP surface, parser limits, stderr signals
 - [substrate_sharing.md](substrate_sharing.md) — sharing one clustor substrate across consumer products
-- [dependencies.md](dependencies.md) — third-party crate inventory and licence posture
+- [consuming_fluxor.md](consuming_fluxor.md) — day-to-day workflow for pulling fluxor in via the local registry
+- [dependencies.md](dependencies.md) — fluxor consumption + `[dev-dependencies]` inventory
 - [test_catalog.md](test_catalog.md) — test inventory and what each scenario asserts
 
 In-flight design work — RFCs, audits, working notes — lives under

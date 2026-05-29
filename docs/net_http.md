@@ -72,3 +72,14 @@ The assertion vocabulary HTTP-gated tests rely on:
 | `[http_ingress] accepted conn_id=N` | client connected |
 | `[http_ingress] request <METHOD> <PATH> conn_id=N` | request parsed |
 | `[http_ingress] closed conn_id=N` | connection torn down |
+
+## See also
+
+- [architecture/observability.md](architecture/observability.md) —
+  the `/readyz`, `/why`, `/metrics` endpoints this surface exposes
+  and what they assert about node state.
+- [architecture/modules.md](architecture/modules.md) —
+  `http_ingress` and `http_adapter` in the four-domain module map.
+- [`../modules/common/http_admin.rs`](../modules/common/http_admin.rs)
+  — the canonical path → op-code mapping shared between
+  `http_adapter` and host tests.

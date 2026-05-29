@@ -28,7 +28,7 @@ modules` builds clustor's PIC modules against the synced fluxor SDK.
 | What | Where it lands after sync | Used by |
 |---|---|---|
 | `fluxor-abi` source | `target/fluxor/fluxor-abi/sdk/{abi,wire,...}.rs` | `modules/app/*/mod.rs` via `#[path]` |
-| `fluxor-sdk` source | `target/fluxor/fluxor-sdk/sdk/...` | shares the abi sdk file set for now |
+| `fluxor-sdk` source | `target/fluxor/fluxor-sdk/sdk/...` | same file set as `fluxor-abi/sdk/` at the resolved fluxor version; will diverge as `fluxor-sdk` grows the macro surface |
 | Fluxor's published fmod palette | `target/<silicon>/modules/<name>.fmod` (every fmod fluxor publishes — foundation, drivers, builtin, probes) | Deployment yamls wire subsets by name; unused fmods sit on disk unmounted |
 | `fluxor-linux` runtime | `target/aarch64-unknown-linux-gnu/release/fluxor-linux` | `tests/support/cluster.rs` spawns it |
 | `module.ld` linker script | `target/fluxor/fluxor-abi/sdk/module.ld` | `fluxor modules build` picks it up automatically |

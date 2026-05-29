@@ -75,3 +75,13 @@ Helpers: `wire::encode_proposal_assigned`, `wire::decode_proposal_assigned`.
 - Leadership change resets pending correlations
   (`become_follower` / `become_leader`). Producers should retry on a new
   leader.
+
+## See also
+
+- [architecture/replication.md](architecture/replication.md) — the
+  surrounding propose / commit pipeline this protocol rides on.
+- [architecture/consumer_facade.md](architecture/consumer_facade.md)
+  — typed Rust helpers (`build_tagged_proposal`, `InflightTable`)
+  that implement the proposer-side bookkeeping described above.
+- [architecture/wire.md](architecture/wire.md) — `MSG_CLIENT_PROPOSAL`
+  and `MSG_PROPOSAL_ASSIGNED` opcode catalog entries.

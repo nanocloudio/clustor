@@ -75,8 +75,8 @@ Each repo packs only what it owns:
 
 | Repo | `make modules TARGET=bcm2712` packs |
 |------|-------------------------------------|
-| `clustor` | substrate (24 modules: raft_engine, wal, peer_router, partition_router, replicator, durability_ledger, commit_tracker, apply_pipeline, cp_bridge, cp_proof_cache, throttle_gate, flow_controller, client_surface, telemetry_agg, client_codec, admin_handler, snapshot_engine, key_manager, read_gate, placement_router, rbac, http_ingress, http_adapter, example_consumer) |
-| `quantum` | quantum-specific (20 modules: ack_tracker, mqtt_codec, kafka_codec, amqp_codec, session_processor, protocol_router, response_mux, topic_engine, dedup_engine, offline_queue, retained_store, backpressure_propagator, forward_coordinator, prefetch_controller, audit_logger, dr_manager, metrics_aggregator, consumer_group_coordinator, transaction_coordinator, tenant_manager) |
+| `clustor` | The 23 substrate modules plus `example_consumer` — full map in [architecture/modules.md](architecture/modules.md) and the canonical edge set in [`../configs/single.yaml`](../configs/single.yaml). |
+| `quantum` | The quantum-specific app modules (codecs, session processing, topic/dedup engines, retained store, audit, DR, metrics, consumer groups, transactions, tenancy). |
 
 Both clustor and quantum publish `.fmod` files into the local
 fluxor registry (`make publish` per project; see

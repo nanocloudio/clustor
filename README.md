@@ -78,6 +78,26 @@ make sync                  # materialise resolved artefacts into target/
 git commit fluxor.lock     # commit the pin
 ```
 
+### Publishing clustor downstream
+
+Projects that depend on clustor (Lattice, Loam, Quantum, …) pin it
+through the same registry mechanism by declaring `clustor = "X.Y"`
+in their `fluxor.toml::[dependencies]`. From clustor's checkout:
+
+```sh
+make publish               # publish clustor-common + 24 substrate fmods
+```
+
+This populates `~/.fluxor/registry/cargo/clustor-common-X.Y.Z.crate`
+and `~/.fluxor/registry/fmod/clustor/<silicon>/<name>/X.Y.Z.fmod`
+for every module under `modules/app/`. Downstream consumers then
+run `make update && make sync` in their own checkouts to resolve
+and materialise the published palette. Bump
+`[workspace.package].version` (Cargo.toml), the matching
+`[package].version` in `crates/clustor-common/Cargo.toml`, and
+`[project].version` in `fluxor.toml` together before publishing a
+new release; `fluxor publish` rejects mismatches at publish time.
+
 ## Quick start
 
 ```sh
