@@ -12,7 +12,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -22,15 +22,17 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 const REFRESH_FRESH_MS: u64 = 5000;
 const REFRESH_STALE_MS: u64 = 600;
@@ -61,7 +63,7 @@ pub extern "C" fn module_new(
     _params: *const u8, _params_len: usize,
     state: *mut u8, state_size: usize, syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -85,7 +87,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -108,7 +110,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             let poll = (sys.channel_poll)(s.out_proof, 0x02);
             if poll > 0 && (poll as u32 & 0x02) != 0 {
-                wire::channel_write_msg(sys, s.out_proof, wire::MSG_CP_PROOF, &buf[..12]);
+                wire_channels::channel_write_msg(sys, s.out_proof, wire::MSG_CP_PROOF, &buf[..12]);
             }
 
             // Quantum enhancement: emit tenant records and capabilities
@@ -121,7 +123,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let mut tr = [0u8; 8];
                     tr[0..4].copy_from_slice(&0u32.to_le_bytes());
                     tr[4..8].copy_from_slice(&10000u32.to_le_bytes());
-                    wire::channel_write_msg(sys, s.out_tenant_records, 0xD0, &tr);
+                    wire_channels::channel_write_msg(sys, s.out_tenant_records, 0xD0, &tr);
                 }
             }
             if s.out_capabilities >= 0 {
@@ -129,7 +131,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if poll_c > 0 && (poll_c as u32 & 0x02) != 0 {
                     // [schema_version:u16 = 1] [mqtt_enabled:u8 = 1]
                     let caps = [0x01u8, 0x00, 0x01];
-                    wire::channel_write_msg(sys, s.out_capabilities, 0xD3, &caps);
+                    wire_channels::channel_write_msg(sys, s.out_capabilities, 0xD3, &caps);
                 }
             }
         }

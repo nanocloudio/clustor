@@ -10,11 +10,11 @@ These compile against the cargo host toolchain and run as part of
 
 | File | Scope | Skip behaviour |
 |---|---|---|
-| `tests/facade.rs` | Encode/decode and bookkeeping for `modules/sdk/replica_facade.rs` — `build_tagged_proposal`, `InflightTable`, `CommittedSubscriber`, `SnapshotInstaller` / `SnapshotExporter`, `MembershipView`, `ReadGateInputs`. The full facade contract documented at `docs/architecture/consumer_facade.md`. | Never skips. |
+| `tests/facade.rs` | Encode/decode and bookkeeping for `modules/common/replica_facade.rs` — `build_tagged_proposal`, `InflightTable`, `CommittedSubscriber`, `SnapshotInstaller` / `SnapshotExporter`, `MembershipView`, `ReadGateInputs`. The full facade contract documented at `docs/architecture/consumer_facade.md`. | Never skips. |
 | `tests/facade_stress.rs` | Facade data structures under thread stress (correlation table + committed subscriber under heavy concurrent push/drain). | Never skips. |
 | `tests/sandbox.rs` | Self-test for the `TestSandbox` helper (`tests/support/sandbox.rs`): per-test scratch dir creation, cleanup on drop, and the `CLUSTOR_KEEP_TEST_SANDBOXES=1` override. | Never skips. |
-| `tests/config_validate.rs` | Renders every `configs/*.yaml` using the defaults in `fluxor.toml::[ci.templates].vars`, prepends `module_search_paths: [modules/app]`, and runs `fluxor validate --target linux` against the rendered config. Catches dangling-edge drift like the previous `replicator.cross_durability_ack` reference in `single-minimal.yaml` with no `replicator` module declared. | Skips with a note if `fluxor` is not on `PATH`. |
-| `tests/http_admin.rs` | Pure-logic coverage for the HTTP admin mapping shared between `http_adapter` and host tests (`modules/sdk/http_admin.rs`): path → op-code mapping, body-size cap, and a drift assertion against the canonical wire ABI bytes. | Never skips. |
+| `tests/config_validate.rs` | Renders every `configs/*.yaml` using the defaults in `fluxor.toml::[ci.templates].vars`, prepends `module_search_paths: [modules/app]`, and runs `fluxor validate --target linux` against the rendered config. Catches dangling-edge drift — e.g., a port reference like `replicator.cross_durability_ack` in a YAML that does not declare `replicator`. | Skips with a note if `fluxor` is not on `PATH`. |
+| `tests/http_admin.rs` | Pure-logic coverage for the HTTP admin mapping shared between `http_adapter` and host tests (`modules/common/http_admin.rs`): path → op-code mapping, body-size cap, and a drift assertion against the canonical wire ABI bytes. | Never skips. |
 
 ## Cluster harness tests (`tests/cluster.rs`, `tests/chaos.rs`, `tests/partition.rs`)
 
@@ -27,8 +27,8 @@ multi-node path.
 Required prerequisites:
 
 - `fluxor` on `PATH` (defaults to `/usr/bin/fluxor`).
-- `fluxor-linux` at `deps/fluxor/target/aarch64-unknown-linux-gnu/release/fluxor-linux`.
-- Built clustor `.fmod` artefacts at `target/fluxor/<silicon>/modules/` (or the legacy `deps/fluxor/target/<silicon>/modules/` with a one-shot deprecation warning).
+- `fluxor-linux` at `target/<host-target>/release/fluxor-linux` — materialised by `make sync` from the local registry (`fluxor publish runtime --binary fluxor-linux` upstream).
+- Built clustor `.fmod` artefacts at `target/<silicon>/modules/` (produced by `make modules`) or `target/fluxor/<silicon>/modules/` (the default `fluxor modules build` output).
 
 To make a missing prereq a hard failure instead of a skip, set
 `CLUSTOR_REQUIRE_E2E=1`. CI surfaces that claim to gate on
@@ -49,16 +49,16 @@ injection) lives at `.context/test_scenarios_pending.md`.
 The fluxor hygiene scanner blocks `#[cfg(test)] mod tests` and
 `#[test]` under `modules/**` and `src/**` per
 `standards/tests.md`. The one structured exemption is
-`modules/sdk/replica_facade.rs`, which is dual-targeted (no_std
+`modules/common/replica_facade.rs`, which is dual-targeted (no_std
 module ELF + host `cargo test` via `#[path]`) and carries its
 exemption row in `fluxor.toml::[[ci.hygiene.exemption]]`.
 
 Everything else that wants test coverage either:
 
 - Lives as an integration test under `tests/` (see above), or
-- Has its pure-logic surface extracted to `modules/sdk/` so the
+- Has its pure-logic surface extracted to `modules/common/` so the
   same `#[path]` mechanism works for both the no_std module and the
-  host test crate. `modules/sdk/http_admin.rs` is the canonical
+  host test crate. `modules/common/http_admin.rs` is the canonical
   example.
 
 ## Benches (`benches/*.rs`)

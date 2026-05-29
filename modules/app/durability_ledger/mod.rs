@@ -17,7 +17,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -27,18 +27,20 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/types.rs"]
+#[path = "../../common/types.rs"]
 mod types;
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 use types::*;
 
@@ -104,7 +106,7 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -139,7 +141,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -156,7 +158,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let poll = (sys.channel_poll)(s.in_ack, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
-            let (msg_type, plen) = wire::channel_read_msg(sys, s.in_ack, &mut s.msg_buf);
+            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_ack, &mut s.msg_buf);
             if msg_type != wire::MSG_FSYNC_ACK || plen < 17 { continue; }
 
             let (term, index, replica) = wire::decode_fsync_ack(&s.msg_buf);
@@ -193,7 +195,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.committed_index,
                         s.self_id,
                     );
-                    wire::channel_write_msg(
+                    wire_channels::channel_write_msg(
                         sys,
                         s.out_quorum,
                         wire::MSG_DURABILITY_PROOF,

@@ -39,7 +39,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -49,18 +49,20 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/types.rs"]
+#[path = "../../common/types.rs"]
 mod types;
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 use types::*;
 
@@ -217,7 +219,7 @@ pub extern "C" fn module_new(
     params: *const u8, params_len: usize,
     state: *mut u8, state_size: usize, syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -260,7 +262,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -291,7 +293,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_tls_identity(s: &mut ModuleState, sys: &SyscallTable) {
     if s.tls_identity < 0 {
         return;
@@ -301,7 +303,7 @@ unsafe fn drain_tls_identity(s: &mut ModuleState, sys: &SyscallTable) {
         if poll <= 0 || (poll as u32 & 0x01) == 0 {
             break;
         }
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.tls_identity, &mut s.buf);
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.tls_identity, &mut s.buf);
         if msg_type != wire::MSG_PEER_IDENTITY {
             continue;
         }
@@ -348,7 +350,7 @@ unsafe fn drain_tls_identity(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn try_bind(s: &mut ModuleState, sys: &SyscallTable) {
     if s.net_out < 0 { return; }
 
@@ -366,7 +368,7 @@ unsafe fn try_bind(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn connect_peers(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     if s.net_out < 0 { return; }
 
@@ -397,7 +399,7 @@ unsafe fn connect_peers(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable) {
     if s.net_in < 0 { return; }
 
@@ -526,7 +528,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn send_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize) {
     if s.net_out < 0 { return; }
 
@@ -546,7 +548,7 @@ unsafe fn send_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn handle_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize, data: &[u8]) {
     if data.len() < ID_MSG_LEN { return; }
 
@@ -611,7 +613,7 @@ unsafe fn handle_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize, 
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn route_outbound_chan(s: &mut ModuleState, sys: &SyscallTable, chan: i32) {
     if chan < 0 || s.net_out < 0 { return; }
 
@@ -623,7 +625,7 @@ unsafe fn route_outbound_chan(s: &mut ModuleState, sys: &SyscallTable, chan: i32
         if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 { break; }
 
         let (target, partition_id, msg_type, plen) =
-            wire::channel_read_routed_partitioned(sys, chan, &mut s.buf);
+            wire_channels::channel_read_routed_partitioned(sys, chan, &mut s.buf);
         if plen == 0 && msg_type == 0 { break; }
 
         // Trace: log target + msg_type (partition_id is on the wire
@@ -662,7 +664,7 @@ unsafe fn route_outbound_chan(s: &mut ModuleState, sys: &SyscallTable, chan: i32
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Send data to a peer connection with the 5-byte partitioned wire
 /// envelope: `[partition_id:u16 LE][msg_type:u8][len:u16 LE][data]`.
 /// Wrapped in a CMD_SEND frame as:
@@ -702,7 +704,7 @@ unsafe fn send_to_conn(
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Read conn_id-tagged responses from client_surface and send back to
 /// the originating TCP connection.
 /// Format: [conn_id: u8] [msg_type: u8] [len: u16 LE] [payload]

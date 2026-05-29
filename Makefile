@@ -2,7 +2,7 @@
 
 .PHONY: help build test fmt fmt-check clippy lint ci verify \
         modules modules-all modules-clean up up-cluster clean setup \
-        link-fluxor unlink-fluxor
+        update sync sync-dry publish publish-local
 
 SHELL       := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
@@ -24,64 +24,38 @@ help:
 	@echo "  make up-cluster     spawn REPLICAS replicas (CONFIG=, REPLICAS=)"
 	@echo "  make ci             full CI gate (fluxor ci)"
 	@echo "  make clean          cargo clean + module artefacts"
-	@echo "  make setup          init submodules + install fluxor CLI onto PATH"
-	@echo "  make link-fluxor    swap deps/fluxor submodule for a symlink to FLUXOR_DEV_PATH (dev override)"
-	@echo "  make unlink-fluxor  restore deps/fluxor from the submodule pin"
+	@echo "  make setup          install fluxor CLI onto PATH"
+	@echo "  Fluxor registry consumption (see standards/dependencies.md):"
+	@echo "  make update         resolve fluxor.lock against the local registry"
+	@echo "  make sync[-dry]     install lockfile-resolved fmods + runtimes"
+	@echo "  make publish        canonical publish of clustor's artefacts"
+	@echo "  make publish-local  content-hashed local-only publish"
 
 setup:
-	git submodule update --init --recursive
-	cargo install --locked --path deps/fluxor/tools
+	cargo install --locked --path ../fluxor/tools
 
-# Dev override: replace the submodule checkout at deps/fluxor with a
-# symlink to a sibling working tree, so local fluxor edits flow into
-# clustor builds without a commit-and-bump round trip. The submodule
-# pin in the index doesn't move — `git status` shows the divergence
-# until `make unlink-fluxor` restores the submodule contents.
-#
-# `FLUXOR_DEV_PATH` is interpreted relative to the clustor repo root
-# (default `../fluxor`, i.e. a sibling checkout). The link itself is
-# stored relative to `deps/`, so the resolved target survives moving
-# the parent workspace, as long as the sibling layout is preserved.
-FLUXOR_DEV_PATH ?= ../fluxor
-link-fluxor:
-	@target_abs=$$(realpath -m $(FLUXOR_DEV_PATH)); \
-	if [ ! -d "$$target_abs" ]; then \
-		echo "FLUXOR_DEV_PATH=$$target_abs doesn't exist. Clone fluxor as a sibling or pass FLUXOR_DEV_PATH=<absolute-or-clustor-relative-path>."; \
-		exit 1; \
-	fi; \
-	if [ -L deps/fluxor ]; then \
-		echo "deps/fluxor is already a symlink ($$(readlink deps/fluxor) -> $$(readlink -f deps/fluxor)). Nothing to do."; \
-		exit 0; \
-	fi; \
-	rm -rf deps/fluxor; \
-	link_target=$$(case $(FLUXOR_DEV_PATH) in /*) echo $(FLUXOR_DEV_PATH);; *) echo ../$(FLUXOR_DEV_PATH);; esac); \
-	ln -s "$$link_target" deps/fluxor; \
-	echo "deps/fluxor -> $$link_target  (resolves to $$target_abs; submodule pin unchanged in index)"
-
-unlink-fluxor:
-	@if [ ! -L deps/fluxor ]; then \
-		echo "deps/fluxor is not a symlink; nothing to restore."; \
-		exit 0; \
-	fi; \
-	rm deps/fluxor; \
-	git submodule update --init deps/fluxor
-	@echo "deps/fluxor restored from submodule pin ($$(git -C deps/fluxor rev-parse --short HEAD))"
-
-build:      ; $(CARGO) build --all-targets
-test:       ; $(CARGO) test --workspace
+build:      ; $(CARGO) build --workspace --all-targets
+# Cluster e2e tests (`tests/cluster.rs`, `chaos.rs`, `partition.rs`)
+# each spin up 1–3 `fluxor-linux` child processes. Default cargo
+# parallelism saturates a 4-core Pi-class host and Raft commit
+# budgets miss their deadlines. `--test-threads=4` keeps the
+# concurrent-cluster count bounded; individual unit-test binaries
+# (fast, no children) still run with full intra-binary parallelism.
+TEST_THREADS ?= 4
+test:       ; $(CARGO) test --workspace -- --test-threads=$(TEST_THREADS)
 fmt:        ; $(CARGO) fmt --all
 fmt-check:  ; $(CARGO) fmt --all -- --check
-clippy:     ; $(CARGO) clippy --all-targets --all-features -- -D warnings
+clippy:     ; $(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 lint:       fmt-check clippy
 
 modules:
-	$(FLUXOR) modules build --target $(TARGET) --out target/fluxor
+	$(FLUXOR) modules build --target $(TARGET) --out target
 
 modules-all:
-	$(FLUXOR) modules build --all --out target/fluxor
+	$(FLUXOR) modules build --all --out target
 
 modules-clean:
-	$(FLUXOR) modules clean --out target/fluxor
+	$(FLUXOR) modules clean --out target
 
 CONFIG  ?= configs/single.yaml
 NODE_ID ?= 0
@@ -99,4 +73,24 @@ verify: ci
 
 clean:
 	$(CARGO) clean
-	$(FLUXOR) modules clean --out target/fluxor
+	$(FLUXOR) modules clean --out target
+
+# ── Registry consumption (RFC §11 / standards/dependencies.md) ─────────
+#
+# `make update` regenerates fluxor.lock from clustor's [dependencies].
+# `make sync` materialises every lockfile-resolved fmod + runtime +
+# source crate into clustor's target/ tree. Run sync after every
+# upstream `fluxor publish`.
+
+update:
+	$(FLUXOR) update
+
+sync:
+	$(FLUXOR) sync
+sync-dry:
+	$(FLUXOR) sync --dry-run
+
+publish:
+	$(FLUXOR) publish
+publish-local:
+	$(FLUXOR) publish --local

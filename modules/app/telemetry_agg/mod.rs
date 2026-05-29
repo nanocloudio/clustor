@@ -8,7 +8,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -18,15 +18,17 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 const EMIT_INTERVAL_MS: u64 = 1000;
 
@@ -100,7 +102,7 @@ pub extern "C" fn module_new(
     _params: *const u8, _params_len: usize,
     state: *mut u8, state_size: usize, syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -131,7 +133,7 @@ pub extern "C" fn module_new(
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn ingest_typed_sample(s: &mut ModuleState, payload: &[u8], now: u64) {
     let (module_id, partition_id, metric_id, kind, value) =
         match wire::decode_metric_sample(payload) {
@@ -188,7 +190,7 @@ unsafe fn ingest_typed_sample(s: &mut ModuleState, payload: &[u8], now: u64) {
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -206,7 +208,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         for _ in 0..16 {
             let poll = (sys.channel_poll)(s.in_ingest, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-            let (msg_type, plen) = wire::channel_read_msg(sys, s.in_ingest, &mut s.msg_buf);
+            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_ingest, &mut s.msg_buf);
             match msg_type {
                 wire::MSG_METRICS => {
                     s.messages_ingested += 1;
@@ -240,7 +242,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let poll = (sys.channel_poll)(s.out_readyz, 0x02);
                 if poll > 0 && (poll as u32 & 0x02) != 0 {
                     let buf = [s.ready as u8];
-                    wire::channel_write_msg(sys, s.out_readyz, wire::MSG_READYZ, &buf);
+                    wire_channels::channel_write_msg(sys, s.out_readyz, wire::MSG_READYZ, &buf);
                 }
             }
 
@@ -249,7 +251,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let poll = (sys.channel_poll)(s.out_why, 0x02);
                 if poll > 0 && (poll as u32 & 0x02) != 0 {
                     let buf = [0u8; 1];
-                    wire::channel_write_msg(sys, s.out_why, wire::MSG_WHY, &buf);
+                    wire_channels::channel_write_msg(sys, s.out_why, wire::MSG_WHY, &buf);
                 }
             }
 
@@ -258,7 +260,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let poll = (sys.channel_poll)(s.out_export, 0x02);
                 if poll > 0 && (poll as u32 & 0x02) != 0 {
                     let buf = s.messages_ingested.to_le_bytes();
-                    wire::channel_write_msg(sys, s.out_export, wire::MSG_METRICS, &buf);
+                    wire_channels::channel_write_msg(sys, s.out_export, wire::MSG_METRICS, &buf);
                 }
             }
         }

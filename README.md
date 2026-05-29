@@ -20,46 +20,62 @@ execution-domain rationale is at
 
 ## Setup
 
-`deps/fluxor` is a git submodule, so clone with `--recurse-submodules`
-and then run `make setup`:
+Clustor consumes fluxor through a local-first registry. The
+contract lives at
+[`../standards/dependencies.md`](../standards/dependencies.md);
+the day-to-day guide is
+[`docs/consuming_fluxor.md`](docs/consuming_fluxor.md).
 
 ```sh
-git clone --recurse-submodules git@github.com:nanocloudio/clustor.git
-cd clustor
-make setup                # init submodules + install the fluxor CLI onto PATH
+# one-time, per developer machine
+git clone git@github.com:nanocloudio/fluxor.git ../fluxor
+cd ../fluxor
+make setup                 # install the fluxor CLI onto PATH
+fluxor registry init       # bootstrap ~/.fluxor/registry/
+fluxor registry setup-cargo  # add [registries.fluxor] to ~/.cargo/config.toml
+make publish               # publish abi + sdk crates, fmod palette, runtime
+
+# in clustor's checkout
+cd ../clustor
+make setup                 # install the fluxor CLI onto PATH
+make update                # resolve fluxor.lock against the local registry
+make sync                  # materialise crates / fmods / runtime into target/
 ```
 
-If you forgot `--recurse-submodules`, `make setup` will fix it
-(it runs `git submodule update --init --recursive` first).
+Subsequent fluxor changes flow through with `make publish && (cd
+../clustor && make update && make sync)`. The lockfile records what
+fluxor publishes; the deployment YAML decides which subset is wired
+into the runtime (RFC §5).
 
-### Dev override against a sibling fluxor checkout
+### Iterating on fluxor and clustor together
 
-If you also have `nanocloudio/fluxor` checked out alongside clustor
-and want local fluxor edits to flow into clustor builds without a
-commit-and-bump round trip, swap the submodule checkout for a
-symlink to that sibling:
+When iterating on both repos at once, add them to
+`~/.fluxor/workspace.toml`:
 
-```sh
-make link-fluxor          # deps/fluxor -> ../../fluxor (sibling)
-                          # submodule pin in the index is unchanged;
-                          # `git status` shows deps/fluxor as a typechange.
-
-make unlink-fluxor        # restore deps/fluxor from the submodule pin
+```toml
+[workspace]
+members = [
+  "/home/dev/Development/fluxor",
+  "/home/dev/Development/clustor",
+]
 ```
 
-Run `make unlink-fluxor` before committing if you want a clean
-`git status`. Override the sibling location with
-`FLUXOR_DEV_PATH=<path>` (relative to the clustor repo root or
-absolute). CI never touches the override — it always sees the
-submodule pin.
+`fluxor sync` then prefers fluxor's locally-built `target/`
+artefacts as an override; anything unbuilt locally resolves from
+the registry copy recorded in `fluxor.lock`. Source crates resolve
+through the registry either way — re-publish on demand when you
+change fluxor's SDK source.
 
-### Bumping the fluxor pin
+### Bumping fluxor
 
 ```sh
-make unlink-fluxor
-cd deps/fluxor && git fetch && git checkout <new-sha>
-cd ../.. && git add deps/fluxor && git commit -m "Bump fluxor to <new-sha>"
-make link-fluxor          # back to dev workflow against the sibling
+# in ../fluxor
+make publish               # canonical (bump [project].version first)
+
+# in clustor
+make update                # regenerate fluxor.lock against the registry
+make sync                  # materialise resolved artefacts into target/
+git commit fluxor.lock     # commit the pin
 ```
 
 ## Quick start
@@ -75,7 +91,8 @@ make help                 # everything else
 
 The cluster harness needs `fluxor` on PATH (defaults to
 `/usr/bin/fluxor`) and `fluxor-linux` at
-`deps/fluxor/target/aarch64-unknown-linux-gnu/release/`. Missing
+`target/aarch64-unknown-linux-gnu/release/fluxor-linux` (materialised
+by `make sync` from the local registry). Missing
 prereqs cause `cluster.rs` / `chaos.rs` / `partition.rs` to
 **runtime-skip** with a one-line note rather than fail — so a green
 `cargo test` from a workstation without those prereqs proves only
@@ -91,13 +108,13 @@ behaviour.
 | Path           | Contents |
 |----------------|----------|
 | `modules/app/`    | 24 `no_std` PIC modules — 23 substrate modules (`raft_engine`, `wal`, …) plus `example_consumer`, the minimal downstream module that exercises the per-entry stream. `make modules` packs each `mod.rs` + `manifest.toml` into a `.fmod`. |
-| `modules/sdk/` | Shared types, wire constants, the consumer facade, and the HTTP admin mapping. Pulled into each app module via `#[path]` and into host tests via the same mechanism. |
+| `modules/common/` | Shared types, wire constants, the consumer facade, and the HTTP admin mapping. Pulled into each app module via `#[path]` and into host tests via the same mechanism. |
 | `configs/`     | `fluxor run` graph templates. `single.yaml` (1 node), `multi-2node.yaml` (2 replicas), `multi-3node.yaml` (3 replicas, canonical Raft availability shape), `multi-2node-2p*.yaml` (partition-group experiments), `single-minimal.yaml` (commit-pipeline only). Each carries `__SELF_ID__` / `__LISTEN_PORT__` / `__PEER{0,1,2}_PORT__` placeholders that `fluxor render-template` (and the cluster harness) substitute per node. |
 | `tests/`       | Host-side integration tests: `facade.rs`, `facade_stress.rs`, `cluster.rs`, `chaos.rs`, `sandbox.rs`. The cluster harness at `tests/support/cluster.rs` spawns multi-node `fluxor-linux` processes. |
 | `benches/`     | Criterion microbenches against `replica_facade.rs`. |
 | `docs/`        | Stable reference: architecture (`docs/architecture/`), module map, subsystem deep-dives. |
 | `.context/`    | In-flight design work — RFCs, audits, plans, working notes. Not part of the stable reference surface. |
-| `fluxor.toml`  | Project config consumed by the `fluxor` CLI: CI targets, hygiene tier policy, structured exemptions, and the pinned fluxor SHA. See [`standards/`](../standards/). |
+| `fluxor.toml`  | Project config consumed by the `fluxor` CLI: identity, dependency declarations, CI targets, hygiene tier policy, structured exemptions. See [`standards/`](../standards/). |
 | `Makefile`     | Thin alias layer over the `fluxor` CLI. `make help` lists every canonical target. |
 
 ## Module map
@@ -121,10 +138,10 @@ canonical in [`configs/single.yaml`](configs/single.yaml); see
 
 Replicated apps (Lattice, Loam, Quantum, …) integrate against the
 `no_std` helper at
-[`modules/sdk/replica_facade.rs`](modules/sdk/replica_facade.rs):
+[`modules/common/replica_facade.rs`](modules/common/replica_facade.rs):
 
 ```rust
-#[path = "../sdk/replica_facade.rs"]
+#[path = "../common/replica_facade.rs"]
 mod replica_facade;
 ```
 
@@ -173,8 +190,8 @@ End-to-end cluster smoke (18 multi-node tests, default
 |--------------------------------|-----------|
 | Tests                          | One file per concern: `cluster.rs`, `chaos.rs`, `facade.rs`, `facade_stress.rs`, `sandbox.rs`. No `_it`/`_smoke`/`_checkpoint` suffix salad. |
 | Sandboxes                      | Every disk-touching test goes through `tests/support/sandbox.rs::TestSandbox` (under `target/test-sandboxes/`). `CLUSTOR_KEEP_TEST_SANDBOXES=1` keeps them on drop for post-mortem. |
-| Cluster harness                | `tests/support/cluster.rs`. Each cluster gets a unique yaml stem so `fluxor run`'s outputs land in disjoint `deps/fluxor/target/linux/cluster-<pid>-c<seq>-n<i>/` dirs and are wiped on `Drop`. |
-| Module hygiene                 | `fluxor lint hygiene` (run as part of `fluxor ci`) blocks `#[cfg(test)]` / `mod tests` / `#[test]` under `modules/**` and `src/**` per [`standards/tests.md`](../standards/tests.md). The one exception is `modules/sdk/replica_facade.rs`, which is dual-targeted (`no_std` ELF + host `cargo test`) and carries a structured exemption in `fluxor.toml`. |
+| Cluster harness                | `tests/support/cluster.rs`. Each cluster gets a unique yaml stem so `fluxor run`'s outputs land in disjoint `target/linux/cluster-<pid>-c<seq>-n<i>/` dirs and are wiped on `Drop`. |
+| Module hygiene                 | `fluxor lint hygiene` (run as part of `fluxor ci`) blocks `#[cfg(test)]` / `mod tests` / `#[test]` under `modules/**` and `src/**` per [`standards/tests.md`](../standards/tests.md). The one exception is `modules/common/replica_facade.rs`, which is dual-targeted (`no_std` ELF + host `cargo test`) and carries a structured exemption in `fluxor.toml`. |
 | Cleanup                        | `make clean` runs `cargo clean` plus `fluxor modules clean`. |
 
 ## Specification & docs

@@ -85,7 +85,7 @@ shared with every fluxor application. The rest are clustor's own.
 
 | Module | Description |
 |--------|-------------|
-| `example_consumer` | Minimal downstream consumer module that `#[path]`-includes `modules/sdk/replica_facade.rs` and wires to `apply_pipeline.committed_entries`. Built alongside every clustor module on every `make ci` run — the gate that catches `no_std` regressions in the facade or in the per-entry emitter. See [consumer_facade.md](consumer_facade.md). |
+| `example_consumer` | Minimal downstream consumer module that `#[path]`-includes `modules/common/replica_facade.rs` and wires to `apply_pipeline.committed_entries`. Built alongside every clustor module on every `make ci` run — the gate that catches `no_std` regressions in the facade or in the per-entry emitter. See [consumer_facade.md](consumer_facade.md). |
 
 ---
 
@@ -234,9 +234,9 @@ committed-entry delivery.
 
 The typed integration surface for downstream consumers is the
 `replica_facade` helper at
-[`modules/sdk/replica_facade.rs`](../../modules/sdk/replica_facade.rs).
+[`modules/common/replica_facade.rs`](../../modules/common/replica_facade.rs).
 Consumers include it the same way they include `wire.rs` and
-`types.rs` (`#[path = "../sdk/replica_facade.rs"] mod
+`types.rs` (`#[path = "../common/replica_facade.rs"] mod
 replica_facade;`). The full contract — bounded/opaque command
 invariants, propose lifecycle, leader-change protocol, snapshot
 install layout, and read-gate predicate — lives in

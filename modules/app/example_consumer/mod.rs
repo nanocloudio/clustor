@@ -3,7 +3,7 @@
 //! A minimal reference implementation showing how a downstream
 //! application (Loam, Lattice, future siblings) plugs into a Clustor
 //! replica group through the typed surface in
-//! `modules/sdk/replica_facade.rs`.
+//! `modules/common/replica_facade.rs`.
 //!
 //! What it does:
 //!
@@ -35,7 +35,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -45,16 +45,18 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
-#[path = "../../sdk/replica_facade.rs"]
+#[path = "../../common/replica_facade.rs"]
 mod replica_facade;
 
 use replica_facade::{CommitOrderError, CommittedSubscriber};
@@ -116,7 +118,7 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -152,7 +154,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -169,7 +171,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if poll <= 0 || (poll as u32 & 0x01) == 0 {
                 break;
             }
-            let (msg_type, plen) = wire::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
+            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
             if msg_type != wire::MSG_COMMITTED_ENTRY {
                 continue;
             }
@@ -212,7 +214,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let poll = (sys.channel_poll)(s.in_snapshot_chunk, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
                 let (msg_type, plen) =
-                    wire::channel_read_msg(sys, s.in_snapshot_chunk, &mut s.msg_buf);
+                    wire_channels::channel_read_msg(sys, s.in_snapshot_chunk, &mut s.msg_buf);
                 let pl = plen as usize;
                 match msg_type {
                     wire::MSG_APP_SNAPSHOT_RESET => {
@@ -258,7 +260,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let poll = (sys.channel_poll)(s.in_snapshot_request, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
                 let (msg_type, plen) =
-                    wire::channel_read_msg(sys, s.in_snapshot_request, &mut s.msg_buf);
+                    wire_channels::channel_read_msg(sys, s.in_snapshot_request, &mut s.msg_buf);
                 if msg_type != wire::MSG_APP_SNAPSHOT_REQUEST || (plen as usize) < 16 {
                     continue;
                 }
@@ -271,7 +273,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     &mut out, term, last_idx, 0, true, &body,
                 );
                 if n > 0 {
-                    wire::channel_write_msg(
+                    wire_channels::channel_write_msg(
                         sys, s.out_snapshot_export, wire::MSG_APP_SNAPSHOT_CHUNK, &out[..n],
                     );
                     s.snapshot_chunks_out = s.snapshot_chunks_out.saturating_add(1);
@@ -292,7 +294,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             buf[20..24].copy_from_slice(&(s.subscriber.last_term() as u32).to_le_bytes());
             let poll = (sys.channel_poll)(s.out_metrics, 0x02);
             if poll > 0 && (poll as u32 & 0x02) != 0 {
-                wire::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf);
+                wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf);
             }
         }
 

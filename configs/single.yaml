@@ -83,7 +83,7 @@ modules:
   # `docs/native_fluxor.md` for the dataflow. `http_ingress` binds
   # `__HTTP_PORT__` on the same `linux_net` instance `peer_router`
   # uses — linux_net's CMD_BIND supports concurrent listeners on
-  # distinct ports per `deps/fluxor/modules/builtin/linux/linux_net/README.md`.
+  # distinct ports per fluxor's `modules/builtin/linux/linux_net/README.md`.
   - name: http_adapter
   - name: http_ingress
     params:

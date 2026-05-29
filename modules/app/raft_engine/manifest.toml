@@ -25,7 +25,7 @@ content_type = "OctetStream"
 
 # Tagged proposals carry an 8-byte correlation_id prefix so the leader can
 # emit MSG_PROPOSAL_ASSIGNED on the proposal_assigned port once a log index
-# is assigned. See modules/sdk/wire.rs::encode_tagged_proposal.
+# is assigned. See modules/common/wire.rs::encode_tagged_proposal.
 [[ports]]
 name = "proposals_tagged"
 direction = "input"

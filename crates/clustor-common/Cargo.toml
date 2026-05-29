@@ -1,0 +1,80 @@
+[package]
+name              = "clustor-common"
+version.workspace = true
+edition           = "2021"
+license           = "Apache-2.0"
+description       = "Clustor common — no_std helpers shared across Clustor PIC modules and host consumers"
+repository        = "https://github.com/nanocloudio/clustor"
+documentation     = "https://github.com/nanocloudio/clustor/tree/main/docs"
+readme            = false
+keywords          = ["raft", "consensus", "no_std", "fluxor"]
+categories        = ["no-std", "data-structures"]
+
+# Path layout follows the fluxor-abi / fluxor-sdk pattern (RFC §6.5.1):
+# `common/` is a symlink to `../../modules/common`. Cargo follows
+# the symlink at package time so the published `.crate` tarball is
+# self-contained. The source of truth stays at `modules/common/*.rs`,
+# which clustor's PIC modules `#[path]`-include directly.
+#
+# `include` is an explicit allowlist. The published crate ships
+# only the pure no_std surface mounted by `src/lib.rs`. PIC-only
+# files (notably `wire_channels.rs`, which wraps fluxor's
+# `SyscallTable`) sit alongside the pure files so app modules can
+# `#[path]`-include them, but they must not ship to host consumers
+# — that would undercut the pure-no_std-fragments contract from
+# RFC §6.5.1. Mount new pure files in `src/lib.rs` and add them
+# here at the same time.
+include = [
+    "Cargo.toml",
+    "src/lib.rs",
+    "common/collections.rs",
+    "common/http_admin.rs",
+    "common/replica_facade.rs",
+    "common/types.rs",
+    "common/wire.rs",
+]
+
+[lib]
+name = "clustor_common"
+path = "src/lib.rs"
+
+# No runtime dependencies. The pure facade surface (collections,
+# types, replica_facade, http_admin, wire) is self-contained no_std
+# code with no `unsafe` and no syscalls. PIC consumers reach
+# fluxor's `abi.rs` (and the channel-I/O wrappers in
+# `modules/common/wire_channels.rs`) through their own `#[path]`
+# mounts.
+[dependencies]
+
+# Inline lints rather than `workspace = true` because clustor's
+# workspace-lints baseline forbids `unsafe_code` (correct for the
+# facade root) but the facade crate compiles `replica_facade.rs`,
+# whose embedded `#[cfg(test)]` blocks use `.unwrap()` / `panic!()`
+# legitimately. Mirror the workspace baseline minus the lints that
+# conflict with that shape.
+[lints.rust]
+unsafe_code               = "forbid"
+unused_must_use           = "deny"
+elided_lifetimes_in_paths = "warn"
+# `replica_facade.rs` is mounted as the cargo-crate lib and as a
+# `#[path]` include from each PIC module. Different consumers use
+# different subsets; the unused-elsewhere helpers must stay public.
+dead_code                 = "allow"
+
+[lints.clippy]
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "allow", priority = -1 }  # relaxed for the facade crate
+
+allow_attributes                = "deny"
+allow_attributes_without_reason = "deny"
+
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+
+# `#[cfg(test)]` blocks inside `replica_facade.rs` use these.
+unwrap_used   = "allow"
+expect_used   = "allow"
+panic         = "allow"
+print_stdout  = "allow"
+print_stderr  = "allow"

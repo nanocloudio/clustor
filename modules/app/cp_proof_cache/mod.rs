@@ -6,7 +6,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -16,18 +16,20 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/types.rs"]
+#[path = "../../common/types.rs"]
 mod types;
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 use types::*;
 
@@ -66,7 +68,7 @@ pub extern "C" fn module_new(
     params: *const u8, params_len: usize,
     state: *mut u8, state_size: usize, syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -101,7 +103,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -116,7 +118,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         loop {
             let poll = (sys.channel_poll)(s.in_proof, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-            let (msg_type, plen) = wire::channel_read_msg(sys, s.in_proof, &mut s.msg_buf);
+            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_proof, &mut s.msg_buf);
             if msg_type == wire::MSG_CP_PROOF && plen >= 8 {
                 s.last_proof_ms = now;
             }
@@ -145,7 +147,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if poll > 0 && (poll as u32 & 0x02) != 0 {
                 let mut buf = [0u8; 1];
                 wire::encode_cache_state(&mut buf, new_state);
-                wire::channel_write_msg(sys, s.out_cache_state, wire::MSG_CACHE_STATE, &buf[..1]);
+                wire_channels::channel_write_msg(sys, s.out_cache_state, wire::MSG_CACHE_STATE, &buf[..1]);
             }
 
             // Emit FallbackSignal when entering/leaving strict fallback
@@ -154,7 +156,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let poll = (sys.channel_poll)(s.out_fallback, 0x02);
                 if poll > 0 && (poll as u32 & 0x02) != 0 {
                     let buf = [fallback as u8];
-                    wire::channel_write_msg(sys, s.out_fallback, wire::MSG_FALLBACK_SIGNAL, &buf[..1]);
+                    wire_channels::channel_write_msg(sys, s.out_fallback, wire::MSG_FALLBACK_SIGNAL, &buf[..1]);
                 }
             }
         }

@@ -7,7 +7,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -17,15 +17,17 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 #[repr(C)]
 struct ModuleState {
@@ -59,7 +61,7 @@ pub extern "C" fn module_new(
     _params: *const u8, _params_len: usize,
     state: *mut u8, state_size: usize, syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -86,7 +88,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -100,7 +102,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         loop {
             let poll = (sys.channel_poll)(s.in_credits, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-            let (msg_type, plen) = wire::channel_read_msg(sys, s.in_credits, &mut s.msg_buf);
+            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_credits, &mut s.msg_buf);
             if msg_type == wire::MSG_THROTTLE_CREDITS && plen >= 8 {
                 let (entry, byte) = wire::decode_credits(&s.msg_buf);
                 s.entry_credits = entry;
@@ -113,7 +115,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let poll = (sys.channel_poll)(s.in_requests, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
-            let (msg_type, plen) = wire::channel_read_msg(sys, s.in_requests, &mut s.msg_buf);
+            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_requests, &mut s.msg_buf);
             if msg_type != wire::MSG_CLIENT_PROPOSAL || plen == 0 { continue; }
 
             let payload_len = plen as usize;
@@ -133,7 +135,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // raft_engine.proposals_tagged (configured in YAML).
                 let poll_out = (sys.channel_poll)(s.out_admitted, 0x02);
                 if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                    wire::channel_write_msg(sys, s.out_admitted, wire::MSG_CLIENT_PROPOSAL, &s.msg_buf[..payload_len]);
+                    wire_channels::channel_write_msg(sys, s.out_admitted, wire::MSG_CLIENT_PROPOSAL, &s.msg_buf[..payload_len]);
                     s.entry_credits -= 1;
                     s.byte_credits -= payload_len as i32;
                     s.admitted_count += 1;
@@ -157,7 +159,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             entry_clamped,
                             s.byte_credits,
                         );
-                        wire::channel_write_msg(
+                        wire_channels::channel_write_msg(
                             sys,
                             s.out_rejected,
                             wire::MSG_CLIENT_REJECT_INTERNAL,

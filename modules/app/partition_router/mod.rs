@@ -23,7 +23,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -33,15 +33,17 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 const PROPOSAL_BUF: usize = 2048;
 
@@ -104,7 +106,7 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -161,7 +163,7 @@ fn pick_chan(table: &[i32; MAX_LOCAL_PARTITIONS], partition_id: u16) -> i32 {
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -176,7 +178,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let poll_in = (sys.channel_poll)(s.in_proposals, 0x01);
             if poll_in <= 0 || (poll_in as u32 & 0x01) == 0 { break; }
 
-            let (msg_type, plen) = wire::channel_read_msg(sys, s.in_proposals, &mut s.msg_buf);
+            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_proposals, &mut s.msg_buf);
             if msg_type != wire::MSG_CLIENT_PROPOSAL || plen == 0 { continue; }
             let body_len = plen as usize;
 
@@ -197,7 +199,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.proposals_dropped = s.proposals_dropped.wrapping_add(1);
                 continue;
             }
-            wire::channel_write_partitioned(
+            wire_channels::channel_write_partitioned(
                 sys,
                 chan,
                 partition_id,
@@ -217,7 +219,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let poll_in = (sys.channel_poll)(s.in_proposals_tagged, 0x01);
                 if poll_in <= 0 || (poll_in as u32 & 0x01) == 0 { break; }
 
-                let (msg_type, plen) = wire::channel_read_msg(
+                let (msg_type, plen) = wire_channels::channel_read_msg(
                     sys,
                     s.in_proposals_tagged,
                     &mut s.msg_buf,
@@ -246,7 +248,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // recipient (raft_engine.proposals_partitioned_tagged)
                 // strips the correlation prefix on the way into its
                 // batch.
-                wire::channel_write_partitioned(
+                wire_channels::channel_write_partitioned(
                     sys,
                     chan,
                     partition_id,

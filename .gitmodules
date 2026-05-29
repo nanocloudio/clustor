@@ -1,3 +1,0 @@
-[submodule "deps/fluxor"]
-	path = deps/fluxor
-	url = git@github.com:nanocloudio/fluxor.git

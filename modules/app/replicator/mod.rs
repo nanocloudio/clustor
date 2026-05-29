@@ -16,7 +16,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -26,18 +26,20 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/types.rs"]
+#[path = "../../common/types.rs"]
 mod types;
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 use types::*;
 
@@ -214,7 +216,7 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -275,7 +277,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -313,7 +315,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn replicate_entries(s: &mut ModuleState, sys: &SyscallTable) {
     // Process up to 4 entries per step
     for _ in 0..4 {
@@ -324,7 +326,7 @@ unsafe fn replicate_entries(s: &mut ModuleState, sys: &SyscallTable) {
         let poll_out = (sys.channel_poll)(s.out_net, 0x02);
         if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 { break; }
 
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
         if msg_type != wire::MSG_APPEND_ENTRIES || (plen as usize) < wire::AE_HDR_LEN { continue; }
 
         dev_log(sys, 3, b"[repl] ae in".as_ptr(), 12);
@@ -348,7 +350,7 @@ unsafe fn replicate_entries(s: &mut ModuleState, sys: &SyscallTable) {
         for i in 0..MAX_NODES {
             if !s.peers[i].active { continue; }
             if i == s.self_id as usize { continue; }
-            let w = wire::channel_write_routed_partitioned(
+            let w = wire_channels::channel_write_routed_partitioned(
                 sys, s.out_net, i as u8, s.partition_id,
                 wire::MSG_APPEND_ENTRIES, payload,
             );
@@ -367,7 +369,7 @@ unsafe fn replicate_entries(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_ack < 0 { return; }
 
@@ -380,7 +382,7 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
         let (partition_id, msg_type, plen) =
-            wire::channel_read_partitioned(sys, s.in_ack, &mut s.msg_buf);
+            wire_channels::channel_read_partitioned(sys, s.in_ack, &mut s.msg_buf);
         if plen == 0 && msg_type == 0 { break; }
         if partition_id != s.partition_id { continue; }
         if plen < 17 { continue; }
@@ -409,7 +411,7 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
                     if poll_d > 0 && (poll_d as u32 & 0x02) != 0 {
                         let mut ack = [0u8; 17];
                         wire::encode_fsync_ack(&mut ack, term, durable_index, replica);
-                        wire::channel_write_msg(
+                        wire_channels::channel_write_msg(
                             sys,
                             s.out_cross_durability_ack,
                             wire::MSG_FSYNC_ACK,
@@ -442,7 +444,7 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
                         if was_voting && index > prev_match && s.out_match >= 0 {
                             let poll_out = (sys.channel_poll)(s.out_match, 0x02);
                             if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                                wire::channel_write_msg(
+                                wire_channels::channel_write_msg(
                                     sys, s.out_match,
                                     wire::MSG_APPEND_ENTRIES_RESP,
                                     &s.msg_buf[..plen as usize],
@@ -499,7 +501,7 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
                 if s.out_snapshot_import >= 0 {
                     let poll_out = (sys.channel_poll)(s.out_snapshot_import, 0x02);
                     if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                        wire::channel_write_msg(
+                        wire_channels::channel_write_msg(
                             sys, s.out_snapshot_import,
                             msg_type, &s.msg_buf[..plen as usize],
                         );
@@ -516,7 +518,7 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn issue_wal_request(
     s: &mut ModuleState,
     sys: &SyscallTable,
@@ -557,7 +559,7 @@ unsafe fn issue_wal_request(
     }
     let mut req = [0u8; wire::WAL_ENTRY_REQUEST_LEN];
     wire::encode_wal_entry_request(&mut req, request_id, wal_index);
-    wire::channel_write_msg(sys, s.out_wal_request, wire::MSG_WAL_ENTRY_REQUEST, &req);
+    wire_channels::channel_write_msg(sys, s.out_wal_request, wire::MSG_WAL_ENTRY_REQUEST, &req);
 }
 
 /// # Safety
@@ -565,7 +567,7 @@ unsafe fn issue_wal_request(
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_voter_set_update(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_voter_set < 0 {
         return;
@@ -575,7 +577,7 @@ unsafe fn drain_voter_set_update(s: &mut ModuleState, sys: &SyscallTable) {
         if poll <= 0 || (poll as u32 & 0x01) == 0 {
             break;
         }
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_voter_set, &mut s.msg_buf);
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_voter_set, &mut s.msg_buf);
         if msg_type != wire::MSG_VOTER_SET_UPDATE || (plen as usize) < 3 {
             continue;
         }
@@ -632,7 +634,7 @@ unsafe fn drain_voter_set_update(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Promote a non-voting peer to voting once its match_index is
 /// within `VOTING_LAG_THRESHOLD` of the leader's last-emitted tip.
 /// Called from the AE-success branch in `process_acks`.
@@ -666,13 +668,13 @@ unsafe fn maybe_promote(s: &mut ModuleState, sys: &SyscallTable, peer: u8) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn request_snapshot_install(s: &ModuleState, sys: &SyscallTable, target: u8) {
     if s.out_snapshot_request < 0 { return; }
     let poll = (sys.channel_poll)(s.out_snapshot_request, 0x02);
     if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
     let buf = [target; 1];
-    wire::channel_write_msg(
+    wire_channels::channel_write_msg(
         sys, s.out_snapshot_request, wire::MSG_SNAPSHOT_INSTALL_REQUEST, &buf,
     );
 }
@@ -682,13 +684,13 @@ unsafe fn request_snapshot_install(s: &ModuleState, sys: &SyscallTable, target: 
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn process_wal_replies(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_wal_reply < 0 { return; }
     for _ in 0..8 {
         let poll = (sys.channel_poll)(s.in_wal_reply, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_wal_reply, &mut s.msg_buf);
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_wal_reply, &mut s.msg_buf);
         if msg_type != wire::MSG_WAL_ENTRY_REPLY { continue; }
         let pl = plen as usize;
         let (request_id, term, index, body_off) =
@@ -753,7 +755,7 @@ unsafe fn process_wal_replies(s: &mut ModuleState, sys: &SyscallTable) {
 
         let poll_out = (sys.channel_poll)(s.out_net, 0x02);
         if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 { continue; }
-        let w = wire::channel_write_routed_partitioned(
+        let w = wire_channels::channel_write_routed_partitioned(
             sys,
             s.out_net,
             peer,
@@ -776,7 +778,7 @@ unsafe fn process_wal_replies(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn forward_snapshots(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_snapshot_rx < 0 { return; }
 
@@ -784,7 +786,7 @@ unsafe fn forward_snapshots(s: &mut ModuleState, sys: &SyscallTable) {
         let poll = (sys.channel_poll)(s.in_snapshot_rx, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_snapshot_rx, &mut s.msg_buf);
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_snapshot_rx, &mut s.msg_buf);
         if plen == 0 { continue; }
 
         let pass_through = matches!(
@@ -799,7 +801,7 @@ unsafe fn forward_snapshots(s: &mut ModuleState, sys: &SyscallTable) {
         let target = wire::TARGET_BROADCAST;
         let poll_out = (sys.channel_poll)(s.out_net, 0x02);
         if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-            wire::channel_write_routed_partitioned(
+            wire_channels::channel_write_routed_partitioned(
                 sys, s.out_net, target, s.partition_id,
                 msg_type, &s.msg_buf[..plen as usize],
             );
@@ -812,7 +814,7 @@ unsafe fn forward_snapshots(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
     if s.out_metrics < 0 { return; }
     let now = dev_millis(sys);
@@ -828,6 +830,6 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
 
     let poll = (sys.channel_poll)(s.out_metrics, 0x02);
     if poll > 0 && (poll as u32 & 0x02) != 0 {
-        wire::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf[..16]);
+        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf[..16]);
     }
 }

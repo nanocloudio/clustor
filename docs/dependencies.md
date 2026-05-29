@@ -1,11 +1,11 @@
 # Dependency Inventory
 
-Clustor's `[dependencies]` table is empty. Every cryptographic
-primitive, codec, transport, and runtime piece the substrate needs is
-part of the fluxor SDK or implemented in `modules/sdk/`. The
-substrate has no `cargo install`-able dependency footprint at runtime;
-shipping a module just means packing its `.fmod` and dropping it into
-the graph.
+Clustor's runtime substrate has no `cargo install`-able footprint —
+cryptographic primitives, codecs, transports, and runtime helpers
+come from fluxor's published SDK (consumed via the local registry,
+see [`../../standards/dependencies.md`](../../standards/dependencies.md)).
+Shipping a clustor module just means packing its `.fmod` and dropping
+it into the graph.
 
 That leaves only the host-side build and test surface to account for.
 
@@ -22,12 +22,26 @@ the `clustor` cargo package's compiled artefact (currently just the
 empty `lib_stub.rs`), not in any module ELF. The substrate's runtime
 footprint is unchanged.
 
-## Submodule: `deps/fluxor`
+## Fluxor consumption
 
-Clustor pins the `fluxor` source tree as a submodule (in practice a
-local symlink during development; a real git submodule in CI). The
-pinned ABI lives in `fluxor.toml::[required].fluxor.abi`; `fluxor ci`'s
-version-skew phase fails if the installed CLI's ABI doesn't match.
+Clustor consumes fluxor through the local registry; see
+[`../../standards/dependencies.md`](../../standards/dependencies.md)
+for the contract. The pin lives in
+`fluxor.toml::[dependencies] fluxor = "X.Y"`; `fluxor update`
+resolves it to specific crate, fmod, and runtime versions, recorded
+in `fluxor.lock`. `fluxor sync` materialises those into
+`target/fluxor/<crate>/` (source crates) and
+`target/<host-target>/release/<bin>` (runtime binaries).
+
+The ABI is derived from the resolved fluxor version; `fluxor ci`'s
+version-skew phase fails if the installed CLI's ABI doesn't match
+the resolved lockfile entry. `[required] fluxor = { abi = N }` is
+also honoured as an optional explicit assertion for defense in
+depth.
+
+PIC modules in `modules/app/*/mod.rs` `#[path]`-mount fluxor's SDK
+source from the synced location at
+`target/fluxor/fluxor-abi/sdk/<file>.rs`.
 
 ## Verifying
 

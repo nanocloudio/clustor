@@ -1,27 +1,27 @@
 //! HTTP admin path / op-code mapping, shared between the
 //! `http_adapter` module and host-side tests.
 //!
-//! Pulled in from both sides via `#[path = "../sdk/http_admin.rs"]`
+//! Pulled in from both sides via `#[path = "../common/http_admin.rs"]`,
 //! so the wire constant for each `/admin/<op>` path is defined in
-//! exactly one place and host tests can exercise the mapping without
-//! pulling the whole no_std module into the cargo build.
+//! exactly one place and host tests can exercise the mapping in
+//! isolation.
 //!
-//! ## Why the constants are duplicated here
+//! ## Why the op-code constants are duplicated here
 //!
-//! The op-code byte values (`ADMIN_OP_*`) are the wire admin ABI and
-//! also live in `modules/sdk/wire.rs`. wire.rs takes `&SyscallTable`
-//! in its channel-write helpers, which means a host test crate can't
-//! pull wire.rs in without stubbing the kernel ABI. Duplicating the
-//! constants here keeps host tests trivial; the
-//! `op_code_values_match_wire_ABI` assertion below catches drift in
-//! either direction.
+//! The op-code byte values (`ADMIN_OP_*`) are also defined in
+//! `modules/common/wire.rs` alongside the rest of the wire ABI.
+//! Repeating them in this file keeps host tests of the path mapping
+//! self-contained — they assert against the five admin codes
+//! directly without pulling in the whole wire module — and the
+//! `op_code_values_match_wire_abi` assertion in
+//! `tests/http_admin.rs` catches drift in either direction.
 
 #![allow(
     dead_code,
     reason = "shared via #[path] into multiple targets; each consumer uses a subset of the surface so single-target rustc invocations see unused items"
 )]
 
-// Mirror of `modules/sdk/wire.rs`'s `ADMIN_OP_*` constants. If
+// Mirror of `modules/common/wire.rs`'s `ADMIN_OP_*` constants. If
 // either side changes, the `op_code_values_match_wire_ABI` test in
 // the http_admin host test crate fails.
 pub const ADMIN_OP_FREEZE: u8 = 0x01;

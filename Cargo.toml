@@ -1,5 +1,10 @@
 [workspace]
-members = ["."]
+members = [".", "crates/clustor-common"]
+
+[workspace.package]
+# Shared by every publishable crate via `version.workspace = true`.
+# Mirrors `fluxor.toml::[project].version`; publish enforces equality.
+version = "0.1.0"
 
 # Workspace lint policy, per standards/lints.md §1. Every member
 # (only `clustor` today) opts in via `[lints] workspace = true`
@@ -39,13 +44,13 @@ name = "clustor"
 version = "0.1.0"
 edition = "2021"
 
-# Clustor is built as a set of fluxor-native PIC modules (see
-# `modules/app/` and `make modules`). The cargo package no longer
-# ships a `src/lib.rs` library. Cargo retains the package shell so
-# the host-side test/bench targets that pull
-# `modules/sdk/replica_facade.rs` via `#[path = ...]` can still be
-# compiled and exercised on the host toolchain. The actual on-target
-# module ELFs are produced by `make modules TARGET=<board>`.
+# Clustor ships as a set of fluxor-native PIC modules (see
+# `modules/app/` and `make modules`). The cargo package itself
+# has no library target beyond `lib_stub.rs`; it exists so the
+# host-side test and bench targets that pull
+# `modules/common/replica_facade.rs` via `#[path = ...]` can be
+# compiled and exercised on the host toolchain. On-target module
+# ELFs are produced by `make modules TARGET=<board>`.
 autobins = false
 autoexamples = false
 autobenches = false
@@ -187,7 +192,7 @@ path = "tests/wal_group_fsync.rs"
 # Criterion benches. Each uses `harness = false` so criterion's own
 # main runs instead of the default libtest harness. Run with
 # `cargo bench` or `cargo bench --bench <name> -- --quick`. All
-# benches pull `modules/sdk/replica_facade.rs` directly via
+# benches pull `modules/common/replica_facade.rs` directly via
 # `#[path]` — no library link is required.
 #
 # Commented out: `benches/` is `.gitignore`d (per the project

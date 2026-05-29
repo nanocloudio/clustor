@@ -9,7 +9,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -19,18 +19,20 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/types.rs"]
+#[path = "../../common/types.rs"]
 mod types;
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 use types::*;
 
@@ -111,7 +113,7 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -154,7 +156,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -195,7 +197,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_voter_set(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     if s.in_voter_set < 0 {
         return false;
@@ -206,7 +208,7 @@ unsafe fn drain_voter_set(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         if poll <= 0 || (poll as u32 & 0x01) == 0 {
             break;
         }
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_voter_set, &mut s.msg_buf);
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_voter_set, &mut s.msg_buf);
         if msg_type != wire::MSG_VOTER_SET_UPDATE || (plen as usize) < 3 {
             continue;
         }
@@ -228,14 +230,14 @@ unsafe fn drain_voter_set(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_match_indices(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     let mut changed = false;
     loop {
         let poll = (sys.channel_poll)(s.in_match, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_match, &mut s.msg_buf);
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_match, &mut s.msg_buf);
         if plen < 17 { continue; }
 
         // Accept match index updates from replicator
@@ -256,7 +258,7 @@ unsafe fn drain_match_indices(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_durability(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     if s.in_durable < 0 { return false; }
     let mut changed = false;
@@ -264,7 +266,7 @@ unsafe fn drain_durability(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         let poll = (sys.channel_poll)(s.in_durable, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_durable, &mut s.msg_buf);
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_durable, &mut s.msg_buf);
         if msg_type != wire::MSG_DURABILITY_PROOF || (plen as usize) < wire::DURABILITY_PROOF_LEN {
             continue;
         }
@@ -295,14 +297,14 @@ unsafe fn drain_durability(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_cp_state(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_cp_state < 0 { return; }
     loop {
         let poll = (sys.channel_poll)(s.in_cp_state, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_cp_state, &mut s.msg_buf);
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_cp_state, &mut s.msg_buf);
         if msg_type == wire::MSG_CACHE_STATE && plen >= 1 {
             s.cp_cache_state = wire::decode_cache_state(&s.msg_buf);
             s.strict_fallback = s.cp_cache_state >= CP_STALE;
@@ -317,7 +319,7 @@ unsafe fn drain_cp_state(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn advance_commit(s: &mut ModuleState, sys: &SyscallTable) {
     // Compute quorum match index. If a voter-set update has populated
     // `current_voters` we use the joint-aware path (RFC §1.2); during
@@ -361,7 +363,7 @@ unsafe fn advance_commit(s: &mut ModuleState, sys: &SyscallTable) {
         if poll > 0 && (poll as u32 & 0x02) != 0 {
             let mut buf = [0u8; 16];
             wire::encode_term_index(&mut buf, s.committed_term, s.committed_index);
-            wire::channel_write_msg(sys, s.out_committed, wire::MSG_COMMITTED_BATCH, &buf[..16]);
+            wire_channels::channel_write_msg(sys, s.out_committed, wire::MSG_COMMITTED_BATCH, &buf[..16]);
             dev_log(sys, 3, b"[commit] adv".as_ptr(), 12);
         }
     }

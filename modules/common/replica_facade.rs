@@ -6,14 +6,14 @@
 //! replica group through the same set of channel ports on the consensus graph
 //! (`raft_engine.proposals_tagged`, `raft_engine.proposal_assigned`,
 //! `commit_tracker.committed`, `snapshot_engine.import/export`, etc.). The
-//! wire envelopes are defined in `modules/sdk/wire.rs`; the per-message
+//! wire envelopes are defined in `modules/common/wire.rs`; the per-message
 //! payload layouts are defined in the producing module.
 //!
 //! This file is the *typed Rust surface* over that contract. It is pulled in
 //! by each consumer's fluxor module via the standard pattern
 //!
 //! ```ignore
-//! #[path = "../sdk/replica_facade.rs"]
+//! #[path = "../common/replica_facade.rs"]
 //! mod replica_facade;
 //! ```
 //!
@@ -101,14 +101,14 @@ pub const SNAPSHOT_MANIFEST_LEN: usize = 32;
 /// Snapshot manifest magic: ASCII "SNAP" little-endian.
 pub const SNAPSHOT_MAGIC: u32 = 0x534E_4150;
 
-/// CP cache states (mirror of `modules/sdk/types.rs::CP_*`).
+/// CP cache states (mirror of `modules/common/types.rs::CP_*`).
 pub const CACHE_FRESH: u8 = 0;
 pub const CACHE_CACHED: u8 = 1;
 pub const CACHE_STALE: u8 = 2;
 pub const CACHE_EXPIRED: u8 = 3;
 
 /// Maximum replicas a single partition can hold. Matches
-/// `modules/sdk/types.rs::MAX_NODES`.
+/// `modules/common/types.rs::MAX_NODES`.
 pub const MAX_NODES: usize = 7;
 
 /// Default in-flight proposal capacity. Consumers needing more

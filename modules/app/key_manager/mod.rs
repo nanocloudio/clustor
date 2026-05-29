@@ -7,7 +7,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -17,15 +17,17 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 const ROTATION_INTERVAL_MS: u64 = 168 * 3600 * 1000; // weekly
 
@@ -56,7 +58,7 @@ pub extern "C" fn module_new(
     _params: *const u8, _params_len: usize,
     state: *mut u8, state_size: usize, syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -81,7 +83,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -109,7 +111,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let poll = (sys.channel_poll)(s.out_cert, 0x02);
                 if poll > 0 && (poll as u32 & 0x02) != 0 {
                     let buf = s.dek_epoch.to_le_bytes();
-                    wire::channel_write_msg(sys, s.out_cert, wire::MSG_CERT_REFRESH, &buf);
+                    wire_channels::channel_write_msg(sys, s.out_cert, wire::MSG_CERT_REFRESH, &buf);
                 }
             }
         }
@@ -123,11 +125,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_dek(s: &ModuleState, sys: &SyscallTable) {
     let poll = (sys.channel_poll)(s.out_dek, 0x02);
     if poll > 0 && (poll as u32 & 0x02) != 0 {
         let buf = s.dek_epoch.to_le_bytes();
-        wire::channel_write_msg(sys, s.out_dek, wire::MSG_DEK_EPOCH, &buf);
+        wire_channels::channel_write_msg(sys, s.out_dek, wire::MSG_DEK_EPOCH, &buf);
     }
 }

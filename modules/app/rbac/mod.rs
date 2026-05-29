@@ -31,7 +31,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -41,15 +41,17 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 // Role bits
 const ROLE_OPERATOR: u8     = 0x01;
@@ -165,7 +167,7 @@ pub extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -206,7 +208,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -229,7 +231,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             }
 
-            let (msg_type, plen) = wire::channel_read_msg(sys, s.in_requests, &mut s.msg_buf);
+            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_requests, &mut s.msg_buf);
             if msg_type != wire::MSG_ADMIN_COMMAND || plen == 0 {
                 continue;
             }
@@ -244,7 +246,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if authorized {
                 let poll_out = (sys.channel_poll)(s.out_authorized, 0x02);
                 if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                    wire::channel_write_msg(
+                    wire_channels::channel_write_msg(
                         sys,
                         s.out_authorized,
                         wire::MSG_ADMIN_COMMAND,
@@ -257,7 +259,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let poll_out = (sys.channel_poll)(s.out_denied, 0x02);
                     if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
                         let resp = [conn_id, wire::ADMIN_STATUS_REJECTED];
-                        wire::channel_write_msg(
+                        wire_channels::channel_write_msg(
                             sys,
                             s.out_denied,
                             wire::MSG_ADMIN_RESPONSE,
@@ -273,7 +275,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let poll_out = (sys.channel_poll)(s.out_audit, 0x02);
                 if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
                     let audit = [authorized as u8, role, conn_id];
-                    wire::channel_write_msg(sys, s.out_audit, wire::MSG_METRICS, &audit);
+                    wire_channels::channel_write_msg(sys, s.out_audit, wire::MSG_METRICS, &audit);
                 }
             }
         }
@@ -287,7 +289,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_identity(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_identity < 0 {
         return;
@@ -297,7 +299,7 @@ unsafe fn drain_identity(s: &mut ModuleState, sys: &SyscallTable) {
         if poll <= 0 || (poll as u32 & 0x01) == 0 {
             break;
         }
-        let (msg_type, plen) = wire::channel_read_msg(sys, s.in_identity, &mut s.msg_buf);
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_identity, &mut s.msg_buf);
         if msg_type != wire::MSG_PEER_IDENTITY {
             continue;
         }
@@ -323,7 +325,7 @@ unsafe fn drain_identity(s: &mut ModuleState, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn record_identity(s: &mut ModuleState, conn_id: u8, verified: bool, svid: &[u8]) {
     // Refuse to downgrade a TLS-verified binding via a plaintext envelope.
     if let Some(existing) = find_binding(s, conn_id) {

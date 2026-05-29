@@ -1,0 +1,305 @@
+# fluxor.lock — generated, edit via `fluxor update`
+# Lockfile format defined in `.context/rfc_project_dependencies.md` §7.5
+
+lockfile_version = 1
+generated_by = "fluxor 0.1.0"
+
+[[crate]]
+name = "fluxor-abi"
+version = "0.1.0"
+hash = "sha256:150aa927c69ed2397f0fd5a88f4c813f4c29af21401f9e8dbec8687a79ef12d8"
+source = "cargo/fluxor-abi-0.1.0.crate"
+
+[[crate]]
+name = "fluxor-sdk"
+version = "0.1.0"
+hash = "sha256:638e7318bfae6785a8151e3fe2818fd739ddd4730337401c7043857e5a727cb0"
+source = "cargo/fluxor-sdk-0.1.0.crate"
+
+[[fmod]]
+project = "fluxor"
+name = "bank"
+target = "bcm2712"
+version = "2.0.0"
+hash = "sha256:75d8649ac29506b9c80a607b989ecdd679aa10b618bc2469ec3a92d7c6f06f61"
+source = "fmod/fluxor/bcm2712/bank/2.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "codec"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:58ea361ad463f443e27fedfd7057c95a3e4249a3a95a92989c67b94b4b664ba3"
+source = "fmod/fluxor/bcm2712/codec/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "conn_guard"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:2d71760cbab3ff5c0c35bf912ebaf99418d35c1f220ea3961a26d006bd8b4f1b"
+source = "fmod/fluxor/bcm2712/conn_guard/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "demux"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:ee22a1d79eac3c42b3c2080ff4e36ed5f7873ece940f1e12d0ab9e7f76754ddf"
+source = "fmod/fluxor/bcm2712/demux/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "dma_probe"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:55609502c62c09e90922a193e6551dd67431501d06da9def71520e1285ce6941"
+source = "fmod/fluxor/bcm2712/dma_probe/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "dns"
+target = "bcm2712"
+version = "2.0.0"
+hash = "sha256:a59643cb1d74dedc7375657fde114d48fa09736d2d1f54f58625dc8a036394f9"
+source = "fmod/fluxor/bcm2712/dns/2.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "e810"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:1189822cbd26b956d7ba7dc6f75a77c52b7dbd1202757f023f3e5442878fb95c"
+source = "fmod/fluxor/bcm2712/e810/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "echo_anchor"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:31e3b037faa0c17b8ea3fd7d9783a52a601eed332495486d68d80b60c587028b"
+source = "fmod/fluxor/bcm2712/echo_anchor/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "echo_worker"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:5940043c1e3a3c140be31b6e7e77aab33f3438064c5f6317434878214c3210f3"
+source = "fmod/fluxor/bcm2712/echo_worker/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "eth_parser"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:8a354e4655d553895710d3c9f095a5cbb501b02a87553fcb9fa27b4a5c07c166"
+source = "fmod/fluxor/bcm2712/eth_parser/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "fat32"
+target = "bcm2712"
+version = "2.0.0"
+hash = "sha256:2c879eb68b1c26b682e441ffa3abe1a80bc620fb8fa68e0c23a096498b50a95e"
+source = "fmod/fluxor/bcm2712/fat32/2.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "fs_tap"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:54bb4e657a62d9bb09457123008e6bdc1d555ffa31b4c6073d2be937a434c7dc"
+source = "fmod/fluxor/bcm2712/fs_tap/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "gesture"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:25ad472159e202718ca4dba722f25f58804ed575436abc03226a58b387fb9896"
+source = "fmod/fluxor/bcm2712/gesture/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "http"
+target = "bcm2712"
+version = "2.0.0"
+hash = "sha256:ca99e873d9ed5ae675af8b1b5ad8dc646df587e264ae7c88c30a40ec53f0a972"
+source = "fmod/fluxor/bcm2712/http/2.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "ip"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:b31407bfe29e4cb594e2c452a6ce7a5929f4bc0a45497c0b95bcc7c20433ee31"
+source = "fmod/fluxor/bcm2712/ip/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "kv_store"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:ddb03535416cbfeedf3428cf97899bf97ec94e6398932228626dac305e9c70be"
+source = "fmod/fluxor/bcm2712/kv_store/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "log_net"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:9bd30ea5853e6146630a245cbc40f3b00b9cf26cf1ffc5ba21a9f4f379669b6b"
+source = "fmod/fluxor/bcm2712/log_net/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "monitor"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:0ce9efe5cd1f38981eecaec8d728fe1b32af93eb749a50ca69110b786ff9576f"
+source = "fmod/fluxor/bcm2712/monitor/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "nvme"
+target = "bcm2712"
+version = "0.2.0"
+hash = "sha256:d1aafb48b5a64a659d49d0964d9c2d4001fb2e8930c663d1a4ed8b64a2f72987"
+source = "fmod/fluxor/bcm2712/nvme/0.2.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "nvme_arena_probe"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:6112b9d9e307f96339e98fa97e8e52843dddb7dbdc0e138cba0791c514017be4"
+source = "fmod/fluxor/bcm2712/nvme_arena_probe/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "nvme_perf_probe"
+target = "bcm2712"
+version = "0.1.0"
+hash = "sha256:56c938ea3c87e093f41d2beb149d3ca0ad83d694de0ec498e566c504b0eb2d6c"
+source = "fmod/fluxor/bcm2712/nvme_perf_probe/0.1.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "pcie_scan"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:e705766a8c87f93358ffe5eea2c2eb4a0e01190a6eaf8c719770a9a2d2f4b7d4"
+source = "fmod/fluxor/bcm2712/pcie_scan/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "pkt_filter"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:494b0ec7e8f3f854357416cd9e79eb2bda0f5aeb8bb75e401b34ca21eaaa724a"
+source = "fmod/fluxor/bcm2712/pkt_filter/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "quic"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:cd296c9bb827f7b833b6d23c6d9fc8b638496f3a3876c03e5faa84cf9ebf0d0b"
+source = "fmod/fluxor/bcm2712/quic/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "reconfigure"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:ff522a963cae3cddb14460011871fda4f9d2455a9d670ee064e0098e69a2a6cd"
+source = "fmod/fluxor/bcm2712/reconfigure/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "remote_channel"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:4c6e507087f1a798b7d3d10a80694633ee017d87a683dec334d58a4e23a8e5d5"
+source = "fmod/fluxor/bcm2712/remote_channel/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "rp1_gem"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:d0e8cebcb72294e47000a5b2e45808fdf3f1ec2443508bc1b807efed9ecfe7a9"
+source = "fmod/fluxor/bcm2712/rp1_gem/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "sequencer"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:67ff64e2aedb2db8f8a08dbad9e776ebad2b72f1e07bb63415a0bf5ea51d03b3"
+source = "fmod/fluxor/bcm2712/sequencer/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "smmu"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:abac4aeb5afd91274bb5cef3c925f3be00ad0b64e5a735394a86e1375ee050c6"
+source = "fmod/fluxor/bcm2712/smmu/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "synth_source"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:9864282dd4dbadbeb3fd6578e6d957e2c43fccb816e6b5707423e58877b108f8"
+source = "fmod/fluxor/bcm2712/synth_source/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "test_fault"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:21119c02d291e48a498548b774bf67a56253a42304b8dc5a7814736557e5ddcc"
+source = "fmod/fluxor/bcm2712/test_fault/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "tls"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:858aefdec1684480ff23662e91601713e6b86d7d5427c690021fe698f4c406e1"
+source = "fmod/fluxor/bcm2712/tls/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "usb_midi_host"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:1bbd643222239ecd908c3fae1f68b484a0ba81e86ab29034e781925068835470"
+source = "fmod/fluxor/bcm2712/usb_midi_host/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "virtio_net"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:a7e86785ce5fb2350be2a00e8d0022c8e9275555e18dc6d355f68971d1241e58"
+source = "fmod/fluxor/bcm2712/virtio_net/1.0.0.fmod"
+
+[[fmod]]
+project = "fluxor"
+name = "ws_stream"
+target = "bcm2712"
+version = "1.0.0"
+hash = "sha256:4d677bd0574e85323926c58972196b1fe7e4e81f5932cf72d66b4e8a6e15ee85"
+source = "fmod/fluxor/bcm2712/ws_stream/1.0.0.fmod"
+
+[[runtime]]
+project = "fluxor"
+name = "fluxor-linux"
+host_target = "aarch64-unknown-linux-gnu"
+version = "0.1.0"
+hash = "sha256:9cd432fa8603d6e77ae7f05e8d4007fa94965b88d8c13a7abafd251fd6c82b77"
+source = "bin/fluxor/aarch64-unknown-linux-gnu/fluxor-linux/0.1.0"

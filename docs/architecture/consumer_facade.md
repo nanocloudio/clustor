@@ -5,16 +5,16 @@ expresses clustor as a set of cooperative modules connected by
 mailbox channels. Downstream consumers — Loam, Lattice, future
 siblings — attach their own fluxor module to a small set of those
 ports and exchange messages using the wire envelopes defined in
-`modules/sdk/wire.rs`.
+`modules/common/wire.rs`.
 
 This document is the contract for that attachment surface.
 
 The typed Rust helper that implements the encoding and lifecycle
-bookkeeping lives at `modules/sdk/replica_facade.rs`. Consumer
+bookkeeping lives at `modules/common/replica_facade.rs`. Consumer
 modules include it the same way they include `wire.rs` and `types.rs`:
 
 ```rust
-#[path = "../sdk/replica_facade.rs"]
+#[path = "../common/replica_facade.rs"]
 mod replica_facade;
 ```
 
@@ -69,7 +69,7 @@ channel-driven exchange. Each consumer module owns its own
 `InflightTable`, `CommittedSubscriber`,
 `SnapshotInstaller` / `SnapshotExporter`, `MembershipView`, and
 `ReadGateInputs`. The helpers in
-`modules/sdk/replica_facade.rs` define the encode/decode and
+`modules/common/replica_facade.rs` define the encode/decode and
 bookkeeping that step-mode poll loops use.
 
 There is no `Future`-typed return value — work completes when the
@@ -338,7 +338,7 @@ same core as `read_gate`.
 
 - **Host-side `cargo test`** covers the encode/decode and
   state-machine layers (`tests/facade.rs` plus the inline
-  `#[cfg(test)]` module in `modules/sdk/replica_facade.rs`,
+  `#[cfg(test)]` module in `modules/common/replica_facade.rs`,
   49+ tests). This is the primary regression net for per-entry
   ordering, inflight correlation, snapshot framing, and bounded-size
   invariants.

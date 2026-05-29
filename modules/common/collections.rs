@@ -118,6 +118,12 @@ pub struct Crc32c {
     state: u32,
 }
 
+impl Default for Crc32c {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Crc32c {
     pub const fn new() -> Self {
         Self { state: 0xFFFF_FFFF }

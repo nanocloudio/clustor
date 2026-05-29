@@ -4,7 +4,7 @@ entry = "mod.rs"
 hardware_targets = ["bcm2712"]
 
 # Example replicated consumer — demonstrates how a downstream application
-# wires into a Clustor replica group via `modules/sdk/replica_facade.rs`.
+# wires into a Clustor replica group via `modules/common/replica_facade.rs`.
 # Non-essential: stripping this module from a deployment graph does not
 # affect cluster correctness. Exists as an integration smoke test of the
 # facade contract. See docs/architecture/consumer_facade.md.

@@ -31,7 +31,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in deps/fluxor/modules/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
 )]
 
 use core::ffi::c_void;
@@ -41,18 +41,20 @@ use core::ffi::c_void;
     dead_code,
     reason = "see file-level allow: SDK surface is shared across modules"
 )]
-#[path = "../../../deps/fluxor/modules/sdk/abi.rs"]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
 mod abi;
 use abi::SyscallTable;
 
-include!("../../../deps/fluxor/modules/sdk/runtime.rs");
-include!("../../../deps/fluxor/modules/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
 
-#[path = "../../sdk/types.rs"]
+#[path = "../../common/types.rs"]
 mod types;
 
-#[path = "../../sdk/wire.rs"]
+#[path = "../../common/wire.rs"]
 mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 use types::*;
 
@@ -142,7 +144,7 @@ pub extern "C" fn module_new(
     params: *const u8, params_len: usize,
     state: *mut u8, state_size: usize, syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -176,7 +178,7 @@ pub extern "C" fn module_new(
 #[no_mangle]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (deps/fluxor/modules/sdk/abi.rs),
+    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of
     // at least `module_state_size()` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
@@ -191,7 +193,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             for _ in 0..4 {
                 let poll = (sys.channel_poll)(s.in_key_update, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (msg_type, plen) = wire::channel_read_msg(sys, s.in_key_update, &mut s.msg_buf);
+                let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_key_update, &mut s.msg_buf);
                 if msg_type == wire::MSG_DEK_EPOCH && plen >= 4 {
                     s.dek_epoch = u32::from_le_bytes([
                         s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3],
@@ -205,7 +207,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             for _ in 0..4 {
                 let poll = (sys.channel_poll)(s.in_trigger, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (msg_type, plen) = wire::channel_read_msg(sys, s.in_trigger, &mut s.msg_buf);
+                let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_trigger, &mut s.msg_buf);
                 if msg_type == wire::MSG_SNAPSHOT_TRIGGER && plen >= 16 {
                     let (term, index) = wire::decode_term_index(&s.msg_buf);
                     persist_manifest(s, sys, term, index);
@@ -226,7 +228,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let poll = (sys.channel_poll)(s.in_install_request, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
                 let (msg_type, plen) =
-                    wire::channel_read_msg(sys, s.in_install_request, &mut s.msg_buf);
+                    wire_channels::channel_read_msg(sys, s.in_install_request, &mut s.msg_buf);
                 if msg_type != wire::MSG_SNAPSHOT_INSTALL_REQUEST || (plen as usize) < 1 {
                     continue;
                 }
@@ -244,7 +246,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             for _ in 0..4 {
                 let poll = (sys.channel_poll)(s.in_import, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (msg_type, plen) = wire::channel_read_msg(sys, s.in_import, &mut s.msg_buf);
+                let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_import, &mut s.msg_buf);
                 if plen == 0 { continue; }
                 let pl = plen as usize;
                 match msg_type {
@@ -271,7 +273,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: usize) {
     let (term, last_idx, last_term, offset, done, hdr_len) =
         match wire::decode_install_snapshot(&s.msg_buf[..plen]) {
@@ -336,7 +338,7 @@ unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: us
                     s.in_progress_last_idx,
                     s.in_progress_last_term,
                 );
-                wire::channel_write_msg(
+                wire_channels::channel_write_msg(
                     sys,
                     s.out_installed,
                     wire::MSG_SNAPSHOT_INSTALLED,
@@ -356,7 +358,7 @@ unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: us
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Emit an InstallSnapshot RPC out to replicator/peers as one or more
 /// chunks of up to `MAX_CHUNK_BODY` bytes. The "body" today is empty
 /// because the substrate has no state-machine snapshot — peers learn
@@ -373,7 +375,7 @@ unsafe fn emit_install_chunk(s: &mut ModuleState, sys: &SyscallTable, term: Term
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_install_body(
     s: &mut ModuleState,
     sys: &SyscallTable,
@@ -391,7 +393,7 @@ unsafe fn emit_install_body(
         let mut buf = [0u8; wire::INSTALL_SNAPSHOT_HDR];
         let n = wire::encode_install_snapshot(&mut buf, term, index, term, 0, true, &[]);
         if n > 0 {
-            wire::channel_write_msg(sys, s.out_export, wire::MSG_INSTALL_SNAPSHOT, &buf[..n]);
+            wire_channels::channel_write_msg(sys, s.out_export, wire::MSG_INSTALL_SNAPSHOT, &buf[..n]);
         }
         return;
     }
@@ -419,7 +421,7 @@ unsafe fn emit_install_body(
             &body[start..start + chunk],
         );
         if n == 0 { return; }
-        wire::channel_write_msg(sys, s.out_export, wire::MSG_INSTALL_SNAPSHOT, &buf[..n]);
+        wire_channels::channel_write_msg(sys, s.out_export, wire::MSG_INSTALL_SNAPSHOT, &buf[..n]);
         offset += chunk as u64;
         remaining -= chunk;
     }
@@ -430,7 +432,7 @@ unsafe fn emit_install_body(
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Build snapshot path:
 ///   partition_id == 0  →  `wal/snap_<NNNNNNNN>.bin`
 ///   partition_id == N  →  `wal/p<NNNN>/snap_<NNNNNNNN>.bin`
@@ -471,7 +473,7 @@ unsafe fn build_snapshot_path(s: &mut ModuleState, index: Index) -> usize {
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `deps/fluxor/modules/sdk/abi.rs`.
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Write a 32-byte snapshot manifest to disk and fsync.
 unsafe fn persist_manifest(s: &mut ModuleState, sys: &SyscallTable, term: Term, index: Index) {
     let plen = build_snapshot_path(s, index);
