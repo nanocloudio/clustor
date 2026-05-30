@@ -34,7 +34,8 @@ How the system works. These are the authoritative references.
 - [architecture/observability.md](architecture/observability.md) — metrics, telemetry, throttle/explain APIs, artifact bundles
 - [architecture/compatibility.md](architecture/compatibility.md) — wire stability, version negotiation, cache states, readiness
 - [architecture/modules.md](architecture/modules.md) — module reference, four-domain layout, hot-path properties
-- [architecture/consumer_facade.md](architecture/consumer_facade.md) — the `replica_facade` contract for downstream consumers
+- [architecture/substrate_capability_surface.md](architecture/substrate_capability_surface.md) — the seven-primitive substrate contract downstream consumers code against
+- [architecture/consumer_facade.md](architecture/consumer_facade.md) — typed Rust helpers (`replica_facade`) implementing the consumer side of that surface
 
 ## Guides and integration
 

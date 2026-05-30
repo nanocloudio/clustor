@@ -7,7 +7,11 @@ siblings — attach their own fluxor module to a small set of those
 ports and exchange messages using the wire envelopes defined in
 `modules/common/wire.rs`.
 
-This document is the contract for that attachment surface.
+This document is the typed-Rust contract for that attachment.
+The implementation-agnostic primitive enumeration ("what the
+substrate guarantees, regardless of provider") lives in
+[substrate_capability_surface.md](substrate_capability_surface.md);
+the helpers here are one canonical realisation of that surface.
 
 The typed Rust helper that implements the encoding and lifecycle
 bookkeeping lives at `modules/common/replica_facade.rs`. Consumer
