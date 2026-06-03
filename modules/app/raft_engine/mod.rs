@@ -1645,8 +1645,16 @@ unsafe fn drain_proposals(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Copy `&s.msg_buf[off..off+len]` into the proposal batch and record the
-/// correlation_id in the parallel array. Returns false if the batch is
-/// full (caller should stop draining).
+/// correlation_id in the parallel array. Flushes immediately once the
+/// batch reaches `proposal_batch_max` so the operator-configured cap
+/// holds inside a single drain pass — without this, two proposals
+/// drained back-to-back would land in the same WAL index and the
+/// per-proposal `correlation_id → wal_index` mapping the apply pipeline
+/// hands to client_codec would collide. The end-of-tick `should_flush`
+/// check (see `module_step`) is still the path for the time-based
+/// flush. Returns false only when the batch buffer is byte-full or the
+/// hard `MAX_BATCH_PROPOSALS` slot cap is reached — callers should stop
+/// draining and let the next tick try again.
 unsafe fn append_to_batch(
     s: &mut ModuleState,
     sys: &SyscallTable,
@@ -1672,6 +1680,14 @@ unsafe fn append_to_batch(
     if s.proposal_batch_count == 1 {
         s.proposal_batch_start_ms = now;
         dev_log(sys, 3, b"[raft] prop".as_ptr(), 11);
+    }
+
+    // Honour the count-based flush cap inside the drain pass.
+    // `proposal_batch_max == 1` (the default; see `module_init`) makes
+    // every proposal its own log index. Higher caps still batch up to
+    // that limit, then flush so the next append starts a fresh entry.
+    if s.proposal_batch_count >= s.proposal_batch_max {
+        flush_proposal_batch(s, sys);
     }
     true
 }

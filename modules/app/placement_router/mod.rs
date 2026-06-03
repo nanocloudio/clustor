@@ -1,11 +1,29 @@
 //! Placement Router — Emits epoch-based routing updates.
 //!
 //! Pure source module. Maintains the current placement epoch and emits
-//! PlacementUpdate messages when the epoch changes (driven by admin
-//! operations or CP refresh).
+//! `MSG_PLACEMENT_UPDATE` (out[0]) when the epoch changes (driven by
+//! admin operations or CP refresh).
 //!
-//! Quantum enhancement: also emits epoch_events (out[1]) for session
-//! fencing on rebalance. Optional — Clustor-only graphs leave unwired.
+//! Also emits `MSG_PLACEMENT_EPOCH_EVENT` (out[1]) per kpg so that
+//! downstream session-bearing consumers (lattice's `watch_registry`,
+//! `lease_manager`, `kv_state_worker`; future siblings) can advance
+//! their per-session `session_epoch` atomically with the placement
+//! change and fence stale frames in flight on rebind. Optional —
+//! graphs that don't need session fencing leave the port unwired.
+//!
+//! Wire shape of the kpg-keyed epoch event (7 bytes):
+//!   `[kpg_id:u16 LE][new_epoch:u32 LE][reason:u8]`
+//!
+//! Single-kpg deployments today carry `kpg_id = 0` only at the
+//! bootstrap emission. Sustained per-kpg tracking arrives with the
+//! multi-kpg admin path; the wire shape is already fixed for that
+//! future. `reason` (one of):
+//!   0 = bootstrap, 1 = admin (reserved), 2 = rebalance (reserved).
+//!
+//! Distinct from quantum's `MSG_EPOCH_EVENT (0xD4)` global-epoch
+//! slot; the kpg-keyed contract is `MSG_PLACEMENT_EPOCH_EVENT
+//! (0xD5)`, declared byte-compatibly in both clustor and lattice
+//! `modules/common/wire.rs`.
 
 #![no_std]
 #![allow(
@@ -33,11 +51,26 @@ mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
 
+/// Reason byte values for `MSG_PLACEMENT_EPOCH_EVENT`. The emission
+/// path selects `BOOTSTRAP` on the initial placement-router epoch
+/// and `ADMIN` on any subsequent transition. `REBALANCE` is wire-
+/// reserved for when the rebalance scheduler lands and needs to
+/// distinguish substrate-driven moves from operator-driven ones.
+const EPOCH_REASON_BOOTSTRAP: u8 = 0;
+const EPOCH_REASON_ADMIN: u8 = 1;
+#[allow(dead_code, reason = "wire-reserved; emitted when rebalance scheduler lands")]
+const EPOCH_REASON_REBALANCE: u8 = 2;
+
+/// Default kpg_id for the single-kpg deployment. Downstream
+/// consumers that haven't migrated to per-kpg session tracking yet
+/// treat any non-zero new_epoch as the global epoch.
+const DEFAULT_KPG_ID: u16 = 0;
+
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
     out_routing: i32,       // out[0]: PlacementUpdate to client_codec
-    out_epoch_events: i32,  // out[1]: epoch-change events (Quantum enhancement, optional)
+    out_epoch_events: i32,  // out[1]: kpg-keyed MSG_PLACEMENT_EPOCH_EVENT for session fencing
     current_epoch: u32,
     prev_epoch: u32,
     emitted: bool,
@@ -102,14 +135,35 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // Quantum enhancement: emit epoch-change events when epoch advances
+        // Emit a kpg-keyed epoch event each time the placement
+        // epoch advances. Downstream consumers fence in-flight
+        // session frames on receipt; see module-level doc for the
+        // wire shape and reason-byte conventions.
         if s.current_epoch != s.prev_epoch && s.out_epoch_events >= 0 {
             let poll = (sys.channel_poll)(s.out_epoch_events, 0x02);
             if poll > 0 && (poll as u32 & 0x02) != 0 {
-                let mut buf = [0u8; 8];
-                buf[0..4].copy_from_slice(&s.prev_epoch.to_le_bytes());
-                buf[4..8].copy_from_slice(&s.current_epoch.to_le_bytes());
-                wire_channels::channel_write_msg(sys, s.out_epoch_events, 0xD4, &buf);
+                // Bootstrap is the very first transition out of
+                // `prev_epoch = 0`. Any subsequent placement change
+                // (admin op or, eventually, rebalance) reuses this
+                // emission point — until those inputs are wired,
+                // the post-bootstrap branch never fires, but the
+                // reason byte is honest about which class of
+                // transition the consumer is observing.
+                let reason = if s.prev_epoch == 0 {
+                    EPOCH_REASON_BOOTSTRAP
+                } else {
+                    EPOCH_REASON_ADMIN
+                };
+                let mut buf = [0u8; 7];
+                buf[0..2].copy_from_slice(&DEFAULT_KPG_ID.to_le_bytes());
+                buf[2..6].copy_from_slice(&s.current_epoch.to_le_bytes());
+                buf[6] = reason;
+                wire_channels::channel_write_msg(
+                    sys,
+                    s.out_epoch_events,
+                    wire::MSG_PLACEMENT_EPOCH_EVENT,
+                    &buf,
+                );
                 s.prev_epoch = s.current_epoch;
             }
         }

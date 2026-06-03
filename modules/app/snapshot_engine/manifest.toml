@@ -3,10 +3,25 @@ type = "Transformer"
 entry = "mod.rs"
 hardware_targets = ["bcm2712"]
 
-# Per-partition snapshot manifest persistence (see mod.rs). Multi-Raft
-# graphs instantiate one snapshot_engine per partition; each writes to
-# a disjoint subtree (`wal/p<id>/snap_*.bin`), so `write` (not
-# `exclusive`) is correct.
+# Snapshot manifest persistence (see mod.rs). Manifests land at
+# `wal/p<NNNN>_snap_<NNNNNNNN>.bin` relative to the fluxor process's
+# current working directory — all partitions share the same `wal/`
+# directory as the WAL segments, with the partition_id stamped into
+# the filename rather than a per-partition subdirectory. `write`
+# (not `exclusive`) lets multi-Raft graphs instantiate one
+# snapshot_engine per partition over the same FS contract; the
+# manifest-gate (the `required_caps` bitmap) actually grants access
+# at runtime.
+#
+# Operator requirement (shared with `wal`): the `wal/` directory
+# MUST exist and be writable in the launching process's CWD before
+# fluxor starts. The Linux FS provider's `OPEN_CREATE` opcode
+# creates files but does not auto-`mkdir` parents — there is no
+# `FS_MKDIR` syscall today. A missing `wal/` directory means
+# `[snap] no fs` fires on every snapshot trigger and no manifest is
+# persisted, which is a data-loss hazard in production. See
+# `modules/app/wal/manifest.toml` for the same note from the WAL
+# side.
 [[resources]]
 requires_contract = "fs"
 access = "write"
@@ -32,6 +47,21 @@ content_type = "OctetStream"
 # AE conflict-repair retry alone.
 [[ports]]
 name = "install_request"
+direction = "input"
+content_type = "OctetStream"
+
+# Aggregated per-kpg retention floors from a downstream
+# `compaction_coordinator` (e.g. lattice's
+# `modules/app/compaction_coordinator/`). The snapshot engine tracks
+# the latest `floor_revision` per `kpg_id` and refuses to advance
+# compaction past any active floor — without this input, a watcher
+# whose `start_revision` is below a fresh snapshot's
+# `last_included_index` cannot replay after rebind. Optional:
+# single-node or non-replay-bound deployments leave this port
+# unwired and the engine treats every trigger as permitted.
+# Payload: `MSG_COMPACTION_FLOOR [kpg_id:u16 LE][floor_revision:u64 LE]`.
+[[ports]]
+name = "retention_floor"
 direction = "input"
 content_type = "OctetStream"
 

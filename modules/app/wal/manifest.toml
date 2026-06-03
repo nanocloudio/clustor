@@ -43,11 +43,24 @@ name = "entry_reply"
 direction = "output"
 content_type = "OctetStream"
 
-# Multi-Raft graphs instantiate one `wal` per partition; each writes
-# to a disjoint subtree (`wal/p<id>/`). `write` (not `exclusive`)
-# lets multiple instances coexist on the same FS contract; the
-# manifest-gate (required_caps bitmap) is what actually grants
-# access at runtime.
+# WAL segments land at `wal/p<NNNN>_seg_<NNNNNNNN>` relative to the
+# fluxor process's current working directory. All partitions share
+# one `wal/` directory; the partition_id is stamped into the
+# filename rather than a per-partition subdirectory. `write` (not
+# `exclusive`) lets multi-Raft graphs instantiate one `wal` per
+# partition over the same FS contract; the manifest-gate (the
+# `required_caps` bitmap) is what actually grants access at runtime.
+#
+# Operator requirement: the `wal/` directory MUST exist and be
+# writable in the launching process's CWD before fluxor starts.
+# The Linux FS provider's `OPEN_CREATE` opcode creates files but
+# does not auto-`mkdir` parents — there is no `FS_MKDIR` syscall
+# today. The single-directory layout means one `mkdir wal` (or a
+# symlink to real storage: `ln -s /var/lib/quantum/wal wal`)
+# suffices for any partition count. A missing `wal/` silently
+# degrades the WAL to in-memory only — entries are acked but
+# never persisted — which is fine for ephemeral dev rigs but a
+# data-loss hazard in production.
 [[resources]]
 requires_contract = "fs"
 access = "write"

@@ -701,6 +701,17 @@ pub const MSG_HTTP_REQUEST: u8        = 0x74;
 /// frames the wire-level HTTP response itself.
 pub const MSG_HTTP_RESPONSE: u8       = 0x75;
 
+/// Multiplexed client record on the cleartext path. Payload is
+/// `[conn_id:u8][raw client bytes]`. peer_router wraps every cleartext
+/// write in this length-delimited envelope so records from different
+/// conn_ids never coalesce on the byte-FIFO channel (a raw write per
+/// record loses the per-record boundary and the next conn_id byte is
+/// misread as stream data, silently dropping that connection). Consumers
+/// (client_surface, quantum's protocol_router) demarcate with
+/// `channel_read_msg`. The msg_type value matches quantum's
+/// `wire::MSG_CLIENT_FRAME` so the envelope is identical on both sides.
+pub const MSG_CLIENT_FRAME: u8        = 0xEA;
+
 /// Metric kinds for `MSG_METRIC_SAMPLE`.
 pub const METRIC_KIND_COUNTER: u8     = 0;
 pub const METRIC_KIND_GAUGE: u8       = 1;
@@ -791,6 +802,39 @@ pub fn decode_metric_sample(buf: &[u8]) -> Option<(u8, u16, u16, u8, i64)> {
 
 // Routing
 pub const MSG_PLACEMENT_UPDATE: u8    = 0x80;
+
+/// `placement_router` → downstream session-bearing modules
+/// (lattice's `watch_registry`, `lease_manager`, `kv_state_worker`,
+/// future quantum equivalents): a kpg's placement has changed and
+/// any session bound to that kpg should advance its session_epoch
+/// atomically so stale frames in flight get fenced.
+///
+/// Payload (7 bytes): `[kpg_id:u16 LE][new_epoch:u32 LE][reason:u8]`.
+///
+/// Byte-compatible with lattice's `modules/common/wire.rs::MSG_PLACEMENT_EPOCH_EVENT`.
+/// Distinct from quantum's `MSG_EPOCH_EVENT` (0xD4), which carries a
+/// global-epoch transition shape — 0xD5 is reserved here for the
+/// kpg-keyed Lattice contract.
+///
+/// `reason` field — values shipped today:
+///   0 = bootstrap (initial placement-router epoch on launch)
+///   1 = admin     (operator-driven placement change, reserved)
+///   2 = rebalance (substrate-driven, reserved)
+pub const MSG_PLACEMENT_EPOCH_EVENT: u8 = 0xD5;
+
+/// `compaction_coordinator` (downstream substrate consumer, e.g.
+/// lattice) → `snapshot_engine`: aggregated per-kpg retention floor.
+/// `snapshot_engine` must not advance compaction past `floor_revision`
+/// for that `kpg_id` — otherwise a watcher whose `start_revision` is
+/// below the new floor cannot be satisfied by replay-after-rebind.
+///
+/// Payload (10 bytes): `[kpg_id:u16 LE][floor_revision:u64 LE]`.
+///
+/// Byte-compatible with lattice's `modules/common/wire.rs::MSG_COMPACTION_FLOOR`.
+/// The per-source `MSG_RETENTION_FLOOR` (0xE0, lattice-only) is
+/// aggregated by lattice's `compaction_coordinator` before reaching
+/// clustor; the substrate sees only the aggregated form.
+pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
 
 /// Envelope header size (1 byte type + 2 bytes length).
 pub const ENVELOPE_HDR: usize = 3;

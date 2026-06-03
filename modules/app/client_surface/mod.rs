@@ -115,16 +115,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
 
-        // 1. Route inbound requests by message type
-        //    peer_router prepends [conn_id: u8] before the wire envelope.
-        //    Raw format: [conn_id] [msg_type] [len: u16 LE] [payload]
+        // 1. Route inbound requests by message type.
+        //    peer_router wraps each cleartext record in a MSG_CLIENT_FRAME
+        //    envelope; channel_read_msg strips it, leaving the record payload
+        //    `[conn_id][msg_type][len: u16 LE][payload]` at msg_buf[0..]. The
+        //    framing keeps records for distinct conn_ids from coalescing on
+        //    the byte FIFO (see wire::MSG_CLIENT_FRAME).
         for _ in 0..8 {
             let poll = (sys.channel_poll)(s.in_requests, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
-            let n = (sys.channel_read)(s.in_requests, s.msg_buf.as_mut_ptr(), 2048);
-            if n < 4 { break; } // need at least conn_id + 3-byte envelope header
-            let len = n as usize;
+            let (_frame_type, plen) =
+                wire_channels::channel_read_msg(sys, s.in_requests, &mut s.msg_buf);
+            if plen < 4 { continue; } // need at least conn_id + 3-byte envelope header
+            let len = plen as usize;
 
             // Extract conn_id prefix
             let conn_id = s.msg_buf[0];

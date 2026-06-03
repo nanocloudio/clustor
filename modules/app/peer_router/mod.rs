@@ -66,7 +66,14 @@ mod wire_channels;
 
 use types::*;
 
-const MAX_CONNS: usize = 8;
+// Connection slot table. Sized to hold every concurrent peer link plus
+// all simultaneous client connections — quantum fronts this router with
+// an MQTT/AMQP/Kafka broker where many clients connect at once, so a
+// raft-cluster-sized table (≈ a handful of peers) starves clients: once
+// the table fills, alloc_conn drops NMSG_ACCEPT for the overflow conns
+// and those clients never get a CONNACK. 64 covers a 7-node cluster's
+// peer links with ample client headroom.
+const MAX_CONNS: usize = 64;
 const BUF_SIZE: usize = 2048;
 const RECONNECT_MS: u64 = 2000;
 
@@ -490,16 +497,18 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable) {
                             }
                         }
                     } else {
-                        // Client traffic → client_surface
+                        // Client traffic → client_surface. Frame each record
+                        // as a MSG_CLIENT_FRAME envelope so records from
+                        // different conn_ids don't coalesce on the byte FIFO
+                        // (see wire::MSG_CLIENT_FRAME).
                         dev_log(&*s.syscalls, 3, b"[pr] data in".as_ptr(), 12);
                         if s.cleartext >= 0 && cl < 511 {
                             let mut tagged = [0u8; 512];
                             tagged[0] = conn_id;
                             tagged[1..1 + cl].copy_from_slice(&local[..cl]);
-                            let p = (sys.channel_poll)(s.cleartext, 0x02);
-                            if p > 0 && (p as u32 & 0x02) != 0 {
-                                (sys.channel_write)(s.cleartext, tagged.as_ptr(), 1 + cl);
-                            }
+                            wire_channels::channel_write_msg(
+                                sys, s.cleartext, wire::MSG_CLIENT_FRAME, &tagged[..1 + cl],
+                            );
                         }
                     }
                 }
@@ -559,15 +568,16 @@ unsafe fn handle_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize, 
         s.conns[slot].replica_id = -1; // client
 
         // Forward the data that arrived (it's application data, not identity)
-        // Prepend conn_id for response routing
+        // Prepend conn_id for response routing. Frame as MSG_CLIENT_FRAME so
+        // concurrent first-data records from different conn_ids stay
+        // demarcated on the byte FIFO (see wire::MSG_CLIENT_FRAME).
         if s.cleartext >= 0 && data.len() < 511 {
             let mut tagged = [0u8; 512];
             tagged[0] = s.conns[slot].conn_id;
             tagged[1..1 + data.len()].copy_from_slice(data);
-            let p = (sys.channel_poll)(s.cleartext, 0x02);
-            if p > 0 && (p as u32 & 0x02) != 0 {
-                (sys.channel_write)(s.cleartext, tagged.as_ptr(), 1 + data.len());
-            }
+            wire_channels::channel_write_msg(
+                sys, s.cleartext, wire::MSG_CLIENT_FRAME, &tagged[..1 + data.len()],
+            );
         }
         return;
     }
@@ -715,13 +725,20 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         let poll = (sys.channel_poll)(s.client_resp, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
-        let n = (sys.channel_read)(s.client_resp, s.buf.as_mut_ptr(), BUF_SIZE);
+        // Envelope-framed read so back-to-back writes from the
+        // codecs / response_mux don't coalesce on the byte FIFO.
+        // The msg_type is informational here — peer_router routes
+        // every frame the same way (NCMD_SEND of `[conn_id][data]`
+        // to the connected client). Future demuxers can dispatch
+        // on `_msg_type` if they need to.
+        let (_msg_type, plen) =
+            wire_channels::channel_read_msg(sys, s.client_resp, &mut s.buf);
         dev_log(sys, 3, b"[pr] resp rx".as_ptr(), 12);
-        if n < 2 { break; } // need conn_id + at least 1 byte of payload
-        let len = n as usize;
+        let len = plen as usize;
+        if len < 2 { continue; }
 
         let conn_id = s.buf[0];
-        let data = &s.buf[1..len]; // the wire envelope + payload
+        let data = &s.buf[1..len];
         let data_len = data.len();
         if data_len == 0 { continue; }
 

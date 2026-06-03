@@ -8,8 +8,13 @@ name = "routing"
 direction = "output"
 content_type = "OctetStream"
 
-# Quantum enhancement: epoch-change events for session fencing.
-# Optional — Clustor-only graphs leave unwired.
+# Kpg-keyed placement-epoch events for downstream session fencing.
+# Consumers (lattice's `watch_registry`, `lease_manager`,
+# `kv_state_worker`; future siblings) advance per-session
+# `session_epoch` atomically with each event so stale frames in
+# flight get fenced cleanly on rebind. Optional — graphs that don't
+# need session fencing leave the port unwired.
+# Payload: `MSG_PLACEMENT_EPOCH_EVENT [kpg_id:u16 LE][new_epoch:u32 LE][reason:u8]`.
 [[ports]]
 name = "epoch_events"
 direction = "output"

@@ -189,6 +189,10 @@ path = "tests/sdk_primitives.rs"
 name = "wal_group_fsync"
 path = "tests/wal_group_fsync.rs"
 
+[[test]]
+name = "wal_replay"
+path = "tests/wal_replay.rs"
+
 # Criterion benches. Each uses `harness = false` so criterion's own
 # main runs instead of the default libtest harness. Run with
 # `cargo bench` or `cargo bench --bench <name> -- --quick`. All

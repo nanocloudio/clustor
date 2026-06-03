@@ -81,9 +81,12 @@ define_params! {
 
     // 3, aead — reserved (0=none, 1=aes_256_gcm); not yet read at runtime.
 
-    // Partition slot for multi-Raft graphs. Default 0 → legacy "wal/seg_*"
-    // path. Non-zero → "wal/p<NNNN>/seg_<NNNNNNNN>" so per-partition WALs
-    // don't collide on disk. See .context/rfc_partition_groups.md.
+    // Partition slot for multi-Raft graphs. Stamped into the segment
+    // filename (`wal/p<NNNN>_seg_<NNNNNNNN>`) so per-partition WALs
+    // don't collide on disk. All partitions share one `wal/`
+    // directory, so the operator only needs to mkdir that root path
+    // once regardless of partition count. See
+    // .context/rfc_partition_groups.md for the multi-Raft model.
     4, partition_id, u16, 0
         => |s, d, len| { s.partition_id = p_u16(d, len, 0, 0); };
 
@@ -127,6 +130,16 @@ const WAL_PATH_MAX: usize = 48;
 // Module phases
 const PHASE_REPLAY: u8 = 0;
 const PHASE_NORMAL: u8 = 1;
+
+/// How many consecutive missing segments the replay scanner
+/// tolerates before declaring "no more segments". Replay walks
+/// from `replay_seg = 1` and probes each sequence number; a real
+/// gap in the segment file set (e.g. seqs 3 and 4 deleted by
+/// compaction) shouldn't truncate the rebuilt log. Sixteen
+/// consecutive misses cover ordinary post-compaction layouts
+/// without making startup unboundedly slow when the WAL is
+/// genuinely empty.
+const REPLAY_GAP_TOLERANCE: u8 = 16;
 
 #[repr(C)]
 struct ModuleState {
@@ -188,6 +201,20 @@ struct ModuleState {
     replay_fd: i32,         // fd for replay segment, -1 = none
     replay_file_size: u32,  // total bytes in replay segment
     replay_pos: u32,        // current read position
+    /// Consecutive `FS_OPEN` failures while scanning for the next
+    /// existing segment. Replay walks from `replay_seg = 1` and
+    /// tolerates gaps up to `REPLAY_GAP_TOLERANCE`, which lets it
+    /// survive both fresh deployments (no segments at all) and
+    /// restarts after compaction has deleted leading segments.
+    replay_misses: u8,
+    /// Lowest segment_seq we successfully opened during this replay
+    /// pass; becomes `oldest_segment_seq` on transition to
+    /// `PHASE_NORMAL`. Zero until the first successful open.
+    replay_first_found: u32,
+    /// Highest segment_seq we successfully opened; +1 becomes the
+    /// new `segment_seq` for fresh appends after replay. Zero until
+    /// the first successful open.
+    replay_last_found: u32,
 
     // Group-fsync batching (active iff fsync_mode == 1).
     fsync_mode: u8,
@@ -256,6 +283,9 @@ pub extern "C" fn module_new(
         s.phase = PHASE_REPLAY;
         s.replay_seg = 1;
         s.replay_fd = -1;
+        s.replay_misses = 0;
+        s.replay_first_found = 0;
+        s.replay_last_found = 0;
         s.entry_ring = [EntryLoc::zero(); ENTRY_RING_SIZE];
         s.entry_ring_max_index = 0;
         s.entry_ring_min_index = 0;
@@ -576,22 +606,57 @@ unsafe fn compact_before(s: &mut ModuleState, sys: &SyscallTable, before_index: 
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn step_replay(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
     // Try to open the current replay segment.
-    // Use FS_OPEN without O_CREAT semantics: open the file, check its size.
-    // If the file doesn't exist or is empty, replay is complete.
-    // Note: the Linux FS provider opens O_RDWR|O_CREAT, so we check size
-    // to distinguish real segments from auto-created empty ones.
+    //
+    // Replay walks forward from `replay_seg = 1` probing for
+    // segment files. `FS_OPEN` is read-only-if-exists per the
+    // Linux FS provider, so a missing file returns negative. A
+    // single miss does NOT end replay — we tolerate up to
+    // `REPLAY_GAP_TOLERANCE` consecutive misses, which lets us
+    // survive both fresh deployments (zero segments → bounded
+    // scan terminates cleanly) and restarts after compaction has
+    // deleted leading segments (gaps in the seq range).
+    //
+    // A successful open with size > 0 resets the miss counter and
+    // records the seq in `replay_first_found` / `replay_last_found`
+    // so the transition to PHASE_NORMAL can set `oldest_segment_seq`
+    // and `segment_seq` to the right values for ongoing operation.
+    // Size 0 still terminates replay (an empty segment is the
+    // tombstone an in-flight rotation may leave behind).
     if s.replay_fd < 0 {
         build_segment_path(s, s.replay_seg);
         let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), s.path_len as usize);
         if fd < 0 {
-            // FS not available — skip replay
-            dev_log(sys, 3, b"[wal] no fs".as_ptr(), 11);
+            // Missing segment — count it and either advance or
+            // declare replay done depending on the miss tally.
+            s.replay_misses = s.replay_misses.saturating_add(1);
+            if s.replay_misses < REPLAY_GAP_TOLERANCE {
+                // Skip and try the next seq on the following tick.
+                // Bounded work per tick (one open).
+                s.replay_seg = s.replay_seg.saturating_add(1);
+                return 0;
+            }
+            // Bound reached: replay is done. Distinguish the
+            // "found nothing at all" case (fresh deployment or
+            // missing wal/ dir) from "found some, ran out" so the
+            // log line stays diagnostic — the former emits
+            // `[wal] no fs`, the latter `[wal] replay done`.
+            if s.replay_last_found == 0 {
+                dev_log(sys, 3, b"[wal] no fs".as_ptr(), 11);
+                // No segments found: start writes at seq 1.
+                s.segment_seq = 1;
+                s.oldest_segment_seq = 1;
+            } else {
+                dev_log(sys, 3, b"[wal] replay done".as_ptr(), 17);
+                s.segment_seq = s.replay_last_found.saturating_add(1);
+                s.oldest_segment_seq = s.replay_first_found;
+            }
             s.phase = PHASE_NORMAL;
-            s.segment_seq = s.replay_seg;
             return 0;
         }
 
-        // Check file size — empty or nonexistent means no more segments.
+        // Check file size — an empty segment is the tombstone an
+        // in-flight rotation may leave behind. Treat it the same
+        // way we treat a final miss: terminate replay here.
         // FS_STAT writes [size:u32 LE][mtime:u32 LE] into the supplied buffer.
         let mut stat_buf = [0u8; 8];
         let stat_rc = (sys.provider_call)(fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
@@ -599,13 +664,27 @@ unsafe fn step_replay(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
             u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
         };
         if size == 0 {
-            // No data in this segment — replay complete
             (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
             dev_log(sys, 3, b"[wal] replay done".as_ptr(), 17);
             s.phase = PHASE_NORMAL;
-            s.segment_seq = s.replay_seg;
+            if s.replay_last_found == 0 {
+                // Empty very first segment file: start at seq 1.
+                s.segment_seq = 1;
+                s.oldest_segment_seq = 1;
+            } else {
+                s.segment_seq = s.replay_last_found.saturating_add(1);
+                s.oldest_segment_seq = s.replay_first_found;
+            }
             return 0;
         }
+
+        // Real segment data found — reset the gap counter and
+        // record the seq for the post-replay bounds.
+        s.replay_misses = 0;
+        if s.replay_first_found == 0 {
+            s.replay_first_found = s.replay_seg;
+        }
+        s.replay_last_found = s.replay_seg;
 
         s.replay_fd = fd;
         s.replay_file_size = size;
@@ -694,22 +773,34 @@ unsafe fn build_segment_path(s: &mut ModuleState, seq: u32) {
 /// into `out` and return the length written. Used by both the
 /// stateful `build_segment_path` (above) and by random-access
 /// readers that need a local path buffer.
+///
+/// Layout: `wal/p<NNNN>_seg_<NNNNNNNN>` — single-directory, every
+/// partition's segments live alongside each other under one
+/// `wal/` directory. The partition prefix is always present
+/// (`p0000` for single-partition deployments) so the directory
+/// contains one consistent filename shape and operators see at a
+/// glance which partition a segment belongs to.
+///
+/// Operator requirement: `wal/` must exist and be writable in the
+/// process working directory. The Linux FS provider's
+/// `OPEN_CREATE` opcode creates files but does not `mkdir`
+/// parents (there is no `FS_MKDIR` opcode today). The single-
+/// directory layout means a single `mkdir wal` (or a symlink to
+/// the operator's preferred path, e.g. `ln -s /var/lib/quantum/wal
+/// wal`) suffices for any partition count. See
+/// `modules/app/wal/manifest.toml` for the wider deployment note.
 fn encode_segment_path(partition_id: u16, seq: u32, out: &mut [u8]) -> usize {
     let cap = out.len();
     let mut i = 0usize;
-    for &b in b"wal/" {
+    for &b in b"wal/p" {
         if i < cap { out[i] = b; i += 1; }
     }
-    if partition_id != 0 {
-        if i < cap { out[i] = b'p'; i += 1; }
-        for digit in (0..4).rev() {
-            let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
-            let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-            if i < cap { out[i] = ch; i += 1; }
-        }
-        if i < cap { out[i] = b'/'; i += 1; }
+    for digit in (0..4).rev() {
+        let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        if i < cap { out[i] = ch; i += 1; }
     }
-    for &b in b"seg_" {
+    for &b in b"_seg_" {
         if i < cap { out[i] = b; i += 1; }
     }
     for digit in (0..8).rev() {

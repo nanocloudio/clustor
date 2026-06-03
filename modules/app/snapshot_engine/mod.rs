@@ -62,6 +62,11 @@ const FS_OPEN: u32 = 0x0900;
 const FS_WRITE: u32 = 0x0906;
 const FS_FSYNC: u32 = 0x0905;
 const FS_CLOSE: u32 = 0x0903;
+/// Write-side opener. `FS_OPEN` is read-only-if-exists per the FS
+/// contract (see `target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs`);
+/// snapshot manifests are created from scratch, so persistence needs
+/// the write tier.
+const FS_OPEN_CREATE: u32 = 0x0909;
 
 const SNAP_PATH_MAX: usize = 64;
 const MANIFEST_LEN: usize = 32;
@@ -85,6 +90,41 @@ define_params! {
         => |s, d, len| { s.partition_id = p_u16(d, len, 0, 0); };
 }
 
+/// Per-kpg retention-floor table capacity. Downstream consumers
+/// (lattice's `compaction_coordinator` and the substrate-side
+/// surfaces it aggregates) emit one `MSG_COMPACTION_FLOOR` per
+/// active kpg they care about. 32 slots covers any realistic
+/// per-partition kpg count; on overflow the engine fails closed
+/// (see `retention_floor_overflow`) — eviction would silently
+/// widen the compaction window past a floor we used to honour, and
+/// fail-open would do the same for the unrecorded floor. Adjust
+/// upwards if the lattice / quantum integration later proves it's
+/// not enough.
+const RETENTION_FLOOR_SLOTS: usize = 32;
+
+/// Empty-slot sentinel for the retention-floor table. `0xFFFF` is
+/// wire-reserved as "never a real kpg id" so this value can mark
+/// vacant slots without colliding with `kpg_id = 0`, which is the
+/// well-known single-kpg / default placement-router id and the most
+/// common `MSG_COMPACTION_FLOOR` key in practice.
+const FLOOR_SLOT_EMPTY: u16 = u16::MAX;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RetentionFloorSlot {
+    kpg_id: u16,
+    floor_revision: u64,
+}
+
+impl RetentionFloorSlot {
+    const fn empty() -> Self {
+        Self {
+            kpg_id: FLOOR_SLOT_EMPTY,
+            floor_revision: 0,
+        }
+    }
+}
+
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
@@ -92,6 +132,7 @@ struct ModuleState {
     in_trigger: i32,            // in[1]: SnapshotTrigger from wal
     in_key_update: i32,         // in[2]: DekEpoch from key_manager
     in_install_request: i32,    // in[3]: MSG_SNAPSHOT_INSTALL_REQUEST from replicator (§4.2)
+    in_retention_floor: i32,    // in[4]: MSG_COMPACTION_FLOOR from compaction_coordinator
     out_export: i32,            // out[0]: export chunks to replicator (peer transfer)
     out_manifest: i32,          // out[1]: manifest auth to peer_router (deferred)
     out_metrics: i32,           // out[2]: metrics to telemetry_agg
@@ -108,6 +149,27 @@ struct ModuleState {
     dek_epoch: u32,
     snapshots_taken: u32,
     chunks_imported: u32,
+    /// Snapshot triggers we declined because their `last_included_index`
+    /// would have advanced compaction past the lowest active retention
+    /// floor. Counted so operators can spot a stuck floor; the
+    /// trigger itself is dropped (the leader's next rotation will
+    /// re-fire it). Bumping a floor downwards is the application's
+    /// job, not the snapshot engine's.
+    triggers_deferred: u32,
+
+    /// Per-kpg retention floors received from
+    /// `compaction_coordinator`. Reads and writes are linear scans
+    /// (no hashing) — `RETENTION_FLOOR_SLOTS` is small enough that
+    /// the scan fits comfortably in one tick budget.
+    retention_floors: [RetentionFloorSlot; RETENTION_FLOOR_SLOTS],
+    /// Sticky bit set when a `MSG_COMPACTION_FLOOR` arrived for a
+    /// kpg the table couldn't accommodate. The trigger gate fails
+    /// closed (refuses to advance compaction) while this is set,
+    /// because we no longer have a complete picture of which
+    /// indices are still replay-needed. Recovery requires an
+    /// operator restart with a larger `RETENTION_FLOOR_SLOTS`;
+    /// there is no automatic clear path.
+    retention_floor_overflow: bool,
 
     // In-flight install state (single-stream, fail-open if interleaved):
     in_progress_term: u64,
@@ -161,9 +223,14 @@ pub extern "C" fn module_new(
         s.in_trigger = dev_channel_port(sys, 0, 1);
         s.in_key_update = dev_channel_port(sys, 0, 2);
         s.in_install_request = dev_channel_port(sys, 0, 3);
+        s.in_retention_floor = dev_channel_port(sys, 0, 4);
         s.out_manifest = dev_channel_port(sys, 1, 1);
         s.out_metrics = dev_channel_port(sys, 1, 2);
         s.out_installed = dev_channel_port(sys, 1, 3);
+
+        s.retention_floors = [RetentionFloorSlot::empty(); RETENTION_FLOOR_SLOTS];
+        s.retention_floor_overflow = false;
+        s.triggers_deferred = 0;
 
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
@@ -202,6 +269,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // 1b. Drain retention-floor updates from compaction_coordinator
+        //     so the floor check below uses the freshest values when a
+        //     trigger arrives in the same tick. The floor envelope is
+        //     idempotent (same kpg_id, possibly-advanced floor_revision),
+        //     so processing it before the trigger keeps the gate
+        //     conservative: a floor declared in tick N applies to a
+        //     trigger seen in tick N or later.
+        drain_retention_floors(s, sys);
+
         // 2. Snapshot triggers from wal.
         if s.in_trigger >= 0 {
             for _ in 0..4 {
@@ -210,6 +286,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_trigger, &mut s.msg_buf);
                 if msg_type == wire::MSG_SNAPSHOT_TRIGGER && plen >= 16 {
                     let (term, index) = wire::decode_term_index(&s.msg_buf);
+                    // Retention floor gate: a snapshot at `index`
+                    // implies compaction will trim entries < index.
+                    // Any kpg whose floor_revision is below `index`
+                    // still needs those entries for a replay-after-
+                    // rebind, so we must NOT proceed. The trigger is
+                    // dropped (logged); the leader's next rotation
+                    // will re-fire it once the floor has caught up
+                    // (typically when the lagging watcher rebinds or
+                    // moves on).
+                    if !retention_floor_allows(s, index) {
+                        s.triggers_deferred = s.triggers_deferred.saturating_add(1);
+                        dev_log(sys, 3, b"[snap] floor block".as_ptr(), 18);
+                        continue;
+                    }
                     persist_manifest(s, sys, term, index);
                     s.last_snapshot_term = term;
                     s.last_snapshot_index = index;
@@ -433,24 +523,30 @@ unsafe fn emit_install_body(
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-/// Build snapshot path:
-///   partition_id == 0  →  `wal/snap_<NNNNNNNN>.bin`
-///   partition_id == N  →  `wal/p<NNNN>/snap_<NNNNNNNN>.bin`
+/// Build snapshot path: `wal/p<NNNN>_snap_<NNNNNNNN>.bin`.
+///
+/// All partitions share the one `wal/` directory; the partition_id
+/// is stamped into the filename rather than a per-partition
+/// subdirectory. This mirrors `wal/p<NNNN>_seg_<NNNNNNNN>` (see
+/// `modules/app/wal/mod.rs::encode_segment_path`) so the operator
+/// only needs to ensure one `wal/` directory exists regardless of
+/// partition count — the Linux FS provider's `OPEN_CREATE` opcode
+/// creates files but does not auto-`mkdir` parents, so the flat
+/// layout is what makes the persisted manifest actually appear on
+/// disk in a default deployment. See
+/// `modules/app/snapshot_engine/manifest.toml` for the operator
+/// note.
 unsafe fn build_snapshot_path(s: &mut ModuleState, index: Index) -> usize {
     let mut i = 0usize;
-    for &b in b"wal/" {
+    for &b in b"wal/p" {
         if i < SNAP_PATH_MAX { s.path_buf[i] = b; i += 1; }
     }
-    if s.partition_id != 0 {
-        if i < SNAP_PATH_MAX { s.path_buf[i] = b'p'; i += 1; }
-        for digit in (0..4).rev() {
-            let nibble = ((s.partition_id >> (digit * 4)) & 0xF) as u8;
-            let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-            if i < SNAP_PATH_MAX { s.path_buf[i] = ch; i += 1; }
-        }
-        if i < SNAP_PATH_MAX { s.path_buf[i] = b'/'; i += 1; }
+    for digit in (0..4).rev() {
+        let nibble = ((s.partition_id >> (digit * 4)) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        if i < SNAP_PATH_MAX { s.path_buf[i] = ch; i += 1; }
     }
-    for &b in b"snap_" {
+    for &b in b"_snap_" {
         if i < SNAP_PATH_MAX { s.path_buf[i] = b; i += 1; }
     }
     // 8-hex-digit suffix from the low 32 bits of index (matches
@@ -468,6 +564,116 @@ unsafe fn build_snapshot_path(s: &mut ModuleState, index: Index) -> usize {
     i
 }
 
+/// Drain pending `MSG_COMPACTION_FLOOR` envelopes on the
+/// retention-floor input and upsert each into the per-kpg floor
+/// table. Bounded per-tick: at most four envelopes are absorbed so
+/// the snapshot trigger path always gets a chance to run on the
+/// same tick. Floor updates are idempotent (same `kpg_id`, possibly-
+/// advanced `floor_revision`), so missing an update on tick N just
+/// defers it to tick N+1.
+///
+/// Wire shape (10 bytes): `[kpg_id:u16 LE][floor_revision:u64 LE]`.
+/// See `modules/common/wire.rs::MSG_COMPACTION_FLOOR` for the
+/// byte-compatible declaration shared with lattice.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a
+/// `&SyscallTable` whose function pointers reach live kernel
+/// routines per the module ABI in
+/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn drain_retention_floors(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_retention_floor < 0 {
+        return;
+    }
+    for _ in 0..4 {
+        let poll = (sys.channel_poll)(s.in_retention_floor, 0x01);
+        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            break;
+        }
+        let (msg_type, plen) =
+            wire_channels::channel_read_msg(sys, s.in_retention_floor, &mut s.msg_buf);
+        if msg_type != wire::MSG_COMPACTION_FLOOR || (plen as usize) < 10 {
+            continue;
+        }
+        let kpg_id = u16::from_le_bytes([s.msg_buf[0], s.msg_buf[1]]);
+        // `0xFFFF` is the empty-slot sentinel; the wire reserves it
+        // as "never a real kpg id" so a downstream that ever sent it
+        // would be telling us about a nonexistent kpg. Drop loudly.
+        if kpg_id == FLOOR_SLOT_EMPTY {
+            dev_log(sys, 3, b"[snap] kpg sentinel".as_ptr(), 19);
+            continue;
+        }
+        let floor_revision = u64::from_le_bytes([
+            s.msg_buf[2], s.msg_buf[3], s.msg_buf[4], s.msg_buf[5],
+            s.msg_buf[6], s.msg_buf[7], s.msg_buf[8], s.msg_buf[9],
+        ]);
+        upsert_retention_floor(s, sys, kpg_id, floor_revision);
+    }
+}
+
+/// Insert or update the floor for `kpg_id`. Existing entry → update
+/// in place. No entry → fill the first empty slot. Table full →
+/// set the sticky overflow flag (the trigger gate fails closed
+/// while it's set, blocking any further compaction advancement
+/// until an operator restart with more slots) and log loudly so
+/// the operator notices.
+unsafe fn upsert_retention_floor(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    kpg_id: u16,
+    floor_revision: u64,
+) {
+    // Existing entry: linear scan.
+    for slot in &mut s.retention_floors {
+        if slot.kpg_id == kpg_id {
+            slot.floor_revision = floor_revision;
+            return;
+        }
+    }
+    // First empty slot.
+    for slot in &mut s.retention_floors {
+        if slot.kpg_id == FLOOR_SLOT_EMPTY {
+            slot.kpg_id = kpg_id;
+            slot.floor_revision = floor_revision;
+            return;
+        }
+    }
+    // Table full. The new kpg's floor has nowhere to land, so we
+    // can no longer answer "is this index safe to compact past?"
+    // honestly — that kpg might need indices we'd otherwise allow
+    // to be trimmed. Fail closed: latch the overflow flag so
+    // `retention_floor_allows` returns false until restart. Loud
+    // log so the operator knows to bump `RETENTION_FLOOR_SLOTS`.
+    s.retention_floor_overflow = true;
+    dev_log(sys, 3, b"[snap] floor full".as_ptr(), 17);
+}
+
+/// Test whether a snapshot at `index` is permitted under the
+/// current retention-floor set. Returns `false` whenever the floor
+/// table has overflowed (we can't reason about an unrecorded floor,
+/// so fail closed) or any populated slot's `floor_revision < index`
+/// (advancing past that floor would lose replay-needed entries).
+/// Returns `true` when the floor set is empty (no consumer has
+/// asked for retention, so any snapshot index is fine).
+///
+/// Bounded scan; matches the upsert path's complexity. Safe to
+/// call from the hot trigger path.
+fn retention_floor_allows(s: &ModuleState, index: u64) -> bool {
+    if s.retention_floor_overflow {
+        return false;
+    }
+    for slot in &s.retention_floors {
+        if slot.kpg_id == FLOOR_SLOT_EMPTY {
+            continue;
+        }
+        if slot.floor_revision < index {
+            return false;
+        }
+    }
+    true
+}
+
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
@@ -479,10 +685,16 @@ unsafe fn persist_manifest(s: &mut ModuleState, sys: &SyscallTable, term: Term, 
     let plen = build_snapshot_path(s, index);
     if plen == 0 { return; }
 
-    let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+    // Snapshot manifests are always created fresh. `FS_OPEN` is
+    // read-only-if-exists per the FS contract; opening at the
+    // write tier (`FS_OPEN_CREATE`) is the only path that produces
+    // a valid fd for a not-yet-existing manifest file.
+    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
     if fd < 0 {
-        // FS unavailable (e.g. unwired contract on a drone). Log so
-        // we know the trigger fired but no disk artefact will appear.
+        // FS contract unwired or the `wal/` parent directory
+        // doesn't exist (`OPEN_CREATE` creates files but does not
+        // `mkdir` parents). Log so the operator knows the trigger
+        // fired but no disk artefact will appear.
         dev_log(sys, 3, b"[snap] no fs".as_ptr(), 12);
         return;
     }
