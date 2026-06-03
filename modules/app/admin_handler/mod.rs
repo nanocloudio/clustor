@@ -17,13 +17,16 @@
 //! tracked in RFC §14):
 //!   ADD_VOTER, REMOVE_VOTER, anything else.
 //!
-//! Idempotency ring is in-memory; persistence across restarts is
-//! achieved by replicating admin commands through Raft (RFC §3.1) so
-//! the canonical "this command has been applied" record lives in the
-//! WAL. The in-memory ring still suppresses rapid retries while the
-//! command is in flight; a restart that loses the ring at worst
-//! double-applies an idempotent op (FREEZE→FREEZE, etc.) — which is
-//! safe by construction for the supported op set.
+//! Idempotency is in-memory and deliberately narrow: it collapses only
+//! a *rapid retransmit* — a command identical to the one immediately
+//! preceding it within a short in-flight window (`idemp_ttl_ms`). Two
+//! genuinely distinct operations (and any alternating sequence such as
+//! FREEZE/THAW/FREEZE) each get their own Raft entry. Cross-command and
+//! cross-restart idempotency is not this module's job: the canonical
+//! "this command has been applied" record lives in the WAL via Raft
+//! replication (RFC §3.1), and the supported op set is double-apply-safe
+//! by construction (FREEZE→FREEZE, etc.), so a lost in-memory predecessor
+//! at worst re-applies an idempotent op.
 
 #![no_std]
 #![allow(
@@ -51,15 +54,7 @@ mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
 
-const IDEMP_SLOTS: usize = 32;
 const CMD_RING: usize = 16;
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct IdempEntry {
-    key_hash: u32,
-    timestamp_ms: u64,
-}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -74,9 +69,13 @@ struct ModuleState {
     out_responses: i32,   // out[1]: MSG_ADMIN_RESPONSE to client_surface
     out_proposal: i32,    // out[2]: ADMIN_MARKER-prefixed MSG_CLIENT_PROPOSAL for replicable ops
 
+    // Idempotency collapses only a *rapid retransmit* — a command
+    // identical to the one immediately preceding it within the in-flight
+    // window. `last_cmd_hash == 0` means "no prior command". A distinct
+    // or alternating op is always a fresh command. See the module header.
     idemp_ttl_ms: u64,
-    idemp: [IdempEntry; IDEMP_SLOTS],
-    idemp_count: u8,
+    last_cmd_hash: u32,
+    last_cmd_ms: u64,
     commands_processed: u32,
 
     next_command_id: u32,
@@ -127,7 +126,14 @@ pub extern "C" fn module_new(
         s.in_applied = dev_channel_port(sys, 0, 1);
         s.out_responses = dev_channel_port(sys, 1, 1);
         s.out_proposal = dev_channel_port(sys, 1, 2);
-        s.idemp_ttl_ms = 3_600_000; // 1 hour
+        // In-flight retransmit window: a duplicate is only collapsed if
+        // it lands within this gap of an identical predecessor. Long
+        // enough to swallow a client TCP retransmit, short enough that a
+        // genuine later op (operator re-issuing the same command) is its
+        // own entry.
+        s.idemp_ttl_ms = 2_000; // 2 s
+        s.last_cmd_hash = 0;
+        s.last_cmd_ms = 0;
         s.next_command_id = 1;
         s.cmd_head = 0;
         for slot in s.cmd_ring.iter_mut() { *slot = CmdEntry { command_id: 0, conn_id: 0 }; }
@@ -209,16 +215,14 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
         cmd[..cmd_len].copy_from_slice(&s.msg_buf[1..pl]);
         let key_hash = hash_bytes(&cmd[..cmd_len]);
 
-        // Idempotency check
-        let mut dup = false;
-        for i in 0..s.idemp_count as usize {
-            if s.idemp[i].key_hash == key_hash
-                && now.wrapping_sub(s.idemp[i].timestamp_ms) < s.idemp_ttl_ms
-            {
-                dup = true;
-                break;
-            }
-        }
+        // Idempotency check — collapse only a rapid retransmit: a
+        // command identical to its immediate predecessor within the
+        // in-flight window. Alternating or otherwise-distinct ops each
+        // get their own entry (the alternating freeze/thaw the
+        // wal_replay test drives must produce one entry per op).
+        let dup = s.last_cmd_hash == key_hash
+            && key_hash != 0
+            && now.wrapping_sub(s.last_cmd_ms) < s.idemp_ttl_ms;
         if dup {
             emit_admin_response(s, sys, conn_id, wire::ADMIN_STATUS_DUPLICATE);
             continue;
@@ -250,10 +254,10 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
             continue;
         }
 
-        // Record idempotency
-        let slot = (s.idemp_count as usize) % IDEMP_SLOTS;
-        s.idemp[slot] = IdempEntry { key_hash, timestamp_ms: now };
-        if (s.idemp_count as usize) < IDEMP_SLOTS { s.idemp_count += 1; }
+        // Record this command as the predecessor for the next request's
+        // retransmit check.
+        s.last_cmd_hash = key_hash;
+        s.last_cmd_ms = now;
 
         // Allocate a command_id and remember the conn_id so we can route
         // the eventual MSG_ADMIN_APPLIED back to the right client.

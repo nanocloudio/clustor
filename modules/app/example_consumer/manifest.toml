@@ -43,3 +43,7 @@ content_type = "OctetStream"
 name = "snapshot_export"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Minimal downstream demo consumer of apply_pipeline.committed_entries.
+exempt = "minimal downstream demo consumer; applied-entry throughput is observed upstream at apply_pipeline (entries_applied) — it rides the substrate as fluxor echo_worker rides its transport"

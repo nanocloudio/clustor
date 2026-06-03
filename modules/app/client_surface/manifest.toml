@@ -57,3 +57,7 @@ content_type = "OctetStream"
 name = "responses"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Envelope demux/aggregate between peer_router and raft/codec/rbac.
+metrics = ["bytes_in", "bytes_out", "requests"]

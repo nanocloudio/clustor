@@ -22,3 +22,7 @@ content_type = "OctetStream"
 name = "rejected"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Admission control: every request lands on admitted or rejected.
+metrics = ["requests_admitted", "requests_rejected"]

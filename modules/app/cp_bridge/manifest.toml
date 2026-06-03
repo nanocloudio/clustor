@@ -19,3 +19,7 @@ content_type = "OctetStream"
 name = "capabilities"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# HTTP client polling the external CP service for proofs.
+metrics = ["bytes_in", "bytes_out", "requests"]

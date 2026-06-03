@@ -81,3 +81,7 @@ content_type = "OctetStream"
 name = "admin_committed"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Ordered dedup delivery to the state machine; `[apply] ok` per applied entry.
+metrics = ["entries_applied", "dedup_drops"]

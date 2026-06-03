@@ -33,3 +33,8 @@ content_type = "OctetStream"
 name = "raft_proposal"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Idempotency-keyed admin routing; counters mirror the status replies
+# (ADMIN_STATUS_OK / DUPLICATE / UNSUPPORTED).
+metrics = ["requests", "duplicates", "unsupported"]

@@ -22,3 +22,9 @@ content_type = "OctetStream"
 name = "export"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# The metrics collector itself — decodes other modules MSG_METRIC_SAMPLE and
+# re-emits aggregated /readyz, /why, /metrics payloads. Originates no
+# data-plane telemetry of its own (cf. fluxor log_net).
+exempt = "telemetry aggregator/collector — aggregates and re-emits other modules MSG_METRIC_SAMPLE into /readyz, /why, /metrics; originates no data-plane telemetry of its own (cf. fluxor log_net)"

@@ -68,3 +68,8 @@ content_type = "OctetStream"
 name = "proposals_tagged_p3"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Stateless partition demux — fans proposals to the per-partition raft_engine
+# instances by id without transforming them.
+exempt = "stateless partition demultiplexer; proposal throughput is counted at each per-partition raft_engine instance (proposals_received), not re-counted here"

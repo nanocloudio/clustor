@@ -210,3 +210,13 @@ content_type = "OctetStream"
 [[resources]]
 requires_contract = "fs"
 access = "write"
+
+[observability]
+# Metric ids mirror `wire::metric_ids` (RAFT_*): typed MSG_METRIC_SAMPLE
+# emitted to telemetry_agg each second from emit_metrics.
+metrics = [
+  "role", "current_term",
+  "proposals_received", "entries_appended", "elections_started",
+  "proposals_dropped_frozen", "proposals_dropped_strict",
+  "frozen_flag", "strict_fallback_flag",
+]

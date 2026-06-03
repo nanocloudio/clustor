@@ -51,3 +51,8 @@ content_type = "OctetStream"
 name = "admin_request"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Request translation + endpoint cache; mirrors requests_handled / requests_404
+# and self-emits a MSG_METRIC_SAMPLE.
+metrics = ["requests", "requests_404"]

@@ -52,3 +52,8 @@ content_type = "OctetStream"
 name = "raft_rpc"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Per-peer / per-client envelope routing over TCP; bytes_in/out reuse the
+# fluxor transport vocabulary, connections.open the ip-playbook gauge.
+metrics = ["bytes_in", "bytes_out", "connections.open"]

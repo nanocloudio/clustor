@@ -19,3 +19,7 @@ content_type = "OctetStream"
 name = "epoch_events"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Epoch-keyed routing; emits epoch_events and rejects stale placements.
+metrics = ["placement_epoch", "stale_rejects"]

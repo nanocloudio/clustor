@@ -22,3 +22,9 @@ content_type = "OctetStream"
 name = "metrics"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Cache state machine; MetricsPayload to telemetry_agg on each transition.
+# cache.state is the Fresh/Cached/Stale/Expired gauge, strict_fallback the
+# fallback-trigger counter.
+metrics = ["cache.state", "strict_fallback"]

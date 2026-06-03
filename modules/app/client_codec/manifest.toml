@@ -56,3 +56,7 @@ content_type = "OctetStream"
 name = "reads"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Client wire codec (raw -> parsed, responses framed back out).
+metrics = ["bytes_in", "bytes_out", "requests"]

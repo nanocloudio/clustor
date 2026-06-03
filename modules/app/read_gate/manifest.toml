@@ -12,3 +12,7 @@ content_type = "OctetStream"
 name = "permits"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Linearizable read-permit gate; reads_blocked counts strict-fallback blocks.
+metrics = ["reads_permitted", "reads_blocked"]

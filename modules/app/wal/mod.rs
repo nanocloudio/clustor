@@ -179,6 +179,11 @@ struct ModuleState {
 
     // File I/O
     fd: i32,                    // file descriptor for current segment, -1 = not open
+    /// Set once `OPEN_CREATE` has failed on the write path so the
+    /// `[wal] no fs` in-memory-fallback signal is emitted exactly once,
+    /// not per flush. This is the *real* fs-unavailable marker (a fresh
+    /// deployment with a writable empty `wal/` never trips it).
+    no_fs_logged: bool,
     path_buf: [u8; WAL_PATH_MAX],
     path_len: u8,
 
@@ -280,6 +285,7 @@ pub extern "C" fn module_new(
         s.oldest_segment_seq = 1;
         s.crc = Crc32c::new();
         s.fd = -1;
+        s.no_fs_logged = false;
         s.phase = PHASE_REPLAY;
         s.replay_seg = 1;
         s.replay_fd = -1;
@@ -635,18 +641,20 @@ unsafe fn step_replay(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
                 s.replay_seg = s.replay_seg.saturating_add(1);
                 return 0;
             }
-            // Bound reached: replay is done. Distinguish the
-            // "found nothing at all" case (fresh deployment or
-            // missing wal/ dir) from "found some, ran out" so the
-            // log line stays diagnostic — the former emits
-            // `[wal] no fs`, the latter `[wal] replay done`.
+            // Bound reached: replay is done. Finding no segments here
+            // is NOT proof the filesystem is unavailable — a fresh
+            // deployment has an empty (but perfectly writable) `wal/`.
+            // Whether the FS is actually missing is only known on the
+            // write path (`ensure_segment_open`), which emits
+            // `[wal] no fs` if `OPEN_CREATE` fails. So replay just
+            // reports completion either way and lets the writer make
+            // the fallback call.
+            dev_log(sys, 3, b"[wal] replay done".as_ptr(), 17);
             if s.replay_last_found == 0 {
-                dev_log(sys, 3, b"[wal] no fs".as_ptr(), 11);
                 // No segments found: start writes at seq 1.
                 s.segment_seq = 1;
                 s.oldest_segment_seq = 1;
             } else {
-                dev_log(sys, 3, b"[wal] replay done".as_ptr(), 17);
                 s.segment_seq = s.replay_last_found.saturating_add(1);
                 s.oldest_segment_seq = s.replay_first_found;
             }
@@ -986,6 +994,13 @@ unsafe fn ensure_segment_open(s: &mut ModuleState, sys: &SyscallTable) {
     if s.fd >= 0 { return; }
     build_segment_path(s, s.segment_seq);
     s.fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), s.path_len as usize);
+    if s.fd < 0 && !s.no_fs_logged {
+        // FS genuinely unavailable (no mounted filesystem / missing
+        // `wal/`): the module degrades to in-memory only. Emit the
+        // fallback signal once.
+        s.no_fs_logged = true;
+        dev_log(sys, 3, b"[wal] no fs".as_ptr(), 11);
+    }
 }
 
 /// # Safety

@@ -89,3 +89,8 @@ content_type = "OctetStream"
 name = "installed_local"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Chunked snapshot export/import + manifest persistence; chunk_bytes is the
+# transferred-body counter (`[snap] installed` / `body cap`).
+metrics = ["snapshots_exported", "snapshots_installed", "chunk_bytes"]

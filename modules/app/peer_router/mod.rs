@@ -423,8 +423,25 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable) {
 
         match event {
             NMSG_ACCEPT => {
-                // payload: [conn_id: u8]
-                if payload_len >= 1 {
+                // payload: [conn_id: u8][local_port: u16 LE]
+                //
+                // We share `net_in` (linux_net / ip `net_out`) with the
+                // other anchors on this node — `http_ingress` binds its
+                // own diagnostic port on the same provider. The provider
+                // tees every MSG_ACCEPTED to all anchors and stamps the
+                // accepting listener's port so each anchor claims only
+                // the conns its own CMD_BIND accepted (see fluxor
+                // `ip::net_send_accepted` / `linux_net` providers). Without
+                // this filter peer_router would alloc a slot for an
+                // http_ingress connection and forward its raw HTTP bytes
+                // to client_surface as a bogus client proposal.
+                let local_port = if payload_len >= 3 {
+                    u16::from_le_bytes([s.buf[NET_FRAME_HDR + 1], s.buf[NET_FRAME_HDR + 2]])
+                } else {
+                    // Legacy providers that omit the port: claim as before.
+                    s.listen_port
+                };
+                if payload_len >= 1 && local_port == s.listen_port {
                     if let Some(slot) = alloc_conn(s) {
                         s.conns[slot] = Conn {
                             conn_id, replica_id: -1, active: true,

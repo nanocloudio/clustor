@@ -64,3 +64,8 @@ content_type = "OctetStream"
 [[resources]]
 requires_contract = "fs"
 access = "write"
+
+[observability]
+# Metric ids mirror `wire::metric_ids` (WAL_*): MSG_METRICS to telemetry_agg
+# plus the `[wal] hb` heartbeat line. bytes_written is the AEAD-segment lane.
+metrics = ["entries_written", "bytes_written", "segment_seq"]

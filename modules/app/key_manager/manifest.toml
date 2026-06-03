@@ -12,3 +12,9 @@ content_type = "OctetStream"
 name = "cert_refresh"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Pure DEK/KEK epoch source on a rotation timer — moves no data-plane bytes.
+# Key-epoch rollovers are observed where the keys are consumed: wal segment
+# AEAD (segment_seq) and tls session establishment.
+exempt = "pure key-epoch source on a rotation timer; no data-plane bytes — epoch rollovers are observed where keys are consumed (wal AEAD segments, tls sessions)"

@@ -51,3 +51,9 @@ name = "request"
 direction = "output"
 content_type = "OctetStream"
 
+
+[observability]
+# HTTP/1.1 admin listener; reuses the fluxor http vocabulary so the span
+# attaches under the same name the foundation http module mints.
+metrics = ["bytes_in", "bytes_out", "requests"]
+spans   = ["http.server.request"]

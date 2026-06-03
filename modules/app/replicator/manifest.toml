@@ -81,3 +81,8 @@ content_type = "OctetStream"
 name = "cross_durability_ack"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Metric ids mirror `wire::metric_ids` (REPL_*): MSG_METRIC_SAMPLE from
+# emit_metrics over the AppendEntries pipeline.
+metrics = ["rpcs_sent", "acks_received", "nacks_received", "catchup_sent"]

@@ -42,3 +42,7 @@ content_type = "OctetStream"
 name = "committed"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Quorum commit-index computation; `[commit] adv` marks each advance.
+metrics = ["commit_index", "commit_advances"]

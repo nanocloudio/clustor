@@ -12,3 +12,7 @@ content_type = "OctetStream"
 name = "quorum_durable"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Per-replica fsynced indices -> quorum-durable index; `[dur] quorum` on advance.
+metrics = ["durable_index", "quorum_transitions"]

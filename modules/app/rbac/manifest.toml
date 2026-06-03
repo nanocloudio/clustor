@@ -32,3 +32,8 @@ content_type = "OctetStream"
 name = "audit_events"
 direction = "output"
 content_type = "OctetStream"
+
+[observability]
+# Role evaluation per conn_id; denials counts ADMIN_STATUS_REJECTED,
+# break_glass_grants the audited break-glass admissions.
+metrics = ["evaluations", "denials", "break_glass_grants"]
