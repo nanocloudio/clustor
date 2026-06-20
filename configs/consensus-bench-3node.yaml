@@ -1,32 +1,29 @@
-# Clustor — 3-replica single-partition test cluster (template).
+# Clustor — L2 consensus bench, 3-replica (real quorum replication).
+# `.context/rfc_performance_benchmarking.md` §14 item 2.
 #
-# DEV/TEST ONLY. The `http_adapter.admin_request → admin_handler.requests`
-# edge near the end of this file routes `POST /admin/<op>` straight
-# into admin_handler without going through `rbac`. Don't deploy this
-# config to anywhere the HTTP port isn't already behind an
-# authenticated proxy. Routing HTTP admin through rbac is tracked at
-# docs/native_fluxor.md.
+# 3-node twin of `configs/consensus-bench.yaml`: the full multi-node
+# consensus pipeline (real AppendEntries → 2 followers → quorum-durable
+# commit) with a `consensus_bench` injector feeding raft_engine.proposals
+# directly on every node. Only the leader's raft drains proposals (the
+# followers' injectors just backpressure on a full local channel), so the
+# leader drives real quorum-replicated commits; scrape whichever node
+# reports raft role=2 (leader). The delta vs the single-node bench's
+# commit_latency_ms IS the quorum-RTT contribution. This is also the
+# meaningful test of the follower-path fail-closed fix (RFC §13): the
+# leader replicates to follower WALs that must accept entries or NACK.
 #
-# This file is a TEMPLATE: it contains `__SELF_ID__`,
-# `__LISTEN_PORT__`, and `__PEER{0,1,2}_PORT__` placeholders that
-# must be substituted per node before `fluxor run`. Render with:
+# TEMPLATE: render per node with `fluxor render-template` (see below),
+# substituting __SELF_ID__ / __LISTEN_PORT__ / __PEER{0,1,2}_PORT__ /
+# __HTTP_PORT__. Driven by a 3-process spawn (see tests/hardware/README.md
+# L2 3-node procedure); the cluster harness templating in
+# tests/support/cluster.rs renders the same placeholders.
 #
-#   fluxor up configs/multi-3node.yaml --replicas 3          # spawn all
-#   fluxor render-template configs/multi-3node.yaml \
-#       --var SELF_ID=0 --var LISTEN_PORT=9090 \
-#       --var PEER0_PORT=9090 --var PEER1_PORT=9091 --var PEER2_PORT=9092 \
-#       --var HTTP_PORT=19090 > /tmp/n0.yaml                  # one node
+# Like the single-node bench, the cp_proof_cache.strict_fallback →
+# raft_engine.fallback_signal edge is CUT: with no real control plane the
+# proof cache ages out of Fresh and would latch raft into strict fallback
+# (dropping proposals). Commit safety still rests on quorum durability.
 #
-# Three replicas on localhost. voter_count=3 means majority=2, so
-# the cluster survives one node failure. With two of three down,
-# no progress is possible — that's the canonical Raft availability
-# guarantee the topology exists to verify.
-#
-# This is the same shape as `multi-2node.yaml` but with peer_count
-# raised to 3 and a `peer2_port` knob. The cluster harness at
-# `tests/support/cluster.rs` uses this template for all 3-replica
-# scenarios so each test exercises a real multi-node graph (not
-# three independent single-node processes).
+# DEV/TEST ONLY — HTTP admin bypasses rbac.
 
 target: linux
 tick_us: 1000
@@ -42,6 +39,16 @@ platform:
   net: {}
 
 modules:
+  # L2 load injector — drives proposals into raft_engine.proposals on
+  # every node; only the leader appends. Same params as the single-node
+  # bench; tune batch_per_step / inject_period to set offered load.
+  - name: consensus_bench
+    params:
+      total: 1000000
+      body_size: 64
+      batch_per_step: 4
+      inject_period: 1
+      warmup_ms: 2500
   - name: peer_router
     params:
       self_id: __SELF_ID__
@@ -74,6 +81,12 @@ modules:
 
   - name: apply_pipeline
   - name: wal
+    params:
+      # Match configs/consensus-bench.yaml so the 3-node commit-latency
+      # is comparable to the single-node baseline (delta = quorum RTT).
+      fsync_mode: 1
+      group_window_ms: 5
+      group_max_pending: 4
   - name: durability_ledger
     params:
       self_id: __SELF_ID__
@@ -86,6 +99,8 @@ modules:
   - name: flow_controller
   - name: key_manager
   - name: telemetry_agg
+    params:
+      emit_interval_ms: 250
   - name: client_surface
   - name: rbac
   - name: admin_handler
@@ -232,8 +247,9 @@ wiring:
     to: read_gate.cache
   - from: cp_proof_cache.cache_state
     to: commit_tracker.cp_state
-  - from: cp_proof_cache.strict_fallback
-    to: raft_engine.fallback_signal
+  # NB: cp_proof_cache.strict_fallback → raft_engine.fallback_signal is
+  # intentionally omitted (see file header) — no real control plane, so
+  # the proof cache would otherwise latch raft into strict fallback.
   - from: read_gate.permits
     to: apply_pipeline.read_permits
   - from: placement_router.routing
@@ -254,6 +270,14 @@ wiring:
   # the client proposal path so every replica applies the entry.
   - from: admin_handler.raft_proposal
     to: raft_engine.proposals
+
+  # ── L2 injector ────────────────────────────────────────────
+  # consensus_bench → raft proposals (untagged port; coexists with the
+  # admin_handler.raft_proposal fan-in already wired to this port).
+  - from: consensus_bench.proposals
+    to: raft_engine.proposals
+  - from: consensus_bench.metrics
+    to: telemetry_agg.ingest
 
   # ── Telemetry ──────────────────────────────────────────────
   - from: raft_engine.metrics

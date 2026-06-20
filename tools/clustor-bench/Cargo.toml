@@ -1,0 +1,50 @@
+[package]
+name = "clustor-bench"
+version.workspace = true
+edition = "2021"
+publish = false
+description = "Off-DUT benchmark harness for clustor: /metrics scrape + parser (clustor-scrape) and open-loop load generator (clustor-loadgen). Std-only, no external deps (RFC §5)."
+
+# std-only by design: this is the driver-host tool (RFC §1, 192.168.1.10), it
+# never runs on fluxor, and keeping it dependency-free means it builds on an
+# offline Pi. Networking is raw std::net; JSON + the latency histogram are
+# hand-rolled in lib.rs.
+
+# Tool-shaped package (driver-host CLI): it prints JSON to stdout and uses
+# unwrap on arg parsing, so the strict lib-grade workspace lints don't fit.
+# Mirrors the `clustor` package's [lints] override (Cargo.toml). Exempted from
+# the workspace-lint opt-in audit via `[[ci.lints.exemption]]` in fluxor.toml.
+[lints.rust]
+unsafe_code               = "forbid"
+unused_must_use           = "deny"
+elided_lifetimes_in_paths = "warn"
+
+[lints.clippy]
+all      = { level = "deny",  priority = -1 }
+pedantic = { level = "allow", priority = -1 }
+
+allow_attributes                = "deny"
+allow_attributes_without_reason = "deny"
+
+dbg_macro     = "deny"
+todo          = "warn"
+unimplemented = "warn"
+
+unwrap_used        = "allow"
+expect_used        = "allow"
+panic              = "allow"
+print_stdout       = "allow"
+print_stderr       = "allow"
+disallowed_macros  = "allow"
+
+[lib]
+name = "clustor_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clustor-scrape"
+path = "src/bin/scrape.rs"
+
+[[bin]]
+name = "clustor-loadgen"
+path = "src/bin/loadgen.rs"

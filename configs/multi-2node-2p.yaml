@@ -89,6 +89,7 @@ modules:
     params:
       self_id: __SELF_ID__
       voter_count: 2
+      partition_id: 0
   - name: apply_pipeline_p0
     type: apply_pipeline
     params:
@@ -125,6 +126,7 @@ modules:
     params:
       self_id: __SELF_ID__
       voter_count: 2
+      partition_id: 1
   - name: apply_pipeline_p1
     type: apply_pipeline
     params:
@@ -277,6 +279,18 @@ wiring:
   - from: replicator_p0.metrics
     to: telemetry_agg.ingest
   - from: replicator_p1.metrics
+    to: telemetry_agg.ingest
+  - from: peer_router.metrics
+    to: telemetry_agg.ingest
+  - from: throttle_gate.metrics
+    to: telemetry_agg.ingest
+  - from: commit_tracker_p0.metrics
+    to: telemetry_agg.ingest
+  - from: commit_tracker_p1.metrics
+    to: telemetry_agg.ingest
+  - from: apply_pipeline_p0.metrics
+    to: telemetry_agg.ingest
+  - from: apply_pipeline_p1.metrics
     to: telemetry_agg.ingest
   - from: telemetry_agg.readyz
     to: client_surface.readyz_data

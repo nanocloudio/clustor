@@ -49,9 +49,29 @@ mod wire_channels;
 #[path = "../../common/http_admin.rs"]
 mod http_admin;
 
-/// Bound on cached envelope bodies. /metrics output is the largest;
-/// 1 KiB matches the size used elsewhere for telemetry payloads.
+/// Bound on the small cached envelopes — `/readyz` and `/why` carry a
+/// single status byte, so 1 KiB is ample.
 const ENVELOPE_CACHE: usize = 1024;
+
+/// Bound on the cached `/metrics` body. The telemetry_agg export is the
+/// largest envelope on this adapter: a binary record stream capped at
+/// `SAFE_EXPORT_MAX` (7400 B) by the aggregator so a frame always fits
+/// the 8 KiB channel ring. This buffer MUST be >= that cap, or
+/// `channel_read_msg` drops every oversized export (its payload-too-large
+/// path drains and discards the frame), freezing `/metrics` on the last
+/// export small enough to fit — which is exactly what silently hid the
+/// metric fan-in once the per-module step histograms pushed the export
+/// past the old 4 KiB bound. 7600 clears the 7400 cap and still keeps the
+/// HTTP response frame (3 B envelope + 5 B header + body) under 8 KiB.
+const METRICS_CACHE: usize = 7600;
+
+/// Wire frame for a cached HTTP response handed to http_ingress:
+/// `conn_id(1) + status(2) + body_len(2) + body`. The body can be the
+/// full `/metrics` export, so this is sized to `METRICS_CACHE`. 5 + 7600 +
+/// the 3-byte channel envelope = 7608 < CHANNEL_BUFFER_SIZE (8192). Lives on
+/// the step stack (64 KB EL0 / 1 MB EL1 on bcm2712, host thread stack on
+/// linux), comfortably within budget.
+const RESP_FRAME_MAX: usize = 5 + METRICS_CACHE;
 
 #[repr(C)]
 struct ModuleState {
@@ -71,7 +91,7 @@ struct ModuleState {
     readyz_len: u16,
     why_buf: [u8; ENVELOPE_CACHE],
     why_len: u16,
-    metrics_buf: [u8; ENVELOPE_CACHE],
+    metrics_buf: [u8; METRICS_CACHE],
     metrics_len: u16,
 
     requests_handled: u32,
@@ -82,7 +102,10 @@ struct ModuleState {
     /// sees 503 for each one. Surfaced through the metrics aggregator
     /// so a sustained admin queue stall is operationally visible.
     admin_dropped: u32,
-    msg_buf: [u8; 2048],
+    /// Scratch for draining an envelope off any input channel. Sized to
+    /// the largest payload (the `/metrics` export) so `channel_read_msg`
+    /// never hits its payload-too-large drop path on a valid frame.
+    msg_buf: [u8; METRICS_CACHE],
 }
 
 #[no_mangle]
@@ -197,7 +220,8 @@ unsafe fn cache_one(s: &mut ModuleState, sys: &SyscallTable, slot: u8) {
         }
         let (msg_type, plen) = wire_channels::channel_read_msg(sys, chan, &mut s.msg_buf);
         let pl = plen as usize;
-        let take = pl.min(ENVELOPE_CACHE);
+        // Metrics get the large cache; readyz/why are single-byte bodies.
+        let take = pl.min(if slot == 2 { METRICS_CACHE } else { ENVELOPE_CACHE });
         let expected = match slot {
             0 => wire::MSG_READYZ,
             1 => wire::MSG_WHY,
@@ -263,6 +287,30 @@ unsafe fn serve_requests(s: &mut ModuleState, sys: &SyscallTable) {
         // (`MSG_ADMIN_RESPONSE`) goes to client_surface today;
         // wiring the sync reply back through http_adapter is a
         // follow-up slice.
+        // POST /propose — client-write bridge (RFC §8 stopgap). Wraps the
+        // request body as a RAW client proposal (op ADMIN_OP_PROPOSE; the
+        // admin_handler strips the admin framing and emits an unmarked
+        // MSG_CLIENT_PROPOSAL), replies 202 once it's on the wire. Lets an
+        // off-DUT generator drive real writes over HTTP without a dedicated
+        // native ingress. A synchronous commit-ack reply (correlation-tracked)
+        // is a follow-up; 202-on-accept suffices for open-loop load + the
+        // in-band commit-latency histogram.
+        if _method == b'P' && eq_path(path, b"/propose") {
+            let body_off = 3 + path_len;
+            let body_len = pl - body_off;
+            let mut body_local = [0u8; 1024];
+            let take = body_len.min(body_local.len());
+            body_local[..take].copy_from_slice(&s.msg_buf[body_off..body_off + take]);
+            if emit_admin_command(s, sys, conn_id, wire::ADMIN_OP_PROPOSE, &body_local[..take]) {
+                emit_response(s, sys, conn_id, 202, b"accepted");
+            } else {
+                s.admin_dropped = s.admin_dropped.saturating_add(1);
+                emit_response(s, sys, conn_id, 503, b"propose queue unavailable");
+            }
+            s.requests_handled = s.requests_handled.saturating_add(1);
+            continue;
+        }
+
         if _method == b'P' && path.starts_with(b"/admin/") {
             let op_name = &path[b"/admin/".len()..];
             // Copy body before re-borrowing msg_buf.
@@ -417,16 +465,21 @@ unsafe fn emit_response(
     status: u16,
     body: &[u8],
 ) {
-    let body_len = body.len().min(0xFFFF);
-    let total = 1 + 2 + 2 + body_len;
-    if total > 2048 {
-        return;
-    }
+    // Header is conn_id(1) + status(2) + body_len(2); the body can be a full
+    // cached envelope — the largest is the `/metrics` export (METRICS_CACHE,
+    // up to ~7.4 KiB). The frame must fit one channel message
+    // (CHANNEL_BUFFER_SIZE = 8 KiB): 3 B envelope + 5 B header + body stays
+    // under 8 KiB because METRICS_CACHE (7600) + 8 < 8192. The frame is built
+    // in the state-resident `resp_frame` (not the stack) to keep the per-step
+    // stack frame small on embedded targets.
+    const RESP_HDR_LEN: usize = 1 + 2 + 2;
+    let body_len = body.len().min(METRICS_CACHE);
+    let total = RESP_HDR_LEN + body_len;
     let poll = (sys.channel_poll)(s.out_response, 0x02);
     if poll <= 0 || (poll as u32 & 0x02) == 0 {
         return;
     }
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; RESP_FRAME_MAX];
     buf[0] = conn_id;
     buf[1..3].copy_from_slice(&status.to_le_bytes());
     buf[3..5].copy_from_slice(&(body_len as u16).to_le_bytes());

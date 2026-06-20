@@ -1,42 +1,78 @@
-# single-node test cluster with WAL group-fsync (Throughput profile).
-# Mirrors `configs/single.yaml` with `wal.fsync_mode = 1` plus a
-# small `group_max_pending` so the threshold flush trips inside the
-# test budget. Drives `tests/wal_group_fsync.rs`.
+# L2 consensus latency/throughput bench — CM5 BARE-METAL twin of
+# `consensus-bench.yaml` (`.context/rfc_performance_benchmarking.md` §6).
+# Full single-node consensus pipeline with a `consensus_bench` injector
+# feeding raft_engine.proposals directly. propose→commit latency and
+# commit throughput read from the instrumented producers (raft
+# commit_latency_ms, commit_tracker commit_advances) over /metrics
+# (scrape :19090 over the wire) + log_net UDP:6666.
 #
-# DEV/TEST ONLY — HTTP admin bypasses rbac, same caveat as
-# `configs/single.yaml`.
-target: linux
+# Differs from the linux twin only in: target cm5, `platform.debug.to: net`
+# (log_net observation), and `ip` (not `linux_net`) as the net module.
+#
+# ⚠ Bare-metal has no dev_fs provider yet — the WAL degrades to in-memory
+# (FS_OPEN_CREATE → ENODEV; see single-cm5-throughput.yaml). So this
+# measures the CONSENSUS + SCHEDULER path on real silicon, NOT a
+# disk-durable commit. Re-take when the fluxor cm5 NVMe provider lands.
+#
+# Validated 2026-06-16 on pi5-a (RFC §14): below the knee tracks offered
+# rate at p50≈4–6 ms; saturating plateau ≈1000–1060/s committed, inflight
+# pinned at the cap (24), commit_index sane, lossless — the durability-
+# backpressure fix holds on bare metal.
+#
+# ⚠ Sweep mechanics: raise offered load via `inject_period` (or a SMALL
+# `batch_per_step`), NOT a large batch. The injector is itself an on-DUT
+# cooperative module; a heavy `batch_per_step` (e.g. 8) burns tick time and
+# STARVES the commit/apply pipeline — a measurement artifact (8000/s
+# offered@batch=8 collapsed achieved to ~270/s while still lossless). Keep
+# batch ≤2. offered/s ≈ batch_per_step / inject_period × 1000.
+#
+# DEV/TEST ONLY — HTTP admin bypasses rbac.
+target: cm5
 tick_us: 1000
 
 scheduler:
   accept_cycles: true
 
 platform:
+  debug:
+    to: net
   net: {}
 
 modules:
+  # L2 load injector — drives proposals into raft_engine.proposals.
+  - name: consensus_bench
+    params:
+      total: 4000
+      body_size: 64
+      batch_per_step: 1
+      # Default 1 proposal every 4 ms ≈ 250/s — well below the ~1000/s
+      # bare-metal knee, so it completes cleanly (4000 committed, p50≈6 ms)
+      # as an "it works" smoke. To sweep the knee, drop inject_period
+      # toward 1 (1000/s) and beyond into the plateau (see header).
+      inject_period: 4
+      warmup_ms: 2000
   - name: peer_router
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       peer_count: 1
-      listen_port: __LISTEN_PORT__
-      peer0_port: __LISTEN_PORT__
+      listen_port: 9090
+      peer0_port: 9090
   - name: client_codec
     params:
-      self_id: __SELF_ID__
+      self_id: 0
   - name: throttle_gate
   - name: raft_engine
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       voter_count: 1
       heartbeat_interval_ms: 150
   - name: replicator
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       peer_count: 1
   - name: commit_tracker
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       voter_count: 1
   - name: apply_pipeline
   - name: wal
@@ -49,7 +85,7 @@ modules:
       group_max_pending: 4
   - name: durability_ledger
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       voter_count: 1
       partition_id: 0
   - name: cp_bridge
@@ -58,6 +94,8 @@ modules:
   - name: flow_controller
   - name: key_manager
   - name: telemetry_agg
+    params:
+      emit_interval_ms: 250
   - name: client_surface
   - name: rbac
   - name: admin_handler
@@ -65,17 +103,17 @@ modules:
   - name: placement_router
 
   - name: http_adapter
-  # Binds on the same `linux_net` as `peer_router` (CMD_BIND on a
+  # Binds on the same `ip` as `peer_router` (CMD_BIND on a
   # distinct port). See `configs/single.yaml`.
   - name: http_ingress
     params:
-      listen_port: __HTTP_PORT__
+      listen_port: 19090
 
 wiring:
-  - from: linux_net.net_out
+  - from: ip.net_out
     to: peer_router.net_in
   - from: peer_router.net_out
-    to: linux_net.net_in
+    to: ip.net_in
 
   - from: peer_router.cleartext
     to: client_surface.requests
@@ -166,8 +204,12 @@ wiring:
     to: read_gate.cache
   - from: cp_proof_cache.cache_state
     to: commit_tracker.cp_state
-  - from: cp_proof_cache.strict_fallback
-    to: raft_engine.fallback_signal
+  # NB: cp_proof_cache.strict_fallback → raft_engine.fallback_signal is
+  # intentionally omitted here. With no real control plane feeding
+  # cp_bridge, the proof cache ages out of Fresh after ~1 s and would
+  # latch raft into strict fallback (dropping proposals). For an
+  # isolated L2 consensus bench we keep raft appending; commit safety
+  # still rests on quorum durability (durability_ledger → commit_tracker).
   - from: read_gate.permits
     to: apply_pipeline.read_permits
   - from: placement_router.routing
@@ -185,6 +227,13 @@ wiring:
     to: client_surface.admin_responses
   - from: admin_handler.raft_proposal
     to: raft_engine.proposals
+
+  # L2 injector → raft proposals (untagged port; coexists with the
+  # admin_handler.raft_proposal fan-in already wired to this port).
+  - from: consensus_bench.proposals
+    to: raft_engine.proposals
+  - from: consensus_bench.metrics
+    to: telemetry_agg.ingest
 
   - from: raft_engine.metrics
     to: telemetry_agg.ingest
@@ -215,10 +264,10 @@ wiring:
   - from: telemetry_agg.export
     to: client_surface.metrics_data
 
-  - from: linux_net.net_out
+  - from: ip.net_out
     to: http_ingress.net_in
   - from: http_ingress.net_out
-    to: linux_net.net_in
+    to: ip.net_in
   - from: http_ingress.request
     to: http_adapter.request
   - from: http_adapter.response

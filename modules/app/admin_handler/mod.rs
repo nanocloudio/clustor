@@ -215,6 +215,27 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
         cmd[..cmd_len].copy_from_slice(&s.msg_buf[1..pl]);
         let key_hash = hash_bytes(&cmd[..cmd_len]);
 
+        // Client-write bridge (RFC §8): ADMIN_OP_PROPOSE carries opaque
+        // application data, not an admin op. Emit it as a RAW (unmarked)
+        // MSG_CLIENT_PROPOSAL to raft and return — NO idempotency collapse
+        // (distinct client writes may legitimately repeat a body), no admin
+        // apply, no admin response. `cmd` is `[op_code][op_body]`, so the
+        // proposal body is `cmd[1..]`.
+        if op_code == wire::ADMIN_OP_PROPOSE {
+            if s.out_proposal >= 0 && cmd_len > 1 {
+                let poll_out = (sys.channel_poll)(s.out_proposal, 0x02);
+                if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+                    wire_channels::channel_write_msg(
+                        sys,
+                        s.out_proposal,
+                        wire::MSG_CLIENT_PROPOSAL,
+                        &cmd[1..cmd_len],
+                    );
+                }
+            }
+            continue;
+        }
+
         // Idempotency check — collapse only a rapid retransmit: a
         // command identical to its immediate predecessor within the
         // in-flight window. Alternating or otherwise-distinct ops each

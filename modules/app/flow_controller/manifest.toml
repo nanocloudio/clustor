@@ -24,6 +24,7 @@ direction = "output"
 content_type = "OctetStream"
 
 [observability]
-# Dual-token PID controller; MetricsPayload to telemetry_agg. Gauges track
-# the current entry- and byte-credit pools driving the throttle envelope.
+# Dual-token PID controller; typed MSG_METRIC_SAMPLE gauges to
+# telemetry_agg (RFC §4.2) tracking the current entry- and byte-credit
+# pools driving the throttle envelope.
 metrics = ["entry_credits", "byte_credits"]

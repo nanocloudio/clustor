@@ -3,6 +3,13 @@ type = "Transformer"
 entry = "mod.rs"
 hardware_targets = ["bcm2712"]
 
+# Pulls the kernel-scope step-time histogram over the monitor syscall
+# (`STEP_HISTOGRAM_QUERY`, RFC §4.3) — requires the `monitor` capability.
+# Without it, bare-metal EL0 capability enforcement denies the call
+# (`[cap] module called 0x0c55 without permissions = ["monitor"]`) and the
+# step histogram is silently empty. Mirrors foundation/observe's grant.
+permissions = ["monitor"]
+
 [[ports]]
 name = "ingest"
 direction = "input"

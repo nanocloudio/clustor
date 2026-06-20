@@ -109,6 +109,14 @@ const READ_TIMEOUT_MS: u64 = 5_000;
 /// CP permit "freshness" TTL — if we haven't seen a permit in this
 /// many ms, treat the cache as stale and refuse new ready-emit.
 const READ_PERMIT_TTL_MS: u64 = 1_000;
+const METRICS_INTERVAL_MS: u64 = 1_000;
+
+/// Minimum spacing between re-issues of the SAME missing-index WAL refetch
+/// request. One request is outstanding at a time; if its reply is lost or
+/// the WAL is momentarily busy we re-ask after this window rather than every
+/// step (which would flood `wal.entry_request`). At tick_us=6000 this is
+/// ~8 steps — comfortably longer than a WAL serve round-trip.
+const ENTRY_REFETCH_RETRY_MS: u64 = 50;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -181,12 +189,26 @@ struct ModuleState {
     in_log_entries: i32,        // in[2]: WalEntry fan-out from raft_engine.log_observe
     in_reads: i32,              // in[3]: MSG_CLIENT_READ_REQUEST from client_codec
     in_read_probe_reply: i32,   // in[4]: MSG_READ_PROBE_REPLY from raft_engine
+    in_entry_reply: i32,        // in[5]: MSG_WAL_ENTRY_REPLY from wal.entry_reply (gap refetch)
     out_applied: i32,           // out[0]: response stream to client_codec
     out_committed_entries: i32, // out[1]: per-entry MSG_COMMITTED_ENTRY stream
     out_read_probe_request: i32,// out[2]: MSG_READ_PROBE_REQ to raft_engine
     out_admin_committed: i32,   // out[3]: MSG_ADMIN_COMMITTED for ADMIN_MARKER bodies
+    out_metrics: i32,           // out[4]: MSG_METRIC_SAMPLE to telemetry_agg
+    out_entry_request: i32,     // out[5]: MSG_WAL_ENTRY_REQUEST to wal.entry_request (gap refetch)
 
     partition_id: u16,
+
+    // ── Gap refetch (apply-side WAL read-back) ────────────────
+    /// Index currently being refetched from the WAL (0 = none). At most one
+    /// outstanding request; cleared when the matching reply arrives.
+    awaiting_entry: Index,
+    /// Monotone request id stamped into each MSG_WAL_ENTRY_REQUEST.
+    entry_request_id: u32,
+    /// `dev_millis` of the last refetch request, for re-issue throttling.
+    last_entry_request_ms: u64,
+    /// Counter: entries recovered via WAL refetch (APPLY_REFETCHED gauge).
+    entries_refetched: u32,
 
     // ── Commit tracking ───────────────────────────────────────
     apply_index: Index,
@@ -196,6 +218,13 @@ struct ModuleState {
     entries_applied: u32,
     entries_buffered: u32,
     entries_evicted: u32,
+
+    // ── Metrics ───────────────────────────────────────────────
+    last_metrics_ms: u64,
+    /// `clustor.flow.apply_batch_latency_ms` cumulative bucket counts
+    /// (RFC §4.1): wall time of each `drain_committed_batches` pass that
+    /// actually applied ≥1 entry, µs-classified.
+    apply_batch_buckets: [u32; wire::hist::APPLY_BATCH_US.len() + 1],
 
     // ── Pending-entry buffer ──────────────────────────────────
     pending: [PendingEntry; PENDING_ENTRY_SLOTS],
@@ -257,9 +286,17 @@ pub extern "C" fn module_new(
         s.in_log_entries = dev_channel_port(sys, 0, 2);
         s.in_reads = dev_channel_port(sys, 0, 3);
         s.in_read_probe_reply = dev_channel_port(sys, 0, 4);
+        s.in_entry_reply = dev_channel_port(sys, 0, 5);
         s.out_committed_entries = dev_channel_port(sys, 1, 1);
         s.out_read_probe_request = dev_channel_port(sys, 1, 2);
         s.out_admin_committed = dev_channel_port(sys, 1, 3);
+        s.out_metrics = dev_channel_port(sys, 1, 4);
+        s.out_entry_request = dev_channel_port(sys, 1, 5);
+        s.awaiting_entry = 0;
+        s.entry_request_id = 0;
+        s.last_entry_request_ms = 0;
+        s.entries_refetched = 0;
+        s.apply_batch_buckets = [0u32; wire::hist::APPLY_BATCH_US.len() + 1];
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
@@ -298,9 +335,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //    populated before we evaluate commit horizons.
         drain_log_entries(s, sys);
 
+        // 1b) Insert any WAL refetch replies for entries the lossy observer
+        //     fan-out dropped, then attempt to apply — so progress continues
+        //     even when no new commit batch arrives this step.
+        drain_entry_replies(s, sys);
+        drain_pending_entries(s, sys);
+
         // 2) Drain commit-horizon updates and emit per-entry committed
         //    messages for any buffered entries with index <= horizon.
+        //    Time the pass and fold it into the apply-batch histogram
+        //    when it actually applied entries (RFC §4.1).
+        let applied_before = s.entries_applied;
+        let batch_start = dev_micros(sys);
         drain_committed_batches(s, sys);
+        if s.entries_applied != applied_before {
+            let elapsed = dev_micros(sys).wrapping_sub(batch_start);
+            let b = wire::hist::bucket(&wire::hist::APPLY_BATCH_US, elapsed);
+            s.apply_batch_buckets[b] = s.apply_batch_buckets[b].saturating_add(1);
+        }
 
         // 3) Track CP read permits — used to gate the read queue.
         drain_read_permits(s, sys, now);
@@ -318,8 +370,72 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //    plus reject any that have timed out without freshness.
         drain_pending_reads(s, sys, now);
 
+        // 6) Periodic metrics (RFC §4.1/§4.2).
+        emit_metrics(s, sys, now);
+
         0
     }
+}
+
+/// Emit apply counters, the queue-depth gauge, and the apply-batch
+/// latency histogram as typed samples (RFC §4.3). Partition-stamped so
+/// per-partition apply_pipelines don't collide. Dropped under
+/// backpressure — telemetry never stalls the apply path.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
+    if s.out_metrics < 0 { return; }
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    s.last_metrics_ms = now;
+
+    // Current queue depth: occupied pending-entry slots (index != 0).
+    let mut depth: i64 = 0;
+    for e in s.pending.iter() {
+        if e.index != 0 { depth += 1; }
+    }
+
+    let mid = wire::MODULE_ID_APPLY_PIPELINE;
+    let pid = s.partition_id;
+    emit_sample(s, sys, mid, pid, wire::metric_ids::APPLY_ENTRIES_APPLIED, wire::METRIC_KIND_COUNTER, i64::from(s.entries_applied));
+    emit_sample(s, sys, mid, pid, wire::metric_ids::APPLY_QUEUE_DEPTH, wire::METRIC_KIND_GAUGE, depth);
+    emit_sample(s, sys, mid, pid, wire::metric_ids::APPLY_REFETCHED, wire::METRIC_KIND_COUNTER, i64::from(s.entries_refetched));
+    // Readiness sub-signal (real /readyz): apply cursor caught up to commit.
+    let caught_up = (s.apply_index >= s.commit_horizon) as i64;
+    emit_sample(s, sys, mid, pid, wire::metric_ids::APPLY_CAUGHT_UP, wire::METRIC_KIND_GAUGE, caught_up);
+    // Drop/eviction counters (observability closeout).
+    emit_sample(s, sys, mid, pid, wire::metric_ids::APPLY_ENTRIES_EVICTED, wire::METRIC_KIND_COUNTER, i64::from(s.entries_evicted));
+    emit_sample(s, sys, mid, pid, wire::metric_ids::APPLY_READS_EVICTED, wire::METRIC_KIND_COUNTER, i64::from(s.reads_evicted));
+    // Cumulative bucket counts per the wire contract (wire::hist): emit the
+    // running prefix sum so bucket i = count of samples <= bound[i].
+    let base = wire::hist::HIST_BASE;
+    let mut cum: i64 = 0;
+    for i in 0..s.apply_batch_buckets.len() {
+        cum += i64::from(s.apply_batch_buckets[i]);
+        emit_sample(s, sys, mid, pid, base + i as u16, wire::METRIC_KIND_HISTOGRAM, cum);
+    }
+}
+
+/// Emit one typed metric sample if `out_metrics` has write space.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn emit_sample(
+    s: &ModuleState,
+    sys: &SyscallTable,
+    module_id: u8,
+    partition_id: u16,
+    metric_id: u16,
+    kind: u8,
+    value: i64,
+) {
+    let poll = (sys.channel_poll)(s.out_metrics, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
+    wire::encode_metric_sample(&mut buf, module_id, partition_id, metric_id, kind, value);
+    wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
 }
 
 /// # Safety
@@ -462,32 +578,9 @@ unsafe fn drain_committed_batches(s: &mut ModuleState, sys: &SyscallTable) {
         }
 
         // Emit per-entry messages for any buffered entries that the new
-        // horizon now covers. Ascending order: scan for the smallest
-        // pending index > apply_index that is also <= commit_horizon,
-        // emit it, repeat until none remain.
-        loop {
-            let mut victim: Option<usize> = None;
-            let mut victim_index: Index = Index::MAX;
-            for (i, slot) in s.pending.iter().enumerate() {
-                if !slot.is_empty()
-                    && slot.index > s.apply_index
-                    && slot.index <= s.commit_horizon
-                    && slot.index < victim_index
-                {
-                    victim_index = slot.index;
-                    victim = Some(i);
-                }
-            }
-            let Some(slot_idx) = victim else { break };
-            if victim_index != s.apply_index + 1 {
-                // Strict state-machine safety: do not advance across
-                // gaps. The durable log still has the entry; a real
-                // consumer should recover via snapshot/install rather
-                // than applying out of order.
-                break;
-            }
-            emit_committed_entry(s, sys, slot_idx);
-        }
+        // horizon now covers (in ascending order; on a gap, refetch the
+        // missing index from the WAL rather than stalling).
+        drain_pending_entries(s, sys);
 
         // Internal client ack to client_codec. Shape:
         // `[partition_id:u16][term:u64][index:u64]`.
@@ -501,6 +594,133 @@ unsafe fn drain_committed_batches(s: &mut ModuleState, sys: &SyscallTable) {
             wire_channels::channel_write_msg(sys, s.out_applied, wire::MSG_CLIENT_RESPONSE, &resp[..18]);
         }
         dev_log(sys, 3, b"[apply] ok".as_ptr(), 10);
+    }
+}
+
+/// Apply buffered entries in strict ascending order up to the commit
+/// horizon. When the next-needed index (`apply_index + 1`) is missing from
+/// the observer buffer — the best-effort `log_observe` fan-out dropped its
+/// body under overdrive — request it back from the durable WAL via
+/// `entry_request` instead of stalling forever. The reply lands on
+/// `entry_reply`, is reinserted into `pending` by `drain_entry_replies`, and
+/// applied on a subsequent pass. Data is never lost (the entry is durable in
+/// the WAL); this keeps apply LIVE under commit-outruns-apply overdrive.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn drain_pending_entries(s: &mut ModuleState, sys: &SyscallTable) {
+    loop {
+        let mut victim: Option<usize> = None;
+        let mut victim_index: Index = Index::MAX;
+        for (i, slot) in s.pending.iter().enumerate() {
+            if !slot.is_empty()
+                && slot.index > s.apply_index
+                && slot.index <= s.commit_horizon
+                && slot.index < victim_index
+            {
+                victim_index = slot.index;
+                victim = Some(i);
+            }
+        }
+        match victim {
+            // Nothing buffered in (apply_index, commit_horizon] yet we're
+            // behind the horizon: the body was dropped on the lossy observer
+            // fan-out. Refetch the next-needed index from the durable WAL.
+            None => {
+                if s.apply_index < s.commit_horizon {
+                    request_missing_entry(s, sys, s.apply_index + 1);
+                }
+                break;
+            }
+            Some(slot_idx) => {
+                if victim_index != s.apply_index + 1 {
+                    // Gap: the next-needed index is missing from the buffer.
+                    // Refetch it from the WAL; apply resumes once it lands.
+                    request_missing_entry(s, sys, s.apply_index + 1);
+                    break;
+                }
+                emit_committed_entry(s, sys, slot_idx);
+            }
+        }
+    }
+}
+
+/// Ask the WAL for the durable entry at `index` (the missing next-to-apply
+/// index). At most one request is outstanding; the same index is re-issued
+/// only after `ENTRY_REFETCH_RETRY_MS` so a lost reply self-heals without
+/// flooding `wal.entry_request`.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn request_missing_entry(s: &mut ModuleState, sys: &SyscallTable, index: Index) {
+    if s.out_entry_request < 0 || index == 0 { return; }
+    let now = dev_millis(sys);
+    if s.awaiting_entry == index
+        && now.wrapping_sub(s.last_entry_request_ms) < ENTRY_REFETCH_RETRY_MS
+    {
+        return;
+    }
+    let poll = (sys.channel_poll)(s.out_entry_request, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    s.entry_request_id = s.entry_request_id.wrapping_add(1);
+    let mut buf = [0u8; wire::WAL_ENTRY_REQUEST_LEN];
+    wire::encode_wal_entry_request(&mut buf, s.entry_request_id, index);
+    let w = wire_channels::channel_write_msg(
+        sys, s.out_entry_request, wire::MSG_WAL_ENTRY_REQUEST, &buf,
+    );
+    if w > 0 {
+        s.awaiting_entry = index;
+        s.last_entry_request_ms = now;
+    }
+}
+
+/// Consume WAL refetch replies (`MSG_WAL_ENTRY_REPLY`) and reinsert their
+/// bodies into the pending buffer so the next apply pass can deliver them.
+/// The reply body is the raw proposal body (the WAL stripped the 16-byte
+/// term/index header), so it is staged at `msg_buf[16..]` to match
+/// `store_pending`'s fixed slice.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn drain_entry_replies(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_entry_reply < 0 { return; }
+    for _ in 0..8 {
+        let poll = (sys.channel_poll)(s.in_entry_reply, 0x01);
+        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+        let (msg_type, plen) =
+            wire_channels::channel_read_msg(sys, s.in_entry_reply, &mut s.msg_buf);
+        if msg_type != wire::MSG_WAL_ENTRY_REPLY { continue; }
+        let plen = plen as usize;
+        let (_req_id, term, index, _prev_term, hdr) =
+            match wire::decode_wal_entry_reply(&s.msg_buf[..plen]) {
+                Some(v) => v,
+                None => continue,
+            };
+        if index == 0 { continue; }
+        if plen <= hdr {
+            // NOT_FOUND (below WAL retention) — the gap stands. Leave
+            // awaiting_entry SET so request_missing_entry's retry throttle
+            // holds the re-request to once per ENTRY_REFETCH_RETRY_MS rather
+            // than re-requesting on the very next drain — which would flood
+            // wal.entry_request for a permanent gap.
+            continue;
+        }
+        // A real entry resolves the outstanding request, so the next gap can
+        // be refetched immediately.
+        if index == s.awaiting_entry { s.awaiting_entry = 0; }
+        if index <= s.apply_index { continue; } // already applied
+        let body_len = (plen - hdr).min(PENDING_BODY_CAP);
+        // Relocate the body from the 20-byte-reply-header offset to offset 16
+        // (forward copy, dest < src, so non-overlapping-safe) for store_pending.
+        s.msg_buf.copy_within(hdr..hdr + body_len, 16);
+        store_pending(s, term, index, body_len);
+        s.entries_refetched = s.entries_refetched.saturating_add(1);
     }
 }
 

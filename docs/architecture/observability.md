@@ -46,6 +46,47 @@ inclusive upper bounds listed:
 Deployments outside profile SLOs still alert even if they saturate
 the top bucket — saturation is itself the signal.
 
+Producers classify each sample in integer units (`wire::hist::*`
+holds the bounds in µs or ms so the `no_std` hot path never touches
+floating point) and emit one `MSG_METRIC_SAMPLE` per bucket with
+`kind = METRIC_KIND_HISTOGRAM` and `value = cumulative count`. Bucket
+`i` occupies `metric_id = wire::hist::HIST_BASE + i`; there are
+`bounds.len() + 1` buckets (the last is the implicit `+Inf` overflow).
+All four specified histograms now emit, plus the kernel step-timing
+histogram:
+
+| Histogram | Producer | Timed at |
+|---|---|---|
+| `clustor.wal.fsync_latency_ms` | `wal` | every `FS_FSYNC` |
+| `clustor.raft.commit_latency_ms` | `raft_engine` | leader append→commit, via a per-index timestamp ring |
+| `clustor.flow.apply_batch_latency_ms` | `apply_pipeline` | per commit-apply pass that delivers ≥1 entry |
+| `clustor.snapshot.transfer_seconds` | `snapshot_engine` | first install chunk → `done` |
+| kernel scheduler step-time | `telemetry_agg` | scraped over the monitor ABI, exported under the telemetry module id |
+
+### Export wire format
+
+`telemetry_agg` keeps a latest-value table keyed by
+`(module_id, partition_id, metric_id)` and serializes it into the
+`MSG_METRICS` export that `http_adapter` caches and serves verbatim at
+`GET /metrics`. The payload is a fixed-width binary record stream
+(`wire::METRICS_EXPORT_MAGIC`):
+
+```
+[0]      magic   = 0xC7
+[1]      version = 1
+[2..4]   record_count : u16 LE
+[4..]    record_count × 14-byte records, each:
+         [module_id:u8][partition_id:u16 LE][metric_id:u16 LE]
+         [kind:u8][value:i64 LE]
+```
+
+Each record is byte-identical to the `MSG_METRIC_SAMPLE` body, so a
+scraper iterates fixed-width records with no per-module parser. The
+aggregator appends its own self-metrics (`module_id = 0x15`:
+messages ingested, typed samples, slots used) and the scheduler
+step-timing histogram. A benchmark driver or rig scrapes `/metrics`
+at a window's start and end and diffs the records.
+
 ### Required telemetry fields
 
 Every conforming node exports the following. Tooling rejects runs

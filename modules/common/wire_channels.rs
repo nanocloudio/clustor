@@ -27,6 +27,65 @@ use crate::wire::{
     ENVELOPE_HDR, MAX_PAYLOAD, PARTITIONED_HDR, ROUTED_HDR, ROUTED_PARTITIONED_HDR,
 };
 
+/// Compose `hdr` + `payload` into one stack buffer and emit a SINGLE
+/// `channel_write`. Returns the total bytes written (`hdr.len() +
+/// payload.len()`) on success, or `<= 0` when the frame did not fit (the
+/// channel is full) or is oversize — in which case NOTHING was written.
+///
+/// Why one write, not two: fluxor FIFO channels are byte rings whose
+/// `channel_write` is **all-or-nothing** (`kernel::ringbuf::write` returns
+/// 0 if the frame doesn't fit — "partial writes corrupt byte-stream
+/// framing"). Writing the header and payload as two separate
+/// `channel_write` calls therefore tears a frame whenever the ring has
+/// room for the header but not the payload: the header commits, the
+/// payload write returns 0, and every subsequent frame on the channel is
+/// misaligned (the reader takes the next frame's bytes as this one's
+/// payload). At saturation a downstream that frees ~one frame per step
+/// keeps the ring in exactly that danger zone, so the tear is the common
+/// case, not a rare one — it was the root cause of the L2 consensus cliff
+/// (raft → wal entries silently shredded → garbage commit_index, RFC
+/// §13/§14). A single combined write is atomic against that: the whole
+/// frame lands or nothing does, and the return value is a reliable
+/// "did it fit" backpressure signal. Mirrors the fluxor SDK's own
+/// `msg_write` (`runtime.rs`), which composes into one buffer for the
+/// same reason.
+///
+/// # Safety
+/// `sys` must point to a valid SyscallTable. `chan` must be a valid handle.
+#[inline]
+unsafe fn write_framed(
+    sys: &crate::abi::SyscallTable,
+    chan: i32,
+    hdr: &[u8],
+    payload: &[u8],
+) -> i32 {
+    let total = hdr.len() + payload.len();
+    // The channel ring caps at CHANNEL_BUFFER_SIZE; a larger frame can
+    // never be delivered. Reject up front rather than half-write.
+    if total > crate::abi::CHANNEL_BUFFER_SIZE {
+        return -1;
+    }
+    let mut buf = [0u8; crate::abi::CHANNEL_BUFFER_SIZE];
+    buf[..hdr.len()].copy_from_slice(hdr);
+    buf[hdr.len()..total].copy_from_slice(payload);
+    let w = (sys.channel_write)(chan, buf.as_ptr(), total);
+    // `channel_write` returns `total` (whole frame landed), a short
+    // non-negative count (partial — shouldn't happen for the all-or-nothing
+    // ring), or a NEGATIVE errno (CHAN_EAGAIN = -11 when the channel is full,
+    // CHAN_EINVAL, …). Compare SIGNED: the old `(w as usize) < total` test
+    // wrapped a negative errno to a huge usize, so a full-channel EAGAIN read
+    // as ">= total" and the caller was told the write SUCCEEDED — silently
+    // dropping the frame (the root cause of consensus_bench proposals vanishing
+    // under disk-latency backpressure: sent=4000 but only ~268 reached raft).
+    // Anything that didn't fully land is a failure: pass a negative errno
+    // through (so callers can distinguish full-vs-error) and collapse a short
+    // count to 0.
+    if w < total as i32 {
+        return if w < 0 { w } else { 0 };
+    }
+    total as i32
+}
+
 /// Write a complete envelope (header + payload) into a channel.
 /// Returns bytes written (ENVELOPE_HDR + payload_len) on success, or <=0 on
 /// failure (channel full or error).
@@ -40,21 +99,11 @@ pub unsafe fn channel_write_msg(
     msg_type: u8,
     payload: &[u8],
 ) -> i32 {
-    let total = ENVELOPE_HDR + payload.len();
-    if total > MAX_PAYLOAD + ENVELOPE_HDR { return -1; }
+    if ENVELOPE_HDR + payload.len() > MAX_PAYLOAD + ENVELOPE_HDR { return -1; }
 
     let mut hdr = [0u8; ENVELOPE_HDR];
     encode_header(&mut hdr, msg_type, payload.len() as u16);
-
-    let w1 = (sys.channel_write)(chan, hdr.as_ptr(), ENVELOPE_HDR);
-    if w1 < ENVELOPE_HDR as i32 { return -1; }
-
-    if !payload.is_empty() {
-        let w2 = (sys.channel_write)(chan, payload.as_ptr(), payload.len());
-        if w2 < payload.len() as i32 { return -1; }
-    }
-
-    total as i32
+    write_framed(sys, chan, &hdr, payload)
 }
 
 /// Read a complete envelope (header + payload) from a channel into `buf`.
@@ -113,21 +162,11 @@ pub unsafe fn channel_write_partitioned(
     msg_type: u8,
     payload: &[u8],
 ) -> i32 {
-    let total = PARTITIONED_HDR + payload.len();
-    if total > MAX_PAYLOAD + PARTITIONED_HDR { return -1; }
+    if PARTITIONED_HDR + payload.len() > MAX_PAYLOAD + PARTITIONED_HDR { return -1; }
 
     let mut hdr = [0u8; PARTITIONED_HDR];
     encode_partitioned_header(&mut hdr, partition_id, msg_type, payload.len() as u16);
-
-    let w1 = (sys.channel_write)(chan, hdr.as_ptr(), PARTITIONED_HDR);
-    if w1 < PARTITIONED_HDR as i32 { return -1; }
-
-    if !payload.is_empty() {
-        let w2 = (sys.channel_write)(chan, payload.as_ptr(), payload.len());
-        if w2 < payload.len() as i32 { return -1; }
-    }
-
-    total as i32
+    write_framed(sys, chan, &hdr, payload)
 }
 
 /// Read a complete partitioned envelope from a channel. Header is consumed
@@ -185,8 +224,7 @@ pub unsafe fn channel_write_routed(
     msg_type: u8,
     payload: &[u8],
 ) -> i32 {
-    let total = ROUTED_HDR + payload.len();
-    if total > MAX_PAYLOAD + ROUTED_HDR { return -1; }
+    if ROUTED_HDR + payload.len() > MAX_PAYLOAD + ROUTED_HDR { return -1; }
 
     let mut hdr = [0u8; ROUTED_HDR];
     hdr[0] = target;
@@ -194,16 +232,7 @@ pub unsafe fn channel_write_routed(
     let lb = (payload.len() as u16).to_le_bytes();
     hdr[2] = lb[0];
     hdr[3] = lb[1];
-
-    let w1 = (sys.channel_write)(chan, hdr.as_ptr(), ROUTED_HDR);
-    if w1 < ROUTED_HDR as i32 { return -1; }
-
-    if !payload.is_empty() {
-        let w2 = (sys.channel_write)(chan, payload.as_ptr(), payload.len());
-        if w2 < payload.len() as i32 { return -1; }
-    }
-
-    total as i32
+    write_framed(sys, chan, &hdr, payload)
 }
 
 /// Read a routed message. Returns (target, msg_type, payload_len).
@@ -262,8 +291,7 @@ pub unsafe fn channel_write_routed_partitioned(
     msg_type: u8,
     payload: &[u8],
 ) -> i32 {
-    let total = ROUTED_PARTITIONED_HDR + payload.len();
-    if total > MAX_PAYLOAD + ROUTED_PARTITIONED_HDR { return -1; }
+    if ROUTED_PARTITIONED_HDR + payload.len() > MAX_PAYLOAD + ROUTED_PARTITIONED_HDR { return -1; }
 
     let mut hdr = [0u8; ROUTED_PARTITIONED_HDR];
     hdr[0] = target;
@@ -274,16 +302,7 @@ pub unsafe fn channel_write_routed_partitioned(
     let lb = (payload.len() as u16).to_le_bytes();
     hdr[4] = lb[0];
     hdr[5] = lb[1];
-
-    let w1 = (sys.channel_write)(chan, hdr.as_ptr(), ROUTED_PARTITIONED_HDR);
-    if w1 < ROUTED_PARTITIONED_HDR as i32 { return -1; }
-
-    if !payload.is_empty() {
-        let w2 = (sys.channel_write)(chan, payload.as_ptr(), payload.len());
-        if w2 < payload.len() as i32 { return -1; }
-    }
-
-    total as i32
+    write_framed(sys, chan, &hdr, payload)
 }
 
 /// Read a routed + partitioned message. Returns

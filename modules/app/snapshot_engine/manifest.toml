@@ -91,6 +91,9 @@ direction = "output"
 content_type = "OctetStream"
 
 [observability]
-# Chunked snapshot export/import + manifest persistence; chunk_bytes is the
-# transferred-body counter (`[snap] installed` / `body cap`).
-metrics = ["snapshots_exported", "snapshots_installed", "chunk_bytes"]
+# Chunked snapshot export/import + manifest persistence. Typed
+# MSG_METRIC_SAMPLE counters (snapshots_taken, chunks_imported,
+# triggers_deferred) plus the transfer_seconds histogram (RFC §4.1),
+# timed from first install chunk to `done`. Partition-stamped.
+metrics = ["snapshots_taken", "chunks_imported", "triggers_deferred", "bytes_written", "install_failures"]
+histograms = ["transfer_seconds"]

@@ -29,6 +29,8 @@ mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
 
+const METRICS_INTERVAL_MS: u64 = 1000;
+
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
@@ -36,11 +38,13 @@ struct ModuleState {
     in_credits: i32,       // in[1]: ThrottleCredits from flow_controller
     out_admitted: i32,     // out[0]: admitted ClientProposal to raft_engine
     out_rejected: i32,     // out[1]: rejected → client_codec
+    out_metrics: i32,      // out[2]: MSG_METRIC_SAMPLE to telemetry_agg
 
     entry_credits: i32,
     byte_credits: i32,
     admitted_count: u32,
     rejected_count: u32,
+    last_metrics_ms: u64,
     msg_buf: [u8; 2048],
 }
 
@@ -77,6 +81,7 @@ pub extern "C" fn module_new(
         s.out_admitted = out_chan;
         s.in_credits = dev_channel_port(sys, 0, 1);
         s.out_rejected = dev_channel_port(sys, 1, 1);
+        s.out_metrics = dev_channel_port(sys, 1, 2);
         // Start with generous credits until flow_controller takes over
         s.entry_credits = 4096;
         s.byte_credits = 64 * 1024;
@@ -112,6 +117,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 2. Process requests
         for _ in 0..8 {
+            // Admission backpressure (RFC §13/§14): if we have credits we
+            // intend to admit, but the downstream raft.proposals_tagged
+            // channel has no space (raft is applying durability
+            // backpressure on a full WAL), stop pulling requests so they
+            // stay queued in client_codec rather than being read here and
+            // silently dropped. Without credits we'd reject anyway, so the
+            // gate only applies to the would-admit case.
+            if s.entry_credits > 0 {
+                let poll_out = (sys.channel_poll)(s.out_admitted, 0x02);
+                if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 { break; }
+            }
+
             let poll = (sys.channel_poll)(s.in_requests, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
@@ -130,17 +147,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.msg_buf[4], s.msg_buf[5], s.msg_buf[6], s.msg_buf[7],
             ]);
 
+            let mut admitted = false;
             if s.entry_credits > 0 && s.byte_credits >= payload_len as i32 {
                 // Admit — forward the tagged payload unchanged to
                 // raft_engine.proposals_tagged (configured in YAML).
-                let poll_out = (sys.channel_poll)(s.out_admitted, 0x02);
-                if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                    wire_channels::channel_write_msg(sys, s.out_admitted, wire::MSG_CLIENT_PROPOSAL, &s.msg_buf[..payload_len]);
+                // `channel_write_msg` is a single atomic frame write, so a
+                // `<= 0` return means raft's channel filled between the
+                // pre-read poll and here and NOTHING was written — fall
+                // through to a throttled reject rather than dropping the
+                // proposal silently, so the client retries (RFC §13/§14).
+                let written = wire_channels::channel_write_msg(
+                    sys, s.out_admitted, wire::MSG_CLIENT_PROPOSAL, &s.msg_buf[..payload_len],
+                );
+                if written > 0 {
                     s.entry_credits -= 1;
                     s.byte_credits -= payload_len as i32;
                     s.admitted_count += 1;
+                    admitted = true;
                 }
-            } else {
+            }
+            if !admitted {
                 // Reject with the internal envelope: `[correlation_id][body]`.
                 // client_codec will look up correlation_id → conn_id and
                 // emit the wire-facing MSG_CLIENT_REJECT.
@@ -171,6 +197,36 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // 3. Periodic admission metrics (RFC §4.2).
+        emit_metrics(s, sys);
+
         0
+    }
+}
+
+/// Emit admit/reject counters as typed samples (RFC §4.3). Node-level
+/// module, so partition_id is 0. Dropped under backpressure.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.out_metrics < 0 { return; }
+    let now = dev_millis(sys);
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    s.last_metrics_ms = now;
+
+    let mid = wire::MODULE_ID_THROTTLE_GATE;
+    let kc = wire::METRIC_KIND_COUNTER;
+    let samples: [(u16, i64); 2] = [
+        (wire::metric_ids::THROTTLE_ADMITTED, i64::from(s.admitted_count)),
+        (wire::metric_ids::THROTTLE_REJECTED, i64::from(s.rejected_count)),
+    ];
+    for &(metric_id, value) in samples.iter() {
+        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
+        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
+        wire::encode_metric_sample(&mut buf, mid, 0, metric_id, kc, value);
+        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
     }
 }

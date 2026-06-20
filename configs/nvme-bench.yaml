@@ -1,0 +1,74 @@
+# L0 NVMe floor benchmark (`.context/rfc_performance_benchmarking.md` §6).
+#
+# Runs the `nvme_bench` module ALONE over the fluxor `dev_fs` contract —
+# no WAL, no Raft — to establish the raw storage floor. Results surface
+# two ways:
+#   - `[nvbench] ...` lines over log_net (UDP:6666 via platform.debug),
+#   - typed metrics at `GET /metrics` (telemetry_agg + http surface),
+#     including the fsync-latency histogram (same buckets as the WAL).
+#
+# TARGET = linux on purpose. The bare-metal cm5 build has no filesystem
+# provider yet (wal's FS_OPEN_CREATE returns ENODEV — see
+# single-cm5-throughput.yaml), so the bare-metal poll-mode NVMe floor is
+# blocked on a fluxor dev_fs/nvme provider. Until that lands, run this on
+# the DUT's SD-card Linux (or the driver host) with `wal/` symlinked to a
+# mount on the NVMe under test:
+#
+#     ssh dut 'cd /run/nvbench && ln -sf /mnt/nvme-test wal && \
+#              fluxor run --template configs/nvme-bench.yaml --node-id 0'
+#
+# Cross-check the device ceiling with fio (see the run procedure in
+# tests/hardware/README.md).
+
+target: linux
+tick_us: 1000
+
+# The http_ingress ↔ net ↔ http_adapter pair is a bidirectional
+# feedback cycle (request in / response out over the same net handle);
+# accept it like the other diagnostic-surface configs do.
+scheduler:
+  accept_cycles: true
+
+platform:
+  net: {}
+  debug:
+    to: net
+
+modules:
+  - name: nvme_bench
+    params:
+      block_size: 4096      # WAL-relevant block; sweep 4096/16384/65536
+      seq_blocks: 16384     # 64 MiB sequential at 4 KiB
+      fsync_every: 1        # per-write fsync = the strict-WAL floor
+      rand_blocks: 4096     # 16 MiB random
+      step_batch: 64        # blocks per cooperative step
+
+  - name: telemetry_agg
+    params:
+      emit_interval_ms: 250
+
+  - name: http_adapter
+  - name: http_ingress
+    params:
+      listen_port: 19090
+
+wiring:
+  # Bench metrics → aggregator.
+  - from: nvme_bench.metrics
+    to: telemetry_agg.ingest
+
+  # Diagnostic HTTP surface for GET /metrics, /readyz, /why.
+  - from: linux_net.net_out
+    to: http_ingress.net_in
+  - from: http_ingress.net_out
+    to: linux_net.net_in
+  - from: http_ingress.request
+    to: http_adapter.request
+  - from: http_adapter.response
+    to: http_ingress.response
+  - from: telemetry_agg.readyz
+    to: http_adapter.readyz
+  - from: telemetry_agg.why
+    to: http_adapter.why
+  - from: telemetry_agg.export
+    to: http_adapter.metrics

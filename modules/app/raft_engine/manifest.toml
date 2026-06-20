@@ -95,6 +95,21 @@ name = "wal_flushed"
 direction = "input"
 content_type = "OctetStream"
 
+# Boot-time replay-complete signal from `wal.replay_complete`
+# (MSG_WAL_REPLAY_COMPLETE `[term:u64][high_water:u64]`). On a
+# crash-recovery boot raft loads only a THROTTLED durable hint from
+# RAFT0000.MET; resuming at it makes new post-recovery appends collide
+# with the replayed index space. raft holds proposal intake until this
+# arrives, then resumes `last_log_index` at the WAL's exact on-disk
+# high-water and re-seeds apply_pipeline. A DEDICATED edge — must NOT
+# share `wal.flushed` (which also fans out to durability_ledger; a
+# one-shot signal there deadlocks the boot). Optional; leave unwired for
+# non-recovery graphs.
+[[ports]]
+name = "wal_replay_complete"
+direction = "input"
+content_type = "OctetStream"
+
 [[ports]]
 name = "append_entries"
 direction = "output"
@@ -219,4 +234,14 @@ metrics = [
   "proposals_received", "entries_appended", "elections_started",
   "proposals_dropped_frozen", "proposals_dropped_strict",
   "frozen_flag", "strict_fallback_flag",
+  # Durability-backpressure signals (RFC §13/§14): flushes held because
+  # wal.entries had no space, and the uncommitted-inflight window the
+  # leader caps to keep the log from racing past quorum-durable commit.
+  "flushes_deferred", "uncommitted_inflight",
+  # Raft §5.3 conflict-repair: divergent-suffix truncations driven (0 in
+  # steady state; non-zero after failover-induced log divergence).
+  "log_truncations",
 ]
+# commit_latency_ms: leader-side append→commit latency (RFC §4.1),
+# timed via a per-index timestamp ring, folded on commit-advance.
+histograms = ["commit_latency_ms"]

@@ -1,10 +1,15 @@
-# single-node test cluster with WAL group-fsync (Throughput profile).
-# Mirrors `configs/single.yaml` with `wal.fsync_mode = 1` plus a
-# small `group_max_pending` so the threshold flush trips inside the
-# test budget. Drives `tests/wal_group_fsync.rs`.
+# L2 consensus bench — THROTTLED variant
+# (`.context/rfc_performance_benchmarking.md` §6, §13). Same single-node
+# consensus pipeline as `consensus-bench.yaml`, but the `consensus_bench`
+# injector emits TAGGED proposals into `throttle_gate.requests` (admission
+# control in the loop) at a saturating rate, to test whether the lag-based
+# `flow_controller` protects the WAL from the over-production cliff.
+# Finding: it does not — throttle admits everything (lag ≈ 0 single-node),
+# same cliff. propose→commit latency/throughput are read from the
+# instrumented producers over /metrics + log_net. Linux target via
+# fluxor-linux; see tests/hardware/README.md.
 #
-# DEV/TEST ONLY — HTTP admin bypasses rbac, same caveat as
-# `configs/single.yaml`.
+# DEV/TEST ONLY — HTTP admin bypasses rbac.
 target: linux
 tick_us: 1000
 
@@ -15,28 +20,42 @@ platform:
   net: {}
 
 modules:
+  # L2 load injector — drives proposals into raft_engine.proposals.
+  - name: consensus_bench
+    params:
+      total: 1000000
+      body_size: 64
+      batch_per_step: 4
+      # 1 proposal every 4 ms ≈ 250/s — at or below sustainable WAL
+      # throughput on this rig so the raft→wal channel never overflows
+      # (raft has no backpressure on the direct-injection path). Raise the
+      # rate to find the saturation knee once admission control is in the
+      # loop or backpressure lands.
+      inject_period: 1
+      tagged: 1
+      warmup_ms: 2000
   - name: peer_router
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       peer_count: 1
-      listen_port: __LISTEN_PORT__
-      peer0_port: __LISTEN_PORT__
+      listen_port: 9090
+      peer0_port: 9090
   - name: client_codec
     params:
-      self_id: __SELF_ID__
+      self_id: 0
   - name: throttle_gate
   - name: raft_engine
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       voter_count: 1
       heartbeat_interval_ms: 150
   - name: replicator
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       peer_count: 1
   - name: commit_tracker
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       voter_count: 1
   - name: apply_pipeline
   - name: wal
@@ -49,7 +68,7 @@ modules:
       group_max_pending: 4
   - name: durability_ledger
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       voter_count: 1
       partition_id: 0
   - name: cp_bridge
@@ -58,6 +77,8 @@ modules:
   - name: flow_controller
   - name: key_manager
   - name: telemetry_agg
+    params:
+      emit_interval_ms: 250
   - name: client_surface
   - name: rbac
   - name: admin_handler
@@ -69,7 +90,7 @@ modules:
   # distinct port). See `configs/single.yaml`.
   - name: http_ingress
     params:
-      listen_port: __HTTP_PORT__
+      listen_port: 19090
 
 wiring:
   - from: linux_net.net_out
@@ -166,8 +187,12 @@ wiring:
     to: read_gate.cache
   - from: cp_proof_cache.cache_state
     to: commit_tracker.cp_state
-  - from: cp_proof_cache.strict_fallback
-    to: raft_engine.fallback_signal
+  # NB: cp_proof_cache.strict_fallback → raft_engine.fallback_signal is
+  # intentionally omitted here. With no real control plane feeding
+  # cp_bridge, the proof cache ages out of Fresh after ~1 s and would
+  # latch raft into strict fallback (dropping proposals). For an
+  # isolated L2 consensus bench we keep raft appending; commit safety
+  # still rests on quorum durability (durability_ledger → commit_tracker).
   - from: read_gate.permits
     to: apply_pipeline.read_permits
   - from: placement_router.routing
@@ -184,7 +209,14 @@ wiring:
   - from: admin_handler.responses
     to: client_surface.admin_responses
   - from: admin_handler.raft_proposal
-    to: raft_engine.proposals
+    to: throttle_gate.requests
+
+  # L2 injector → raft proposals (untagged port; coexists with the
+  # admin_handler.raft_proposal fan-in already wired to this port).
+  - from: consensus_bench.proposals
+    to: throttle_gate.requests
+  - from: consensus_bench.metrics
+    to: telemetry_agg.ingest
 
   - from: raft_engine.metrics
     to: telemetry_agg.ingest

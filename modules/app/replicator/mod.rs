@@ -187,6 +187,10 @@ struct ModuleState {
     rpcs_sent: u32,
     acks_received: u32,
     nacks_received: u32,
+    /// Failure responses due to follower WAL backpressure (busy), counted
+    /// separately from divergence NACKs so the in-flight gauge stays exact
+    /// and a backpressure storm doesn't masquerade as log divergence.
+    backpressure_responses: u32,
     catchup_sent: u32,
     last_metrics_ms: u64,
 
@@ -300,6 +304,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 3. Drain WAL read-back replies and turn them into targeted AEs.
         process_wal_replies(s, sys);
 
+        // 3b. Periodic catch-up driver: nudge every lagging follower toward
+        //     the leader's tip each tick, independent of ack timing. The
+        //     periodic AE fan-out only ever sends the TIP, so a follower that
+        //     fell behind (failover, transient drop) relies entirely on
+        //     targeted read-backs; driving them here (not just on ack events)
+        //     keeps catch-up converging even when a follower's acks stall
+        //     under load. Deduped by the pending table, so this can't pile up.
+        drive_catchup(s, sys);
+
         // 4. Forward snapshot chunks
         forward_snapshots(s, sys);
 
@@ -390,7 +403,7 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
         match msg_type {
             wire::MSG_APPEND_ENTRIES_RESP => {
                 dev_log(sys, 3, b"[repl] ack".as_ptr(), 10);
-                let (term, index, replica, success, durable_index) =
+                let (term, index, replica, success, durable_index, busy) =
                     match wire::decode_append_entries_resp(&s.msg_buf[..plen as usize]) {
                         Some(v) => v,
                         None => continue,
@@ -455,39 +468,61 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
                         // up to within `VOTING_LAG_THRESHOLD` of the
                         // leader's tip becomes a full voter.
                         maybe_promote(s, sys, replica);
+                        // Proactive catch-up: if this peer is still behind the
+                        // leader's tip, pipeline the next missing entry NOW via
+                        // a WAL read-back instead of waiting for the periodic
+                        // tip-broadcast to NACK. Converges a lagging follower in
+                        // O(gap) read-backs rather than O(gap) NACK round-trips
+                        // — the difference between a follower that recovers in
+                        // ~ms and one that wedges commit after a failover.
+                        let pn = s.peers[replica as usize].next_index;
+                        if s.peers[replica as usize].active
+                            && pn > 0
+                            && pn <= s.last_emitted_index
+                        {
+                            issue_wal_request(s, sys, replica, pn);
+                        }
+                        // Count the ack ONLY on success — failures are counted
+                        // below — so the in-flight gauge retires each RPC once.
+                        s.acks_received = s.acks_received.saturating_add(1);
+                    } else if busy {
+                        // Follower WAL backpressure, NOT log divergence: the
+                        // entry was rejected only because the follower's WAL
+                        // channel was momentarily full. Release the in-flight
+                        // slot and leave next_index UNCHANGED so the next
+                        // replication tick retries the SAME entry — rolling
+                        // back here would drive needless log repair / snapshot
+                        // recovery under load.
+                        let peer = &mut s.peers[replica as usize];
+                        if peer.inflight > 0 { peer.inflight -= 1; }
+                        s.backpressure_responses = s.backpressure_responses.saturating_add(1);
+                        let _ = term;
                     } else {
                         // NACK: follower's log doesn't agree with our
-                        // prev_log_* at this index. Roll next_index back
-                        // by one and issue a WAL read-back so we can
-                        // re-send the entry that lives at (next_index - 1).
-                        // The follower's reply payload carries its
-                        // current last_log_index — use it as a hint to
-                        // skip multiple rounds when the gap is large.
+                        // prev_log_* at this index (a gap because it's behind,
+                        // or a conflict it just truncated). The reply carries
+                        // the follower's CURRENT last_log_index — which, after
+                        // it handled this AE, is authoritative for "what I
+                        // have". Set next_index = that + 1 directly rather than
+                        // decrementing by one: the decrement dance can roll
+                        // next_index BACK below real progress when a stale
+                        // tip-broadcast NACK arrives after a catch-up entry
+                        // already advanced the follower (the periodic send
+                        // fans the tip to every peer regardless of next_index).
                         let peer = &mut s.peers[replica as usize];
                         if peer.inflight > 0 { peer.inflight -= 1; }
                         s.nacks_received = s.nacks_received.saturating_add(1);
-                        let mut new_next = peer.next_index.saturating_sub(1).max(1);
-                        // If the follower's reported last_log_index is
-                        // strictly less than our roll-back target, jump
-                        // straight there (saves rounds when gap is big).
-                        if index > 0 && index + 1 < new_next {
-                            new_next = index + 1;
-                        }
+                        let new_next = index.saturating_add(1).max(1);
                         peer.next_index = new_next;
                         // Term advance: stay safe if the follower bumped term.
                         let _ = term;
-                        let catch_index = new_next.saturating_sub(1);
-                        if catch_index == 0 {
-                            // Edge case: we've rolled all the way to
-                            // before the log starts. Nothing to read
-                            // back. Snapshot install (§4.2) is the
-                            // recovery path.
-                        } else {
-                            issue_wal_request(s, sys, replica, catch_index);
-                        }
+                        // Read back the entry the follower is MISSING — the one
+                        // at next_index (the first it doesn't have), NOT
+                        // next_index-1 (an entry it already holds, which would
+                        // replay idempotently and never advance it).
+                        issue_wal_request(s, sys, replica, new_next);
                     }
                 }
-                s.acks_received += 1;
             }
             wire::MSG_HEARTBEAT_RESP | wire::MSG_REQUEST_VOTE_RESP | wire::MSG_PRE_VOTE_RESP => {
                 // Forward vote/heartbeat responses to raft_engine via net_out
@@ -519,6 +554,37 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// Nudge every active follower that is behind the leader's tip toward it via
+/// a targeted WAL read-back. Idempotent per tick: `issue_wal_request` dedups
+/// by `(peer, index)` and the table caps in-flight requests, so calling this
+/// every step just keeps the catch-up pipeline primed without flooding.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a
+/// `&SyscallTable` whose function pointers reach live kernel routines per
+/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn drive_catchup(s: &mut ModuleState, sys: &SyscallTable) {
+    let tip = s.last_emitted_index;
+    if tip == 0 {
+        return;
+    }
+    for i in 0..MAX_NODES {
+        if i == s.self_id as usize {
+            continue;
+        }
+        if !s.peers[i].active {
+            continue;
+        }
+        let next = s.peers[i].next_index;
+        // Behind the tip → fetch the first entry it's missing. (`next == 0`
+        // shouldn't happen, but guard so we never request index 0.)
+        if next > 0 && next <= tip {
+            issue_wal_request(s, sys, i as u8, next);
+        }
+    }
+}
+
 unsafe fn issue_wal_request(
     s: &mut ModuleState,
     sys: &SyscallTable,
@@ -693,7 +759,7 @@ unsafe fn process_wal_replies(s: &mut ModuleState, sys: &SyscallTable) {
         let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_wal_reply, &mut s.msg_buf);
         if msg_type != wire::MSG_WAL_ENTRY_REPLY { continue; }
         let pl = plen as usize;
-        let (request_id, term, index, body_off) =
+        let (request_id, term, index, prev_term, body_off) =
             match wire::decode_wal_entry_reply(&s.msg_buf[..pl]) {
                 Some(v) => v,
                 None => continue,
@@ -721,27 +787,27 @@ unsafe fn process_wal_replies(s: &mut ModuleState, sys: &SyscallTable) {
             continue;
         }
 
-        // Build an AE: prev_log_* is the entry before `index`, then the
-        // body at `index` itself. We don't always have the prev tip on
-        // hand. If the read-back returned index N and the last broadcast
-        // was N+1, we know (N+1's prev_log_*) == (N's term/index) — but
-        // that's only valid in the simple case. The robust path is to
-        // issue a second WAL request for (index - 1); for now we take a
-        // shortcut: use `(term, index - 1)` and rely on the follower's
-        // own NACK loop to fix it if the previous term was different.
-        // This converges in O(term-changes) rounds.
+        // Build a catch-up AE: send entry `index` with prev_log = (index-1,
+        // prev_term). prev_term comes from the WAL reply (the true term of
+        // index-1), so the follower's log-match succeeds instead of seeing a
+        // spurious term conflict and truncating. `term` (of `index`) is the
+        // entry's own term, used as the AE's entry_term.
         let prev_idx = index.saturating_sub(1);
-        let prev_term = term;
         let body = &s.msg_buf[body_off..pl];
 
         let peer_state = &s.peers[peer as usize];
         let leader_commit = peer_state.match_index; // conservative — follower clamps anyway
         let _ = leader_commit;
 
+        // The AE's `term` is the LEADER's current term (so a higher-term
+        // follower accepts the leader's authority), NOT the read-back entry's
+        // term — those differ exactly in the cross-term failover catch-up
+        // case. `entry_term` is the entry's own term (`term`).
+        let ae_term = if s.last_emitted_term >= term { s.last_emitted_term } else { term };
         let mut ae_buf = [0u8; 2048];
         let total = wire::encode_append_entries(
             &mut ae_buf,
-            term,
+            ae_term,
             s.self_id,
             prev_idx,
             prev_term,
@@ -820,6 +886,37 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
     let now = dev_millis(sys);
     if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
     s.last_metrics_ms = now;
+
+    // Typed metric samples (RFC §4.3) so telemetry_agg's export table
+    // carries replicator counters. The legacy MSG_METRICS envelope is
+    // still emitted below for observers that parse it.
+    let mid = wire::MODULE_ID_REPLICATOR;
+    let pid = s.partition_id;
+    let kc = wire::METRIC_KIND_COUNTER;
+    let kg = wire::METRIC_KIND_GAUGE;
+    // §4.2 saturation gauge: AppendEntries dispatched but not yet
+    // acked/nacked — the in-flight replication depth. Each response retires
+    // exactly one RPC and increments exactly one of acks/nacks/backpressure,
+    // so subtracting all three keeps the gauge exact.
+    let inflight = s.rpcs_sent
+        .saturating_sub(s.acks_received)
+        .saturating_sub(s.nacks_received)
+        .saturating_sub(s.backpressure_responses);
+    let samples: [(u16, u8, i64); 6] = [
+        (wire::metric_ids::REPL_RPCS_SENT, kc, i64::from(s.rpcs_sent)),
+        (wire::metric_ids::REPL_ACKS_RECEIVED, kc, i64::from(s.acks_received)),
+        (wire::metric_ids::REPL_NACKS_RECEIVED, kc, i64::from(s.nacks_received)),
+        (wire::metric_ids::REPL_CATCHUP_SENT, kc, i64::from(s.catchup_sent)),
+        (wire::metric_ids::REPL_INFLIGHT_DEPTH, kg, i64::from(inflight)),
+        (wire::metric_ids::REPL_BACKPRESSURE, kc, i64::from(s.backpressure_responses)),
+    ];
+    for &(metric_id, kind, value) in samples.iter() {
+        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
+        let mut sbuf = [0u8; wire::METRIC_SAMPLE_LEN];
+        wire::encode_metric_sample(&mut sbuf, mid, pid, metric_id, kind, value);
+        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &sbuf);
+    }
 
     // rpcs_sent(4) + acks_received(4) + nacks(4) + catchup(4) = 16 bytes
     let mut buf = [0u8; 16];

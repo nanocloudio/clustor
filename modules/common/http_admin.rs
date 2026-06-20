@@ -29,6 +29,8 @@ pub const ADMIN_OP_THAW: u8 = 0x02;
 pub const ADMIN_OP_TRANSFER_LEADER: u8 = 0x03;
 pub const ADMIN_OP_DURABILITY_MODE: u8 = 0x04;
 pub const ADMIN_OP_SNAPSHOT: u8 = 0x05;
+/// `POST /propose` client-write bridge — see `wire::ADMIN_OP_PROPOSE`.
+pub const ADMIN_OP_PROPOSE: u8 = 0x08;
 
 /// Max body length the admin envelope can carry. `emit_admin_command`
 /// uses a 1 KiB stack buffer with a 2-byte header (conn_id + op_code),

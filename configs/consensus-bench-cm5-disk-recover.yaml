@@ -1,0 +1,352 @@
+# L2 consensus latency/throughput bench — CM5 BARE-METAL twin of
+# `consensus-bench.yaml` (`.context/rfc_performance_benchmarking.md` §6).
+# Full single-node consensus pipeline with a `consensus_bench` injector
+# feeding raft_engine.proposals directly. propose→commit latency and
+# commit throughput read from the instrumented producers (raft
+# commit_latency_ms, commit_tracker commit_advances) over /metrics
+# (scrape :19090 over the wire) + log_net UDP:6666.
+#
+# Differs from the linux twin only in: target cm5, `platform.debug.to: net`
+# (log_net observation), and `ip` (not `linux_net`) as the net module.
+#
+# DISK-DURABLE variant: nvme + fat32 provide the FS contract, so the WAL
+# writes real segment files (root_path=1, 8.3 names) to the NVMe FAT32
+# partition and fsyncs through the device NVMe Flush. This is the
+# disk-durable L2 commit path + the WAL's L1 metrics on real silicon.
+#
+# Validated 2026-06-16 on pi5-a (RFC §14): below the knee tracks offered
+# rate at p50≈4–6 ms; saturating plateau ≈1000–1060/s committed, inflight
+# pinned at the cap (24), commit_index sane, lossless — the durability-
+# backpressure fix holds on bare metal.
+#
+# ⚠ Sweep mechanics: raise offered load via `inject_period` (or a SMALL
+# `batch_per_step`), NOT a large batch. The injector is itself an on-DUT
+# cooperative module; a heavy `batch_per_step` (e.g. 8) burns tick time and
+# STARVES the commit/apply pipeline — a measurement artifact (8000/s
+# offered@batch=8 collapsed achieved to ~270/s while still lossless). Keep
+# batch ≤2. offered/s ≈ batch_per_step / inject_period × 1000.
+#
+# DEV/TEST ONLY — HTTP admin bypasses rbac.
+target: cm5
+tick_us: 6000
+
+scheduler:
+  accept_cycles: true
+
+platform:
+  debug:
+    to: net
+  net: {}
+
+modules:
+  # ── disk stack: nvme block device + fat32 filesystem ──
+  - name: nvme
+    bind: m2_primary
+    namespace: 1
+    queue_depth: 32
+  - name: fat32
+    path: /
+    # NO clean_root for recovery: clean_root truncates the ROOT DIRECTORY on
+    # the first file-create, which would DELETE the very WAL segment files we
+    # need to replay (it fired when raft persisted RAFT0000.MET / the WAL
+    # rotated, aborting replay mid-stream). The cold root-dir scan that
+    # clean_root was avoiding is now absorbed by the WAL replay Burst path,
+    # so recovery preserves the on-disk segments instead of wiping them.
+    init_free_hint: 20000   # seed free-scan past the bench partition orphan region
+    clear_free_region: 2000 # fluxor gates this on clean_root (fresh-format only),
+                            # so on this recovery mount (no clean_root) it is a
+                            # no-op: the established WAL segment + RAFT0000.MET
+                            # FAT chains are preserved. (Before the fluxor gate it
+                            # blindly zeroed FAT[20000..22000], severing the
+                            # multi-cluster segment chain past cluster 1 — replay
+                            # then reconstructed only ~1 cluster. Kept for symmetry
+                            # with -establish.)
+
+  # L2 load injector — drives proposals into raft_engine.proposals.
+  - name: consensus_bench
+    params:
+      # L4 crash-recovery: inject a bounded batch, let it fully commit + fsync
+      # to the NVMe FAT32 segments, then hard power-cut and reboot. The reboot
+      # replays the segments (skip_replay OFF below) and raft loads RAFT0000.MET
+      # — committed state must survive the power loss.
+      total: 200
+      body_size: 64
+      batch_per_step: 1
+      # inject_period is counted in MODULE STEPS, not ms. On the disk graph
+      # (tick_us=6000) the injector steps ~166/s, so inject_period=8 offers
+      # ~20/s. raft.proposals is a MAILBOX (latest-wins) edge with no
+      # backpressure (see header), and raft only reads it when NOT pinned at
+      # the uncommitted-inflight cap — i.e. at the disk commit rate. Offering
+      # faster than the disk commit throughput silently overwrites unread
+      # proposals (inject_period=1 ⇒ only 268/4000 reached raft). ~20/s sits
+      # safely below the disk commit ceiling so every proposal lands losslessly.
+      inject_period: 8
+      warmup_ms: 8000
+  - name: peer_router
+    params:
+      self_id: 0
+      peer_count: 1
+      listen_port: 9090
+      peer0_port: 9090
+  - name: client_codec
+    params:
+      self_id: 0
+  - name: throttle_gate
+  - name: raft_engine
+    # A batch-processing step (drain proposals + flush + commit/apply notify)
+    # spikes well past the ~2 ms default deadline on the busy disk graph; the
+    # tight default faults raft (module step timeout) and wedges the pipeline.
+    # Give it the same headroom as the WAL. (Work is bounded — 16 proposals per
+    # channel per step, batch_max 64 — so this is headroom, not unbounded I/O.)
+    step_deadline_us: 12000
+    params:
+      self_id: 0
+      voter_count: 1
+      root_path: 1            # L4 recovery: persist term/vote/durable-index to a
+                              # root-level 8.3 file (RAFT0000.MET) so a rebooted
+                              # node recovers its raft state from disk.
+      heartbeat_interval_ms: 150
+  - name: replicator
+    params:
+      self_id: 0
+      peer_count: 1
+  - name: commit_tracker
+    params:
+      self_id: 0
+      voter_count: 1
+  - name: apply_pipeline
+    # Heavy stepper on the disk graph (applies committed entries in bursts);
+    # give it headroom over the tight default so an apply burst doesn't fault.
+    step_deadline_us: 12000
+  - name: wal
+    step_deadline_us: 12000
+    # The disk WAL occasionally overruns the 12.5 ms step cap on a cold-region
+    # first-touch (the NVMe penalizes the first access to a region since
+    # power-on). The advisory guard lets the slow step COMPLETE (warming the
+    # region) before flagging it, so a restart resumes from preserved state and
+    # the now-warm retry is fast. Skip (the default) terminates on the first
+    # such transient and wedges the pipeline; restart rides them out.
+    fault_policy: restart
+    max_restarts: 500
+    params:
+      fsync_mode: 1
+      group_window_ms: 5
+      group_max_pending: 4
+      root_path: 1            # 8.3 root segment names for FAT32 (no mkdir)
+      segment_bytes: 65536    # 64 KiB segments → rotation within the run
+      # skip_replay OMITTED (=0): L4 recovery REPLAYS segments on reboot to
+      # reconstruct committed state after a power-cut. (The L1/L2 throughput
+      # config sets skip_replay:1 for a fresh start; this recovery config does
+      # not — replay is the behaviour under test.)
+  - name: durability_ledger
+    params:
+      self_id: 0
+      voter_count: 1
+      partition_id: 0
+  - name: cp_bridge
+  - name: cp_proof_cache
+  - name: read_gate
+  - name: flow_controller
+  - name: key_manager
+  - name: telemetry_agg
+    params:
+      emit_interval_ms: 250
+  - name: client_surface
+  - name: rbac
+  - name: admin_handler
+  - name: snapshot_engine
+  - name: placement_router
+
+  - name: http_adapter
+  # Binds on the same `ip` as `peer_router` (CMD_BIND on a
+  # distinct port). See `configs/single.yaml`.
+  - name: http_ingress
+    params:
+      listen_port: 19090
+
+wiring:
+  # ── nvme block device ↔ fat32 filesystem ──
+  - from: nvme.blocks
+    to: fat32.blocks
+  - from: fat32.block_writes
+    to: nvme.requests
+
+  - from: ip.net_out
+    to: peer_router.net_in
+  - from: peer_router.net_out
+    to: ip.net_in
+
+  - from: peer_router.cleartext
+    to: client_surface.requests
+  - from: peer_router.peer_rx
+    to: replicator.ack
+  - from: peer_router.raft_rpc
+    to: raft_engine.rpc
+
+  - from: client_surface.client_req
+    to: client_codec.raw
+  - from: client_surface.admin_req
+    to: rbac.request
+  - from: client_surface.responses
+    to: peer_router.client_resp
+
+  - from: client_codec.parsed
+    to: throttle_gate.requests
+  - from: throttle_gate.admitted
+    to: raft_engine.proposals_tagged
+  - from: raft_engine.proposal_assigned
+    to: client_codec.proposal_assigned
+  - from: raft_engine.leader_state
+    to: client_codec.leader_state
+  - from: throttle_gate.rejected
+    to: client_codec.responses
+
+  - from: flow_controller.credits
+    to: throttle_gate.credit_supply
+  - from: flow_controller.envelope
+    to: client_surface.throttle_status
+
+  - from: raft_engine.append_entries
+    to: replicator.entries
+  - from: replicator.net_out
+    to: peer_router.peer_tx
+  - from: replicator.match_indices
+    to: commit_tracker.match
+  - from: replicator.lag_signal
+    to: flow_controller.lag
+  - from: raft_engine.rpc_out
+    to: peer_router.peer_tx
+
+  - from: raft_engine.log_append
+    to: wal.entries
+  - from: wal.flushed
+    to: durability_ledger.ack
+  - from: wal.flushed
+    to: raft_engine.wal_flushed
+  - from: wal.replay_complete
+    to: raft_engine.wal_replay_complete
+  - from: replicator.cross_durability_ack
+    to: durability_ledger.ack
+  - from: durability_ledger.quorum_durable
+    to: commit_tracker.durable
+
+  - from: commit_tracker.committed
+    to: apply_pipeline.entries
+  - from: commit_tracker.committed
+    to: raft_engine.commit
+  - from: raft_engine.commit_advanced
+    to: apply_pipeline.entries
+  - from: raft_engine.log_observe
+    to: apply_pipeline.log_entries
+  # Apply-side gap recovery (Item 2): the recovery-release burst can overflow
+  # the best-effort log_observe fan-out; apply_pipeline refetches any dropped
+  # index from the durable WAL so apply stays lossless post-recovery too.
+  - from: apply_pipeline.entry_request
+    to: wal.entry_request
+  - from: wal.entry_reply
+    to: apply_pipeline.entry_reply
+  - from: client_codec.reads
+    to: apply_pipeline.read
+  - from: apply_pipeline.applied
+    to: client_codec.responses
+  - from: client_codec.responses_out
+    to: client_surface.client_responses
+
+  - from: snapshot_engine.export_chunks
+    to: replicator.snapshot_rx
+  - from: replicator.snapshot_import
+    to: snapshot_engine.import_chunks
+  - from: snapshot_engine.manifest_auth
+    to: peer_router.peer_tx
+  - from: wal.compaction_signal
+    to: snapshot_engine.trigger
+  - from: snapshot_engine.installed_local
+    to: raft_engine.snapshot_installed
+
+  - from: key_manager.dek_epoch
+    to: wal.key_update
+  - from: key_manager.dek_epoch
+    to: snapshot_engine.key_update
+
+  - from: cp_bridge.proof
+    to: cp_proof_cache.proof
+  - from: cp_proof_cache.cache_state
+    to: read_gate.cache
+  - from: cp_proof_cache.cache_state
+    to: commit_tracker.cp_state
+  # NB: cp_proof_cache.strict_fallback → raft_engine.fallback_signal is
+  # intentionally omitted here. With no real control plane feeding
+  # cp_bridge, the proof cache ages out of Fresh after ~1 s and would
+  # latch raft into strict fallback (dropping proposals). For an
+  # isolated L2 consensus bench we keep raft appending; commit safety
+  # still rests on quorum durability (durability_ledger → commit_tracker).
+  - from: read_gate.permits
+    to: apply_pipeline.read_permits
+  - from: placement_router.routing
+    to: client_codec.placement
+
+  - from: rbac.authorized
+    to: admin_handler.requests
+  - from: rbac.denied
+    to: client_surface.admin_responses
+  - from: admin_handler.raft_commands
+    to: raft_engine.admin_proposals
+  - from: raft_engine.admin_applied
+    to: admin_handler.applied
+  - from: admin_handler.responses
+    to: client_surface.admin_responses
+  - from: admin_handler.raft_proposal
+    to: raft_engine.proposals
+
+  # L2 injector → raft proposals (untagged port; coexists with the
+  # admin_handler.raft_proposal fan-in already wired to this port).
+  - from: consensus_bench.proposals
+    to: raft_engine.proposals
+  - from: consensus_bench.metrics
+    to: telemetry_agg.ingest
+
+  - from: raft_engine.metrics
+    to: telemetry_agg.ingest
+  - from: replicator.metrics
+    to: telemetry_agg.ingest
+  - from: wal.metrics
+    to: telemetry_agg.ingest
+  - from: flow_controller.metrics
+    to: telemetry_agg.ingest
+  - from: cp_proof_cache.metrics
+    to: telemetry_agg.ingest
+  - from: snapshot_engine.metrics
+    to: telemetry_agg.ingest
+  - from: rbac.audit_events
+    to: telemetry_agg.ingest
+  - from: peer_router.metrics
+    to: telemetry_agg.ingest
+  - from: throttle_gate.metrics
+    to: telemetry_agg.ingest
+  - from: commit_tracker.metrics
+    to: telemetry_agg.ingest
+  - from: apply_pipeline.metrics
+    to: telemetry_agg.ingest
+  - from: telemetry_agg.readyz
+    to: client_surface.readyz_data
+  - from: telemetry_agg.why
+    to: client_surface.why_data
+  - from: telemetry_agg.export
+    to: client_surface.metrics_data
+
+  - from: ip.net_out
+    to: http_ingress.net_in
+  - from: http_ingress.net_out
+    to: ip.net_in
+  - from: http_ingress.request
+    to: http_adapter.request
+  - from: http_adapter.response
+    to: http_ingress.response
+  - from: telemetry_agg.readyz
+    to: http_adapter.readyz
+  - from: telemetry_agg.why
+    to: http_adapter.why
+  - from: telemetry_agg.export
+    to: http_adapter.metrics
+  - from: http_adapter.admin_request
+    to: admin_handler.requests

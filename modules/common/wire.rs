@@ -168,6 +168,12 @@ pub const ADMIN_OP_DURABILITY_MODE: u8  = 0x04;
 pub const ADMIN_OP_SNAPSHOT: u8         = 0x05;
 pub const ADMIN_OP_ADD_VOTER: u8        = 0x06;
 pub const ADMIN_OP_REMOVE_VOTER: u8     = 0x07;
+/// `POST /propose` client-write bridge (RFC §8 stopgap). Carried on the admin
+/// command channel for wiring reuse, but admin_handler emits it as a RAW
+/// (un-marked) `MSG_CLIENT_PROPOSAL` — the op_body is opaque application data,
+/// NOT an admin op, so it is never applied at commit time. Lets an off-DUT
+/// generator drive real client writes over HTTP without a dedicated ingress.
+pub const ADMIN_OP_PROPOSE: u8          = 0x08;
 
 /// Body-prefix byte for an admin entry replicated through the Raft log
 /// (RFC §3.1). When a committed entry's body starts with this byte,
@@ -406,11 +412,42 @@ pub const MSG_APPLY_PIPELINE_RESET: u8 = 0x2B;
 /// `[before_index:u64 LE]`. WAL deletes segments whose max-index <
 /// `before_index` and trims its in-memory offset map.
 pub const MSG_WAL_COMPACT_BEFORE: u8  = 0x2C;
+/// WAL → raft_engine boot-time replay-complete signal. Emitted exactly
+/// once after the WAL finishes its replay scan (PHASE_REPLAY → NORMAL),
+/// carrying the EXACT on-disk high-water it reconstructed. Payload
+/// (16 bytes): `[term:u64 LE][high_water_index:u64 LE]` (encoded via
+/// `encode_term_index`). On a crash-recovery boot raft loads only a
+/// THROTTLED durable hint from `RAFT0000.MET` (`META_PERSIST_STRIDE`),
+/// which lags the WAL's true replayed high-water; resuming at the stale
+/// hint makes new post-recovery appends collide with the replayed index
+/// space. raft HOLDS proposal intake until this signal arrives, then
+/// resumes `last_log_index` at `high_water_index` and re-seeds
+/// apply_pipeline. This needs its OWN dedicated edge — it CANNOT ride
+/// the shared `wal.flushed` fan-out (which also feeds durability_ledger;
+/// a one-shot signal there is consumed by the wrong consumer and the
+/// boot deadlocks). See the L4 recovery follow-up (RFC §14 item 3b).
+pub const MSG_WAL_REPLAY_COMPLETE: u8 = 0x2D;
+/// raft_engine → WAL log-suffix truncation (Raft §5.3 conflict repair).
+/// Emitted by a follower when an AppendEntries reveals a divergent suffix:
+/// every entry strictly AFTER `keep_through_index` must be discarded before
+/// the leader's entries can be appended. Payload (8 bytes):
+/// `[keep_through_index:u64 LE]`. The WAL drops in-memory offset-map slots
+/// above the floor, seeks the live segment to the end of `keep_through_index`,
+/// writes a zero-length terminator frame so replay stops there, and fsyncs.
+/// SAFETY: raft never emits this for `keep_through_index < commit_index` —
+/// committed entries are immutable, so truncation can only ever touch the
+/// uncommitted tail. Shares the `wal.compact_before` control channel.
+pub const MSG_WAL_TRUNCATE_AFTER: u8  = 0x2E;
 
 /// `MSG_WAL_ENTRY_REQUEST` payload size (12 bytes).
 pub const WAL_ENTRY_REQUEST_LEN: usize = 12;
-/// Fixed header size of `MSG_WAL_ENTRY_REPLY` (20 bytes); body follows.
-pub const WAL_ENTRY_REPLY_HDR: usize = 20;
+/// Fixed header size of `MSG_WAL_ENTRY_REPLY` (28 bytes); body follows.
+/// `[request_id:u32][term:u64][index:u64][prev_term:u64]`. `prev_term` is the
+/// term of the entry at `index-1` (0 if `index<=1` or not resident) so the
+/// replicator can build a catch-up AppendEntries with the CORRECT
+/// `prev_log_term` — guessing it (e.g. reusing `term`) causes a follower to
+/// see a spurious term conflict at a term boundary and wrongly truncate.
+pub const WAL_ENTRY_REPLY_HDR: usize = 28;
 
 #[inline]
 pub fn encode_wal_entry_request(buf: &mut [u8; WAL_ENTRY_REQUEST_LEN], request_id: u32, wal_index: u64) {
@@ -434,14 +471,16 @@ pub fn encode_wal_entry_reply_hdr(
     request_id: u32,
     term: u64,
     index: u64,
+    prev_term: u64,
 ) {
     buf[0..4].copy_from_slice(&request_id.to_le_bytes());
     buf[4..12].copy_from_slice(&term.to_le_bytes());
     buf[12..20].copy_from_slice(&index.to_le_bytes());
+    buf[20..28].copy_from_slice(&prev_term.to_le_bytes());
 }
 
 #[inline]
-pub fn decode_wal_entry_reply(buf: &[u8]) -> Option<(u32, u64, u64, usize)> {
+pub fn decode_wal_entry_reply(buf: &[u8]) -> Option<(u32, u64, u64, u64, usize)> {
     if buf.len() < WAL_ENTRY_REPLY_HDR { return None; }
     let request_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let term = u64::from_le_bytes([
@@ -450,7 +489,10 @@ pub fn decode_wal_entry_reply(buf: &[u8]) -> Option<(u32, u64, u64, usize)> {
     let index = u64::from_le_bytes([
         buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
     ]);
-    Some((request_id, term, index, WAL_ENTRY_REPLY_HDR))
+    let prev_term = u64::from_le_bytes([
+        buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
+    ]);
+    Some((request_id, term, index, prev_term, WAL_ENTRY_REPLY_HDR))
 }
 /// Per-entry committed envelope emitted on `apply_pipeline.committed_entries`.
 /// Payload: `[term:u64 LE][index:u64 LE][body...]`. Same body bytes the
@@ -739,6 +781,9 @@ pub const MODULE_ID_ADMIN_HANDLER: u8     = 0x11;
 pub const MODULE_ID_RBAC: u8              = 0x12;
 pub const MODULE_ID_KEY_MANAGER: u8       = 0x13;
 pub const MODULE_ID_CP_BRIDGE: u8         = 0x14;
+pub const MODULE_ID_TELEMETRY_AGG: u8     = 0x15;
+pub const MODULE_ID_NVME_BENCH: u8        = 0x16;
+pub const MODULE_ID_CONSENSUS_BENCH: u8   = 0x17;
 
 /// Per-module metric ids. Each module owns a small private space
 /// (0x00..0xFF). Documented next to the module's metric emission.
@@ -753,18 +798,247 @@ pub mod metric_ids {
     pub const RAFT_PROPOSALS_DROPPED_STRICT: u16 = 0x0007;
     pub const RAFT_FROZEN_FLAG: u16            = 0x0008;
     pub const RAFT_STRICT_FALLBACK_FLAG: u16   = 0x0009;
+    /// Counter: proposal-batch flushes deferred because `wal.entries`
+    /// (out_log) had no write space — the durability-backpressure signal
+    /// (RFC §13/§14). Non-zero means raft held the log at WAL durability
+    /// rather than over-producing; sustained growth = WAL-bound plateau.
+    pub const RAFT_FLUSHES_DEFERRED: u16       = 0x000A;
+    /// Gauge: uncommitted-inflight window (`last_log_index - commit_index`).
+    /// Sitting at `MAX_UNCOMMITTED_INFLIGHT` means the leader is holding
+    /// intake to keep the log from running past quorum-durable commit
+    /// (RFC §13/§14 durability backpressure).
+    pub const RAFT_UNCOMMITTED_INFLIGHT: u16   = 0x000B;
+    /// Gauge: raft's `last_log_index` (highest appended index). After a
+    /// crash-recovery boot this reflects whether raft RESUMED its index from
+    /// the persisted metadata (high) or restarted fresh (low) — the L4
+    /// recovery-coherence diagnostic.
+    pub const RAFT_LAST_LOG_INDEX: u16         = 0x000C;
+    /// Gauge: raft's own `commit_index` view (fed from commit_tracker).
+    pub const RAFT_COMMIT_INDEX: u16           = 0x000D;
+    /// Gauge: 1 while raft is holding proposal intake awaiting the WAL's
+    /// replay-complete high-water (recovery boot), else 0. Diagnostic.
+    pub const RAFT_AWAITING_REPLAY: u16        = 0x000E;
+    /// Gauge: the WAL replay high-water raft last RESUMED at via
+    /// MSG_WAL_REPLAY_COMPLETE (0 if none received). Diagnostic.
+    pub const RAFT_REPLAY_HW: u16              = 0x000F;
+    /// Gauge: log index raft loaded from RAFT0000.MET at boot (0 = fresh).
+    pub const RAFT_META_HINT: u16              = 0x0010;
+    /// Counter: Raft §5.3 conflict-repair truncations driven (divergent
+    /// suffix discarded). Steady-state replication should hold this at 0;
+    /// non-zero marks log divergence + repair (e.g. post-failover).
+    pub const RAFT_LOG_TRUNCATIONS: u16        = 0x0011;
+    /// Gauge (readiness sub-signal): 1 once boot replay is complete, metadata
+    /// is loaded, and consensus is established (we are leader, or we know the
+    /// leader). Consumed by telemetry_agg to drive a real `/readyz` instead of
+    /// a fixed boot timer. 0 until all three hold.
+    pub const RAFT_READY: u16                  = 0x0012;
 
     // wal (module_id = 0x02)
     pub const WAL_ENTRIES_WRITTEN: u16         = 0x0001;
     pub const WAL_BYTES_WRITTEN: u16           = 0x0002;
     pub const WAL_SEGMENT_SEQ: u16             = 0x0003;
+    /// UpDownCounter: entries written but not yet group-fsynced.
+    pub const WAL_PENDING_DEPTH: u16           = 0x0004;
+    /// Gauge: last FS_OPEN_CREATE return (>=0 = disk fd, <0 = errno;
+    /// in-memory fallback diagnostic).
+    pub const WAL_OPEN_RC: u16                 = 0x0005;
+    /// Counter: module_step invocations (frozen = not being stepped).
+    pub const WAL_STEPS: u16                   = 0x0006;
+    /// Gauge: high-water (current_index) the WAL handed raft in
+    /// MSG_WAL_REPLAY_COMPLETE (0 until emitted). Diagnostic.
+    pub const WAL_REPLAY_HW: u16               = 0x0007;
+    /// Counter: entries re-emitted during boot replay. Diagnostic — lets a
+    /// scraper tell replayed entries apart from fresh appends in
+    /// `entries_written`.
+    pub const WAL_REPLAYED: u16                = 0x0008;
+    /// Gauge: FS_STAT size (bytes) of the FIRST segment opened during replay.
+    /// Diagnostic — distinguishes a physically-truncated on-disk segment from
+    /// a read-back that stops at a cluster boundary.
+    pub const WAL_REPLAY_FSIZE: u16            = 0x0009;
+    /// Counter: entry-request lookups that hit (served a body). Diagnostic.
+    pub const WAL_ENTRYREQ_SERVED: u16         = 0x000A;
+    /// Counter: entry-request lookups that returned NOT_FOUND (below ring /
+    /// disk read failed). Diagnostic for the apply-refetch stall.
+    pub const WAL_ENTRYREQ_NOTFOUND: u16       = 0x000B;
+    /// Counter: durable-write failures (FS_WRITE short/error, FS_FSYNC error,
+    /// or segment open failure). Non-zero means entries went un-acked rather
+    /// than being falsely reported durable.
+    pub const WAL_WRITE_ERRORS: u16            = 0x000C;
+    /// Counter: WAL replay entries rejected because the stored CRC32C did not
+    /// match the recomputed payload checksum (torn / corrupt entry). A torn
+    /// tail stops replay at that point rather than replaying garbage.
+    pub const WAL_CHECKSUM_FAILURES: u16       = 0x000D;
+    /// Counter: WAL log-suffix truncations applied (Raft §5.3 conflict
+    /// repair discarded a divergent uncommitted tail).
+    pub const WAL_TRUNCATIONS: u16             = 0x000E;
 
     // replicator (module_id = 0x03)
     pub const REPL_RPCS_SENT: u16              = 0x0001;
     pub const REPL_ACKS_RECEIVED: u16          = 0x0002;
     pub const REPL_NACKS_RECEIVED: u16         = 0x0003;
     pub const REPL_CATCHUP_SENT: u16           = 0x0004;
+    /// UpDownCounter: AppendEntries RPCs in flight (sent, not yet acked).
+    pub const REPL_INFLIGHT_DEPTH: u16         = 0x0005;
+    /// Counter: failure responses caused by follower WAL backpressure (busy),
+    /// as distinct from log-divergence NACKs. Retire an in-flight RPC without
+    /// rolling next_index back.
+    pub const REPL_BACKPRESSURE: u16           = 0x0006;
+
+    // commit_tracker (module_id = 0x04)
+    pub const COMMIT_INDEX: u16                = 0x0001;
+    pub const COMMIT_ADVANCES: u16             = 0x0002;
+
+    // snapshot_engine (module_id = 0x07)
+    pub const SNAP_SNAPSHOTS_TAKEN: u16        = 0x0001;
+    pub const SNAP_CHUNKS_IMPORTED: u16        = 0x0002;
+    pub const SNAP_TRIGGERS_DEFERRED: u16      = 0x0003;
+    /// Counter: snapshot body bytes durably written to disk.
+    pub const SNAP_BYTES_WRITTEN: u16          = 0x0004;
+    /// Counter: durable-install failures (short write / fsync error) — the
+    /// install signal was withheld so consensus never trusts a torn body.
+    pub const SNAP_INSTALL_FAILURES: u16       = 0x0005;
+
+    // apply_pipeline (module_id = 0x06)
+    pub const APPLY_ENTRIES_APPLIED: u16       = 0x0001;
+    pub const APPLY_DEDUP_DROPS: u16           = 0x0002;
+    /// UpDownCounter: committed entries queued, not yet delivered.
+    pub const APPLY_QUEUE_DEPTH: u16           = 0x0003;
+    /// Counter: committed entries refetched from the WAL after the lossy
+    /// `log_observe` fan-out dropped the body under overdrive (apply-side
+    /// gap recovery). Non-zero means the observer stream gapped but apply
+    /// stayed lossless by reading the durable entry back from the WAL.
+    pub const APPLY_REFETCHED: u16             = 0x0004;
+    /// Gauge (readiness sub-signal): 1 when the apply cursor has caught up to
+    /// the committed horizon (`apply_index >= commit_horizon`). Consumed by
+    /// telemetry_agg's real `/readyz`.
+    pub const APPLY_CAUGHT_UP: u16             = 0x0005;
+    /// Counter: pending committed entries evicted from the body buffer before
+    /// they could be applied (overdrive backpressure surfaced as a drop).
+    pub const APPLY_ENTRIES_EVICTED: u16       = 0x0006;
+    /// Counter: refetch read-back slots evicted before consumption.
+    pub const APPLY_READS_EVICTED: u16         = 0x0007;
+
+    // throttle_gate (module_id = 0x0A)
+    pub const THROTTLE_ADMITTED: u16           = 0x0001;
+    pub const THROTTLE_REJECTED: u16           = 0x0002;
+
+    // flow_controller (module_id = 0x0B)
+    /// UpDownCounter: remaining entry-credit pool.
+    pub const FLOW_ENTRY_CREDITS: u16          = 0x0001;
+    /// UpDownCounter: remaining byte-credit pool.
+    pub const FLOW_BYTE_CREDITS: u16           = 0x0002;
+
+    // peer_router (module_id = 0x0E)
+    /// UpDownCounter: open peer connections.
+    pub const PEER_CONNECTIONS_OPEN: u16       = 0x0001;
+    /// Counter: total data bytes received from the network.
+    pub const PEER_BYTES_IN: u16               = 0x0002;
+    /// Counter: total data bytes sent to the network.
+    pub const PEER_BYTES_OUT: u16              = 0x0003;
+
+    // telemetry_agg (module_id = 0x15) — the aggregator's self-metrics.
+    pub const TELE_MESSAGES_INGESTED: u16      = 0x0001;
+    pub const TELE_TYPED_SAMPLES: u16          = 0x0002;
+    pub const TELE_METRIC_SLOTS_USED: u16      = 0x0003;
+    /// Counter: metric-table slots evicted (oldest-write LRU) because the
+    /// fixed table filled. Non-zero means the table is undersized for the
+    /// live metric cardinality — surfaces silent loss before it bites.
+    pub const TELE_METRICS_EVICTED: u16        = 0x0004;
+    /// Counter: export records dropped this scrape because the ~8 KiB channel
+    /// ring budget was hit (table tail or per-module step histograms). Makes
+    /// export truncation observable instead of silent.
+    pub const TELE_RECORDS_DROPPED: u16        = 0x0005;
+
+    // nvme_bench (module_id = 0x16) — L0 NVMe floor bench (RFC §6).
+    pub const NVBENCH_PHASE: u16               = 0x0001;
+    pub const NVBENCH_BYTES_WRITTEN: u16       = 0x0002;
+    pub const NVBENCH_SEQ_KBPS: u16            = 0x0003;
+    pub const NVBENCH_RAND_KBPS: u16           = 0x0004;
+    pub const NVBENCH_FSYNCS: u16              = 0x0005;
+    pub const NVBENCH_STEPS: u16               = 0x0006;
+    pub const NVBENCH_OPEN_RC: u16             = 0x0007;
+    pub const NVBENCH_OPEN_RETRIES: u16        = 0x0008;
+    pub const NVBENCH_VERIFY_FAIL: u16         = 0x0009;
+    /// Counter: failed FS_WRITE/FS_SEEK/FS_FSYNC ops (short write, errno).
+    /// Non-zero invalidates the throughput figures for the run.
+    pub const NVBENCH_IO_ERRORS: u16           = 0x000A;
+
+    // consensus_bench (module_id = 0x17) — L2 consensus load injector.
+    pub const CBENCH_PHASE: u16                = 0x0001;
+    pub const CBENCH_PROPOSALS_SENT: u16       = 0x0002;
+    pub const CBENCH_BLOCKED: u16              = 0x0003;
 }
+
+/// Fixed-bucket histograms (RFC §4.1, `docs/architecture/observability.md`).
+///
+/// Each histogram occupies a contiguous per-module `metric_id` range
+/// starting at [`hist::HIST_BASE`]: bucket `i` is emitted as a
+/// `METRIC_KIND_HISTOGRAM` sample at `metric_id = HIST_BASE + i`,
+/// `value = cumulative count in that bucket` (monotone high-water).
+/// There are `bounds.len() + 1` buckets — the final one is the implicit
+/// `+Inf` overflow bucket, so saturation of the top bucket is itself a
+/// signal. Bounds are stored in the producer's native sampling unit
+/// (µs or ms) so classification stays integer-only in `no_std`.
+pub mod hist {
+    /// First `metric_id` of any histogram bucket range. Chosen above the
+    /// scalar `metric_ids` space so the two never collide within a module.
+    pub const HIST_BASE: u16 = 0x1000;
+
+    /// First `metric_id` for telemetry_agg's PER-MODULE kernel step-timing
+    /// histogram (RFC §4.3). Each scheduler module's 8 step buckets are
+    /// emitted under `module_id = MODULE_ID_TELEMETRY_AGG`,
+    /// `partition_id = scheduler_module_idx`, `metric_id = STEP_PERMOD_BASE + i`
+    /// — distinct from the global step histogram (which uses HIST_BASE,
+    /// partition 0) so the two never collide.
+    pub const STEP_PERMOD_BASE: u16 = 0x1100;
+
+    /// `clustor.wal.fsync_latency_ms` — inclusive upper bounds, microseconds.
+    pub const FSYNC_LATENCY_US: [u64; 15] = [
+        250, 500, 1_000, 2_000, 4_000, 6_000, 8_000, 10_000,
+        15_000, 20_000, 30_000, 40_000, 60_000, 80_000, 100_000,
+    ];
+    /// `clustor.raft.commit_latency_ms` — inclusive upper bounds, microseconds.
+    pub const COMMIT_LATENCY_US: [u64; 14] = [
+        500, 1_000, 2_000, 4_000, 6_000, 8_000, 10_000,
+        15_000, 20_000, 30_000, 40_000, 60_000, 80_000, 100_000,
+    ];
+    /// `clustor.flow.apply_batch_latency_ms` — inclusive upper bounds, microseconds.
+    pub const APPLY_BATCH_US: [u64; 8] = [
+        250, 500, 1_000, 2_000, 4_000, 6_000, 8_000, 10_000,
+    ];
+    /// `clustor.snapshot.transfer_seconds` — inclusive upper bounds, milliseconds.
+    pub const SNAPSHOT_MS: [u64; 9] = [
+        1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000,
+    ];
+
+    /// Classify `v` (same unit as `bounds`) into a bucket index in
+    /// `0..=bounds.len()`. The returned index is the first bound `v`
+    /// is `<=`; `bounds.len()` is the `+Inf` overflow bucket.
+    #[inline]
+    #[must_use]
+    pub fn bucket(bounds: &[u64], v: u64) -> usize {
+        let mut i = 0usize;
+        while i < bounds.len() {
+            if v <= bounds[i] {
+                return i;
+            }
+            i += 1;
+        }
+        bounds.len()
+    }
+}
+
+/// `/metrics` export payload (telemetry_agg → http_adapter → `GET /metrics`).
+///
+/// Layout: `[magic:u8=0xC7][version:u8=1][record_count:u16 LE]` followed by
+/// `record_count` 14-byte records, each identical to the
+/// [`MSG_METRIC_SAMPLE`] body (`encode_metric_sample`): `module_id:u8`,
+/// `partition_id:u16 LE`, `metric_id:u16 LE`, `kind:u8`, `value:i64 LE`.
+/// A scraper iterates fixed-width records with no per-module parser.
+pub const METRICS_EXPORT_MAGIC: u8   = 0xC7;
+pub const METRICS_EXPORT_VERSION: u8 = 1;
+pub const METRICS_EXPORT_HDR: usize  = 4;
+pub const METRICS_RECORD_LEN: usize  = METRIC_SAMPLE_LEN;
 
 /// `MSG_METRIC_SAMPLE` payload size (14 bytes).
 pub const METRIC_SAMPLE_LEN: usize = 14;
@@ -1101,7 +1375,11 @@ pub fn decode_fsync_ack(buf: &[u8]) -> (u64, u64, u8) {
 /// shape so older readers (e.g. `commit_tracker.drain_match_indices`,
 /// which only needs `(term, last_log_index, replica)`) keep working
 /// without code change.
-pub const AE_RESP_LEN: usize = 25;
+/// Byte 25 is a `busy` flag: a failure (`success == 0`) that means the
+/// follower's WAL channel was full (local durability backpressure), NOT a log
+/// mismatch. The leader retries the same entry instead of rolling `next_index`
+/// back — see `replicator`. Absent (legacy/short frame) it defaults to 0.
+pub const AE_RESP_LEN: usize = 26;
 
 #[inline]
 pub fn encode_append_entries_resp(
@@ -1111,31 +1389,34 @@ pub fn encode_append_entries_resp(
     self_id: u8,
     success: bool,
     durable_index: u64,
+    busy: bool,
 ) {
     encode_term_index_replica(buf, term, last_log_index, self_id);
     buf[16] = self_id | ((success as u8) << 7);
     buf[17..25].copy_from_slice(&durable_index.to_le_bytes());
+    buf[25] = busy as u8;
 }
 
-/// Decode an AppendEntriesResponse payload. Accepts either the
-/// 25-byte modern shape or the legacy 17-byte shape (durable_index
-/// defaults to 0, which leaves the leader's `durability_ledger`
+/// Decode an AppendEntriesResponse payload. Accepts the 26-byte modern shape,
+/// the 25-byte shape (busy defaults to 0), or the legacy 17-byte shape
+/// (durable_index defaults to 0, which leaves the leader's `durability_ledger`
 /// progress slot for that replica unchanged).
-/// Returns `(term, last_log_index, replica, success, durable_index)`.
+/// Returns `(term, last_log_index, replica, success, durable_index, busy)`.
 #[inline]
-pub fn decode_append_entries_resp(buf: &[u8]) -> Option<(u64, u64, u8, bool, u64)> {
+pub fn decode_append_entries_resp(buf: &[u8]) -> Option<(u64, u64, u8, bool, u64, bool)> {
     if buf.len() < 17 { return None; }
     let (term, last_index, replica_byte) = decode_term_index_replica(buf);
     let success = (replica_byte & 0x80) != 0;
     let replica = replica_byte & 0x7F;
-    let durable_index = if buf.len() >= AE_RESP_LEN {
+    let durable_index = if buf.len() >= 25 {
         u64::from_le_bytes([
             buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23], buf[24],
         ])
     } else {
         0
     };
-    Some((term, last_index, replica, success, durable_index))
+    let busy = buf.len() >= 26 && buf[25] != 0;
+    Some((term, last_index, replica, success, durable_index, busy))
 }
 
 /// DurabilityProof payload size (19 bytes):

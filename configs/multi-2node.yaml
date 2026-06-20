@@ -120,6 +120,10 @@ wiring:
     to: flow_controller.lag
   - from: raft_engine.log_append
     to: wal.entries
+  # Raft §5.3 conflict-repair: a leader-divergent follower truncates its WAL
+  # suffix on this control edge (shares wal.compact_before; MSG_WAL_TRUNCATE_AFTER).
+  - from: raft_engine.wal_compact
+    to: wal.compact_before
   - from: wal.flushed
     to: durability_ledger.ack
   # Spec §10.4.1: every replica tracks its own `local_wal_durable_index`
@@ -164,6 +168,12 @@ wiring:
   - from: wal.metrics
     to: telemetry_agg.ingest
   - from: replicator.metrics
+    to: telemetry_agg.ingest
+  - from: peer_router.metrics
+    to: telemetry_agg.ingest
+  - from: commit_tracker.metrics
+    to: telemetry_agg.ingest
+  - from: apply_pipeline.metrics
     to: telemetry_agg.ingest
   - from: telemetry_agg.readyz
     to: client_surface.readyz_data

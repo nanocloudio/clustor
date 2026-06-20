@@ -56,6 +56,10 @@ mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
 
+#[path = "../../common/collections.rs"]
+mod collections;
+
+use collections::Crc32c;
 use types::*;
 
 const FS_OPEN: u32 = 0x0900;
@@ -68,9 +72,35 @@ const FS_CLOSE: u32 = 0x0903;
 /// the write tier.
 const FS_OPEN_CREATE: u32 = 0x0909;
 
+/// `module_step` return code for `StepOutcome::Burst` (kernel ABI:
+/// 0=Continue, 1=Done, 2=Burst, 3=Ready). Returned from a step that
+/// performed a synchronous disk op (manifest persist / chunk ingest):
+/// on this NVMe a cold first-touch FS_OPEN_CREATE/write runs tens to
+/// >100 ms, which would trip the step guard. Burst makes the scheduler
+/// forgive that one-time overrun (the Burst transition disarms the
+/// normal-deadline arm without checking it, then re-arms with the 8x
+/// burst budget) — the same mechanism the WAL replay path uses for its
+/// cold root-dir scan. Bounded work (≤4 triggers/step), so this is a
+/// headroom grant, not unbounded I/O.
+const STEP_BURST: i32 = 2;
+
 const SNAP_PATH_MAX: usize = 64;
 const MANIFEST_LEN: usize = 32;
 const MAGIC_SNAP: u32 = 0x534E_4150; // "SNAP" little-endian as bytes
+
+/// Durable snapshot file layout (crash-atomic without an FS rename, which the
+/// FS contract does not expose):
+///   `[MAGIC_SNAP:u32][partition:u16][rsvd:u16][term:u64][last_idx:u64]`
+///   `[last_term:u64][dek_epoch:u32][body_len:u32]` = `SNAP_HDR_LEN` bytes,
+///   then `body[body_len]`, then `[body_crc32c:u32][END_MAGIC:u32]`.
+/// Written sequentially in one pass with a SINGLE trailing fsync, so a torn
+/// or interrupted write never leaves a readable trailer — `load_snapshot`
+/// rejects any file whose `END_MAGIC` or CRC doesn't check out and the node
+/// falls back to its log. Snapshot filenames are index-keyed and indices are
+/// monotonic, so a fresh install never overwrites a shorter valid file.
+const SNAP_HDR_LEN: usize = 40;
+const SNAP_TRAILER_LEN: usize = 8;
+const END_MAGIC_SNAP: u32 = 0x534E_4445; // "ENDS"
 
 /// Max snapshot body bytes we'll buffer in module memory before
 /// finalising. Once the state-machine snapshot API (§2.1) lands, the
@@ -101,6 +131,7 @@ define_params! {
 /// upwards if the lattice / quantum integration later proves it's
 /// not enough.
 const RETENTION_FLOOR_SLOTS: usize = 32;
+const METRICS_INTERVAL_MS: u64 = 1000;
 
 /// Empty-slot sentinel for the retention-floor table. `0xFFFF` is
 /// wire-reserved as "never a real kpg id" so this value can mark
@@ -156,6 +187,12 @@ struct ModuleState {
     /// re-fire it). Bumping a floor downwards is the application's
     /// job, not the snapshot engine's.
     triggers_deferred: u32,
+    /// Total snapshot body bytes durably written to disk (across installs).
+    snap_bytes_written: u64,
+    /// Count of durable-install failures (OPEN_CREATE failed, short write, or
+    /// fsync error). Non-zero means a received snapshot was NOT installed —
+    /// the install signal is withheld so consensus never trusts a torn body.
+    install_failures: u32,
 
     /// Per-kpg retention floors received from
     /// `compaction_coordinator`. Reads and writes are linear scans
@@ -170,6 +207,16 @@ struct ModuleState {
     /// operator restart with a larger `RETENTION_FLOOR_SLOTS`;
     /// there is no automatic clear path.
     retention_floor_overflow: bool,
+
+    // Metrics
+    last_metrics_ms: u64,
+    /// Monotonic ms when the current install's first chunk arrived;
+    /// used to time `clustor.snapshot.transfer_seconds`.
+    install_start_ms: u64,
+    /// `clustor.snapshot.transfer_seconds` cumulative bucket counts
+    /// (RFC §4.1): wall time from first install chunk to `done`,
+    /// ms-classified against `wire::hist::SNAPSHOT_MS`.
+    transfer_buckets: [u32; wire::hist::SNAPSHOT_MS.len() + 1],
 
     // In-flight install state (single-stream, fail-open if interleaved):
     in_progress_term: u64,
@@ -231,6 +278,7 @@ pub extern "C" fn module_new(
         s.retention_floors = [RetentionFloorSlot::empty(); RETENTION_FLOOR_SLOTS];
         s.retention_floor_overflow = false;
         s.triggers_deferred = 0;
+        s.transfer_buckets = [0u32; wire::hist::SNAPSHOT_MS.len() + 1];
 
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
@@ -254,6 +302,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+        // Set when this step performed a synchronous disk op whose cold
+        // first-touch can exceed the step deadline; we return Burst so the
+        // scheduler forgives that one-time overrun (see STEP_BURST).
+        let mut cold_fs = false;
 
         // 1. Drain key updates (track current DEK epoch for manifest).
         if s.in_key_update >= 0 {
@@ -301,6 +353,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         continue;
                     }
                     persist_manifest(s, sys, term, index);
+                    cold_fs = true; // manifest persist did a (possibly cold) FS write
                     s.last_snapshot_term = term;
                     s.last_snapshot_index = index;
                     emit_install_chunk(s, sys, term, index);
@@ -342,6 +395,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 match msg_type {
                     wire::MSG_INSTALL_SNAPSHOT => {
                         ingest_install_chunk(s, sys, pl);
+                        cold_fs = true; // chunk ingest persists to disk
                     }
                     wire::MSG_SNAPSHOT_CHUNK => {
                         // Legacy untyped chunk — count for backward
@@ -354,8 +408,69 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        0
+        // 4. Periodic metrics (RFC §4.1/§4.3).
+        emit_metrics(s, sys);
+
+        // Burst (forgive the cold-disk overrun) on a step that persisted a
+        // manifest or ingested an install chunk; otherwise Continue.
+        if cold_fs { STEP_BURST } else { 0 }
     }
+}
+
+/// Emit snapshot counters and the transfer-time histogram as typed
+/// samples (RFC §4.3). Partition-stamped. Dropped under backpressure.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.out_metrics < 0 { return; }
+    let now = dev_millis(sys);
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    s.last_metrics_ms = now;
+
+    let mid = wire::MODULE_ID_SNAPSHOT_ENGINE;
+    let pid = s.partition_id;
+    let kc = wire::METRIC_KIND_COUNTER;
+    let scalars: [(u16, i64); 5] = [
+        (wire::metric_ids::SNAP_SNAPSHOTS_TAKEN, i64::from(s.snapshots_taken)),
+        (wire::metric_ids::SNAP_CHUNKS_IMPORTED, i64::from(s.chunks_imported)),
+        (wire::metric_ids::SNAP_TRIGGERS_DEFERRED, i64::from(s.triggers_deferred)),
+        (wire::metric_ids::SNAP_BYTES_WRITTEN, s.snap_bytes_written as i64),
+        (wire::metric_ids::SNAP_INSTALL_FAILURES, i64::from(s.install_failures)),
+    ];
+    for &(metric_id, value) in scalars.iter() {
+        emit_sample(s, sys, mid, pid, metric_id, kc, value);
+    }
+    // Cumulative bucket counts per the wire contract (wire::hist): emit the
+    // running prefix sum so bucket i = count of samples <= bound[i].
+    let base = wire::hist::HIST_BASE;
+    let mut cum: i64 = 0;
+    for i in 0..s.transfer_buckets.len() {
+        cum += i64::from(s.transfer_buckets[i]);
+        emit_sample(s, sys, mid, pid, base + i as u16, wire::METRIC_KIND_HISTOGRAM, cum);
+    }
+}
+
+/// Emit one typed metric sample if `out_metrics` has write space.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn emit_sample(
+    s: &ModuleState,
+    sys: &SyscallTable,
+    module_id: u8,
+    partition_id: u16,
+    metric_id: u16,
+    kind: u8,
+    value: i64,
+) {
+    let poll = (sys.channel_poll)(s.out_metrics, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
+    wire::encode_metric_sample(&mut buf, module_id, partition_id, metric_id, kind, value);
+    wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
 }
 
 /// # Safety
@@ -385,6 +500,7 @@ unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: us
         s.in_progress_offset = 0;
         s.body_len = 0;
         s.in_progress_active = true;
+        s.install_start_ms = dev_millis(sys);
         // Persist the manifest on first chunk so a crash mid-install
         // still leaves a record of (term, index). Body finalisation
         // happens on `done`.
@@ -414,11 +530,20 @@ unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: us
     s.chunks_imported += 1;
 
     if done {
-        // Finalise: in a full implementation we'd write
-        // body_buf[..body_len] to a temp file alongside the manifest
-        // and atomically rename. Until §2.1 lands and the state
-        // machine actually consumes a body, we just record the size.
-        if s.out_installed >= 0 {
+        // Finalise: durably write the accumulated body to disk
+        // (crash-atomically — see write_snapshot_durable) BEFORE telling
+        // raft the snapshot is installed. The install signal is what lets a
+        // follower advance its state to last_idx and compact its log, so it
+        // must not be emitted until the body survives a crash. A torn/failed
+        // write withholds the signal; the leader re-sends from offset 0.
+        let (durable, had_fs) =
+            write_snapshot_durable(s, sys, s.in_progress_term, s.in_progress_last_idx, s.in_progress_last_term);
+
+        // `had_fs == false` means no FS provider (in-memory graph): there is
+        // no durable artefact possible, but the (term,index) is still a valid
+        // install for an in-memory cluster — preserve the prior behaviour.
+        // With an FS present, only signal on a confirmed durable write.
+        if (durable || !had_fs) && s.out_installed >= 0 {
             let poll = (sys.channel_poll)(s.out_installed, 0x02);
             if poll > 0 && (poll as u32 & 0x02) != 0 {
                 let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
@@ -434,9 +559,15 @@ unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: us
                     wire::MSG_SNAPSHOT_INSTALLED,
                     &buf,
                 );
+                s.last_snapshot_term = s.in_progress_term;
+                s.last_snapshot_index = s.in_progress_last_idx;
                 dev_log(sys, 3, b"[snap] installed".as_ptr(), 16);
             }
         }
+        // Fold the install duration into the transfer histogram (§4.1).
+        let elapsed_ms = dev_millis(sys).wrapping_sub(s.install_start_ms);
+        let b = wire::hist::bucket(&wire::hist::SNAPSHOT_MS, elapsed_ms);
+        s.transfer_buckets[b] = s.transfer_buckets[b].saturating_add(1);
         s.in_progress_active = false;
         s.body_len = 0;
         s.in_progress_offset = 0;
@@ -713,4 +844,81 @@ unsafe fn persist_manifest(s: &mut ModuleState, sys: &SyscallTable, term: Term, 
     (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
 
     dev_log(sys, 3, b"[snap] manifest".as_ptr(), 15);
+}
+
+/// Durably write the received snapshot body to disk, crash-atomically (see
+/// `SNAP_HDR_LEN`). Returns true iff the whole file — header, body, and the
+/// CRC+END_MAGIC trailer — landed and fsynced. On any short write or FS
+/// failure the caller must withhold `MSG_SNAPSHOT_INSTALLED` so consensus
+/// never advances onto a torn snapshot. A `false` return with `fd < 0` means
+/// the FS is unwired (in-memory graph) — there's nothing to install durably,
+/// which the caller treats as a soft skip, not a hard failure.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a
+/// `&SyscallTable` whose function pointers reach live kernel routines per
+/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn write_snapshot_durable(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    term: Term,
+    last_idx: Index,
+    last_term: Term,
+) -> (bool, bool) {
+    let plen = build_snapshot_path(s, last_idx);
+    if plen == 0 {
+        return (false, false);
+    }
+    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
+    if fd < 0 {
+        // FS unwired / parent dir missing — nothing to durably install.
+        return (false, false);
+    }
+    let body_len = s.body_len as usize;
+    let mut hdr = [0u8; SNAP_HDR_LEN];
+    hdr[0..4].copy_from_slice(&MAGIC_SNAP.to_le_bytes());
+    hdr[4..6].copy_from_slice(&s.partition_id.to_le_bytes());
+    // 6..8 reserved
+    hdr[8..16].copy_from_slice(&term.to_le_bytes());
+    hdr[16..24].copy_from_slice(&last_idx.to_le_bytes());
+    hdr[24..32].copy_from_slice(&last_term.to_le_bytes());
+    hdr[32..36].copy_from_slice(&s.dek_epoch.to_le_bytes());
+    hdr[36..40].copy_from_slice(&(body_len as u32).to_le_bytes());
+
+    // CRC32C covers the header + body, binding metadata and payload together.
+    let crc = {
+        let mut c = Crc32c::new();
+        c.update(&hdr);
+        if body_len > 0 {
+            c.update(&s.body_buf[..body_len]);
+        }
+        c.finalize()
+    };
+    let mut trailer = [0u8; SNAP_TRAILER_LEN];
+    trailer[0..4].copy_from_slice(&crc.to_le_bytes());
+    trailer[4..8].copy_from_slice(&END_MAGIC_SNAP.to_le_bytes());
+
+    let mut ok = (sys.provider_call)(fd, FS_WRITE, hdr.as_mut_ptr(), SNAP_HDR_LEN) == SNAP_HDR_LEN as i32;
+    if ok && body_len > 0 {
+        ok = (sys.provider_call)(fd, FS_WRITE, s.body_buf.as_mut_ptr(), body_len) == body_len as i32;
+    }
+    if ok {
+        ok = (sys.provider_call)(fd, FS_WRITE, trailer.as_mut_ptr(), SNAP_TRAILER_LEN)
+            == SNAP_TRAILER_LEN as i32;
+    }
+    if ok {
+        // Single trailing fsync: makes the whole file durable atomically.
+        ok = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) == 0;
+    }
+    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+
+    if ok {
+        s.snap_bytes_written = s.snap_bytes_written.saturating_add(body_len as u64);
+        dev_log(sys, 3, b"[snap] durable".as_ptr(), 14);
+    } else {
+        s.install_failures = s.install_failures.saturating_add(1);
+        dev_log(sys, 3, b"[snap] durable FAIL".as_ptr(), 19);
+    }
+    (ok, true)
 }

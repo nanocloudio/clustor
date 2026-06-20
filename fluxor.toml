@@ -34,6 +34,10 @@ targets = ["bcm2712"]
 crate  = "clustor"
 reason = "test/bench-only package; cargo doesn't allow `lints.workspace = true` + per-lint overrides in the same table, so the package inlines a relaxed mirror of [workspace.lints]"
 
+[[ci.lints.exemption]]
+crate  = "clustor-bench"
+reason = "driver-host bench CLI (clustor-scrape/clustor-loadgen); prints JSON to stdout and unwraps on arg parsing, so it inlines a relaxed mirror of [workspace.lints] like the clustor package"
+
 [ci.hygiene]
 # Tiers where inline tests are banned. `modules/**` is no_std PIC and
 # can't host a std test harness; `src/**` would be too if clustor had
@@ -50,6 +54,11 @@ max_inline_lines = 80
 path   = "modules/common/replica_facade.rs"
 rule   = "inline-tests"
 reason = "dual-target host facade: same file compiles into the no_std module ELF and is pulled into host-side cargo test via #[path]. The #[cfg(test)] block is gated away from the no_std build."
+
+[[ci.hygiene.exemption]]
+path   = "tools/clustor-bench/src/lib.rs"
+rule   = "inline-tests"
+reason = "std-only driver-host bench CLI (not a no_std module); the forbid_inline_tests `src` tier targets clustor's own no_std-adjacent src. These #[cfg(test)] units cover the binary-metrics parser and latency math against private helpers (parse_export, LatencyHist, json_str), so they belong next to the code."
 
 [ci.templates]
 dir = "configs"

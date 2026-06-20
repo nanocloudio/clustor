@@ -1,0 +1,31 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Unused start trigger. The bench auto-runs on startup; this input
+# exists so the module conforms to the Transformer shape and can later
+# be gated on an explicit "go" signal. Leave unwired in configs.
+[[ports]]
+name = "trigger"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# Writes its scratch file at `wal/nvbench.bin` (same directory the WAL
+# uses), so the operator's existing `wal/` mount/symlink covers it.
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[observability]
+# L0 NVMe floor benchmark harness (RFC §6): emits its own bench signals
+# (seq/rand throughput, fsync-latency histogram sharing the WAL buckets,
+# bytes/fsync counters) plus `[nvbench] ...` log_net lines. Not
+# data-plane telemetry, so exempt from the data-mover instrumentation
+# contract.
+exempt = "L0 NVMe floor benchmark; emits bench metrics + [nvbench] log lines, not data-plane telemetry"

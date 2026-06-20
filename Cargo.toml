@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/clustor-common"]
+members = [".", "crates/clustor-common", "tools/clustor-bench"]
 
 [workspace.package]
 # Shared by every publishable crate via `version.workspace = true`.
@@ -109,6 +109,9 @@ too_many_lines          = "allow"
 # do not need a `clustor` library to link against — they pull module
 # source files directly with `#[path = "../modules/.../..."]`.
 path = "lib_stub.rs"
+# The stub has no benches; without this, `cargo bench` runs the lib's
+# default libtest harness (which rejects criterion's `--quick`).
+bench = false
 
 [dependencies]
 
@@ -199,21 +202,21 @@ path = "tests/wal_replay.rs"
 # benches pull `modules/common/replica_facade.rs` directly via
 # `#[path]` — no library link is required.
 #
-# Commented out: `benches/` is `.gitignore`d (per the project
-# pattern that also covers `tests/`). Restore each entry when the
-# matching `benches/<name>.rs` lands on disk; `autobenches = false`
-# in [package] keeps cargo from autodiscovering in the meantime.
-# [[bench]]
-# name = "wire_codec"
-# path = "benches/wire_codec.rs"
-# harness = false
-#
-# [[bench]]
-# name = "inflight_table"
-# path = "benches/inflight_table.rs"
-# harness = false
-#
-# [[bench]]
-# name = "committed_subscriber"
-# path = "benches/committed_subscriber.rs"
-# harness = false
+# `benches/` is `.gitignore`d like `tests/` (the project keeps both
+# trees out of git); the files live on disk and these entries wire
+# them into cargo. `autobenches = false` keeps cargo from
+# autodiscovering anything else.
+[[bench]]
+name = "wire_codec"
+path = "benches/wire_codec.rs"
+harness = false
+
+[[bench]]
+name = "inflight_table"
+path = "benches/inflight_table.rs"
+harness = false
+
+[[bench]]
+name = "committed_subscriber"
+path = "benches/committed_subscriber.rs"
+harness = false

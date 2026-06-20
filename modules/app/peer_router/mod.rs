@@ -75,7 +75,19 @@ use types::*;
 // peer links with ample client headroom.
 const MAX_CONNS: usize = 64;
 const BUF_SIZE: usize = 2048;
+const METRICS_INTERVAL_MS: u64 = 1000;
 const RECONNECT_MS: u64 = 2000;
+/// A `connected` peer silent this long is deemed a dead/half-open link and
+/// torn down for reconnection. Held WELL above the Raft heartbeat/election
+/// cadence so a healthy peer is never dropped — and deliberately generous
+/// (15 s) so a node that's merely slow to service its net input under load /
+/// a scheduling stall is NOT mistaken for a dead link. A too-eager timeout
+/// causes counterproductive reconnect churn precisely when a starved node can
+/// least afford the CPU. Genuine link death is mostly caught immediately by
+/// the transport's `NMSG_CLOSED`; this timeout only backstops the SILENT
+/// half-open case the transport never reports, where a 15–30 s recovery is
+/// perfectly acceptable.
+const PEER_LIVENESS_MS: u64 = 15_000;
 
 // Net protocol (same as ip/tls)
 define_params! {
@@ -169,11 +181,26 @@ struct PeerAddr {
     configured: bool,
     connected: bool,
     last_attempt_ms: u64,
+    /// Wall-clock (ms) of the last identified frame received from this peer.
+    /// A healthy Raft link always carries traffic within a heartbeat interval
+    /// (leader → AE/heartbeat, follower → response), so a `connected` peer that
+    /// goes silent past `PEER_LIVENESS_MS` is a dead/half-open link the
+    /// transport never reported closed — `reconnect_stale_peers` tears it down
+    /// so the existing redial path re-establishes it. Set on identity and on
+    /// every received peer frame; meaningless while `!connected`.
+    last_rx_ms: u64,
 }
 
 impl PeerAddr {
     const fn empty() -> Self {
-        Self { ip: 0, port: 0, configured: false, connected: false, last_attempt_ms: 0 }
+        Self {
+            ip: 0,
+            port: 0,
+            configured: false,
+            connected: false,
+            last_attempt_ms: 0,
+            last_rx_ms: 0,
+        }
     }
 }
 
@@ -191,11 +218,15 @@ struct ModuleState {
     cleartext: i32,     // out[1]: non-Raft client data → client_surface
     peer_rx: i32,       // out[2]: AppendEntries acks → replicator_pN
     raft_rpc: i32,      // out[3]: votes/AE/heartbeats → raft_engine_pN
+    out_metrics: i32,   // out[4]: MSG_METRIC_SAMPLE to telemetry_agg
 
     // Config
     self_id: ReplicaId,
     peer_count: u8,
     listen_port: u16,
+    last_metrics_ms: u64,
+    bytes_in: u64,
+    bytes_out: u64,
 
     // Connection table
     conns: [Conn; MAX_CONNS],
@@ -205,6 +236,16 @@ struct ModuleState {
 
     // State
     bound: bool,
+    /// Set once we've warned that a `MSG_ACCEPTED` arrived WITHOUT a
+    /// stamped listener port (`payload_len < 3`). On a shared
+    /// linux_net/ip provider that means we cannot tell our own client
+    /// conns from another anchor's (e.g. http_ingress's diagnostic
+    /// port) and fall back to claiming everything — which silently
+    /// misroutes the other anchor's bytes here as bogus client
+    /// proposals. The modern provider stamps the port (fluxor
+    /// `c8331d4`); seeing this warning means the runtime is stale or
+    /// a legacy provider is in use. Warn once, not per-accept.
+    legacy_accept_warned: bool,
 
     buf: [u8; BUF_SIZE],
 }
@@ -249,6 +290,7 @@ pub extern "C" fn module_new(
         s.cleartext = dev_channel_port(sys, 1, 1);
         s.peer_rx = dev_channel_port(sys, 1, 2);
         s.raft_rpc = dev_channel_port(sys, 1, 3);
+        s.out_metrics = dev_channel_port(sys, 1, 4);
 
         // Defaults + TLV param parsing
         set_defaults(s);
@@ -281,17 +323,51 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let now = dev_millis(sys);
 
         if !s.bound { try_bind(s, sys); }
+        // Tear down any silently-dead peer link BEFORE redialing, so the
+        // reconnect happens in the same step the staleness is detected.
+        reconnect_stale_peers(s, sys, now);
         connect_peers(s, sys, now);
         // Drain TLS identity bindings BEFORE processing inbound net
         // events so a per-connection identity is in place by the time
         // any in-band handshake arrives. See RFC §5.1.
         drain_tls_identity(s, sys);
-        process_net_events(s, sys);
+        process_net_events(s, sys, now);
         route_outbound_chan(s, sys, s.peer_tx);
         route_outbound_chan(s, sys, s.repl_tx);
         route_client_responses(s, sys);
+        emit_metrics(s, sys, now);
 
         0
+    }
+}
+
+/// Emit the open-connection gauge as a typed sample (RFC §4.2/§4.3).
+/// Node-level module, so partition_id is 0. Dropped under backpressure.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
+    if s.out_metrics < 0 { return; }
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    s.last_metrics_ms = now;
+
+    let mut open: i64 = 0;
+    for c in s.conns.iter() {
+        if c.active { open += 1; }
+    }
+    let mid = wire::MODULE_ID_PEER_ROUTER;
+    let samples: [(u16, u8, i64); 3] = [
+        (wire::metric_ids::PEER_CONNECTIONS_OPEN, wire::METRIC_KIND_GAUGE, open),
+        (wire::metric_ids::PEER_BYTES_IN, wire::METRIC_KIND_COUNTER, s.bytes_in as i64),
+        (wire::metric_ids::PEER_BYTES_OUT, wire::METRIC_KIND_COUNTER, s.bytes_out as i64),
+    ];
+    for &(metric_id, kind, value) in samples.iter() {
+        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
+        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
+        wire::encode_metric_sample(&mut buf, mid, 0, metric_id, kind, value);
+        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
     }
 }
 
@@ -399,6 +475,56 @@ unsafe fn connect_peers(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     }
 }
 
+/// Ask the transport to close a connection (best-effort) so its fd is freed.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a
+/// `&SyscallTable` whose function pointers reach live kernel routines per
+/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn close_conn(s: &mut ModuleState, sys: &SyscallTable, conn_id: u8) {
+    if s.net_out < 0 { return; }
+    let poll = (sys.channel_poll)(s.net_out, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    let payload = [conn_id];
+    net_write_frame(sys, s.net_out, NCMD_CLOSE, payload.as_ptr(), 1,
+                    s.buf.as_mut_ptr(), BUF_SIZE);
+}
+
+/// Tear down peer links that are `connected` but have received no traffic for
+/// `PEER_LIVENESS_MS` — a half-open / silently-dead connection the transport
+/// never reported closed (no `NMSG_CLOSED`). Closing the conn slot(s) and
+/// clearing `connected` lets `connect_peers` redial on the next pass, so a
+/// node recovers from a transient link drop without an external restart.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a
+/// `&SyscallTable` whose function pointers reach live kernel routines per
+/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn reconnect_stale_peers(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
+    for i in 0..MAX_NODES {
+        if i == s.self_id as usize { continue; }
+        if !s.peer_addrs[i].configured || !s.peer_addrs[i].connected { continue; }
+        if now.wrapping_sub(s.peer_addrs[i].last_rx_ms) <= PEER_LIVENESS_MS { continue; }
+
+        // Silent past the liveness window → dead link. Close every conn slot
+        // bound to this peer (inbound and/or outbound) and free it so a fresh
+        // dial + identity handshake re-establishes the binding cleanly.
+        for slot in 0..MAX_CONNS {
+            if s.conns[slot].active && s.conns[slot].replica_id == i as i8 {
+                close_conn(s, sys, s.conns[slot].conn_id);
+                s.conns[slot] = Conn::empty();
+            }
+        }
+        s.peer_addrs[i].connected = false;
+        // Redial promptly: clear the backoff so connect_peers dials this pass
+        // rather than waiting out a stale RECONNECT_MS window from the last dial.
+        s.peer_addrs[i].last_attempt_ms = now.wrapping_sub(RECONNECT_MS);
+        dev_log(&*s.syscalls, 2, b"[pr] peer stale, reconnecting".as_ptr(), 29);
+    }
+}
+
 // ── Inbound event processing ────────────────────────────────
 
 /// # Safety
@@ -407,7 +533,7 @@ unsafe fn connect_peers(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable) {
+unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     if s.net_in < 0 { return; }
 
     for _ in 0..8 {
@@ -439,6 +565,14 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable) {
                     u16::from_le_bytes([s.buf[NET_FRAME_HDR + 1], s.buf[NET_FRAME_HDR + 2]])
                 } else {
                     // Legacy providers that omit the port: claim as before.
+                    // On a shared provider this misroutes other anchors'
+                    // conns (e.g. http_ingress) here as bogus client
+                    // proposals — warn once so a stale runtime is visible
+                    // rather than a silent double-processing bug.
+                    if !s.legacy_accept_warned {
+                        s.legacy_accept_warned = true;
+                        dev_log(sys, 2, b"[pr] accept w/o port stamp; stale runtime?".as_ptr(), 42);
+                    }
                     s.listen_port
                 };
                 if payload_len >= 1 && local_port == s.listen_port {
@@ -469,6 +603,8 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable) {
                 if payload_len < 2 { continue; }
                 let data_start = NET_FRAME_HDR + 1; // after header + conn_id
                 let data_len = payload_len - 1;
+                s.bytes_in = s.bytes_in.wrapping_add(data_len as u64); // §4.2 ingress
+
                 let mut local = [0u8; 512];
                 let cl = data_len.min(512);
                 local[..cl].copy_from_slice(&s.buf[data_start..data_start + cl]);
@@ -478,11 +614,13 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable) {
 
                 if !s.conns[slot].identified {
                     // Try to parse identity message
-                    handle_identity(s, sys, slot, &local[..cl]);
+                    handle_identity(s, sys, slot, &local[..cl], now);
                 } else {
                     // Route based on replica_id
                     let rid = s.conns[slot].replica_id;
                     if rid >= 0 && (rid as usize) < MAX_NODES {
+                        // Liveness: this peer's link is carrying traffic.
+                        s.peer_addrs[rid as usize].last_rx_ms = now;
                         // Peer traffic: parse 5-byte partitioned envelope
                         // [partition_id:u16 LE][msg_type:u8][len:u16 LE]
                         // - APPEND_ENTRIES_RESP        → peer_rx (replicator_pN)
@@ -575,7 +713,7 @@ unsafe fn send_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize) {
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn handle_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize, data: &[u8]) {
+unsafe fn handle_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize, data: &[u8], now: u64) {
     if data.len() < ID_MSG_LEN { return; }
 
     let magic = u16::from_le_bytes([data[0], data[1]]);
@@ -624,6 +762,25 @@ unsafe fn handle_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize, 
         s.conns[slot].identified = true;
     }
     s.peer_addrs[peer_id as usize].connected = true;
+    // Fresh link — start the liveness window now so a just-established peer
+    // isn't immediately judged stale before its first data frame.
+    s.peer_addrs[peer_id as usize].last_rx_ms = now;
+
+    // Dedupe: keep only this (newest) conn for the peer. A peer pair holds two
+    // directional conns (each side dials the other), and after a reconnect the
+    // OLD conn can linger half-open — `find_conn_by_replica` (outbound routing)
+    // would then keep sending AEs into the dead conn and the peer never hears
+    // from us. Closing every other conn bound to this replica forces routing
+    // onto the live conn (TCP is full-duplex, so one conn carries both
+    // directions). This is what lets a reconnected follower actually receive
+    // AEs and catch up, not just complete the handshake.
+    for other in 0..MAX_CONNS {
+        if other == slot { continue; }
+        if s.conns[other].active && s.conns[other].replica_id == peer_id as i8 {
+            close_conn(s, sys, s.conns[other].conn_id);
+            s.conns[other] = Conn::empty();
+        }
+    }
 
     // If we're the inbound side, reply with our identity
     if !s.conns[slot].outbound {
@@ -719,6 +876,7 @@ unsafe fn send_to_conn(
     if !data.is_empty() {
         payload[6..6 + data.len()].copy_from_slice(data);
     }
+    s.bytes_out = s.bytes_out.wrapping_add(data.len() as u64); // §4.2 egress
 
     net_write_frame(sys, s.net_out, NCMD_SEND, payload.as_ptr(), payload_len,
                     s.buf.as_mut_ptr(), BUF_SIZE);

@@ -32,6 +32,8 @@ mod wire_channels;
 // Q16.16 fixed-point helpers
 const FP_ONE: i32 = 1 << 16;
 
+const METRICS_INTERVAL_MS: u64 = 1000;
+
 fn fp_mul(a: i32, b: i32) -> i32 {
     ((a as i64 * b as i64) >> 16) as i32
 }
@@ -63,6 +65,7 @@ struct ModuleState {
     // Timing
     sample_period_ms: u16,
     last_sample_ms: u64,
+    last_metrics_ms: u64,
 
     // Current lag (from replicator)
     current_lag: i32,
@@ -191,6 +194,35 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // 4. Periodic credit-pool gauges (RFC §4.2).
+        emit_metrics(s, sys, now);
+
         0
+    }
+}
+
+/// Emit the entry/byte credit-pool depths as typed gauges (RFC §4.3).
+/// Node-level module, so partition_id is 0. Dropped under backpressure.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
+    if s.out_metrics < 0 { return; }
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    s.last_metrics_ms = now;
+
+    let mid = wire::MODULE_ID_FLOW_CONTROLLER;
+    let kg = wire::METRIC_KIND_GAUGE;
+    let samples: [(u16, i64); 2] = [
+        (wire::metric_ids::FLOW_ENTRY_CREDITS, i64::from(s.entry_credits)),
+        (wire::metric_ids::FLOW_BYTE_CREDITS, i64::from(s.byte_credits)),
+    ];
+    for &(metric_id, value) in samples.iter() {
+        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
+        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
+        wire::encode_metric_sample(&mut buf, mid, 0, metric_id, kg, value);
+        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
     }
 }

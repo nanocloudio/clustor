@@ -44,6 +44,18 @@ name = "read_probe_reply"
 direction = "input"
 content_type = "OctetStream"
 
+# WAL random-access reply from `wal.entry_reply` (MSG_WAL_ENTRY_REPLY
+# `[request_id:u32][term:u64][index:u64][body...]`). Used by the apply-side
+# gap-recovery path: when the lossy `log_observe` fan-out dropped an entry
+# body under overdrive, apply_pipeline refetches the missing index from the
+# durable WAL via `entry_request` and inserts the reply here so it can keep
+# applying in order. Optional; leave unwired for graphs that tolerate the
+# best-effort observer stream.
+[[ports]]
+name = "entry_reply"
+direction = "input"
+content_type = "OctetStream"
+
 [[ports]]
 name = "applied"
 direction = "output"
@@ -82,6 +94,30 @@ name = "admin_committed"
 direction = "output"
 content_type = "OctetStream"
 
+# MSG_METRIC_SAMPLE fan-in to telemetry_agg.ingest (RFC §4.3). Appended
+# last so applied/committed_entries/read_probe_request/admin_committed
+# keep output indices 0-3.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# WAL random-access request to `wal.entry_request` (MSG_WAL_ENTRY_REQUEST
+# `[request_id:u32][wal_index:u64]`). Emitted when the in-order apply loop
+# hits a gap (the next-needed committed index is missing from the observer
+# buffer because the best-effort `log_observe` fan-out dropped it under
+# overdrive). The WAL serves the durable entry back on `entry_reply`.
+# Appended last so applied/committed_entries/read_probe_request/
+# admin_committed/metrics keep output indices 0-4.
+[[ports]]
+name = "entry_request"
+direction = "output"
+content_type = "OctetStream"
+
 [observability]
-# Ordered dedup delivery to the state machine; `[apply] ok` per applied entry.
-metrics = ["entries_applied", "dedup_drops"]
+# Ordered dedup delivery to the state machine; `[apply] ok` per applied
+# entry. Emitted as typed MSG_METRIC_SAMPLE: entries_applied counter,
+# queue_depth gauge (§4.2), and the apply_batch_latency_ms histogram
+# (§4.1). Partition-stamped for multi-Raft graphs.
+metrics = ["entries_applied", "queue_depth", "refetched", "caught_up", "entries_evicted", "reads_evicted"]
+histograms = ["apply_batch_latency_ms"]

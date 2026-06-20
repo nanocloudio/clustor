@@ -43,6 +43,15 @@ name = "committed"
 direction = "output"
 content_type = "OctetStream"
 
+# MSG_METRIC_SAMPLE fan-in to telemetry_agg.ingest (RFC §4.3). Appended
+# last so `committed` keeps output index 0.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
 [observability]
 # Quorum commit-index computation; `[commit] adv` marks each advance.
+# Emitted as typed MSG_METRIC_SAMPLE (commit_index gauge,
+# commit_advances counter), partition-stamped for multi-Raft graphs.
 metrics = ["commit_index", "commit_advances"]

@@ -51,6 +51,43 @@ const MAX_INFLIGHT_PROBES: usize = 8;
 /// before we give up and answer the read with fallback. Sized to the
 /// election-timeout floor so a slow follower can't trick us.
 const PROBE_TIMEOUT_MS: u64 = 1500;
+/// Durability-backpressure window (RFC §13/§14). The leader stops pulling
+/// new proposals once its log runs this many entries ahead of `commit_index`
+/// (i.e. ahead of quorum-durable state). This bounds over-production end to
+/// end: without it, in WAL group-fsync mode the WAL absorbs writes faster
+/// than they commit, so the raft→wal channel never fills and raft never
+/// sees backpressure — it races ahead, overflowing the `log_observe` fanout
+/// and apply_pipeline's 32-slot body buffer, which then evicts un-applied
+/// entries and stalls (the L2 cliff). Held strictly below
+/// apply_pipeline's `PENDING_ENTRY_SLOTS` (32) so a bounded backlog never
+/// forces an eviction. At sustainable rates the in-flight window is a
+/// handful of entries (rate × commit latency), so this never throttles
+/// healthy load — it only caps the runaway. The injector/throttle_gate
+/// upstream then backpressure (their channel to raft fills), turning the
+/// cliff into a plateau at commit throughput.
+const MAX_UNCOMMITTED_INFLIGHT: u64 = 24;
+
+/// Recent (index → term) ring for follower-side log matching and Raft §5.3
+/// conflict repair. Only the *uncommitted* tail can ever diverge (committed
+/// entries are immutable and identical cluster-wide), and that tail is
+/// bounded by `MAX_UNCOMMITTED_INFLIGHT`, so a small power-of-two ring covers
+/// every index a conflict check can legitimately target. Indices at/below
+/// `commit_index` are trusted to match without a ring hit.
+const TAIL_TERM_RING: usize = 64;
+const TAIL_TERM_MASK: u64 = (TAIL_TERM_RING as u64) - 1;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TailTerm {
+    /// 0 means the slot is empty.
+    index: Index,
+    term: Term,
+}
+
+/// Slots in the append→commit timestamp ring (RFC §4.1 commit latency).
+/// Sized to cover in-flight uncommitted entries on the leader; a wrap
+/// before commit just drops that sample (the equality check guards it).
+const COMMIT_TS_RING: usize = 64;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -114,10 +151,23 @@ define_params! {
     // (raft/p<id>/meta). See .context/rfc_partition_groups.md.
     7, partition_id, u16, 0
         => |s, d, len| { s.partition_id = p_u16(d, len, 0, 0); };
+
+    // 1 = persist metadata to a root-level 8.3 file via FS_OPEN_CREATE
+    // (bare-metal FAT32 has no mkdir). See the `meta_root_path` field.
+    8, root_path, u8, 0
+        => |s, d, len| { s.meta_root_path = p_u8(d, len, 0, 0); };
 }
 
 // FS opcodes
 const FS_OPEN: u32 = 0x0900;
+/// Write-side opener: creates the file if absent (FS_OPEN is read-only-
+/// if-exists). Required for the root-level metadata file on bare-metal
+/// FAT32, which has no mkdir for the default `raft/meta` parent.
+const FS_OPEN_CREATE: u32 = 0x0909;
+/// FS E_AGAIN: provider present but still initialising (fat32 reading the BPB
+/// on a cm5 cold boot). `load_metadata` must retry rather than treat this as
+/// "no metadata" — otherwise a recovering node restarts fresh.
+const FS_E_AGAIN: i32 = -11;
 const FS_READ: u32 = 0x0901;
 const FS_WRITE: u32 = 0x0906;
 const FS_FSYNC: u32 = 0x0905;
@@ -137,6 +187,10 @@ const FS_SEEK: u32 = 0x0902;
 ///    [joint_active:u8]`
 const META_SIZE: usize = 28;
 const META_PATH_MAX: usize = 32;
+/// Persist metadata on the durable-ack path at most once per this many
+/// durable-index advances (a crash loses at most this much of the durable
+/// *hint*; the WAL replay re-derives the exact durable index on recovery).
+const META_PERSIST_STRIDE: Index = 64;
 
 #[repr(C)]
 struct ModuleState {
@@ -155,6 +209,7 @@ struct ModuleState {
     in_read_probe: i32,                   // in[9]: MSG_READ_PROBE_REQ from apply_pipeline
     in_admin_committed: i32,              // in[10]: MSG_ADMIN_COMMITTED from apply_pipeline (§3.1)
     in_wal_flushed: i32,                  // in[11]: MSG_FSYNC_ACK from local wal.flushed (spec §10.4.1)
+    in_wal_replay_complete: i32,          // in[12]: MSG_WAL_REPLAY_COMPLETE from wal.replay_complete (recovery resume)
     out_append: i32,                      // out[0]: AppendEntries to replicator
     out_rpc: i32,                         // out[1]: Vote/Heartbeat RPC to peer_router
     out_log: i32,                         // out[2]: WalEntry to wal
@@ -227,6 +282,13 @@ struct ModuleState {
     last_log_index: Index,
     last_log_term: Term,
     commit_index: Index,
+    /// Recent (index → term) ring (see `TAIL_TERM_RING`). Written whenever
+    /// `last_log_index` advances (leader flush, follower accept); read by the
+    /// follower log-match / conflict-repair path. Zero-initialised (empty).
+    tail_terms: [TailTerm; TAIL_TERM_RING],
+    /// Count of Raft §5.3 conflict-repair truncations this node has driven
+    /// (divergent suffix discarded). Emitted as `raft.log_truncations`.
+    log_truncations: u32,
 
     /// Replica-local WAL-durable watermark (spec §10.4.1
     /// `local_wal_durable_index`). Tracked from MSG_FSYNC_ACK on the
@@ -237,6 +299,55 @@ struct ModuleState {
     /// channel.
     local_durable_index: Index,
 
+    // ── Persistent metadata (term/vote/durable index) ───────
+    /// 1 = persist metadata to a ROOT-level 8.3 file (`RAFT<pppp>.MET`)
+    /// via FS_OPEN_CREATE, mirroring `wal.root_path`. Required on bare-metal
+    /// FAT32 (no mkdir, so the `raft/meta` path can't be created). Default 0
+    /// keeps the `raft/meta` layout for the linux volatile-FS provider.
+    meta_root_path: u8,
+    /// Cached metadata fd (root_path mode): opened once with FS_OPEN_CREATE
+    /// and reused for every persist, so a save never pays a cold dir-scan
+    /// re-open. -1 = not yet opened.
+    meta_fd: i32,
+    /// Highest `local_durable_index` already persisted to the metadata file.
+    /// Throttles the durable-path persist so we don't fsync metadata on every
+    /// single durable-index advance (which would double the WAL fsync load).
+    meta_persisted_durable: Index,
+    /// Set true by load_metadata on a recovery boot (persisted durable index
+    /// > 0). On the first step where the apply-reset channel is writable, raft
+    /// emits MSG_APPLY_PIPELINE_RESET to the recovered durable index so
+    /// apply_pipeline seeds its apply_index to the durable base — otherwise it
+    /// would gap (expecting index 1 while the WAL replay re-acks committed
+    /// entries at the recovered base) and never apply post-recovery commits.
+    /// Cleared once the reset lands. (NB: a production state machine would seed
+    /// from a persisted *applied* snapshot index; for this disk-durable bench
+    /// the durable index is the recovery floor.)
+    pending_recovery_reset: bool,
+    /// True while the boot-time metadata load is still waiting on the FS
+    /// provider (FS_OPEN returned E_AGAIN at module_new — fat32 not ready yet).
+    /// module_step retries load_metadata until it resolves, so a recovering
+    /// node actually picks up its persisted term/vote/durable-index instead of
+    /// silently restarting fresh.
+    meta_load_pending: bool,
+    /// Recovery intake hold. Set in `module_new` whenever the dedicated
+    /// `wal_replay_complete` edge is wired (a disk-recovery graph) —
+    /// deliberately INDEPENDENT of the persisted meta hint, which can read
+    /// back as 0 (throttled / early-save) and must not be the thing that
+    /// decides whether to wait. While true, `step_leader` does NOT drain
+    /// proposals — raft must not append new entries before it learns the
+    /// WAL's true on-disk high-water, or they collide with the index space
+    /// the WAL is still re-acking from replay. Cleared when
+    /// `drain_wal_replay_complete` receives that high-water and resumes
+    /// `last_log_index` there (the WAL's replayed high-water is
+    /// AUTHORITATIVE, overriding the meta hint). See
+    /// `wire::MSG_WAL_REPLAY_COMPLETE`.
+    awaiting_replay: bool,
+    /// Diagnostic: the WAL replay high-water raft last resumed at (0 if none).
+    replay_hw_received: Index,
+    /// Diagnostic: the log index raft loaded from RAFT0000.MET at boot
+    /// (0 = none / fresh). Exposes whether the persisted hint is present.
+    meta_hint_loaded: Index,
+
     // ── Proposal batching ───────────────────────────────────
     proposal_batch: [u8; PROPOSAL_BATCH_CAP],
     proposal_batch_len: u16,
@@ -244,6 +355,22 @@ struct ModuleState {
     proposal_batch_max: u16,
     proposal_batch_start_ms: u64,
     proposal_batch_timeout_ms: u16,
+
+    /// Durability backpressure (RFC §13/§14). Set true when
+    /// `flush_proposal_batch` could not write to `out_log` (the WAL is
+    /// mid-fsync or overloaded). While true, the batch is held pending —
+    /// `last_log_index` is NOT advanced, so raft's log never diverges from
+    /// the WAL — and proposal intake is suspended (`drain_proposals`
+    /// returns early), leaving proposals queued in their input channels so
+    /// the upstream proposer backpressures rather than loses them. Cleared
+    /// on the next successful flush. This is what turns the L2
+    /// over-production cliff (garbage commit_index) into a bounded plateau
+    /// at WAL throughput, and it distinguishes transient fsync-fullness
+    /// (cleared within a tick or two) from sustained overload (stays set,
+    /// channels fill, upstream throttles) without a separate heuristic.
+    flush_deferred: bool,
+    /// Count of flush deferrals — emitted as RAFT_FLUSHES_DEFERRED.
+    flushes_deferred: u32,
 
     /// Parallel array indexed [0..proposal_batch_count). 0 means the
     /// proposal was untagged (no MSG_PROPOSAL_ASSIGNED to emit). Non-zero
@@ -283,6 +410,14 @@ struct ModuleState {
     /// operators can tell admin freeze vs control-plane fallback apart.
     proposals_dropped_strict: u32,
     last_metrics_ms: u64,
+    /// Append→commit timestamp ring for `clustor.raft.commit_latency_ms`
+    /// (RFC §4.1). Keyed by `log_index % COMMIT_TS_RING`; the parallel
+    /// `commit_ts_us` array holds the leader-local `dev_micros` stamp
+    /// taken when the entry was appended. On commit-advance the matching
+    /// slot's age is folded into `commit_latency_buckets` and cleared.
+    commit_ts_index: [Index; COMMIT_TS_RING],
+    commit_ts_us: [u64; COMMIT_TS_RING],
+    commit_latency_buckets: [u32; wire::hist::COMMIT_LATENCY_US.len() + 1],
 
     // ── Leader-state hint ───────────────────────────────────
     // Last (leader_id, term) we broadcast on `leader_state`. Re-emit
@@ -356,6 +491,7 @@ pub extern "C" fn module_new(
         s.in_read_probe = dev_channel_port(sys, 0, 9);
         s.in_admin_committed = dev_channel_port(sys, 0, 10);
         s.in_wal_flushed = dev_channel_port(sys, 0, 11);
+        s.in_wal_replay_complete = dev_channel_port(sys, 0, 12);
         s.out_rpc = dev_channel_port(sys, 1, 1);
         s.out_log = dev_channel_port(sys, 1, 2);
         s.out_metrics = dev_channel_port(sys, 1, 3);
@@ -381,11 +517,26 @@ pub extern "C" fn module_new(
         s.frozen = false;
         s.durability_mode = 0;
         s.pending_transfer_to = 0;
+        s.flush_deferred = false;
+        s.flushes_deferred = 0;
+        s.commit_ts_index = [0; COMMIT_TS_RING];
+        s.commit_ts_us = [0; COMMIT_TS_RING];
+        s.commit_latency_buckets = [0u32; wire::hist::COMMIT_LATENCY_US.len() + 1];
 
         // Defaults + TLV param parsing
         s.voted_for = REPLICA_NONE as i8;
         s.leader_id = REPLICA_NONE as i8;
         s.role = ROLE_FOLLOWER;
+        s.meta_fd = -1;
+        s.meta_persisted_durable = 0;
+        s.pending_recovery_reset = false;
+        s.meta_load_pending = false;
+        // Hold proposal intake from boot whenever the recovery edge is wired,
+        // so raft never appends before the WAL hands over its authoritative
+        // on-disk high-water. Independent of the meta hint (which can be 0).
+        s.awaiting_replay = s.in_wal_replay_complete >= 0;
+        s.replay_hw_received = 0;
+        s.meta_hint_loaded = 0;
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
@@ -416,8 +567,14 @@ pub extern "C" fn module_new(
         // tolerates that.)
         // The emission itself happens in the first step() call.
 
-        // Restore persistent state from metadata file
-        load_metadata(s, sys);
+        // Restore persistent state from metadata file. At cold boot the FS
+        // provider may not be ready (E_AGAIN); if so, retry on later steps
+        // (see module_step) rather than silently starting fresh. Only the
+        // disk-persistent (`root_path`) configuration retries — without it
+        // there is no metadata file to wait for, so a non-persistent graph
+        // (in-memory / linux) proceeds immediately as before.
+        let load_again = load_metadata(s, sys);
+        s.meta_load_pending = load_again && s.meta_root_path != 0;
 
         // Set initial election deadline
         let now = dev_millis(sys);
@@ -442,6 +599,66 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
+
+        // 0a. Boot-time metadata load retry. At cold boot the fat32 provider
+        //     isn't ready when module_new ran (FS_OPEN -> E_AGAIN), so the
+        //     persisted term/vote/durable-index couldn't be read then. Retry
+        //     each step until the FS resolves — otherwise a recovering node
+        //     silently restarts fresh and its new appends collide with the
+        //     replayed index space (the L4 recovery bug).
+        if s.meta_load_pending {
+            s.meta_load_pending = load_metadata(s, sys);
+            // Until the persisted state is in hand, hold the whole step: don't
+            // run elections or append/intake, or raft would assign FRESH log
+            // indices that then collide when the loaded last_log_index lands.
+            // The FS resolves within a few steps of cold boot; a fresh deploy
+            // (no meta file) resolves immediately (load returns not-pending).
+            if s.meta_load_pending {
+                return 0;
+            }
+        }
+
+        // 0. Recovery seeding: fast-forward apply_pipeline to the recovery
+        //    BASE so it resumes applying post-recovery commits instead of
+        //    gapping from apply_index=0. The base is the FIXED recovered
+        //    high-water (`replay_hw_received` for the WAL-handshake path, or
+        //    the persisted hint `last_log_index` for the legacy no-edge path)
+        //    — NOT the live `last_log_index`, which would drift forward once
+        //    intake resumes and make apply skip freshly-appended bodies.
+        //    Crucially, on the WAL-handshake path we keep `awaiting_replay`
+        //    set until THIS reset has actually been emitted, so no new entry
+        //    is appended before apply has been seeded to the base; that keeps
+        //    the post-recovery body stream gap-free in order. Retried until
+        //    the channel is writable, then cleared.
+        if s.pending_recovery_reset {
+            let before = (sys.channel_poll)(s.out_commit_advanced, 0x02);
+            if s.out_commit_advanced >= 0 && before > 0 && (before as u32 & 0x02) != 0 {
+                let high_water = if s.replay_hw_received > 0 {
+                    s.replay_hw_received
+                } else {
+                    s.last_log_index
+                };
+                // Crash recovery is NOT a snapshot install: the committed
+                // entries up to `high_water` still live in the WAL and their
+                // bodies must be REPLAYED into the (volatile) apply consumers,
+                // not skipped. So we advance apply_pipeline's commit_horizon to
+                // `high_water` with a normal MSG_COMMITTED_BATCH (which leaves
+                // its apply_index at the recovery floor — 0, or a snapshot
+                // index if one was installed first); its refetch loop then
+                // pulls each body back from the WAL and applies it in order.
+                // Using MSG_APPLY_PIPELINE_RESET here (snapshot semantics)
+                // would jump apply_index past the bodies and the state machine
+                // would never see the recovered entries.
+                let mut buf = [0u8; 16];
+                wire::encode_term_index(&mut buf, s.last_log_term, high_water);
+                wire_channels::channel_write_msg(
+                    sys, s.out_commit_advanced, wire::MSG_COMMITTED_BATCH, &buf,
+                );
+                s.pending_recovery_reset = false;
+                // Horizon is seeded — now it is safe to accept new proposals.
+                s.awaiting_replay = false;
+            }
+        }
 
         // 1. Process inbound RPCs (all roles)
         process_rpc(s, sys, now);
@@ -474,6 +691,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //     (spec §10.4.1). Cheap drain — leader and follower both
         //     run it but only the follower's value flows over the wire.
         drain_wal_flushed(s, sys);
+
+        // 3f. Boot-time recovery resume: if the WAL has finished replay and
+        //     handed us its exact on-disk high-water, resume `last_log_index`
+        //     there (overriding the stale persisted hint), re-seed
+        //     apply_pipeline, and release the proposal-intake hold.
+        drain_wal_replay_complete(s, sys);
 
         // 4. Role-specific logic
         match s.role {
@@ -868,6 +1091,97 @@ unsafe fn emit_wal_compact_before(s: &ModuleState, sys: &SyscallTable, before_in
     wire_channels::channel_write_msg(sys, s.out_wal_compact, wire::MSG_WAL_COMPACT_BEFORE, &buf);
 }
 
+/// Tell the WAL to discard every entry strictly after `keep_through_index`
+/// (Raft §5.3). Rides the shared `wal.compact_before` control channel.
+///
+/// # Safety
+///
+/// Caller must hold a valid `&ModuleState` and a `&SyscallTable` whose
+/// function pointers reach live kernel routines per the module ABI.
+unsafe fn emit_wal_truncate_after(s: &ModuleState, sys: &SyscallTable, keep_through_index: u64) {
+    if s.out_wal_compact < 0 { return; }
+    let poll = (sys.channel_poll)(s.out_wal_compact, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    let buf = keep_through_index.to_le_bytes();
+    wire_channels::channel_write_msg(sys, s.out_wal_compact, wire::MSG_WAL_TRUNCATE_AFTER, &buf);
+}
+
+/// Record the term we hold at `index` in the tail ring (called whenever
+/// `last_log_index` advances).
+#[inline]
+fn record_tail_term(s: &mut ModuleState, index: Index, term: Term) {
+    if index == 0 { return; }
+    let slot = (index & TAIL_TERM_MASK) as usize;
+    s.tail_terms[slot] = TailTerm { index, term };
+}
+
+/// Term stored at `index` in the tail ring, if still resident. `None` means
+/// the index is not in the ring window (too old / never seen).
+#[inline]
+fn ring_term_at(s: &ModuleState, index: Index) -> Option<Term> {
+    if index == 0 { return Some(0); }
+    let slot = (index & TAIL_TERM_MASK) as usize;
+    let t = s.tail_terms[slot];
+    if t.index == index { Some(t.term) } else { None }
+}
+
+/// True iff our log holds an entry at `index` whose term equals `term`.
+/// Index 0 (before the log) and committed indices match by definition —
+/// committed entries are immutable and identical across the cluster, so a
+/// disagreement there is impossible in correct Raft.
+#[inline]
+fn log_term_matches(s: &ModuleState, index: Index, term: Term) -> bool {
+    if index == 0 || index <= s.commit_index {
+        return true;
+    }
+    ring_term_at(s, index) == Some(term)
+}
+
+/// Discard the divergent suffix: keep entries through `keep_through`, drop the
+/// rest from both our log pointers and the WAL. Refuses to touch committed
+/// state (a defensive no-op — callers never request it).
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and a `&SyscallTable`
+/// whose function pointers reach live kernel routines per the module ABI.
+unsafe fn truncate_log_after(s: &mut ModuleState, sys: &SyscallTable, keep_through: Index) {
+    if s.last_log_index <= keep_through {
+        return;
+    }
+    // SAFETY INVARIANT: committed entries are immutable. Never truncate at or
+    // below commit_index. The log-match checks only ever flag conflicts in the
+    // uncommitted tail, so this clamp should be unreachable — it exists so a
+    // future caller bug degrades to "do nothing" rather than data loss.
+    if keep_through < s.commit_index {
+        return;
+    }
+    // If the WAL truncate channel is unwired (single-node graphs, or a config
+    // that hasn't added the edge), we MUST NOT roll our in-memory log back:
+    // doing so without the WAL also discarding the suffix would let the WAL
+    // replay both the stale and the re-sent entry. Degrade to the conservative
+    // behaviour — leave the log as-is; the caller still NACKs and the leader
+    // retries (the pre-conflict-repair path). Truncation is opt-in via wiring.
+    if s.out_wal_compact < 0 {
+        return;
+    }
+    emit_wal_truncate_after(s, sys, keep_through);
+    // Evict the now-stale ring slots in (keep_through, last_log_index].
+    let mut i = keep_through + 1;
+    let bound = keep_through + TAIL_TERM_RING as u64 + 1;
+    while i <= s.last_log_index && i <= bound {
+        let slot = (i & TAIL_TERM_MASK) as usize;
+        if s.tail_terms[slot].index == i {
+            s.tail_terms[slot].index = 0;
+        }
+        i += 1;
+    }
+    s.last_log_index = keep_through;
+    s.last_log_term = ring_term_at(s, keep_through).unwrap_or(s.last_log_term);
+    s.log_truncations = s.log_truncations.saturating_add(1);
+    dev_log(sys, 3, b"[raft] log truncate".as_ptr(), 19);
+}
+
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut ModuleState` (or shared
@@ -883,7 +1197,28 @@ unsafe fn drain_commit_in(s: &mut ModuleState, sys: &SyscallTable) {
         if msg_type != wire::MSG_COMMITTED_BATCH || (plen as usize) < 16 { continue; }
         let (term, index) = wire::decode_term_index(&s.msg_buf);
         if index > s.commit_index {
+            let prev = s.commit_index;
             s.commit_index = index;
+            // Fold the append→commit age of EVERY entry in this newly-committed
+            // range, not just the batch high-water — a group fsync commits many
+            // entries at once, so recording only `index` biases the latency
+            // histogram (RFC §4.1). Bounded to the ring depth: only the most
+            // recent COMMIT_TS_RING stamps survive, so entries below that
+            // window have no live timestamp and are skipped.
+            let ring_lo = index.saturating_sub(COMMIT_TS_RING as Index - 1);
+            let lo = if prev + 1 > ring_lo { prev + 1 } else { ring_lo };
+            let now = dev_micros(sys);
+            let mut e = lo;
+            while e <= index {
+                let ts_slot = (e as usize) % COMMIT_TS_RING;
+                if s.commit_ts_index[ts_slot] == e {
+                    let lat = now.wrapping_sub(s.commit_ts_us[ts_slot]);
+                    let b = wire::hist::bucket(&wire::hist::COMMIT_LATENCY_US, lat);
+                    s.commit_latency_buckets[b] = s.commit_latency_buckets[b].saturating_add(1);
+                    s.commit_ts_index[ts_slot] = 0;
+                }
+                e += 1;
+            }
             if term > s.current_term {
                 // Shouldn't happen on the leader path, but stay safe.
                 s.current_term = term;
@@ -908,6 +1243,70 @@ unsafe fn drain_wal_flushed(s: &mut ModuleState, sys: &SyscallTable) {
         let (_term, index, _replica) = wire::decode_fsync_ack(&s.msg_buf);
         if index > s.local_durable_index {
             s.local_durable_index = index;
+        }
+    }
+    // Persist the advanced durable watermark (term/vote/durable index) on the
+    // fsync-ack path — but throttled, so we don't add a metadata fsync per
+    // entry (which would double the WAL's fsync load and skew throughput).
+    // term/vote changes persist eagerly at their own call sites; this only
+    // catches durable-index growth. META_PERSIST_STRIDE bounds how much
+    // durable progress a crash can lose from the metadata hint (replay
+    // re-derives the exact index from the WAL regardless).
+    if s.meta_root_path != 0
+        && s.local_durable_index >= s.meta_persisted_durable.wrapping_add(META_PERSIST_STRIDE)
+    {
+        save_metadata(s, sys);
+    }
+}
+
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` (or shared
+/// `&ModuleState` where the signature uses one) and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// Consume the WAL's one-shot replay-complete signal. The WAL's reconstructed
+/// on-disk high-water is the AUTHORITATIVE recovery point — the persisted
+/// metadata `last_log_index` is only a throttled hint that can either lag the
+/// true high-water (the common case: META_PERSIST_STRIDE rounds down) or, if a
+/// crash lost un-replayable tail entries, over-count it. Either way the WAL's
+/// replayed high-water is what is actually recoverable, so on a genuine
+/// recovery boot (`awaiting_replay`) we resume `last_log_index` exactly THERE,
+/// re-seed apply_pipeline to that base via the existing recovery-reset path,
+/// and release the proposal-intake hold so new post-recovery traffic continues
+/// the recovered index space instead of colliding with it.
+unsafe fn drain_wal_replay_complete(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_wal_replay_complete < 0 { return; }
+    for _ in 0..4 {
+        let poll = (sys.channel_poll)(s.in_wal_replay_complete, 0x01);
+        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+        let (msg_type, plen) =
+            wire_channels::channel_read_msg(sys, s.in_wal_replay_complete, &mut s.msg_buf);
+        if msg_type != wire::MSG_WAL_REPLAY_COMPLETE || (plen as usize) < 16 { continue; }
+        let (hw_term, high_water) = wire::decode_term_index(&s.msg_buf);
+        // Only a genuine recovery boot acts on the high-water. A
+        // non-recovery graph (fresh WAL emitting hw=0) must not rewind a
+        // log raft is legitimately growing — so we gate on `awaiting_replay`,
+        // which `load_metadata` set iff we loaded a persisted durable index.
+        if s.awaiting_replay {
+            s.last_log_index = high_water;
+            s.last_log_term = hw_term;
+            record_tail_term(s, high_water, hw_term);
+            s.local_durable_index = high_water;
+            s.meta_persisted_durable = high_water;
+            s.replay_hw_received = high_water;
+            // Re-seed apply_pipeline to the recovered base via the step-0
+            // retry path. The intake hold (`awaiting_replay`) stays SET until
+            // that reset is emitted — only then does step-0 clear it — so raft
+            // never appends a new entry before apply has been seeded to the
+            // base. (For high_water == 0, a fresh skip_replay WAL, there is
+            // nothing to seed: release intake immediately.)
+            if high_water > 0 {
+                s.pending_recovery_reset = true;
+            } else {
+                s.awaiting_replay = false;
+            }
+            dev_log(sys, 3, b"[raft] replay resume".as_ptr(), 20);
         }
     }
 }
@@ -1265,7 +1664,7 @@ unsafe fn handle_append_entries(s: &mut ModuleState, sys: &SyscallTable, plen: u
     if term < s.current_term {
         // Reject: stale term. Send response with our term and current
         // last-log so the leader can decide what to do.
-        send_append_response(s, sys, false);
+        send_append_response(s, sys, false, false);
         return;
     }
 
@@ -1275,29 +1674,46 @@ unsafe fn handle_append_entries(s: &mut ModuleState, sys: &SyscallTable, plen: u
     s.leader_id = leader as i8;
     reset_election_deadline(s, now);
 
-    // Log matching (RFC §5.1). We accept this AE only if its
-    // `prev_log_*` agrees with our last committed log position. This
-    // catches stale or out-of-order appends. Conflict repair (rolling
-    // back our log to an earlier point on mismatch) requires WAL
-    // truncation that we don't yet plumb — see RFC §5.1 for the gap.
-    if prev_log_index > 0 {
-        if prev_log_index != s.last_log_index || prev_log_term != s.last_log_term {
-            dev_log(sys, 3, b"[raft] ae mismatch".as_ptr(), 18);
-            send_append_response(s, sys, false);
-            return;
-        }
-    } else {
-        // prev_log_index == 0 means "append at start of log". Only
-        // accept if we ourselves are at an empty log; otherwise the
-        // leader is misbehaving or we have stale state.
-        if s.last_log_index != 0 {
-            send_append_response(s, sys, false);
-            return;
-        }
+    // ── Log matching + conflict repair (Raft §5.3) ──────────────
+    // (1) Gap: we don't hold an entry as far as prev_log_index. NACK; the
+    //     response carries our last_log_index so the leader (replicator)
+    //     backs next_index up to it instead of decrementing one at a time.
+    if prev_log_index > s.last_log_index {
+        dev_log(sys, 3, b"[raft] ae gap".as_ptr(), 13);
+        send_append_response(s, sys, false, false);
+        return;
+    }
+    // (2) Term conflict at prev_log_index: our entry there disagrees with the
+    //     leader's. Discard everything from prev_log_index onward (uncommitted
+    //     by construction — see `log_term_matches`) and NACK so the leader
+    //     backs up and resends from an agreed point.
+    if !log_term_matches(s, prev_log_index, prev_log_term) {
+        truncate_log_after(s, sys, prev_log_index.saturating_sub(1));
+        dev_log(sys, 3, b"[raft] ae conflict".as_ptr(), 18);
+        send_append_response(s, sys, false, false);
+        return;
     }
 
-    // Accept entry — write to WAL only if the AE carries one.
+    // prev_log_* agrees. Accept the carried entry, if any.
     if entry_index > 0 {
+        // If we already hold an entry at this index, it is either identical
+        // (idempotent retransmit — do NOT re-append, that would duplicate it
+        // in the WAL) or divergent (truncate + NACK so the leader resends it
+        // on a later AE, after the WAL has applied the truncate — the resend
+        // and the truncate must not race within one WAL step).
+        if entry_index <= s.last_log_index {
+            if log_term_matches(s, entry_index, entry_term) {
+                advance_follower_commit(s, sys, leader_commit);
+                send_append_response(s, sys, true, false);
+                return;
+            }
+            truncate_log_after(s, sys, entry_index.saturating_sub(1));
+            dev_log(sys, 3, b"[raft] ae conflict".as_ptr(), 18);
+            send_append_response(s, sys, false, false);
+            return;
+        }
+
+        // Clean append: entry_index == last_log_index + 1.
         let entry_payload_start = wire::AE_HDR_LEN;
         let entry_len = pl.saturating_sub(entry_payload_start);
 
@@ -1309,9 +1725,23 @@ unsafe fn handle_append_entries(s: &mut ModuleState, sys: &SyscallTable, plen: u
                 .copy_from_slice(&s.msg_buf[entry_payload_start..entry_payload_start + copy_len]);
         }
 
-        let poll = (sys.channel_poll)(s.out_log, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
+        // Fail closed on the follower too (RFC §13/§14): attempt the WAL
+        // write first and only advance `last_log_index` if the whole entry
+        // landed. `channel_write_msg` is a single atomic frame write, so a
+        // `<= 0` return means the channel was full and NOTHING was written
+        // — do NOT advance (else our log would claim an entry the WAL never
+        // persisted and diverge). Respond with failure so the leader
+        // retries this AE once our WAL drains; normal Raft log-repair,
+        // driven by local durability backpressure instead of a log mismatch.
+        let written =
             wire_channels::channel_write_msg(sys, s.out_log, wire::MSG_WAL_ENTRY, &wal_buf[..16 + copy_len]);
+        if written <= 0 {
+            s.flushes_deferred = s.flushes_deferred.saturating_add(1);
+            // Local WAL backpressure, NOT a log mismatch: signal `busy` so the
+            // leader retries this same entry once our WAL drains instead of
+            // rolling next_index back (which would trigger needless log repair).
+            send_append_response(s, sys, false, true);
+            return;
         }
 
         if s.out_log_observe >= 0 {
@@ -1325,6 +1755,7 @@ unsafe fn handle_append_entries(s: &mut ModuleState, sys: &SyscallTable, plen: u
 
         s.last_log_index = entry_index;
         s.last_log_term = entry_term;
+        record_tail_term(s, entry_index, entry_term);
         s.entries_appended += 1;
     }
 
@@ -1333,7 +1764,7 @@ unsafe fn handle_append_entries(s: &mut ModuleState, sys: &SyscallTable, plen: u
     // apply pipeline can advance. See RFC §5.1.
     advance_follower_commit(s, sys, leader_commit);
 
-    send_append_response(s, sys, true);
+    send_append_response(s, sys, true, false);
 }
 
 /// # Safety
@@ -1360,7 +1791,7 @@ unsafe fn advance_follower_commit(s: &mut ModuleState, sys: &SyscallTable, leade
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn send_append_response(s: &ModuleState, sys: &SyscallTable, success: bool) {
+unsafe fn send_append_response(s: &ModuleState, sys: &SyscallTable, success: bool, busy: bool) {
     let mut resp = [0u8; wire::AE_RESP_LEN];
     wire::encode_append_entries_resp(
         &mut resp,
@@ -1369,6 +1800,7 @@ unsafe fn send_append_response(s: &ModuleState, sys: &SyscallTable, success: boo
         s.self_id,
         success,
         s.local_durable_index,
+        busy,
     );
 
     // Route back to leader
@@ -1448,13 +1880,33 @@ unsafe fn step_leader(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
         emit_pending_c_new(s, sys, now);
     }
 
-    // 1. Drain proposals into batch
-    drain_proposals(s, sys, now);
+    // 1. Drain proposals into batch — gated by two durability-backpressure
+    //    conditions (RFC §13/§14):
+    //    (a) not holding a WAL-deferred batch (`flush_deferred`): a prior
+    //        flush couldn't write to `out_log`; reading more would coalesce
+    //        onto the held index or drop it.
+    //    (b) the uncommitted-inflight window is under `MAX_UNCOMMITTED_INFLIGHT`:
+    //        the log must not run too far ahead of quorum-durable
+    //        `commit_index`, or the WAL group-fsync path lets raft race past
+    //        what commits, overflowing the observer fanout / apply buffer.
+    //    When either gate is closed, proposals stay queued in their input
+    //    channels and the upstream proposer (throttle_gate / injector)
+    //    backpressures — a plateau at commit throughput, not a cliff.
+    //    (c) not holding for boot-time recovery resume (`awaiting_replay`):
+    //        until the WAL hands us its exact on-disk high-water we'd append
+    //        at a STALE persisted hint and collide with the replayed index
+    //        space. Proposals stay queued upstream until the signal lands.
+    let inflight = s.last_log_index.saturating_sub(s.commit_index);
+    if !s.flush_deferred && !s.awaiting_replay && inflight < MAX_UNCOMMITTED_INFLIGHT {
+        drain_proposals(s, sys, now);
+    }
 
-    // 2. Flush batch if ready
+    // 2. Flush batch if ready. A deferred batch is always "ready" — it
+    //    retries the WAL write every tick until `out_log` has space.
     let batch_elapsed = now.wrapping_sub(s.proposal_batch_start_ms);
     let should_flush = s.proposal_batch_count > 0
-        && (s.proposal_batch_count >= s.proposal_batch_max
+        && (s.flush_deferred
+            || s.proposal_batch_count >= s.proposal_batch_max
             || batch_elapsed >= s.proposal_batch_timeout_ms as u64);
 
     if should_flush {
@@ -1550,6 +2002,18 @@ unsafe fn drain_proposals(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     // MSG_PROPOSAL_ASSIGNED for these.
     if s.in_proposals >= 0 {
         for _ in 0..16 {
+            // Stop pulling proposals the moment either durability-backpressure
+            // gate closes (RFC §13/§14): a deferred WAL flush, or the
+            // uncommitted-inflight window reaching its cap. Checking inside the
+            // loop (not just once per step) bounds the per-step append burst —
+            // without it a single drain pass can append dozens of entries past
+            // the cap before the next check, overrunning the observer fanout /
+            // apply buffer and re-triggering the cliff.
+            if s.flush_deferred
+                || s.last_log_index.saturating_sub(s.commit_index) >= MAX_UNCOMMITTED_INFLIGHT
+            {
+                return;
+            }
             let poll = (sys.channel_poll)(s.in_proposals, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
@@ -1565,6 +2029,11 @@ unsafe fn drain_proposals(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     // MSG_PROPOSAL_ASSIGNED per tagged proposal.
     if s.in_proposals_tagged >= 0 {
         for _ in 0..16 {
+            if s.flush_deferred
+                || s.last_log_index.saturating_sub(s.commit_index) >= MAX_UNCOMMITTED_INFLIGHT
+            {
+                return;
+            }
             let poll = (sys.channel_poll)(s.in_proposals_tagged, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
@@ -1593,6 +2062,11 @@ unsafe fn drain_proposals(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     // this raft.
     if s.in_proposals_partitioned >= 0 {
         for _ in 0..16 {
+            if s.flush_deferred
+                || s.last_log_index.saturating_sub(s.commit_index) >= MAX_UNCOMMITTED_INFLIGHT
+            {
+                return;
+            }
             let poll = (sys.channel_poll)(s.in_proposals_partitioned, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
@@ -1614,6 +2088,11 @@ unsafe fn drain_proposals(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     // misroute-rejection semantics as in[5].
     if s.in_proposals_partitioned_tagged >= 0 {
         for _ in 0..16 {
+            if s.flush_deferred
+                || s.last_log_index.saturating_sub(s.commit_index) >= MAX_UNCOMMITTED_INFLIGHT
+            {
+                return;
+            }
             let poll = (sys.channel_poll)(s.in_proposals_partitioned_tagged, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
@@ -1701,32 +2180,58 @@ unsafe fn append_to_batch(
 unsafe fn flush_proposal_batch(s: &mut ModuleState, sys: &SyscallTable) {
     if s.proposal_batch_count == 0 { return; }
 
-    // Capture the previous log point before advancing. This is the
-    // `prev_log_*` tuple the follower must match before accepting the
-    // new entry.
+    // ── Durability backpressure: fail closed (RFC §13/§14) ──────────
+    // Never advance `last_log_index` past what the WAL actually accepts.
+    // We compose the WAL frame for the NEXT index and attempt the write
+    // FIRST; only on a confirmed write do we commit the index advance.
+    // `channel_write_msg` is now a single atomic frame write (see
+    // `wire_channels::write_framed`), so its return value is a reliable
+    // "did the whole entry land" signal: `<= 0` means the channel is full
+    // (WAL mid-fsync or overloaded) and NOTHING was written — so we hold
+    // the batch and retry next tick without advancing. raft's log can
+    // therefore never get ahead of the WAL: the over-production cliff
+    // (entries silently shredded → garbage commit_index) becomes a bounded
+    // plateau at WAL throughput. `step_leader` suspends intake while
+    // `flush_deferred` is set, so the proposals that would have filled
+    // this batch stay queued upstream (proposer backpressure), not dropped.
     let prev_log_index = s.last_log_index;
     let prev_log_term = if prev_log_index == 0 { 0 } else { s.last_log_term };
-
-    // Advance log
-    s.last_log_index += 1;
-    s.last_log_term = s.current_term;
-
+    let new_index = s.last_log_index + 1;
     let batch_len = s.proposal_batch_len as usize;
 
-    // Write to WAL (log_append) and fan out to observers (log_observe).
-    // Both ports carry the same 16-byte header + body; observers (e.g.
-    // apply_pipeline) buffer them keyed by index and emit per-entry
-    // committed messages once commit_tracker advances the horizon.
-    {
-        let mut wal_buf = [0u8; PROPOSAL_BATCH_CAP + 16];
-        wire::encode_term_index(&mut wal_buf, s.current_term, s.last_log_index);
-        wal_buf[16..16 + batch_len].copy_from_slice(&s.proposal_batch[..batch_len]);
+    let mut wal_buf = [0u8; PROPOSAL_BATCH_CAP + 16];
+    wire::encode_term_index(&mut wal_buf, s.current_term, new_index);
+    wal_buf[16..16 + batch_len].copy_from_slice(&s.proposal_batch[..batch_len]);
 
-        let poll = (sys.channel_poll)(s.out_log, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
-            wire_channels::channel_write_msg(sys, s.out_log, wire::MSG_WAL_ENTRY, &wal_buf[..16 + batch_len]);
+    let written = wire_channels::channel_write_msg(
+        sys, s.out_log, wire::MSG_WAL_ENTRY, &wal_buf[..16 + batch_len],
+    );
+    if written <= 0 {
+        if !s.flush_deferred {
+            s.flush_deferred = true;
+            s.flushes_deferred = s.flushes_deferred.saturating_add(1);
+            dev_log(sys, 3, b"[raft] wal full".as_ptr(), 15);
         }
+        return;
+    }
+    s.flush_deferred = false;
 
+    // The WAL write landed — commit the log advance.
+    s.last_log_index = new_index;
+    s.last_log_term = s.current_term;
+    record_tail_term(s, new_index, s.current_term);
+
+    // Stamp the append time for this index so commit-advance can fold
+    // its age into clustor.raft.commit_latency_ms (RFC §4.1).
+    let ts_slot = (s.last_log_index as usize) % COMMIT_TS_RING;
+    s.commit_ts_index[ts_slot] = s.last_log_index;
+    s.commit_ts_us[ts_slot] = dev_micros(sys);
+
+    // Fan out the same entry to observers (log_observe). Same 16-byte
+    // header + body; observers (e.g. apply_pipeline) buffer them keyed by
+    // index and emit per-entry committed messages once commit_tracker
+    // advances the horizon.
+    {
         // Fanout: drop silently if observer ring is full — the consumer
         // is non-load-bearing for consensus, so a stuck observer must
         // never block the WAL hot path. Observer modules MUST cope with
@@ -1751,8 +2256,6 @@ unsafe fn flush_proposal_batch(s: &mut ModuleState, sys: &SyscallTable) {
     // for that index. The leader has just bumped `last_log_*`, so we
     // recover them by subtracting the increment.
     {
-        let new_index = s.last_log_index;
-
         let mut ae_buf = [0u8; PROPOSAL_BATCH_CAP + wire::AE_HDR_LEN];
         let total = wire::encode_append_entries(
             &mut ae_buf,
@@ -1773,7 +2276,16 @@ unsafe fn flush_proposal_batch(s: &mut ModuleState, sys: &SyscallTable) {
     }
 
     s.entries_appended += 1;
-    save_metadata(s, sys);
+    // NOTE: metadata is intentionally NOT persisted here. Raft's durable state
+    // is `currentTerm`/`votedFor` (persisted on change — election/vote sites)
+    // plus the log itself, which is the WAL. `last_log_index`/`last_log_term`
+    // are *derived* from the log and reconstructed on recovery, so persisting
+    // them per-append is redundant. On a real disk it is also harmful: the meta
+    // path is `raft/meta`, fat32 has no mkdir, so the per-append FS_OPEN fails
+    // ENOENT yet still scans the (large, partly fresh) root directory — a
+    // ~33 ms dir walk that blows raft's step guard and wedges the pipeline.
+    // (Durable term/vote on fat32 needs a root-level 8.3 meta path — see the
+    // wal.root_path pattern — tracked separately.)
     dev_log(sys, 3, b"[raft] flush".as_ptr(), 12);
 
     // All proposals in this batch share the same wal_index. Emit one
@@ -1858,7 +2370,26 @@ unsafe fn send_heartbeat(s: &ModuleState, sys: &SyscallTable) {
 ///   partition_id == 0 → "raft/meta"          (legacy single-partition)
 ///   partition_id == N → "raft/p<NNNN>/meta"  (multi-Raft)
 fn build_meta_path(partition_id: u16) -> ([u8; META_PATH_MAX], usize) {
+    build_meta_path_ex(partition_id, false)
+}
+
+/// Build the metadata path. When `root` is set, emit a ROOT-level 8.3
+/// name (`RAFT<pppp>.MET`, e.g. `RAFT0000.MET`) — FAT32 has no mkdir, so
+/// the `raft/` parent of the default path can't be created. The 8-char
+/// stem (`RAFT` + 4 hex partition digits) + 3-char extension is 8.3-legal.
+fn build_meta_path_ex(partition_id: u16, root: bool) -> ([u8; META_PATH_MAX], usize) {
     let mut buf = [0u8; META_PATH_MAX];
+    if root {
+        let mut i = 0usize;
+        for &b in b"RAFT" { buf[i] = b; i += 1; }
+        for digit in (0..4).rev() {
+            let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
+            buf[i] = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+            i += 1;
+        }
+        for &b in b".MET" { buf[i] = b; i += 1; }
+        return (buf, i);
+    }
     if partition_id == 0 {
         let p = b"raft/meta";
         buf[..p.len()].copy_from_slice(p);
@@ -1885,10 +2416,18 @@ fn build_meta_path(partition_id: u16) -> ([u8; META_PATH_MAX], usize) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Load persistent Raft state from raft/[p<id>/]meta.
-unsafe fn load_metadata(s: &mut ModuleState, sys: &SyscallTable) {
-    let (mut path, plen) = build_meta_path(s.partition_id);
+///
+/// Returns `true` if the FS provider is still initialising (FS_OPEN returned
+/// E_AGAIN) and the caller should RETRY on a later step — at cold boot the
+/// fat32 provider isn't ready when `module_new` runs, so a one-shot load here
+/// silently misses the metadata and the node restarts fresh (the L4
+/// recovery bug). Returns `false` once the load is resolved (loaded, or the
+/// file genuinely doesn't exist = fresh deploy).
+unsafe fn load_metadata(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    let (mut path, plen) = build_meta_path_ex(s.partition_id, s.meta_root_path != 0);
     let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
-    if fd < 0 { return; } // no metadata file — fresh start
+    if fd == FS_E_AGAIN { return true; } // FS provider initialising — retry later
+    if fd < 0 { return false; } // no metadata file — fresh start
 
     let mut buf = [0u8; META_SIZE];
     let n = (sys.provider_call)(fd, FS_READ, buf.as_mut_ptr(), META_SIZE);
@@ -1902,8 +2441,27 @@ unsafe fn load_metadata(s: &mut ModuleState, sys: &SyscallTable) {
         if term > 0 {
             s.current_term = term;
             s.voted_for = voted;
+            // `log_idx` is the persisted DURABLE watermark (see save_metadata).
+            // Seed both the log index and the durable index from it so a
+            // recovered node resumes at the on-disk durable point and replay
+            // re-acks from there rather than re-proposing into a fresh space.
             s.last_log_index = log_idx;
             s.last_log_term = log_term;
+            s.local_durable_index = log_idx;
+            s.meta_persisted_durable = log_idx;
+            s.meta_hint_loaded = log_idx;
+            // Recovery seeding. The persisted `log_idx` is only a THROTTLED
+            // durable hint (META_PERSIST_STRIDE) that can lag — or, after a
+            // crash that lost un-replayable tail entries, over-count — the
+            // WAL's true replayed high-water. So when the dedicated
+            // `wal_replay_complete` edge is wired, the intake hold is already
+            // armed (in module_new) and the WAL's high-water drives the
+            // resume + apply-reset — we do NOTHING here. Only the legacy
+            // graph (no edge) falls back to seeding apply_pipeline from the
+            // (stale) hint via the recovery-reset path.
+            if log_idx > 0 && s.in_wal_replay_complete < 0 {
+                s.pending_recovery_reset = true;
+            }
             dev_log(sys, 3, b"[raft] meta ok".as_ptr(), 14);
         }
         // Joint-consensus fields (RFC §1.2) — only present when META
@@ -1916,6 +2474,7 @@ unsafe fn load_metadata(s: &mut ModuleState, sys: &SyscallTable) {
             s.joint_active = buf[27] != 0;
         }
     }
+    false // resolved (loaded or empty) — no retry needed
 }
 
 /// # Safety
@@ -1925,26 +2484,46 @@ unsafe fn load_metadata(s: &mut ModuleState, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Save persistent Raft state to raft/[p<id>/]meta.
-unsafe fn save_metadata(s: &ModuleState, sys: &SyscallTable) {
-    let (mut path, plen) = build_meta_path(s.partition_id);
-    let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
-    if fd < 0 { return; } // FS not available
+unsafe fn save_metadata(s: &mut ModuleState, sys: &SyscallTable) {
+    // Root-path mode (bare-metal FAT32): open-create ONCE and cache the fd
+    // so each persist is just seek+write+fsync — no cold dir-scan re-open.
+    // The persisted `last_log_index` is the DURABLE watermark
+    // (`local_durable_index`), not the volatile appended index, so a
+    // recovered node never claims durability it didn't have on disk.
+    let fd = if s.meta_root_path != 0 {
+        if s.meta_fd < 0 {
+            let (mut path, plen) = build_meta_path_ex(s.partition_id, true);
+            let opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+            if opened < 0 { return; } // FS not ready (E_AGAIN) or unavailable — retry later
+            s.meta_fd = opened;
+        }
+        s.meta_fd
+    } else {
+        let (mut path, plen) = build_meta_path(s.partition_id);
+        let opened = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+        if opened < 0 { return; } // FS not available (no mkdir → raft/ absent)
+        opened
+    };
 
     // Seek to start (overwrite)
     let zero = 0i32.to_le_bytes();
     (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4);
 
+    let durable = s.local_durable_index;
     let mut buf = [0u8; META_SIZE];
     buf[0..8].copy_from_slice(&s.current_term.to_le_bytes());
     buf[8] = s.voted_for as u8;
-    buf[9..17].copy_from_slice(&s.last_log_index.to_le_bytes());
+    buf[9..17].copy_from_slice(&durable.to_le_bytes());
     buf[17..25].copy_from_slice(&s.last_log_term.to_le_bytes());
     buf[25] = s.current_voters.0;
     buf[26] = s.joint_voters.0;
     buf[27] = s.joint_active as u8;
     (sys.provider_call)(fd, FS_WRITE, buf.as_mut_ptr(), META_SIZE);
     (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    if s.meta_root_path == 0 {
+        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    }
+    s.meta_persisted_durable = durable;
 }
 
 // ── State transitions ───────────────────────────────────────
@@ -2102,7 +2681,14 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     let pid = s.partition_id;
     let kg = wire::METRIC_KIND_GAUGE;
     let kc = wire::METRIC_KIND_COUNTER;
-    let samples: [(u16, u8, i64); 9] = [
+    // Readiness sub-signal (RFC: real /readyz): boot replay done, metadata
+    // loaded, and consensus established (we lead, or we know the leader).
+    let raft_ready = (!s.awaiting_replay
+        && !s.meta_load_pending
+        && (s.role == ROLE_LEADER || s.leader_id >= 0)) as i64;
+    let samples: [(u16, u8, i64); 18] = [
+        (wire::metric_ids::RAFT_LAST_LOG_INDEX, kg, s.last_log_index as i64),
+        (wire::metric_ids::RAFT_COMMIT_INDEX, kg, s.commit_index as i64),
         (wire::metric_ids::RAFT_ROLE, kg, s.role as i64),
         (wire::metric_ids::RAFT_CURRENT_TERM, kg, s.current_term as i64),
         (wire::metric_ids::RAFT_PROPOSALS_RECEIVED, kc, s.proposals_received as i64),
@@ -2112,12 +2698,37 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
         (wire::metric_ids::RAFT_PROPOSALS_DROPPED_STRICT, kc, s.proposals_dropped_strict as i64),
         (wire::metric_ids::RAFT_FROZEN_FLAG, kg, s.frozen as i64),
         (wire::metric_ids::RAFT_STRICT_FALLBACK_FLAG, kg, s.strict_fallback as i64),
+        (wire::metric_ids::RAFT_FLUSHES_DEFERRED, kc, s.flushes_deferred as i64),
+        (
+            wire::metric_ids::RAFT_UNCOMMITTED_INFLIGHT,
+            kg,
+            s.last_log_index.saturating_sub(s.commit_index) as i64,
+        ),
+        (wire::metric_ids::RAFT_AWAITING_REPLAY, kg, s.awaiting_replay as i64),
+        (wire::metric_ids::RAFT_REPLAY_HW, kg, s.replay_hw_received as i64),
+        (wire::metric_ids::RAFT_META_HINT, kg, s.meta_hint_loaded as i64),
+        (wire::metric_ids::RAFT_LOG_TRUNCATIONS, kc, s.log_truncations as i64),
+        (wire::metric_ids::RAFT_READY, kg, raft_ready),
     ];
     for &(metric_id, kind, value) in samples.iter() {
         let poll = (sys.channel_poll)(s.out_metrics, 0x02);
         if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
         let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
         wire::encode_metric_sample(&mut buf, mod_id, pid, metric_id, kind, value);
+        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
+    }
+
+    // commit_latency_ms histogram buckets (RFC §4.1), kind=histogram.
+    // Cumulative per the wire contract (wire::hist): bucket i carries the
+    // count of samples <= bound[i], so emit the running prefix sum.
+    let base = wire::hist::HIST_BASE;
+    let mut cum: i64 = 0;
+    for i in 0..s.commit_latency_buckets.len() {
+        cum += i64::from(s.commit_latency_buckets[i]);
+        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
+        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
+        wire::encode_metric_sample(&mut buf, mod_id, pid, base + i as u16, wire::METRIC_KIND_HISTOGRAM, cum);
         wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
     }
 

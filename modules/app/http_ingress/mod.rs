@@ -77,7 +77,18 @@ mod wire_channels;
 
 const MAX_CONNS: usize = 4;
 const RX_BUF: usize = 2048;
-const TX_BUF: usize = 4096;
+/// Response/TX-path buffer. Must hold the largest cached envelope the
+/// adapter can return — the `/metrics` export, capped at
+/// `telemetry_agg::SAFE_EXPORT_MAX` (7400 B) — plus the HTTP/1.1 status
+/// line + headers (~90 B). At 4 KB the previous value, `channel_read_msg`
+/// silently dropped any `/metrics` response larger than 4 KB (its
+/// payload-too-large path), so a grown export (fan-in records + per-module
+/// step histograms) never reached the wire and `/metrics` looked frozen on
+/// a stale small snapshot. 7680 covers the 7400 cap + headers and keeps the
+/// framed channel write (3 B net hdr + payload) under CHANNEL_BUFFER_SIZE
+/// (8192). Sits on the module step stack (64 KB EL0 / 1 MB EL1 on bcm2712,
+/// host thread stack on linux), so the few-KB bump is well within budget.
+const TX_BUF: usize = 7680;
 const MAX_PATH: usize = 64;
 /// Maximum request body forwarded to `http_adapter` in the
 /// `MSG_HTTP_REQUEST` envelope. Bodies above this are truncated;

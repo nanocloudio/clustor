@@ -36,6 +36,8 @@ mod wire_channels;
 
 use types::*;
 
+const METRICS_INTERVAL_MS: u64 = 1000;
+
 define_params! {
     ModuleState;
 
@@ -47,6 +49,13 @@ define_params! {
 
     3, durability_mode, u8, 1, enum { strict=0, group_fsync=1, relaxed=2 }
         => |s, d, len| { s.durability_mode = p_u8(d, len, 0, 1); };
+
+    // Partition slot for multi-Raft graphs (RFC §1.2). Stamped into
+    // emitted metric samples so per-partition commit_trackers
+    // (`commit_tracker_p0`, `_p1`) don't collide in telemetry_agg's
+    // (module_id, partition_id, metric_id) table.
+    4, partition_id, u16, 0
+        => |s, d, len| { s.partition_id = p_u16(d, len, 0, 0); };
 }
 
 #[repr(C)]
@@ -59,11 +68,17 @@ struct ModuleState {
     in_cp_state: i32,    // in[2]: CacheState from cp_proof_cache
     in_voter_set: i32,   // in[3]: MSG_VOTER_SET_UPDATE from raft_engine (RFC §1.2)
     out_committed: i32,  // out[0]: CommittedBatch to apply_pipeline
+    out_metrics: i32,    // out[1]: MSG_METRIC_SAMPLE to telemetry_agg
 
     // Configuration
     voter_count: u8,
     durability_mode: u8,  // DUR_STRICT / DUR_GROUP_FSYNC / DUR_RELAXED
     self_id: ReplicaId,
+    partition_id: u16,
+
+    // Metrics
+    commit_advances: u32,
+    last_metrics_ms: u64,
 
     /// Current and joint voter NodeSet bitmasks (RFC §1.2). Until
     /// raft_engine pushes the first `MSG_VOTER_SET_UPDATE`, the
@@ -132,6 +147,7 @@ pub extern "C" fn module_new(
         s.in_durable = dev_channel_port(sys, 0, 1);
         s.in_cp_state = dev_channel_port(sys, 0, 2);
         s.in_voter_set = dev_channel_port(sys, 0, 3);
+        s.out_metrics = dev_channel_port(sys, 1, 1);
         s.current_voters = NodeSet::empty();
         s.joint_voters = NodeSet::empty();
         s.joint_active = false;
@@ -188,7 +204,38 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             advance_commit(s, sys);
         }
 
+        // 6. Periodic metrics
+        emit_metrics(s, sys);
+
         0
+    }
+}
+
+/// Emit commit-index gauge + commit-advance counter as typed samples
+/// (RFC §4.3). Dropped under backpressure — telemetry never stalls the
+/// consensus path.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.out_metrics < 0 { return; }
+    let now = dev_millis(sys);
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    s.last_metrics_ms = now;
+
+    let mid = wire::MODULE_ID_COMMIT_TRACKER;
+    let pid = s.partition_id;
+    let samples: [(u16, u8, i64); 2] = [
+        (wire::metric_ids::COMMIT_INDEX, wire::METRIC_KIND_GAUGE, s.committed_index as i64),
+        (wire::metric_ids::COMMIT_ADVANCES, wire::METRIC_KIND_COUNTER, i64::from(s.commit_advances)),
+    ];
+    for &(metric_id, kind, value) in samples.iter() {
+        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
+        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
+        wire::encode_metric_sample(&mut buf, mid, pid, metric_id, kind, value);
+        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
     }
 }
 
@@ -356,7 +403,12 @@ unsafe fn advance_commit(s: &mut ModuleState, sys: &SyscallTable) {
     };
 
     if new_commit > s.committed_index {
+        // Count committed ENTRIES, not advance events: a single advance can
+        // jump the commit index by many entries (group fsync), and throughput
+        // benchmarks read this as entries committed.
+        let advanced = (new_commit - s.committed_index).min(u32::MAX as Index) as u32;
         s.committed_index = new_commit;
+        s.commit_advances = s.commit_advances.saturating_add(advanced);
 
         // Emit committed batch
         let poll = (sys.channel_poll)(s.out_committed, 0x02);
