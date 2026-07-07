@@ -200,12 +200,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+        let work_before = s.requests_parsed.wrapping_add(s.responses_sent);
 
         drain_placement(s, sys);
         drain_leader_state(s, sys);
         drain_proposal_assigned(s, sys);
         parse_requests(s, sys);
         forward_responses(s, sys);
+        if s.requests_parsed.wrapping_add(s.responses_sent) != work_before {
+            dev_report_step_effect(sys, step_effect::WORK_DONE);
+        }
 
         0
     }

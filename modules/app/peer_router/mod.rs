@@ -74,7 +74,12 @@ use types::*;
 // and those clients never get a CONNACK. 64 covers a 7-node cluster's
 // peer links with ample client headroom.
 const MAX_CONNS: usize = 64;
-const BUF_SIZE: usize = 2048;
+// Must hold the largest peer frame: a full proposal batch (2 KiB)
+// plus AE/envelope headers. Undersizing this silently drops batched
+// entries at every hop on the replication path (channel_read_msg
+// discards oversized payloads; encoders return 0) and followers wedge
+// at that index forever.
+const BUF_SIZE: usize = 4096;
 const METRICS_INTERVAL_MS: u64 = 1000;
 const RECONNECT_MS: u64 = 2000;
 /// A `connected` peer silent this long is deemed a dead/half-open link and
@@ -116,14 +121,77 @@ define_params! {
 
     8, peer4_port, u16, 0
         => |s, d, len| { configure_peer(s, 4, p_u16(d, len, 0, 0)); };
+
+    // Per-peer IPv4 host overrides for cross-machine clusters
+    // (dotted-quad strings). Default (absent / unparseable) stays
+    // 127.0.0.1, so single-machine templates work unchanged.
+    9, peer0_host, str, 0
+        => |s, d, len| { configure_peer_host(s, 0, d, len); };
+    10, peer1_host, str, 0
+        => |s, d, len| { configure_peer_host(s, 1, d, len); };
+    11, peer2_host, str, 0
+        => |s, d, len| { configure_peer_host(s, 2, d, len); };
+    12, peer3_host, str, 0
+        => |s, d, len| { configure_peer_host(s, 3, d, len); };
+    13, peer4_host, str, 0
+        => |s, d, len| { configure_peer_host(s, 4, d, len); };
 }
 
 fn configure_peer(s: &mut ModuleState, idx: usize, port: u16) {
     if idx < MAX_NODES && port > 0 {
-        s.peer_addrs[idx].ip = 0x7F000001; // 127.0.0.1 in host (LE) byte order
+        if s.peer_addrs[idx].ip == 0 {
+            s.peer_addrs[idx].ip = 0x7F000001; // 127.0.0.1 (host LE)
+        }
         s.peer_addrs[idx].port = port;
         s.peer_addrs[idx].configured = true;
     }
+}
+
+/// Parse a dotted-quad IPv4 param into the peer's address (host
+/// LE byte order, matching `configure_peer`'s localhost default).
+/// Order-independent with the port param: a host arriving before
+/// OR after peer{N}_port wins over the localhost default.
+unsafe fn configure_peer_host(s: &mut ModuleState, idx: usize, d: *const u8, len: usize) {
+    if idx >= MAX_NODES || d.is_null() || len == 0 || len > 15 {
+        return;
+    }
+    let mut octets = [0u32; 4];
+    let mut oct = 0usize;
+    let mut cur: u32 = 0;
+    let mut digits = 0u8;
+    let mut i = 0usize;
+    while i < len {
+        let c = *d.add(i);
+        match c {
+            b'0'..=b'9' => {
+                cur = cur * 10 + (c - b'0') as u32;
+                digits += 1;
+                if digits > 3 || cur > 255 {
+                    return;
+                }
+            }
+            b'.' => {
+                if digits == 0 || oct >= 3 {
+                    return;
+                }
+                octets[oct] = cur;
+                oct += 1;
+                cur = 0;
+                digits = 0;
+            }
+            _ => return,
+        }
+        i += 1;
+    }
+    if digits == 0 || oct != 3 {
+        return;
+    }
+    octets[3] = cur;
+    let ip = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
+    if ip == 0 {
+        return;
+    }
+    s.peer_addrs[idx].ip = ip;
 }
 
 const NMSG_ACCEPT: u8 = 0x01;  // NET_MSG_ACCEPTED in fluxor ip module
@@ -457,7 +525,15 @@ unsafe fn connect_peers(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
 
     for i in 0..MAX_NODES {
         if !s.peer_addrs[i].configured || s.peer_addrs[i].connected { continue; }
-        if i == s.self_id as usize { continue; }
+        // DIAL-DIRECTION RULE: only the lower self_id dials; the higher
+        // accepts. If both nodes dial each other, the pair holds TWO
+        // TCP links, and the identity dedup ("keep one, close the rest
+        // with this replica_id") runs independently on each node — each
+        // side can keep the OPPOSITE link, so every frame lands on a
+        // link the receiver already closed and the pair loses all
+        // cross-traffic (no heartbeats → split-brain). One dialer =
+        // one link = no dedup race.
+        if (i as u8) <= s.self_id { continue; }
         if now.wrapping_sub(s.peer_addrs[i].last_attempt_ms) < RECONNECT_MS { continue; }
         s.peer_addrs[i].last_attempt_ms = now;
 
@@ -521,7 +597,14 @@ unsafe fn reconnect_stale_peers(s: &mut ModuleState, sys: &SyscallTable, now: u6
         // Redial promptly: clear the backoff so connect_peers dials this pass
         // rather than waiting out a stale RECONNECT_MS window from the last dial.
         s.peer_addrs[i].last_attempt_ms = now.wrapping_sub(RECONNECT_MS);
-        dev_log(&*s.syscalls, 2, b"[pr] peer stale, reconnecting".as_ptr(), 29);
+        {
+            let age_s = (now.wrapping_sub(s.peer_addrs[i].last_rx_ms) / 1000) as u32;
+            let mut m = *b"[pr] stale p=? age=????s";
+            m[13] = b'0' + (i as u8 % 10);
+            let mut x = age_s % 10000;
+            for k in (0..4).rev() { m[19 + k] = b'0' + (x % 10) as u8; x /= 10; }
+            dev_log(&*s.syscalls, 2, m.as_ptr(), m.len());
+        }
     }
 }
 
@@ -587,6 +670,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
             }
             NMSG_CONNOK => {
                 // Outbound connection established — send identity
+                dev_log(sys, 2, b"[pr] dial-ok".as_ptr(), 11);
                 if payload_len >= 1 {
                     if let Some(slot) = alloc_conn(s) {
                         s.conns[slot] = Conn {
@@ -605,8 +689,14 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                 let data_len = payload_len - 1;
                 s.bytes_in = s.bytes_in.wrapping_add(data_len as u64); // §4.2 ingress
 
-                let mut local = [0u8; 512];
-                let cl = data_len.min(512);
+                // Inbound copy sized for the largest peer frame (batched
+                // AppendEntries ≈ 2 KiB + headers). At 512 every batched
+                // AE was truncated to garbage on RECEIPT — the ingress
+                // twin of the egress 512-cap fixed earlier. Small frames
+                // (heartbeats, votes) survived, which is why liveness held
+                // intermittently while catch-up never did.
+                let mut local = [0u8; 4096];
+                let cl = data_len.min(4096);
                 local[..cl].copy_from_slice(&s.buf[data_start..data_start + cl]);
 
                 let slot = find_conn(s, conn_id);
@@ -641,6 +731,15 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                             | wire::MSG_PRE_VOTE_RESP
                             | wire::MSG_HEARTBEAT
                             | wire::MSG_HEARTBEAT_RESP
+                            // ReadIndex leadership-confirm round (RFC §1.3):
+                            // follower receives the leader's PROBE, leader
+                            // receives the follower's RESP — raft_engine
+                            // handles both on its rpc input. Omitting these
+                            // silently killed multi-node linearizable reads
+                            // (every probe timed out → LIN-BOUND reject);
+                            // dormant until lattice wired the read fence.
+                            | wire::MSG_READ_INDEX_PROBE
+                            | wire::MSG_READ_INDEX_PROBE_RESP
                             | wire::MSG_TIMEOUT_NOW => s.raft_rpc,
                             _ => -1,
                         };
@@ -656,7 +755,6 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                         // as a MSG_CLIENT_FRAME envelope so records from
                         // different conn_ids don't coalesce on the byte FIFO
                         // (see wire::MSG_CLIENT_FRAME).
-                        dev_log(&*s.syscalls, 3, b"[pr] data in".as_ptr(), 12);
                         if s.cleartext >= 0 && cl < 511 {
                             let mut tagged = [0u8; 512];
                             tagged[0] = conn_id;
@@ -669,13 +767,37 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                 }
             }
             NMSG_CLOSED => {
+                dev_log(sys, 2, b"[pr] net-closed".as_ptr(), 15);
                 if payload_len >= 1 {
                     let slot = find_conn(s, conn_id);
                     if slot < MAX_CONNS {
                         let rid = s.conns[slot].replica_id;
                         s.conns[slot] = Conn::empty();
+                        // Only mark the peer disconnected if NO other
+                        // identified link to it survives. `handle_identity`'s
+                        // dedup routinely closes a superseded DUPLICATE link
+                        // the instant the live one identifies; clearing
+                        // `connected` unconditionally on that close made
+                        // `connect_peers` redial into a fresh duplicate, which
+                        // dedup then closed too — a self-sustaining churn loop
+                        // that floods the shared linux_net net_out tee /
+                        // net_in merge and starves the client anchors (redis
+                        // unreachable on busy/dialing nodes). Keeping
+                        // `connected` while a live link remains breaks the loop.
                         if rid >= 0 && (rid as usize) < MAX_NODES {
-                            s.peer_addrs[rid as usize].connected = false;
+                            let mut still_linked = false;
+                            for other in 0..MAX_CONNS {
+                                if s.conns[other].active
+                                    && s.conns[other].identified
+                                    && s.conns[other].replica_id == rid
+                                {
+                                    still_linked = true;
+                                    break;
+                                }
+                            }
+                            if !still_linked {
+                                s.peer_addrs[rid as usize].connected = false;
+                            }
                         }
                     }
                 }
@@ -762,6 +884,11 @@ unsafe fn handle_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize, 
         s.conns[slot].identified = true;
     }
     s.peer_addrs[peer_id as usize].connected = true;
+    {
+        let mut m = *b"[pr] conn up p=?";
+        m[15] = b'0' + (peer_id % 10);
+        dev_log(sys, 2, m.as_ptr(), m.len());
+    }
     // Fresh link — start the liveness window now so a just-established peer
     // isn't immediately judged stale before its first data frame.
     s.peer_addrs[peer_id as usize].last_rx_ms = now;
@@ -812,20 +939,13 @@ unsafe fn route_outbound_chan(s: &mut ModuleState, sys: &SyscallTable, chan: i32
             wire_channels::channel_read_routed_partitioned(sys, chan, &mut s.buf);
         if plen == 0 && msg_type == 0 { break; }
 
-        // Trace: log target + msg_type (partition_id is on the wire
-        // but the routing is target-driven; one log line per fan-out
-        // peer is enough to confirm the egress side).
-        {
-            let hex = b"0123456789abcdef";
-            let d: [u8; 7] = [b'[', b'o', b']',
-                hex[(target >> 4) as usize], hex[(target & 0xF) as usize],
-                hex[(msg_type >> 4) as usize], hex[(msg_type & 0xF) as usize]];
-            dev_log(&*s.syscalls, 3, d.as_ptr(), 7);
-        }
-
-        // Copy to stack to release borrow on s.buf
-        let pl = (plen as usize).min(512);
-        let mut local = [0u8; 512];
+        // Copy to stack to release borrow on s.buf. Sized for the
+        // largest legal peer frame: an AppendEntries carrying a full
+        // proposal batch (2 KiB) plus headers. A smaller cap silently
+        // truncates bigger frames, so the first batched entry never
+        // survives transit and followers wedge at that index forever.
+        let pl = (plen as usize).min(4096);
+        let mut local = [0u8; 4096];
         local[..pl].copy_from_slice(&s.buf[..pl]);
 
         if target == wire::TARGET_BROADCAST {
@@ -908,7 +1028,6 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         // on `_msg_type` if they need to.
         let (_msg_type, plen) =
             wire_channels::channel_read_msg(sys, s.client_resp, &mut s.buf);
-        dev_log(sys, 3, b"[pr] resp rx".as_ptr(), 12);
         let len = plen as usize;
         if len < 2 { continue; }
 
@@ -924,23 +1043,8 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         payload[0] = conn_id;
         payload[1..1 + data_len].copy_from_slice(data);
 
-        let r = net_write_frame(sys, s.net_out, NCMD_SEND, payload.as_ptr(), payload_len,
+        net_write_frame(sys, s.net_out, NCMD_SEND, payload.as_ptr(), payload_len,
                         s.buf.as_mut_ptr(), BUF_SIZE);
-        let digits = [
-            b'c', b'=',
-            b'0' + (((conn_id as u16) / 10) % 10) as u8,
-            b'0' + ((conn_id as u16) % 10) as u8,
-            b' ',
-            b'l', b'=',
-            b'0' + (((data_len as u16) / 100) % 10) as u8,
-            b'0' + (((data_len as u16) / 10) % 10) as u8,
-            b'0' + ((data_len as u16) % 10) as u8,
-            b' ',
-            b'r', b'=',
-            if r > 0 { b'+' } else { b'0' },
-        ];
-        dev_log(sys, 3, b"[pr] cmd_send".as_ptr(), 13);
-        dev_log(sys, 3, digits.as_ptr(), 13);
     }
 }
 

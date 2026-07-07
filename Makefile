@@ -1,43 +1,40 @@
-# clustor Makefile — fluxor-based. See ~/Development/nanocloudio/standards/make.md.
+# clustor Makefile — the lifecycle only: clean / build / test /
+# lint / ci / publish, plus the two project targets that earn their
+# names under standards/make.md §1: `bench` (canonicalizes the
+# criterion flags the CI-fast run uses) and `e2e` (composes the
+# sequential, thread-bounded cluster/chaos/partition/wal harness
+# runs). Anything else is the `fluxor` CLI directly.
 
-.PHONY: help build test bench fmt fmt-check clippy lint ci verify e2e modules-std \
-        modules modules-all modules-clean up up-cluster clean setup \
-        update sync sync-dry publish publish-local
+.PHONY: help build test bench lint ci e2e publish clean
 
 SHELL       := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
-CARGO       ?= cargo
-FLUXOR      ?= fluxor
-TARGET      ?= bcm2712
 
 .DEFAULT_GOAL := build
 
 help:
-	@echo "clustor make targets"
-	@echo "  make build          host build"
-	@echo "  make test           cargo test --workspace"
-	@echo "  make bench          host micro-benches (L0/L1, criterion)"
-	@echo "  make fmt|fmt-check  rustfmt"
-	@echo "  make clippy|lint    clippy + fmt-check"
-	@echo "  make modules        build PIC modules for TARGET=$(TARGET)"
-	@echo "  make modules-all    build modules for every target in fluxor.toml"
-	@echo "  make up             render+run a single replica (CONFIG=, NODE_ID=)"
-	@echo "  make up-cluster     spawn REPLICAS replicas (CONFIG=, REPLICAS=)"
-	@echo "  make ci             full CI gate (fluxor ci)"
-	@echo "  make e2e            strict cluster/chaos/partition/wal e2e (needs synced fluxor-linux)"
-	@echo "  make verify         ci + e2e (the resilience regression gate)"
-	@echo "  make clean          cargo clean + module artefacts"
-	@echo "  make setup          install fluxor CLI onto PATH"
-	@echo "  Fluxor registry consumption (see standards/dependencies.md):"
-	@echo "  make update         resolve fluxor.lock against the local registry"
-	@echo "  make sync[-dry]     install lockfile-resolved fmods + runtimes"
-	@echo "  make publish        canonical publish of clustor's artefacts"
-	@echo "  make publish-local  content-hashed local-only publish"
+	@echo "clustor lifecycle:"
+	@echo "  make build     cargo build --workspace --all-targets"
+	@echo "  make test      cargo test --workspace (TEST_THREADS=$(TEST_THREADS))"
+	@echo "  make lint      rustfmt --check + clippy -D warnings"
+	@echo "  make ci        fluxor ci — the full gate (lints, hygiene,"
+	@echo "                 tests, strict module build, lockfile checks)"
+	@echo "  make publish   fluxor publish — canonical registry publish"
+	@echo "  make clean     cargo clean + module artefacts"
+	@echo "clustor-specific:"
+	@echo "  make bench     host L0/L1 micro-benches (criterion, --quick)"
+	@echo "  make e2e       strict cluster/chaos/partition/wal e2e"
+	@echo "                 (sequential, thread-bounded; hard-fails on skip)"
+	@echo ""
+	@echo "Not make targets (use the CLI directly):"
+	@echo "  fluxor modules build [--target …]   PIC modules"
+	@echo "  fluxor run / up                     bring-up"
+	@echo "  fluxor update / sync                registry consumption"
+	@echo "One-time setup: make -C ../fluxor install"
 
-setup:
-	cargo install --locked --path ../fluxor/tools
+build:
+	cargo build --workspace --all-targets
 
-build:      ; $(CARGO) build --workspace --all-targets
 # Cluster e2e tests (`tests/cluster.rs`, `chaos.rs`, `partition.rs`)
 # each spin up 1–3 `fluxor-linux` child processes. Default cargo
 # parallelism saturates a 4-core Pi-class host and Raft commit
@@ -45,87 +42,62 @@ build:      ; $(CARGO) build --workspace --all-targets
 # concurrent-cluster count bounded; individual unit-test binaries
 # (fast, no children) still run with full intra-binary parallelism.
 TEST_THREADS ?= 4
-test:       ; $(CARGO) test --workspace -- --test-threads=$(TEST_THREADS)
+test:
+	cargo test --workspace -- --test-threads=$(TEST_THREADS)
+
 # Host L0/L1 micro-benches (RFC §7.1). `--quick` keeps it CI-fast;
-# drop the flag for full criterion sampling when chasing a regression.
-bench:      ; $(CARGO) bench --benches -- --quick
-fmt:        ; $(CARGO) fmt --all
-fmt-check:  ; $(CARGO) fmt --all -- --check
-clippy:     ; $(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
-lint:       fmt-check clippy
+# drop the flag for full criterion sampling when chasing a
+# regression.
+bench:
+	cargo bench --benches -- --quick
 
-modules:
-	$(FLUXOR) modules build --target $(TARGET) --out target
-
-modules-all:
-	$(FLUXOR) modules build --all --out target
-
-modules-clean:
-	$(FLUXOR) modules clean --out target
-
-CONFIG  ?= configs/single.yaml
-NODE_ID ?= 0
-up: modules
-	$(FLUXOR) run --template $(CONFIG) --node-id $(NODE_ID)
-
-REPLICAS ?= 3
-up-cluster: modules
-	$(FLUXOR) up $(CONFIG) --replicas $(REPLICAS)
+lint:
+	cargo fmt --all -- --check
+	cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 ci:
-	$(FLUXOR) ci
+	fluxor ci
 
 # End-to-end cluster/chaos/partition/wal tests. Each spins up real
-# `fluxor-linux` child processes, so they need (a) the clustor modules built
-# at the harness's standard resolution path (`target/fluxor/<silicon>/modules`,
-# distinct from `make modules`' legacy `target/` path) and (b) a `fluxor-linux`
-# runtime materialised (`make sync`, or a live workspace checkout).
+# `fluxor-linux` child processes, so they need the clustor modules
+# built at the harness's resolution path
+# (`target/fluxor/<silicon>/modules`) and a `fluxor-linux` runtime
+# materialised (`fluxor sync`, or a live workspace checkout).
 #
-# CLUSTOR_REQUIRE_E2E=1 turns the harness's soft-skip into a HARD failure, so
-# CI cannot report green by silently skipping the resilience suite — a
-# permanently green-by-skip chaos suite removes the regression signal.
+# CLUSTOR_REQUIRE_E2E=1 turns the harness's soft-skip into a HARD
+# failure, so CI cannot report green by silently skipping the
+# resilience suite — a permanently green-by-skip chaos suite
+# removes the regression signal.
 #
-# Each test binary is a SEPARATE, sequential `cargo test` invocation rather
-# than one combined command. cargo runs distinct test binaries in parallel, so
-# a combined run would spin up cluster + chaos + partition clusters at once —
-# 16+ `fluxor-linux` nodes on a 4-core host. That oversubscription starves the
-# convergence-sensitive tests (e.g. follower catch-up) past their budgets. Run
-# them one binary at a time, at a modest intra-binary thread count, so no run
-# exceeds a few concurrent 3-node clusters.
+# Each test binary is a SEPARATE, sequential `cargo test`
+# invocation rather than one combined command. cargo runs distinct
+# test binaries in parallel, so a combined run would spin up
+# cluster + chaos + partition clusters at once — 16+ `fluxor-linux`
+# nodes on a 4-core host. That oversubscription starves the
+# convergence-sensitive tests (e.g. follower catch-up) past their
+# budgets. One binary at a time, at a modest intra-binary thread
+# count, keeps it to a few concurrent 3-node clusters.
 E2E_THREADS ?= 2
-e2e: modules-std
-	CLUSTOR_REQUIRE_E2E=1 $(CARGO) test --test wal_replay --test wal_group_fsync -- --test-threads=$(E2E_THREADS)
-	CLUSTOR_REQUIRE_E2E=1 $(CARGO) test --test partition -- --test-threads=$(E2E_THREADS)
-	CLUSTOR_REQUIRE_E2E=1 $(CARGO) test --test chaos -- --test-threads=$(E2E_THREADS)
-	CLUSTOR_REQUIRE_E2E=1 $(CARGO) test --test cluster -- --test-threads=$(E2E_THREADS)
-
-# Build modules to the e2e harness's standard resolution path. (`make modules`
-# targets the legacy `target/` path used by the registry/`fluxor run` flow.)
-modules-std:
-	$(FLUXOR) modules build --target $(TARGET) --out target/fluxor
-
-verify: ci e2e
-
-clean:
-	$(CARGO) clean
-	$(FLUXOR) modules clean --out target
-
-# ── Registry consumption (RFC §11 / standards/dependencies.md) ─────────
-#
-# `make update` regenerates fluxor.lock from clustor's [dependencies].
-# `make sync` materialises every lockfile-resolved fmod + runtime +
-# source crate into clustor's target/ tree. Run sync after every
-# upstream `fluxor publish`.
-
-update:
-	$(FLUXOR) update
-
-sync:
-	$(FLUXOR) sync
-sync-dry:
-	$(FLUXOR) sync --dry-run
+e2e:
+	fluxor modules build --all
+	CLUSTOR_REQUIRE_E2E=1 cargo test --test wal_replay -- --test-threads=$(E2E_THREADS)
+	# wal_group_fsync's 4 tests all launch single-node clusters through
+	# `Cluster::launch`, which wipes and recreates one hardcoded, shared
+	# `<workspace>/wal/` directory per launch (the WAL module resolves
+	# `wal/p...` relative to the spawned process's cwd, with no per-node
+	# override). Concurrent launches within this binary race on that one
+	# directory — confirmed by direct reproduction: 3/3 clean at
+	# --test-threads=1, 3/3 deterministic cross-contamination at
+	# --test-threads=2. Force single-threaded until the harness gives
+	# each node its own WAL directory.
+	CLUSTOR_REQUIRE_E2E=1 cargo test --test wal_group_fsync -- --test-threads=1
+	CLUSTOR_REQUIRE_E2E=1 cargo test --test partition -- --test-threads=$(E2E_THREADS)
+	CLUSTOR_REQUIRE_E2E=1 cargo test --test chaos -- --test-threads=$(E2E_THREADS)
+	CLUSTOR_REQUIRE_E2E=1 cargo test --test cluster -- --test-threads=$(E2E_THREADS)
 
 publish:
-	$(FLUXOR) publish
-publish-local:
-	$(FLUXOR) publish --local
+	fluxor publish
+
+clean:
+	cargo clean
+	fluxor modules clean

@@ -1,0 +1,109 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# Session directory / reservation authority — the durable single-writer
+# role from fluxor's rfc_protocols.md §8.3 / §13.7, backed by the
+# replica group. State machine: modules/common/session_registry.rs;
+# gate tests: tests/session_registry.rs; doc:
+# docs/architecture/session_directory.md.
+#
+# Capability semantics (fluxor capability_surface.md §Continuity Role):
+#   session.directory   — single-writer placement/continuity metadata
+#   session.reservation — quorum-committed counter-block grants (R2)
+#   security.key_wrap   — KEK-wrapped key custody the substrate cannot
+#                         read, TTL + quorum wipe (R1). The KEK itself
+#                         lives with the anchors/HSM, never here.
+#   durable.rpo_zero    — replies are relayed only from the committed-
+#                         entry stream, so anything acked through this
+#                         module is quorum-durable first (R5).
+#
+# fence.enforceable is deliberately NOT declared: this module enforces
+# fence ORDERING (no takeover past an unconfirmed fence) but cannot cut
+# power. The deployment's fence agent (STONITH / fabric cutoff — the
+# fluxor rig's kasa_local backend is the reference) declares it.
+capabilities = [
+  "session.directory",
+  "session.reservation",
+  "security.key_wrap",
+  "durable.rpo_zero",
+]
+
+# Committed entries from apply_pipeline (strict order).
+[[ports]]
+name = "committed_entries"
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_SR_REQUEST from anchors / orchestrators:
+# [request_id:u64][SR_OP_* command body].
+[[ports]]
+name = "requests"
+index = 1
+direction = "input"
+content_type = "OctetStream"
+
+# State-machine snapshot install (MSG_APP_SNAPSHOT_CHUNK / RESET).
+# Optional; unwired in graphs that don't run snapshot installs.
+[[ports]]
+name = "snapshot_chunk"
+index = 2
+direction = "input"
+content_type = "OctetStream"
+
+# Snapshot export trigger (MSG_APP_SNAPSHOT_REQUEST). Optional.
+[[ports]]
+name = "snapshot_request"
+index = 3
+direction = "input"
+content_type = "OctetStream"
+
+# MSG_PROPOSAL_ASSIGNED from raft_engine: [correlation:8][partition:2]
+# [wal_index:8]. Attribution for reply routing — the committed entry at
+# `wal_index` is the proposal with that correlation.
+[[ports]]
+name = "proposal_assigned"
+index = 4
+direction = "input"
+content_type = "OctetStream"
+
+# Tagged proposals (MSG_CLIENT_PROPOSAL) to raft_engine.proposals_tagged.
+[[ports]]
+name = "proposals"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_SR_REPLY back to the requester — emitted ONLY after the command
+# is quorum-committed and applied (R2/R5 ack boundary).
+[[ports]]
+name = "replies"
+index = 1
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+index = 2
+direction = "output"
+content_type = "OctetStream"
+
+# Snapshot export (MSG_APP_SNAPSHOT_CHUNK, done=1 terminated). Optional.
+[[ports]]
+name = "snapshot_export"
+index = 3
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+# Heartbeat snapshot on `metrics` (MSG_METRICS, ~1s cadence): applied
+# cursor plus the six counters below. Per-transition detail is also
+# emitted as MON_SESSION log lines.
+metrics = [
+  "applied_ok",
+  "applied_rejected",
+  "requests_in",
+  "replies_out",
+  "stream_gaps",
+  "recovery_epoch",
+]

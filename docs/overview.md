@@ -35,6 +35,7 @@ How the system works. These are the authoritative references.
 - [architecture/compatibility.md](architecture/compatibility.md) — wire stability, version negotiation, cache states, readiness
 - [architecture/modules.md](architecture/modules.md) — module reference, four-domain layout, hot-path properties
 - [architecture/substrate_capability_surface.md](architecture/substrate_capability_surface.md) — the seven-primitive substrate contract downstream consumers code against
+- [architecture/session_directory.md](architecture/session_directory.md) — the session-directory / reservation-authority consumer (fluxor rfc_protocols.md §13.7): quorum-committed counter-block grants, epoch fencing, key custody, fence ordering
 - [architecture/consumer_facade.md](architecture/consumer_facade.md) — typed Rust helpers (`replica_facade`) implementing the consumer side of that surface
 
 ## Guides and integration

@@ -513,6 +513,9 @@ pub const MSG_READ_PERMIT: u8         = 0x33;
 pub const MSG_THROTTLE_CREDITS: u8    = 0x40;
 pub const MSG_THROTTLE_ENVELOPE: u8   = 0x41;
 pub const MSG_LAG_SIGNAL: u8          = 0x42;
+/// Additive wall-clock refill: `[entry_grant:i32][byte_grant:i32]
+/// [entry_capacity:i32][byte_capacity:i32]`.
+pub const MSG_THROTTLE_REFILL: u8     = 0x43;
 
 // Snapshot
 pub const MSG_SNAPSHOT_CHUNK: u8      = 0x50;
@@ -742,6 +745,11 @@ pub const MSG_HTTP_REQUEST: u8        = 0x74;
 /// text/plain with a short error string. The HTTP server module
 /// frames the wire-level HTTP response itself.
 pub const MSG_HTTP_RESPONSE: u8       = 0x75;
+/// Replaceable readiness snapshot from `http_adapter` to `http_ingress`.
+/// Payload: the latest `MSG_READYZ` body (currently one byte). This travels
+/// through a mailbox edge: only the newest state matters, unlike ordered HTTP
+/// requests and TCP events which remain FIFO.
+pub const MSG_HTTP_READY_SNAPSHOT: u8 = 0x79;
 
 /// Multiplexed client record on the cleartext path. Payload is
 /// `[conn_id:u8][raw client bytes]`. peer_router wraps every cleartext
@@ -784,6 +792,7 @@ pub const MODULE_ID_CP_BRIDGE: u8         = 0x14;
 pub const MODULE_ID_TELEMETRY_AGG: u8     = 0x15;
 pub const MODULE_ID_NVME_BENCH: u8        = 0x16;
 pub const MODULE_ID_CONSENSUS_BENCH: u8   = 0x17;
+pub const MODULE_ID_HTTP_ADAPTER: u8      = 0x18;
 
 /// Per-module metric ids. Each module owns a small private space
 /// (0x00..0xFF). Documented next to the module's metric emission.
@@ -871,6 +880,12 @@ pub mod metric_ids {
     /// Counter: WAL log-suffix truncations applied (Raft §5.3 conflict
     /// repair discarded a divergent uncommitted tail).
     pub const WAL_TRUNCATIONS: u16             = 0x000E;
+    /// Gauge: live byte grant resolved from the classed WAL input edge.
+    pub const WAL_INPUT_BUDGET_BYTES: u16      = 0x000F;
+    /// Gauge: records persisted by the most recent non-empty input pump.
+    pub const WAL_PUMP_RECORDS: u16            = 0x0010;
+    /// Counter: non-contiguous append indices observed at the WAL input.
+    pub const WAL_CONTINUITY_ERRORS: u16       = 0x0011;
 
     // replicator (module_id = 0x03)
     pub const REPL_RPCS_SENT: u16              = 0x0001;
@@ -917,6 +932,21 @@ pub mod metric_ids {
     pub const APPLY_ENTRIES_EVICTED: u16       = 0x0006;
     /// Counter: refetch read-back slots evicted before consumption.
     pub const APPLY_READS_EVICTED: u16         = 0x0007;
+
+    // http_adapter (module_id = 0x18)
+    pub const HTTP_CORRELATIONS_INFLIGHT: u16   = 0x0001;
+    pub const HTTP_INDICES_INFLIGHT: u16        = 0x0002;
+    pub const HTTP_INFLIGHT_HIGH_WATER: u16     = 0x0003;
+    pub const HTTP_PROPOSAL_TIMEOUTS: u16       = 0x0004;
+    pub const HTTP_COMMIT_TIMEOUTS: u16         = 0x0005;
+    pub const HTTP_ASSIGNMENTS_UNMATCHED: u16   = 0x0006;
+    pub const HTTP_ASSIGNMENTS_NO_SLOT: u16     = 0x0007;
+    pub const HTTP_APPLIES_UNMATCHED: u16       = 0x0008;
+    pub const HTTP_REJECTIONS: u16              = 0x0009;
+    pub const HTTP_QUEUE_UNAVAILABLE: u16       = 0x000A;
+    pub const HTTP_COMMITTED: u16               = 0x000B;
+    pub const HTTP_REQUESTS: u16                = 0x000C;
+    pub const HTTP_REQUESTS_404: u16            = 0x000D;
 
     // throttle_gate (module_id = 0x0A)
     pub const THROTTLE_ADMITTED: u16           = 0x0001;
@@ -1073,6 +1103,23 @@ pub fn decode_metric_sample(buf: &[u8]) -> Option<(u8, u16, u16, u8, i64)> {
     ]);
     Some((module_id, partition_id, metric_id, kind, value))
 }
+
+// Session directory (fluxor rfc_protocols.md §8.3 / §13.7 — the
+// replicated session-registry consumer in
+// `modules/app/session_directory/`).
+//
+// `MSG_SR_REQUEST`: anchor/orchestrator → session_directory. Payload:
+// `[request_id:u64 LE][session_registry command body]` where the body
+// is one of the `SR_OP_*` layouts in `modules/common/session_registry.rs`
+// (opcode byte first). The directory replays the body verbatim as a
+// tagged raft proposal; the reply is sent ONLY after the command is
+// quorum-committed and applied — the R2/R5 "durable before ack"
+// invariant lives on this boundary.
+//
+// `MSG_SR_REPLY`: session_directory → requester. Payload:
+// `[request_id:u64 LE][SessionReply (SR_REPLY_LEN bytes)]`.
+pub const MSG_SR_REQUEST: u8          = 0x90;
+pub const MSG_SR_REPLY: u8            = 0x91;
 
 // Routing
 pub const MSG_PLACEMENT_UPDATE: u8    = 0x80;
@@ -1485,6 +1532,31 @@ pub fn decode_credits(buf: &[u8]) -> (i32, i32) {
     let entry = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let byte = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
     (entry, byte)
+}
+
+pub const THROTTLE_REFILL_LEN: usize = 16;
+
+#[inline]
+pub fn encode_throttle_refill(
+    buf: &mut [u8; THROTTLE_REFILL_LEN],
+    entry_grant: i32,
+    byte_grant: i32,
+    entry_capacity: i32,
+    byte_capacity: i32,
+) {
+    buf[0..4].copy_from_slice(&entry_grant.to_le_bytes());
+    buf[4..8].copy_from_slice(&byte_grant.to_le_bytes());
+    buf[8..12].copy_from_slice(&entry_capacity.to_le_bytes());
+    buf[12..16].copy_from_slice(&byte_capacity.to_le_bytes());
+}
+
+#[inline]
+pub fn decode_throttle_refill(buf: &[u8]) -> Option<(i32, i32, i32, i32)> {
+    if buf.len() < THROTTLE_REFILL_LEN { return None; }
+    let i32_at = |off: usize| {
+        i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+    };
+    Some((i32_at(0), i32_at(4), i32_at(8), i32_at(12)))
 }
 
 // ── FNV-1a 64-bit hash ──────────────────────────────────────────────────────

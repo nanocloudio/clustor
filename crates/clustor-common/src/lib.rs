@@ -50,3 +50,7 @@ pub mod replica_facade;
 #[rustfmt::skip]
 #[path = "../common/http_admin.rs"]
 pub mod http_admin;
+
+#[rustfmt::skip]
+#[path = "../common/session_registry.rs"]
+pub mod session_registry;

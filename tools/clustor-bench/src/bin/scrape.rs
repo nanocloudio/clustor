@@ -17,7 +17,9 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use clustor_bench::{fnv1a64, http_get, json_str, parse_export, JsonObj, Snapshot, KIND_COUNTER};
+use clustor_bench::{
+    fnv1a64, http_get, json_str, parse_export, JsonObj, Snapshot, KIND_COUNTER, KIND_HISTOGRAM,
+};
 
 struct Args {
     host: String,
@@ -76,13 +78,9 @@ fn parse_args() -> Args {
 }
 
 fn git_sha() -> String {
-    std::process::Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    // Keep the benchmark tool independent of repository state. CI/release
+    // automation can inject provenance without the runner invoking Git.
+    std::env::var("BUILD_GIT_SHA").unwrap_or_else(|_| "unknown".to_string())
 }
 
 fn now_unix() -> u64 {
@@ -135,7 +133,10 @@ fn main() {
     for k in keys {
         let s = end.by_key[&k];
         let (mid, pid, met) = k;
-        let delta = if s.kind == KIND_COUNTER {
+        // Histogram buckets are cumulative monotone counts just like
+        // counters; deltas isolate the benchmark window's distribution
+        // from the lifetime high-water.
+        let delta = if s.kind == KIND_COUNTER || s.kind == KIND_HISTOGRAM {
             end.counter_delta(&start, k)
         } else {
             s.value

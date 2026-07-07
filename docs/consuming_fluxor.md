@@ -15,7 +15,7 @@ Prescriptive contract:
 ## TL;DR
 
 ```sh
-make update && make sync && make modules
+fluxor update && fluxor sync && fluxor modules build --all
 ```
 
 In clustor's checkout. `update` re-resolves `fluxor.lock` against
@@ -49,7 +49,7 @@ git clone git@github.com:nanocloudio/fluxor.git
 
 # 2. Install the fluxor CLI and bootstrap the registry
 cd fluxor
-make setup                          # cargo install --locked --path tools
+make -C ../fluxor install           # one-time CLI install
 fluxor registry init                # bootstrap ~/.fluxor/registry/
 fluxor registry setup-cargo         # adds [registries.fluxor] to ~/.cargo/config.toml
 
@@ -61,14 +61,14 @@ Then in clustor:
 
 ```sh
 cd ../clustor
-make update                          # resolves fluxor.lock against the registry
-make sync                            # materialises everything into target/
+fluxor update                        # resolves fluxor.lock against the registry
+fluxor sync                            # materialises everything into target/
 ```
 
 After that, the normal clustor workflow works:
 
 ```sh
-make modules                         # builds clustor's PIC modules
+fluxor modules build --all           # builds clustor's PIC modules
 make test                            # cluster harness, facade tests, etc.
 make ci                              # full gate
 ```
@@ -90,8 +90,8 @@ make publish
 
 # downstream picks it up
 cd ../clustor
-make update                          # rewrites fluxor.lock with new version
-make sync                            # copies new artefacts into target/
+fluxor update                        # rewrites fluxor.lock with new version
+fluxor sync                            # copies new artefacts into target/
 git add fluxor.lock                  # commit the new pin
 ```
 
@@ -117,7 +117,7 @@ mode is active.
 
 **In live mode:**
 
-- `make sync` prefers fluxor's locally-built `target/` artefacts as
+- `fluxor sync` prefers fluxor's locally-built `target/` artefacts as
   an override; anything not built locally resolves from the registry
   copy recorded in `fluxor.lock` (hash-verified). Iteration is
   opt-in per artefact — build only what you change, take the rest
@@ -125,7 +125,7 @@ mode is active.
   every workspace member that fell back, so it's clear at a glance
   whether local edits are flowing through.
 - Source crates resolve via the registry-extracted location and
-  refresh whenever you re-run `make sync` after a fluxor publish.
+  refresh whenever you re-run `fluxor sync` after a fluxor publish.
 - `fluxor.lock` hashes are bypassed only for artefacts that
   resolved live; fallbacks stay hash-verified.
 - `[dependencies] fluxor = "..."` in `fluxor.toml` is advisory
@@ -148,19 +148,19 @@ While iterating between fluxor and clustor in Mode B:
 # edited fluxor
 cd ../fluxor
 [edit anything]
-make modules-all          # rebuild the .fmod artefacts you changed
+fluxor modules build --all   # rebuild the .fmod artefacts you changed
                           # (skip if no module source changed)
 make linux-bin            # rebuild fluxor-linux if you changed it
                           # (skip otherwise)
 
 # pick up in clustor
 cd ../clustor
-make sync                 # live builds override; everything else from the registry
-make modules              # rebuild clustor modules against the synced fluxor SDK
+fluxor sync               # live builds override; everything else from the registry
+fluxor modules build --all   # rebuild clustor modules against the synced fluxor SDK
 make test                 # cluster harness picks up the synced fluxor-linux
 ```
 
-Rebuild only what you changed. `make sync` takes whatever fluxor's
+Rebuild only what you changed. `fluxor sync` takes whatever fluxor's
 `target/` holds as the override and resolves everything else from
 the lockfile's registry copy. Sync's tail advisory names every
 workspace member that fell back to the registry, so it's clear at a
@@ -176,8 +176,8 @@ make publish                         # publishes everything at the new version
 
 # downstream adopts
 cd ../clustor
-make update                          # fluxor.lock now has version = "0.1.1"
-make sync                            # crates re-extracted, fmods re-copied
+fluxor update                          # fluxor.lock now has version = "0.1.1"
+fluxor sync                            # crates re-extracted, fmods re-copied
 git diff fluxor.lock                 # review the new pin
 git add fluxor.lock
 git commit -m "Bump fluxor to 0.1.1"
@@ -201,7 +201,7 @@ reproduce your build. CI verifies consistency via `fluxor ci`'s
 
 The `lockfile-consistency` phase rejects drift — if your local
 registry has a different fluxor version than what `fluxor.lock`
-pins, CI fails with a precise diff. Run `make update` to bring the
+pins, CI fails with a precise diff. Run `fluxor update` to bring the
 lockfile up to date.
 
 ### PIC module paths are stable across fluxor versions.
@@ -248,11 +248,11 @@ operate in canonical mode against the registry.
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `make update` says "no matching canonical artefacts" | fluxor hasn't been published yet | Run `make publish` in fluxor's checkout |
-| `make sync` reports `hash mismatch` | Registry tampered or out of sync with lockfile | Re-run `make publish` upstream, then `make update && make sync` here |
-| `fluxor modules build` says "no manifest found for module 'ip'" | Search paths don't include fluxor's modules | Set `$FLUXOR_PROJECT_ROOT` to fluxor's checkout, OR ensure `target/fluxor/fluxor-abi/sdk/` is populated via `make sync` |
+| `fluxor update` says "no matching canonical artefacts" | fluxor hasn't been published yet | Run `make publish` in fluxor's checkout |
+| `fluxor sync` reports `hash mismatch` | Registry tampered or out of sync with lockfile | Re-run `make publish` upstream, then `fluxor update && fluxor sync` here |
+| `fluxor modules build` says "no manifest found for module 'ip'" | Search paths don't include fluxor's modules | Set `$FLUXOR_PROJECT_ROOT` to fluxor's checkout, OR ensure `target/fluxor/fluxor-abi/sdk/` is populated via `fluxor sync` |
 | `cargo check` says "rustc 1.92.0 not supported by fixed@1.31" | Transitive dep of fluxor-sdk wants newer rustc | `cargo update fixed --precise 1.29.0` (or whatever's compatible) |
-| Tests fail to find `fluxor-linux` | Either upstream didn't publish runtime, or sync didn't run | `cd ../fluxor && make publish` then back to clustor `make sync` |
+| Tests fail to find `fluxor-linux` | Either upstream didn't publish runtime, or sync didn't run | `cd ../fluxor && make publish` then back to clustor `fluxor sync` |
 | Tests skip with "fluxor checkout not found" | `config_validate` needs fluxor's `targets/` directory | Set `$FLUXOR_CHECKOUT` env var, or place fluxor at `../fluxor` |
 
 ## Related reading

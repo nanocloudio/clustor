@@ -1,4 +1,5 @@
 version = "0.1.0"
+timer_class = "wall_clock"
 type = "Transformer"
 entry = "mod.rs"
 hardware_targets = ["bcm2712"]
@@ -22,6 +23,13 @@ hardware_targets = ["bcm2712"]
 # persisted, which is a data-loss hazard in production. See
 # `modules/app/wal/manifest.toml` for the same note from the WAL
 # side.
+#
+# On bare-metal FAT32 (no mkdir, 8.3 names) set param `root_path: 1`
+# to write `<p:1hex><idx:7hex>.SNP` at the FS root instead — set it
+# together with the wal module's `root_path` so segments and
+# snapshots share a layout. Superseded snapshot files are retired
+# via FS_UNLINK once the newer one is durable (providers without
+# `caps::UNLINK` simply accumulate orphans, as before).
 [[resources]]
 requires_contract = "fs"
 access = "write"
@@ -90,10 +98,39 @@ name = "installed_local"
 direction = "output"
 content_type = "OctetStream"
 
+# ── App state-machine snapshot (RFC §2.1) ────────────────────────────
+# Optional. When unwired, snapshots stay manifest-only: peers learn the
+# (term, index) and trust their own log/WAL, which is only sound on a
+# graph that never replays from a compaction floor.
+#
+# Input index 5 / output index 4 — appended so existing port indices
+# are unchanged.
+
+# App → engine: `MSG_APP_SNAPSHOT_CHUNK` stream carrying the encoded
+# state machine, labelled with the app's own applied position.
+[[ports]]
+name = "app_snapshot_body"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 4124
+rate_class_max = "transaction"
+
+# Engine → app: `MSG_APP_SNAPSHOT_REQUEST` (capture now) on the local
+# trigger path, and `MSG_APP_SNAPSHOT_RESET` + chunk stream when a peer
+# snapshot is installed.
+[[ports]]
+name = "app_snapshot_ctl"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 4124
+rate_class_max = "transaction"
+
 [observability]
 # Chunked snapshot export/import + manifest persistence. Typed
 # MSG_METRIC_SAMPLE counters (snapshots_taken, chunks_imported,
 # triggers_deferred) plus the transfer_seconds histogram (RFC §4.1),
 # timed from first install chunk to `done`. Partition-stamped.
-metrics = ["snapshots_taken", "chunks_imported", "triggers_deferred", "bytes_written", "install_failures"]
+metrics = ["snapshots_taken", "chunks_imported", "triggers_deferred", "bytes_written", "install_failures", "app_bodies_received", "app_captures_timed_out"]
 histograms = ["transfer_seconds"]

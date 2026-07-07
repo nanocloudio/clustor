@@ -1,4 +1,5 @@
 version = "0.1.0"
+timer_class = "wall_clock"
 type = "Transformer"
 entry = "mod.rs"
 hardware_targets = ["bcm2712"]
@@ -42,6 +43,10 @@ content_type = "OctetStream"
 name = "committed"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + term/index commit horizon (16).
+max_record = 19
+rate_class_max = "transaction"
 
 # MSG_METRIC_SAMPLE fan-in to telemetry_agg.ingest (RFC §4.3). Appended
 # last so `committed` keeps output index 0.
@@ -51,7 +56,20 @@ direction = "output"
 content_type = "OctetStream"
 
 [observability]
-# Quorum commit-index computation; `[commit] adv` marks each advance.
-# Emitted as typed MSG_METRIC_SAMPLE (commit_index gauge,
+# Quorum commit-index computation, emitted as typed
+# MSG_METRIC_SAMPLE (commit_index gauge,
 # commit_advances counter), partition-stamped for multi-Raft graphs.
 metrics = ["commit_index", "commit_advances"]
+
+# Min-match retention floor → snapshot_engine.retention_floor
+# (MSG_COMPACTION_FLOOR): gates snapshot triggers — and
+# therefore WAL compaction — behind the slowest live voter's replicated
+# index, so a leader-local snapshot can never compact entries a lagging
+# follower still needs (with manifest-only snapshots that follower could
+# otherwise never catch up, and its permanent lag signal strangles the
+# proposal path via flow_controller). Optional; leave unwired on
+# followers and single-voter graphs (min match == commit there).
+[[ports]]
+name = "retention_floor"
+direction = "output"
+content_type = "OctetStream"

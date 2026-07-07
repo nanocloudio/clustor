@@ -102,6 +102,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+        let work_before = s.admitted_count.wrapping_add(s.rejected_count);
 
         // 1. Drain credit updates (keep latest)
         loop {
@@ -112,11 +113,42 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let (entry, byte) = wire::decode_credits(&s.msg_buf);
                 s.entry_credits = entry;
                 s.byte_credits = byte;
+            } else if msg_type == wire::MSG_THROTTLE_REFILL
+                && plen as usize >= wire::THROTTLE_REFILL_LEN
+            {
+                if let Some((entry, byte, entry_cap, byte_cap)) =
+                    wire::decode_throttle_refill(&s.msg_buf[..plen as usize])
+                {
+                    s.entry_credits = s.entry_credits.saturating_add(entry);
+                    s.byte_credits = s.byte_credits.saturating_add(byte);
+                    let entry_cap = entry_cap.max(0);
+                    let byte_cap = byte_cap.max(0);
+                    if s.entry_credits > entry_cap { s.entry_credits = entry_cap; }
+                    if s.byte_credits > byte_cap { s.byte_credits = byte_cap; }
+                }
             }
         }
 
         // 2. Process requests
-        for _ in 0..8 {
+        // Drain at least one full wall-clock refill quantum. The flow
+        // controller publishes an absolute grant; stopping at eight could
+        // leave valid tokens unused and the next update would overwrite them,
+        // turning this loop bound into an accidental throughput ceiling.
+        for _ in 0..16 {
+            // Every consumed proposal must have a terminal route. Even when
+            // it will be admitted, require the rejection fan-out to have
+            // space before reading: credits can change only between steps,
+            // and a failed admitted write falls back to rejection below.
+            // Consuming while the rejected channel is full would count a
+            // rejection without delivering it, leaving the HTTP connection
+            // waiting until its socket timeout after an overload burst.
+            if s.out_rejected >= 0 {
+                let poll_rejected = (sys.channel_poll)(s.out_rejected, 0x02);
+                if poll_rejected <= 0 || (poll_rejected as u32 & 0x02) == 0 {
+                    break;
+                }
+            }
+
             // Admission backpressure (RFC §13/§14): if we have credits we
             // intend to admit, but the downstream raft.proposals_tagged
             // channel has no space (raft is applying durability
@@ -185,12 +217,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             entry_clamped,
                             s.byte_credits,
                         );
-                        wire_channels::channel_write_msg(
+                        let written = wire_channels::channel_write_msg(
                             sys,
                             s.out_rejected,
                             wire::MSG_CLIENT_REJECT_INTERNAL,
                             &env[..wire::CLIENT_REJECT_INTERNAL_LEN],
                         );
+                        if written <= 0 {
+                            // The pre-read readiness check makes this
+                            // unreachable in the cooperative scheduler. Do
+                            // not claim a delivered rejection if a provider
+                            // violates that readiness contract.
+                            break;
+                        }
                     }
                 }
                 s.rejected_count += 1;
@@ -199,6 +238,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 3. Periodic admission metrics (RFC §4.2).
         emit_metrics(s, sys);
+        if s.admitted_count.wrapping_add(s.rejected_count) != work_before {
+            dev_report_step_effect(sys, step_effect::WORK_DONE);
+        }
 
         0
     }

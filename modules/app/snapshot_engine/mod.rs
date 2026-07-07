@@ -71,6 +71,20 @@ const FS_CLOSE: u32 = 0x0903;
 /// snapshot manifests are created from scratch, so persistence needs
 /// the write tier.
 const FS_OPEN_CREATE: u32 = 0x0909;
+/// Remove a file by path (`modules/sdk/contracts/storage/fs.rs::UNLINK`).
+/// Used to retire the previous snapshot file once a newer one is durable;
+/// gated on the provider's `caps::UNLINK` bit (see `fs_unlink_supported`).
+const FS_UNLINK: u32 = 0x090A;
+/// FS capability-discovery opcode + the `UNLINK` bit
+/// (`modules/sdk/contracts/storage/fs.rs::{CAPS, caps::UNLINK}`).
+const FS_CAPS: u32 = 0x09FF;
+const FS_CAP_UNLINK: u32 = 1 << 5;
+/// FS E_AGAIN: the provider exists but is still initialising (fat32
+/// reading the BPB/GPT/root on a cold boot). Distinct from ENODEV/ENOSYS
+/// ("no provider"): an E_AGAIN persist failure must NOT be treated as the
+/// in-memory-graph case, or we'd signal an install (and let raft compact
+/// the WAL) against a manifest that never landed.
+const FS_E_AGAIN: i32 = -11;
 
 /// `module_step` return code for `StepOutcome::Burst` (kernel ABI:
 /// 0=Continue, 1=Done, 2=Burst, 3=Ready). Returned from a step that
@@ -113,11 +127,26 @@ const MAX_SNAPSHOT_BODY: usize = 16 * 1024;
 /// `MSG_INSTALL_SNAPSHOT` 33-byte header.
 const MAX_CHUNK_BODY: usize = 4 * 1024;
 
+/// How many steps we'll wait for an app snapshot body before giving up
+/// on the capture. At the rig's 1 ms tick this is ~2 s — long enough
+/// for a worker busy draining a commit batch, short enough that a
+/// wedged app only costs one rotation's snapshot.
+const APP_CAPTURE_TIMEOUT_TICKS: u32 = 2000;
+
 define_params! {
     ModuleState;
 
     1, partition_id, u16, 0
         => |s, d, len| { s.partition_id = p_u16(d, len, 0, 0); };
+
+    // 1 = write snapshot files into the FS ROOT with an 8.3-conforming
+    // name (`<p:1hex><idx:7hex>.SNP`) instead of `wal/p<NNNN>_snap_
+    // <NNNNNNNN>.bin`. Required on bare-metal FAT32, which has no mkdir
+    // (so no `wal/` parent) and rejects names longer than 8.3. Mirrors
+    // the wal module's param of the same name — set BOTH or NEITHER so
+    // segments and snapshots land in the same place.
+    2, root_path, u8, 0
+        => |s, d, len| { s.root_path = p_u8(d, len, 0, 0); };
 }
 
 /// Per-kpg retention-floor table capacity. Downstream consumers
@@ -175,6 +204,13 @@ struct ModuleState {
     last_snapshot_index: u64,
 
     partition_id: u16,
+    /// Param `root_path`: 1 = 8.3 snapshot names at the FS root (bare-metal
+    /// FAT32); 0 = `wal/p<NNNN>_snap_<NNNNNNNN>.bin` (linux layout).
+    root_path: u8,
+    /// FS `caps::UNLINK` probe cache for previous-snapshot retirement:
+    /// 0 = unprobed, 1 = supported, 2 = unsupported. See
+    /// `fs_unlink_supported`.
+    fs_unlink_probe: u8,
 
     // State
     dek_epoch: u32,
@@ -233,6 +269,27 @@ struct ModuleState {
     body_buf: [u8; MAX_SNAPSHOT_BODY],
     body_len: u32,
 
+    // ── App state-machine snapshot round-trip (RFC §2.1) ──────────
+    /// Port to the application state machine (request + restore) and
+    /// the port its encoded body comes back on. Both -1 when the graph
+    /// has no app snapshot provider, in which case snapshots stay
+    /// manifest-only and this whole path is inert.
+    out_app_ctl: i32,
+    in_app_body: i32,
+    /// A capture has been requested and we're waiting for the body.
+    /// Triggers arriving meanwhile are dropped (the next rotation
+    /// re-fires), so this never queues.
+    app_capture_pending: bool,
+    /// Ticks since the request went out — bounds the wait so a wedged
+    /// or silent app can't block snapshotting forever.
+    app_capture_ticks: u32,
+    app_bodies_received: u32,
+    app_captures_timed_out: u32,
+    /// Body staged for the next install emit. Owned by state (not a
+    /// borrow of msg_buf) so `finalize_snapshot` can take `&mut s`.
+    app_body_buf: [u8; MAX_SNAPSHOT_BODY],
+    app_body_len: u32,
+
     // Scratch
     path_buf: [u8; SNAP_PATH_MAX],
     msg_buf: [u8; 8192],
@@ -274,6 +331,11 @@ pub extern "C" fn module_new(
         s.out_manifest = dev_channel_port(sys, 1, 1);
         s.out_metrics = dev_channel_port(sys, 1, 2);
         s.out_installed = dev_channel_port(sys, 1, 3);
+        s.in_app_body = dev_channel_port(sys, 0, 5);
+        s.out_app_ctl = dev_channel_port(sys, 1, 4);
+        s.app_capture_pending = false;
+        s.app_capture_ticks = 0;
+        s.app_body_len = 0;
 
         s.retention_floors = [RetentionFloorSlot::empty(); RETENTION_FLOOR_SLOTS];
         s.retention_floor_overflow = false;
@@ -352,12 +414,29 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         dev_log(sys, 3, b"[snap] floor block".as_ptr(), 18);
                         continue;
                     }
-                    persist_manifest(s, sys, term, index);
+                    // With an app state machine wired, the snapshot is
+                    // only meaningful once we hold its state. Ask for a
+                    // capture and stop here; the body's own (term,
+                    // index) — which may have advanced past this
+                    // trigger — drives finalisation in section 2c.
+                    if s.out_app_ctl >= 0 {
+                        if s.app_capture_pending {
+                            // One capture in flight at a time; the next
+                            // rotation re-fires this trigger.
+                            s.triggers_deferred = s.triggers_deferred.saturating_add(1);
+                            continue;
+                        }
+                        if request_app_capture(s, sys, term, index) {
+                            s.app_capture_pending = true;
+                            s.app_capture_ticks = 0;
+                        }
+                        continue;
+                    }
                     cold_fs = true; // manifest persist did a (possibly cold) FS write
-                    s.last_snapshot_term = term;
-                    s.last_snapshot_index = index;
-                    emit_install_chunk(s, sys, term, index);
-                    s.snapshots_taken += 1;
+                    // No app provider on this graph — manifest-only
+                    // snapshot, exactly as before.
+                    s.app_body_len = 0;
+                    finalize_local_snapshot(s, sys, term, index);
                 }
             }
         }
@@ -381,6 +460,66 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // target byte in the request is preserved for the day
                 // we switch to a routed snapshot port.
                 emit_install_chunk(s, sys, s.last_snapshot_term, s.last_snapshot_index);
+            }
+        }
+
+        // 2c. App state-machine snapshot bodies (RFC §2.1). The body's
+        //     own (term, index) is authoritative — the app may have
+        //     applied past the trigger that prompted the capture.
+        if s.in_app_body >= 0 && s.app_capture_pending {
+            let poll = (sys.channel_poll)(s.in_app_body, 0x01);
+            if poll > 0 && (poll as u32 & 0x01) != 0 {
+                let (msg_type, plen) =
+                    wire_channels::channel_read_msg(sys, s.in_app_body, &mut s.msg_buf);
+                let pl = plen as usize;
+                if msg_type == wire::MSG_APP_SNAPSHOT_CHUNK && pl >= wire::APP_SNAPSHOT_HDR {
+                    let (term, index) = wire::decode_term_index(&s.msg_buf);
+                    let offset = u64::from_le_bytes([
+                        s.msg_buf[16], s.msg_buf[17], s.msg_buf[18], s.msg_buf[19],
+                        s.msg_buf[20], s.msg_buf[21], s.msg_buf[22], s.msg_buf[23],
+                    ]) as usize;
+                    let done = s.msg_buf[24] != 0;
+                    let body_len = pl - wire::APP_SNAPSHOT_HDR;
+                    // Strict in-order accumulation; a gap or an
+                    // oversized body aborts the capture and the next
+                    // rotation re-requests.
+                    if offset != s.app_body_len as usize
+                        || offset + body_len > MAX_SNAPSHOT_BODY
+                    {
+                        s.app_body_len = 0;
+                        s.app_capture_pending = false;
+                        s.app_capture_ticks = 0;
+                        s.triggers_deferred = s.triggers_deferred.saturating_add(1);
+                    } else {
+                        s.app_body_buf[offset..offset + body_len]
+                            .copy_from_slice(&s.msg_buf[wire::APP_SNAPSHOT_HDR..pl]);
+                        s.app_body_len = (offset + body_len) as u32;
+                        if done {
+                            s.app_bodies_received = s.app_bodies_received.saturating_add(1);
+                            s.app_capture_pending = false;
+                            s.app_capture_ticks = 0;
+                            if retention_floor_allows(s, index) {
+                                cold_fs = true; // finalise persists the manifest
+                                finalize_local_snapshot(s, sys, term, index);
+                            } else {
+                                s.triggers_deferred =
+                                    s.triggers_deferred.saturating_add(1);
+                            }
+                            s.app_body_len = 0;
+                        }
+                    }
+                }
+            } else {
+                // Bound the wait: a silent app (encode failed, or the
+                // state outgrew its export budget) must not wedge
+                // snapshotting for good.
+                s.app_capture_ticks = s.app_capture_ticks.saturating_add(1);
+                if s.app_capture_ticks > APP_CAPTURE_TIMEOUT_TICKS {
+                    s.app_capture_pending = false;
+                    s.app_capture_ticks = 0;
+                    s.app_captures_timed_out = s.app_captures_timed_out.saturating_add(1);
+                    dev_log(sys, 3, b"[snap] app timeout".as_ptr(), 18);
+                }
             }
         }
 
@@ -503,8 +642,9 @@ unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: us
         s.install_start_ms = dev_millis(sys);
         // Persist the manifest on first chunk so a crash mid-install
         // still leaves a record of (term, index). Body finalisation
-        // happens on `done`.
-        persist_manifest(s, sys, term, last_idx);
+        // happens on `done` — the durable-install gate lives there, so
+        // this early record's outcome is advisory only.
+        let _ = persist_manifest(s, sys, term, last_idx);
     }
 
     // Offset gating: drop misordered chunks. The leader is expected to
@@ -543,7 +683,22 @@ unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: us
         // no durable artefact possible, but the (term,index) is still a valid
         // install for an in-memory cluster — preserve the prior behaviour.
         // With an FS present, only signal on a confirmed durable write.
-        if (durable || !had_fs) && s.out_installed >= 0 {
+        // Hand the state-machine body to the app BEFORE signalling the
+        // install. The install signal is what lets raft compact its log
+        // to last_idx; if the app never received the state it could
+        // then never catch up. A refused hand-off (channel full)
+        // withholds the signal and the leader re-sends from offset 0.
+        let mut app_restored = true;
+        if s.out_app_ctl >= 0 && s.body_len > 0 {
+            app_restored = emit_app_restore(
+                s,
+                sys,
+                s.in_progress_term,
+                s.in_progress_last_idx,
+            );
+        }
+
+        if app_restored && (durable || !had_fs) && s.out_installed >= 0 {
             let poll = (sys.channel_poll)(s.out_installed, 0x02);
             if poll > 0 && (poll as u32 & 0x02) != 0 {
                 let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
@@ -559,9 +714,16 @@ unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: us
                     wire::MSG_SNAPSHOT_INSTALLED,
                     &buf,
                 );
+                let prev_index = s.last_snapshot_index;
                 s.last_snapshot_term = s.in_progress_term;
                 s.last_snapshot_index = s.in_progress_last_idx;
                 dev_log(sys, 3, b"[snap] installed".as_ptr(), 16);
+                // Exactly-one-snapshot steady state (mirrors the local
+                // trigger path): retire the superseded snapshot file only
+                // when this install confirmed durable on a real FS.
+                if durable {
+                    unlink_prev_snapshot(s, sys, prev_index, s.last_snapshot_index);
+                }
             }
         }
         // Fold the install duration into the transfer histogram (§4.1).
@@ -572,6 +734,93 @@ unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: us
         s.body_len = 0;
         s.in_progress_offset = 0;
     }
+}
+
+
+/// Finalise a locally-taken snapshot at `(term, index)`, shipping
+/// whatever body is staged in `s.app_body_buf[..s.app_body_len]`
+/// (empty = manifest-only).
+///
+/// Shared by the trigger path (no app provider — empty body) and the
+/// app-body path (§2.1 capture round-trip), so both orders of
+/// operations stay identical: persist, signal raft, retire the
+/// superseded manifest, then ship to peers.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines.
+unsafe fn finalize_local_snapshot(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    term: Term,
+    index: Index,
+) {
+    let prev_index = s.last_snapshot_index;
+    let (durable, had_fs) = persist_manifest(s, sys, term, index);
+    if !durable && had_fs {
+        // FS present but the manifest didn't land (provider
+        // initialising, ENOSPC, short write…). Drop it — the next
+        // rotation re-fires. Signalling an install here would let raft
+        // compact WAL segments against a snapshot that isn't on disk.
+        return;
+    }
+    s.last_snapshot_term = term;
+    s.last_snapshot_index = index;
+    // Tell raft the local snapshot is durable so it advances the WAL
+    // compaction floor (the leader-local leg of
+    // `drain_snapshot_installed` — without this signal a leader never
+    // retires segments). Same durable-or-no-FS gate as the import
+    // path; skipped when the port is unwired or briefly full (the next
+    // trigger re-signals).
+    if s.out_installed >= 0 {
+        let poll = (sys.channel_poll)(s.out_installed, 0x02);
+        if poll > 0 && (poll as u32 & 0x02) != 0 {
+            let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
+            wire::encode_snapshot_installed(&mut buf, term, index, term);
+            wire_channels::channel_write_msg(
+                sys,
+                s.out_installed,
+                wire::MSG_SNAPSHOT_INSTALLED,
+                &buf,
+            );
+        }
+    }
+    // Exactly-one-snapshot steady state: retire the previous manifest
+    // only after the new one is durable.
+    if durable {
+        unlink_prev_snapshot(s, sys, prev_index, index);
+    }
+    emit_install_staged(s, sys, term, index);
+    s.snapshots_taken += 1;
+}
+
+/// Ask the app state machine to capture its state now. `(term, index)`
+/// is a hint about the position we'd like; the app answers with its
+/// own applied position, which is authoritative.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines.
+unsafe fn request_app_capture(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    term: Term,
+    index: Index,
+) -> bool {
+    if s.out_app_ctl < 0 {
+        return false;
+    }
+    let poll = (sys.channel_poll)(s.out_app_ctl, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return false;
+    }
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&term.to_le_bytes());
+    buf[8..].copy_from_slice(&index.to_le_bytes());
+    wire_channels::channel_write_msg(sys, s.out_app_ctl, wire::MSG_APP_SNAPSHOT_REQUEST, &buf);
+    true
 }
 
 /// # Safety
@@ -589,6 +838,124 @@ unsafe fn ingest_install_chunk(s: &mut ModuleState, sys: &SyscallTable, plen: us
 /// already multi-chunk capable. See RFC §4.1.
 unsafe fn emit_install_chunk(s: &mut ModuleState, sys: &SyscallTable, term: Term, index: Index) {
     emit_install_body(s, sys, term, index, &[]);
+}
+
+
+/// Deliver an installed snapshot to the app state machine: a
+/// `MSG_APP_SNAPSHOT_RESET` (discard current state) followed by the
+/// body as a `MSG_APP_SNAPSHOT_CHUNK` stream (RFC §2.1).
+///
+/// Returns false if the hand-off could not be completed, in which case
+/// the caller MUST withhold the install signal — otherwise raft would
+/// compact past state the app never received.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines.
+unsafe fn emit_app_restore(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    term: Term,
+    index: Index,
+) -> bool {
+    if s.out_app_ctl < 0 {
+        return false;
+    }
+    let total = s.body_len as usize;
+    // RESET first: the app discards state up front, so a stream that
+    // dies mid-way leaves it empty (catch-up from leader) rather than
+    // half-old/half-new.
+    let poll = (sys.channel_poll)(s.out_app_ctl, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return false;
+    }
+    let mut hdr = [0u8; 16];
+    hdr[..8].copy_from_slice(&term.to_le_bytes());
+    hdr[8..].copy_from_slice(&index.to_le_bytes());
+    wire_channels::channel_write_msg(sys, s.out_app_ctl, wire::MSG_APP_SNAPSHOT_RESET, &hdr);
+
+    let mut sent = 0usize;
+    loop {
+        let chunk = (total - sent).min(MAX_CHUNK_BODY);
+        let done = sent + chunk == total;
+        let poll = (sys.channel_poll)(s.out_app_ctl, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+            return false;
+        }
+        let mut buf = [0u8; wire::APP_SNAPSHOT_HDR + MAX_CHUNK_BODY];
+        buf[..8].copy_from_slice(&term.to_le_bytes());
+        buf[8..16].copy_from_slice(&index.to_le_bytes());
+        buf[16..24].copy_from_slice(&(sent as u64).to_le_bytes());
+        buf[24] = u8::from(done);
+        buf[wire::APP_SNAPSHOT_HDR..wire::APP_SNAPSHOT_HDR + chunk]
+            .copy_from_slice(&s.body_buf[sent..sent + chunk]);
+        wire_channels::channel_write_msg(
+            sys,
+            s.out_app_ctl,
+            wire::MSG_APP_SNAPSHOT_CHUNK,
+            &buf[..wire::APP_SNAPSHOT_HDR + chunk],
+        );
+        sent += chunk;
+        if done {
+            return true;
+        }
+    }
+}
+
+/// Emit an InstallSnapshot RPC carrying the body staged in
+/// `s.app_body_buf[..s.app_body_len]`, chunked to `MAX_CHUNK_BODY`.
+///
+/// Separate from `emit_install_body` because the body lives in state:
+/// passing it as a slice would alias the `&mut ModuleState` the
+/// chunking loop needs.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines.
+unsafe fn emit_install_staged(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    term: Term,
+    index: Index,
+) {
+    let total = s.app_body_len as usize;
+    if total == 0 {
+        emit_install_body(s, sys, term, index, &[]);
+        return;
+    }
+    if s.out_export < 0 {
+        return;
+    }
+    let mut offset: u64 = 0;
+    let mut sent = 0usize;
+    while sent < total {
+        let chunk = (total - sent).min(MAX_CHUNK_BODY);
+        let done = sent + chunk == total;
+        let poll = (sys.channel_poll)(s.out_export, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+            // Channel saturated — the trigger path retries on the next
+            // rotation or an explicit ADMIN_OP_SNAPSHOT.
+            return;
+        }
+        let mut buf = [0u8; wire::INSTALL_SNAPSHOT_HDR + MAX_CHUNK_BODY];
+        let n = wire::encode_install_snapshot(
+            &mut buf,
+            term,
+            index,
+            term,
+            offset,
+            done,
+            &s.app_body_buf[sent..sent + chunk],
+        );
+        if n == 0 {
+            return;
+        }
+        wire_channels::channel_write_msg(sys, s.out_export, wire::MSG_INSTALL_SNAPSHOT, &buf[..n]);
+        offset += chunk as u64;
+        sent += chunk;
+    }
 }
 
 /// # Safety
@@ -669,6 +1036,29 @@ unsafe fn emit_install_body(
 /// note.
 unsafe fn build_snapshot_path(s: &mut ModuleState, index: Index) -> usize {
     let mut i = 0usize;
+    if s.root_path != 0 {
+        // 8.3-conforming, root-relative: "<p:1hex><idx:7hex>.SNP" (≤12
+        // chars). Bare-metal FAT32 has no mkdir (so no `wal/` parent) and
+        // rejects names longer than 8.3. Mirrors the wal module's
+        // `encode_segment_path` root layout ("<p:1hex><seq:7hex>.WAL") —
+        // the distinct extension keeps segments and snapshots separable
+        // in a flat root dir.
+        let p = (s.partition_id & 0xF) as u8;
+        s.path_buf[i] = if p < 10 { b'0' + p } else { b'a' + p - 10 };
+        i += 1;
+        let low = index as u32;
+        for digit in (0..7).rev() {
+            let nibble = ((low >> (digit * 4)) & 0xF) as u8;
+            let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+            s.path_buf[i] = ch;
+            i += 1;
+        }
+        for &b in b".SNP" {
+            s.path_buf[i] = b;
+            i += 1;
+        }
+        return i;
+    }
     for &b in b"wal/p" {
         if i < SNAP_PATH_MAX { s.path_buf[i] = b; i += 1; }
     }
@@ -812,9 +1202,22 @@ fn retention_floor_allows(s: &ModuleState, index: u64) -> bool {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Write a 32-byte snapshot manifest to disk and fsync.
-unsafe fn persist_manifest(s: &mut ModuleState, sys: &SyscallTable, term: Term, index: Index) {
+///
+/// Returns `(durable, had_fs)` — the same shape as
+/// `write_snapshot_durable`: `durable` iff the manifest's write AND fsync
+/// both succeeded; `had_fs = false` only when there is genuinely no FS
+/// provider (in-memory graph), so the caller can distinguish "nothing to
+/// persist" from "persist failed". A still-initialising provider
+/// (`FS_E_AGAIN`) reports `(false, true)`: the FS exists, the persist
+/// failed, and the caller must NOT signal an install against it.
+unsafe fn persist_manifest(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    term: Term,
+    index: Index,
+) -> (bool, bool) {
     let plen = build_snapshot_path(s, index);
-    if plen == 0 { return; }
+    if plen == 0 { return (false, true); }
 
     // Snapshot manifests are always created fresh. `FS_OPEN` is
     // read-only-if-exists per the FS contract; opening at the
@@ -827,7 +1230,7 @@ unsafe fn persist_manifest(s: &mut ModuleState, sys: &SyscallTable, term: Term, 
         // `mkdir` parents). Log so the operator knows the trigger
         // fired but no disk artefact will appear.
         dev_log(sys, 3, b"[snap] no fs".as_ptr(), 12);
-        return;
+        return (false, fd == FS_E_AGAIN);
     }
 
     let mut manifest = [0u8; MANIFEST_LEN];
@@ -839,11 +1242,53 @@ unsafe fn persist_manifest(s: &mut ModuleState, sys: &SyscallTable, term: Term, 
     manifest[24..28].copy_from_slice(&s.dek_epoch.to_le_bytes());
     // bytes 28..32 reserved
 
-    (sys.provider_call)(fd, FS_WRITE, manifest.as_mut_ptr(), MANIFEST_LEN);
-    (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+    let w = (sys.provider_call)(fd, FS_WRITE, manifest.as_mut_ptr(), MANIFEST_LEN);
+    let f = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
     (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    let durable = w == MANIFEST_LEN as i32 && f == 0;
+    if durable {
+        dev_log(sys, 3, b"[snap] manifest".as_ptr(), 15);
+    } else {
+        s.install_failures = s.install_failures.saturating_add(1);
+        dev_log(sys, 3, b"[snap] manifest fail".as_ptr(), 20);
+    }
+    (durable, true)
+}
 
-    dev_log(sys, 3, b"[snap] manifest".as_ptr(), 15);
+/// Lazily probe the FS provider's capability bitmap for `UNLINK` support
+/// (same shape as `wal::fs_unlink_supported`). A failed CAPS call stays
+/// unprobed and retries later rather than caching a transient error.
+unsafe fn fs_unlink_supported(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    if s.fs_unlink_probe == 0 {
+        let mut caps = [0u8; 4];
+        let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+        if rc == 4 {
+            let bits = u32::from_le_bytes(caps);
+            s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
+        }
+    }
+    s.fs_unlink_probe == 1
+}
+
+/// Retire the previous snapshot file after a NEWER one is durable, so the
+/// disk holds exactly one snapshot artefact per partition in steady state
+/// instead of accumulating one per WAL rotation. Best-effort: a missing
+/// file (operator GC, skip_replay renumbering) or a provider without
+/// `caps::UNLINK` leaves the old file orphaned — never an error, the new
+/// snapshot's durability is already established by the caller.
+unsafe fn unlink_prev_snapshot(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    prev_index: Index,
+    new_index: Index,
+) {
+    if prev_index == 0 || prev_index == new_index { return; }
+    if !fs_unlink_supported(s, sys) { return; }
+    let plen = build_snapshot_path(s, prev_index);
+    if plen == 0 { return; }
+    if (sys.provider_call)(-1, FS_UNLINK, s.path_buf.as_mut_ptr(), plen) == 0 {
+        dev_log(sys, 3, b"[snap] retired".as_ptr(), 14);
+    }
 }
 
 /// Durably write the received snapshot body to disk, crash-atomically (see

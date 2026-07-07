@@ -1,5 +1,8 @@
 # Clustor: Minimal Linux test — just the commit pipeline + network
 target: linux
+
+scheduler:
+  accept_cycles: true  # raft feedback pairs (engine⇄wal⇄ledger⇄tracker)
 tick_us: 1000
 
 platform:
@@ -53,6 +56,12 @@ wiring:
   # ── Persistence ───────────────────────────────────────────
   - from: raft_engine.log_append
     to: wal.entries
+  # Dedicated boot handoff: Raft must resume its index at the exact WAL
+  # replay high-water before proposal intake opens. Never multiplex this onto
+  # wal.flushed, which also fans out durability acknowledgements.
+  - from: wal.replay_complete
+    to: raft_engine.wal_replay_complete
+    rate: transaction
   - from: wal.flushed
     to: durability_ledger.ack
   # Spec §10.4.1: every replica feeds its own `local_wal_durable_index`
@@ -78,6 +87,16 @@ wiring:
   # Without this edge the per-entry stream stays silent.
   - from: raft_engine.log_observe
     to: apply_pipeline.log_entries
+  # Gap refetch: apply_pipeline pulls a durable entry's body back from
+  # the WAL by index when it's missing one (post-restart recovery, or
+  # a fan-out gap). Without this a restart advances commit_horizon via
+  # `commit_advanced` but apply_pipeline can never actually apply past
+  # it — it never received the entry bodies to apply.
+  - from: apply_pipeline.entry_request
+    to: wal.entry_request
+    rate: transaction
+  - from: wal.entry_reply
+    to: apply_pipeline.entry_reply
   # Linearizable-read submissions (RFC §4.3): apply_pipeline
   # holds reads until the ReadIndex point is reached.
   - from: client_codec.reads

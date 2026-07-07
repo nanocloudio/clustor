@@ -330,6 +330,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
+        let work_before = s.entries_applied;
 
         // 1) Drain per-entry observer fanout first so the buffer is
         //    populated before we evaluate commit horizons.
@@ -372,6 +373,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 6) Periodic metrics (RFC §4.1/§4.2).
         emit_metrics(s, sys, now);
+        if s.entries_applied != work_before {
+            dev_report_step_effect(sys, step_effect::WORK_DONE);
+        }
 
         0
     }
@@ -449,6 +453,20 @@ unsafe fn drain_log_entries(s: &mut ModuleState, sys: &SyscallTable) {
         return;
     }
     for _ in 0..16 {
+        // Preserve the oldest not-yet-applied entries when the local join
+        // buffer is saturated: reading another observer frame here would
+        // evict the lowest index, which is exactly the entry strict-order
+        // apply needs next.  Leaving the frame on the channel propagates
+        // pressure through the graph; if the lossy Raft observer skips a
+        // later frame, the WAL refetch path recovers that later gap.
+        // The commit input is drained later in this same step and can free
+        // slots without a manifest-specific buffer-size assumption.
+        if !s.pending.iter().any(PendingEntry::is_empty) {
+            drain_pending_entries(s, sys);
+            if !s.pending.iter().any(PendingEntry::is_empty) {
+                break;
+            }
+        }
         let poll = (sys.channel_poll)(s.in_log_entries, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 {
             break;
@@ -465,7 +483,7 @@ unsafe fn drain_log_entries(s: &mut ModuleState, sys: &SyscallTable) {
             continue;
         }
         let body_len = (plen - 16).min(PENDING_BODY_CAP);
-        store_pending(s, term, index, body_len);
+        let _ = store_pending(s, term, index, body_len);
     }
 }
 
@@ -496,7 +514,12 @@ fn apply_pipeline_reset(s: &mut ModuleState, term: Term, index: Index) {
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn store_pending(s: &mut ModuleState, term: Term, index: Index, body_len: usize) {
+unsafe fn store_pending(
+    s: &mut ModuleState,
+    term: Term,
+    index: Index,
+    body_len: usize,
+) -> bool {
     // First pass: same-index replacement (follower truncate-then-append).
     for slot in s.pending.iter_mut() {
         if !slot.is_empty() && slot.index == index {
@@ -505,7 +528,7 @@ unsafe fn store_pending(s: &mut ModuleState, term: Term, index: Index, body_len:
             if body_len > 0 {
                 slot.body[..body_len].copy_from_slice(&s.msg_buf[16..16 + body_len]);
             }
-            return;
+            return true;
         }
     }
     // Second pass: free slot.
@@ -518,27 +541,15 @@ unsafe fn store_pending(s: &mut ModuleState, term: Term, index: Index, body_len:
                 slot.body[..body_len].copy_from_slice(&s.msg_buf[16..16 + body_len]);
             }
             s.entries_buffered += 1;
-            return;
+            return true;
         }
     }
-    // Buffer full. Evict the oldest (lowest-index) un-emitted slot to
-    // make room — fail-open semantics. Consumer MUST cope with gaps.
-    let mut victim: usize = 0;
-    let mut victim_index: Index = Index::MAX;
-    for (i, slot) in s.pending.iter().enumerate() {
-        if slot.index < victim_index {
-            victim_index = slot.index;
-            victim = i;
-        }
-    }
-    let slot = &mut s.pending[victim];
-    slot.index = index;
-    slot.term = term;
-    slot.body_len = body_len as u16;
-    if body_len > 0 {
-        slot.body[..body_len].copy_from_slice(&s.msg_buf[16..16 + body_len]);
-    }
-    s.entries_evicted += 1;
+    // Fail closed: never discard the oldest entry required by strict-order
+    // apply. Observer reads normally stop before reaching this branch; WAL
+    // replies can race a full buffer, in which case the retry timer will ask
+    // for the entry again after committed entries free capacity.
+    s.entries_evicted = s.entries_evicted.saturating_add(1);
+    false
 }
 
 /// # Safety
@@ -582,18 +593,6 @@ unsafe fn drain_committed_batches(s: &mut ModuleState, sys: &SyscallTable) {
         // missing index from the WAL rather than stalling).
         drain_pending_entries(s, sys);
 
-        // Internal client ack to client_codec. Shape:
-        // `[partition_id:u16][term:u64][index:u64]`.
-        // client_codec strips the partition id before writing to the
-        // external client wire.
-        let poll_out = (sys.channel_poll)(s.out_applied, 0x02);
-        if s.apply_index >= index && poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-            let mut resp = [0u8; 18];
-            resp[0..2].copy_from_slice(&s.partition_id.to_le_bytes());
-            wire::encode_term_index(&mut resp[2..18], term, index);
-            wire_channels::channel_write_msg(sys, s.out_applied, wire::MSG_CLIENT_RESPONSE, &resp[..18]);
-        }
-        dev_log(sys, 3, b"[apply] ok".as_ptr(), 10);
     }
 }
 
@@ -612,6 +611,14 @@ unsafe fn drain_committed_batches(s: &mut ModuleState, sys: &SyscallTable) {
 /// `&SyscallTable` per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_pending_entries(s: &mut ModuleState, sys: &SyscallTable) {
     loop {
+        // A committed entry is not retired until its per-index apply
+        // acknowledgement can be published. This makes grouped commit
+        // advances lossless for synchronous clients: every proposal gets an
+        // ack, not only the highest index in a committed batch.
+        if s.out_applied >= 0 {
+            let poll = (sys.channel_poll)(s.out_applied, 0x02);
+            if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
+        }
         let mut victim: Option<usize> = None;
         let mut victim_index: Index = Index::MAX;
         for (i, slot) in s.pending.iter().enumerate() {
@@ -719,8 +726,9 @@ unsafe fn drain_entry_replies(s: &mut ModuleState, sys: &SyscallTable) {
         // Relocate the body from the 20-byte-reply-header offset to offset 16
         // (forward copy, dest < src, so non-overlapping-safe) for store_pending.
         s.msg_buf.copy_within(hdr..hdr + body_len, 16);
-        store_pending(s, term, index, body_len);
-        s.entries_refetched = s.entries_refetched.saturating_add(1);
+        if store_pending(s, term, index, body_len) {
+            s.entries_refetched = s.entries_refetched.saturating_add(1);
+        }
     }
 }
 
@@ -785,8 +793,23 @@ unsafe fn emit_committed_entry(s: &mut ModuleState, sys: &SyscallTable, slot_idx
         // via a snapshot install when it recovers.
     }
 
+    if s.out_applied >= 0 {
+        let mut resp = [0u8; 18];
+        resp[0..2].copy_from_slice(&s.partition_id.to_le_bytes());
+        wire::encode_term_index(&mut resp[2..18], slot.term, slot.index);
+        wire_channels::channel_write_msg(
+            sys, s.out_applied, wire::MSG_CLIENT_RESPONSE, &resp,
+        );
+    }
+
     s.apply_index = slot.index;
     s.entries_applied += 1;
+    // Apply signal — the only external proof a committed entry
+    // actually reached the state machine, distinct from `[wal] entry
+    // ok` (durable-but-not-yet-applied) and `[raft] prop` (proposed-
+    // but-not-yet-committed). Fires once per applied entry regardless
+    // of which downstream ports are wired.
+    dev_log(sys, 3, b"[apply] ok".as_ptr(), 10);
     s.pending[slot_idx] = PendingEntry::empty();
 }
 
@@ -842,13 +865,13 @@ unsafe fn drain_read_submissions(s: &mut ModuleState, sys: &SyscallTable, now: u
         // a back-edge to raft_engine).
         if s.out_read_probe_request >= 0 && s.in_read_probe_reply >= 0 {
             if issue_read_probe(s, sys, corr_id) {
-                enqueue_read(s, corr_id, 0, now, READ_PHASE_AWAITING_PROBE);
+                enqueue_read(s, sys, corr_id, 0, now, READ_PHASE_AWAITING_PROBE);
             } else {
                 // Probe channel full → degrade to legacy for this read.
-                enqueue_read(s, corr_id, s.commit_horizon, now, READ_PHASE_LEGACY);
+                enqueue_read(s, sys, corr_id, s.commit_horizon, now, READ_PHASE_LEGACY);
             }
         } else {
-            enqueue_read(s, corr_id, s.commit_horizon, now, READ_PHASE_LEGACY);
+            enqueue_read(s, sys, corr_id, s.commit_horizon, now, READ_PHASE_LEGACY);
         }
     }
 }
@@ -909,8 +932,9 @@ unsafe fn drain_read_probe_replies(s: &mut ModuleState, sys: &SyscallTable) {
     }
 }
 
-fn enqueue_read(
+unsafe fn enqueue_read(
     s: &mut ModuleState,
+    sys: &SyscallTable,
     correlation_id: u64,
     required_commit: Index,
     submitted_ms: u64,
@@ -923,7 +947,12 @@ fn enqueue_read(
             return;
         }
     }
-    // Full — evict the oldest read (smallest submitted_ms). Fail-open.
+    // Full — evict the oldest read (smallest submitted_ms) and REJECT
+    // it so the submitter can fail closed instead of leaking a stashed
+    // read that never resolves (a silent eviction would leave the
+    // router's fence slot AWAITING forever). Best-effort: if the reject
+    // channel is full the victim still vanishes, but the submitter's
+    // own stash deadline covers that residue.
     let mut victim: usize = 0;
     let mut victim_ms = u64::MAX;
     for (i, slot) in s.pending_reads.iter().enumerate() {
@@ -931,6 +960,10 @@ fn enqueue_read(
             victim_ms = slot.submitted_ms;
             victim = i;
         }
+    }
+    let victim_corr = s.pending_reads[victim].correlation_id;
+    if victim_corr != 0 {
+        let _ = emit_read_reject(s, sys, victim_corr, wire::CLIENT_REJECT_FALLBACK);
     }
     s.pending_reads[victim] = PendingRead { correlation_id, required_commit, submitted_ms, phase };
     s.reads_evicted += 1;

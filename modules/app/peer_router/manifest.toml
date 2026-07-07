@@ -1,4 +1,5 @@
 version = "0.1.0"
+timer_class = "wall_clock"
 type = "Transformer"
 entry = "mod.rs"
 hardware_targets = ["bcm2712"]

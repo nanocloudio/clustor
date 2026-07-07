@@ -41,13 +41,25 @@ mod collections;
 use types::*;
 use collections::Crc32c;
 
-const WRITE_BUF_SIZE: usize = 4096;
+// Holds a complete maximum-sized four-entry durability group (4 * (8-byte
+// frame header + 2064-byte WAL payload) ≈ 8.3 KiB) plus a replay terminator,
+// rounded up to a power of two. Sizing this to `group_max_pending=4` is what
+// turns the group into one provider write instead of merely grouping its
+// fsync.
+const WRITE_BUF_SIZE: usize = 16 * 1024;
 const METRICS_INTERVAL_MS: u64 = 1000;
 
 /// Power of two so `index % RING_SIZE` is a cheap mask. Sized to cover
 /// the last few seconds of a hot writer without inflating module state.
 const ENTRY_RING_SIZE: usize = 256;
 const ENTRY_RING_MASK: u64 = (ENTRY_RING_SIZE as u64) - 1;
+const MEMORY_ENTRY_BODY_CAP: usize = 2048;
+
+/// WCET/fairness backstop for the transaction-budgeted input pump. The byte
+/// grant is the pacing authority; this cap only bounds the number of provider
+/// calls when records are very small. Eight records still removes the
+/// one-record-per-tick ceiling while keeping a worst-case step auditable.
+const MAX_ENTRY_PUMP_RECORDS: usize = 8;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -68,6 +80,20 @@ struct EntryLoc {
 impl EntryLoc {
     const fn zero() -> Self {
         Self { index: 0, term: 0, seg_seq: 0, payload_offset: 0, payload_len: 0 }
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct MemoryEntry {
+    index: u64,
+    body_len: u16,
+    body: [u8; MEMORY_ENTRY_BODY_CAP],
+}
+
+impl MemoryEntry {
+    const fn zero() -> Self {
+        Self { index: 0, body_len: 0, body: [0; MEMORY_ENTRY_BODY_CAP] }
     }
 }
 
@@ -97,8 +123,8 @@ define_params! {
     5, self_id, u8, 0
         => |s, d, len| { s.self_id = p_u8(d, len, 0, 0); };
 
-    // 0 = per-entry fsync + ack (default, strict). 1 = group fsync:
-    // FS_WRITE per entry, but fsync + ack deferred until either
+    // 0 = per-entry write + fsync + ack (default, strict). 1 = group fsync:
+    // complete records are coalesced into one write, with fsync + ack deferred until either
     // `group_window_ms` elapses or `group_max_pending` entries accumulate,
     // at which point one ack is emitted carrying the high-water
     // (term, index). Replay-time re-ack stays per-entry in both modes.
@@ -121,6 +147,19 @@ define_params! {
     // 1 = skip boot replay (start fresh). See the `skip_replay` field doc.
     10, skip_replay, u8, 0
         => |s, d, len| { s.skip_replay = p_u8(d, len, 0, 0); };
+
+    // 1 = request a physically preallocated, fixed-capacity segment. When the
+    // FS provider supports PREALLOCATE, every durability group writes an
+    // in-band zero-length terminator and FSYNC no longer has to grow file-size
+    // metadata. Providers without the capability retain normal EOF framing.
+    11, fixed_segment, u8, 0
+        => |s, d, len| { s.fixed_segment = p_u8(d, len, 0, 0); };
+
+    // Optional device-quiescence interval after physical preallocation and
+    // before replay-complete releases Raft admission.
+    12, preallocate_settle_ms, u16, 0
+        => |s, d, len| { s.preallocate_settle_ms = p_u16(d, len, 0, 0); };
+
 }
 
 // FS opcodes (from abi::dev_fs)
@@ -136,6 +175,14 @@ const FS_STAT: u32 = 0x0904;
 /// so a fresh WAL with no segment file on disk silently degrades to
 /// in-memory; segment creation needs the write tier.
 const FS_OPEN_CREATE: u32 = 0x0909;
+/// Remove a file by path (`modules/sdk/contracts/storage/fs.rs::UNLINK`).
+/// Gated on the provider's `caps::UNLINK` bit — see `fs_unlink_supported`.
+const FS_UNLINK: u32 = 0x090A;
+const FS_PREALLOCATE: u32 = 0x090E;
+/// FS capability-discovery opcode + the `UNLINK` bit
+/// (`modules/sdk/contracts/storage/fs.rs::{CAPS, caps::UNLINK}`).
+const FS_CAPS: u32 = 0x09FF;
+const FS_CAP_UNLINK: u32 = 1 << 5;
 
 /// FS E_AGAIN: the FS provider is present but still initialising (e.g. fat32
 /// reading the BPB/GPT/root on a cm5 cold boot). Distinct from a hard error
@@ -208,6 +255,10 @@ struct ModuleState {
     /// last 256 indices; older indices fall through to a NOT_FOUND
     /// reply and snapshot fallback.
     entry_ring: [EntryLoc; ENTRY_RING_SIZE],
+    /// Proposal bodies retained by the explicit no-filesystem fallback.
+    /// Uses the same index mask and retention horizon as `entry_ring`, so
+    /// apply/replication gap refetch remains correct in ephemeral graphs.
+    memory_entries: [MemoryEntry; ENTRY_RING_SIZE],
     entry_ring_max_index: u64,
     entry_ring_min_index: u64,
 
@@ -225,13 +276,18 @@ struct ModuleState {
     no_fs: bool,
     dbg_last_open_rc: i32,
     dbg_steps: u64,
+    input_budget_bytes: u32,
+    pump_records: u8,
     path_buf: [u8; WAL_PATH_MAX],
     path_len: u8,
 
     // Write buffer
     write_buf: [u8; WRITE_BUF_SIZE],
     write_pos: u16,
-    needs_flush: bool,
+    /// The staged bytes end in a zero-length replay terminator after a
+    /// truncate. Such a batch is flushed immediately and the fd is rewound to
+    /// logical `cursor` before fsync/ack.
+    staged_terminator: bool,
 
     // CRC
     crc: Crc32c,
@@ -242,6 +298,10 @@ struct ModuleState {
     /// Durable-write failures (short/failed FS_WRITE, FS_FSYNC error, or
     /// segment open failure). Each one means the entry was NOT acked durable.
     write_errors: u32,
+    /// Sticky fail-closed latch. A later high-water ack must never cover a
+    /// missing WAL record.
+    continuity_fault: bool,
+    continuity_errors: u32,
     /// Replay-time CRC32C mismatches (torn / corrupt entries). A mismatch
     /// stops replay of that segment at the bad frame so we never replay
     /// garbage past a torn tail.
@@ -288,6 +348,14 @@ struct ModuleState {
     /// otherwise be re-acked into the fresh consensus index space. Leave 0
     /// (default) for crash-recovery (L4) where replay reconstructs state.
     skip_replay: u8,
+    /// FS `caps::UNLINK` probe cache for compaction's segment deletion:
+    /// 0 = unprobed, 1 = supported, 2 = unsupported. See
+    /// `fs_unlink_supported`.
+    fs_unlink_probe: u8,
+    fixed_segment: u8,
+    fixed_segment_active: bool,
+    preallocate_settle_ms: u16,
+    preallocate_ready_at_ms: u64,
     batch_start_ms: u64,
     pending_count: u16,
     pending_max_index: Index,
@@ -319,7 +387,7 @@ struct ModuleState {
     entryreq_notfound: u32,
 
     // Scratch buffer for reading messages
-    msg_buf: [u8; 2048],
+    msg_buf: [u8; 4096],
 }
 
 #[no_mangle]
@@ -374,6 +442,8 @@ pub extern "C" fn module_new(
         s.replay_first_size = 0;
         s.entryreq_served = 0;
         s.entryreq_notfound = 0;
+        s.continuity_fault = false;
+        s.continuity_errors = 0;
 
         s.segment_seq = 1;
         s.oldest_segment_seq = 1;
@@ -382,6 +452,12 @@ pub extern "C" fn module_new(
         s.no_fs_logged = false;
         s.no_fs = false;
         s.dbg_last_open_rc = 1; // sentinel != any real fd/errno so first rc logs
+        s.input_budget_bytes = 0;
+        s.pump_records = 0;
+        s.write_pos = 0;
+        s.staged_terminator = false;
+        s.fixed_segment_active = false;
+        s.preallocate_ready_at_ms = 0;
         s.phase = PHASE_REPLAY;
         s.replay_seg = 1;
         s.replay_fd = -1;
@@ -389,6 +465,7 @@ pub extern "C" fn module_new(
         s.replay_first_found = 0;
         s.replay_last_found = 0;
         s.entry_ring = [EntryLoc::zero(); ENTRY_RING_SIZE];
+        s.memory_entries = [MemoryEntry::zero(); ENTRY_RING_SIZE];
         s.entry_ring_max_index = 0;
         s.entry_ring_min_index = 0;
         s.fsync_buckets = [0u32; wire::hist::FSYNC_LATENCY_US.len() + 1];
@@ -435,12 +512,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             return step_replay(s, sys);
         }
 
-        // Hand raft_engine the exact on-disk high-water reconstructed by
-        // replay, exactly once, now that we've reached PHASE_NORMAL. Until
-        // this lands a recovering raft holds proposal intake (it only has a
-        // throttled durable hint); after it raft resumes its log index here.
-        maybe_emit_replay_complete(s, sys);
-
         // FS-readiness gate. While the segment isn't open and we haven't
         // decided the FS is genuinely absent, (re)try the open every step.
         // On E_AGAIN (provider still initialising — fat32 reading the BPB on
@@ -453,7 +524,28 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 emit_metrics(s, sys);
                 return 0;
             }
+            if s.fixed_segment_active {
+                // Physical segment reservation is bounded boot/rotation work,
+                // but intentionally much larger than a steady-state step.
+                // Burst classifies that one-time elapsed interval correctly;
+                // no entry has been consumed yet.
+                return STEP_BURST;
+            }
         }
+
+        // replay_complete is the admission handoff to Raft and therefore the
+        // source of /readyz. Keep it closed until post-allocation device work
+        // has quiesced; otherwise the first client burst observes the SSD's
+        // transient background phase as a 400+ ms queue.
+        if s.fixed_segment_active && dev_millis(sys) < s.preallocate_ready_at_ms {
+            emit_metrics(s, sys);
+            return 0;
+        }
+
+        // Hand raft_engine the exact on-disk high-water reconstructed by
+        // replay, exactly once, only after the write side is ready. Until this
+        // lands a recovering/fresh fixed graph holds proposal intake.
+        maybe_emit_replay_complete(s, sys);
 
         // Time-based group flush: a quiescent writer drains its tail
         // batch within group_window_ms even when no new entries arrive.
@@ -474,8 +566,40 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //    written above the divergent tail and then rewound away.
         drain_compact_before(s, sys);
 
-        // 3. Process entries
-        process_entries(s, sys);
+        // 3. Persist complete records up to the live transaction budget. A
+        // classed input derives its grant from the graph and current pacer
+        // period; an unclassed legacy graph retains one-record-per-step
+        // behaviour. Atomic records may overshoot the byte grant by at most
+        // one validated max_record.
+        let grant = dev_input_flow_budget(sys, s.in_entries, 0) as u64;
+        s.input_budget_bytes = grant.min(u32::MAX as u64) as u32;
+        let mut consumed = 0u64;
+        let mut records = 0usize;
+        while records < MAX_ENTRY_PUMP_RECORDS && (grant == 0 || consumed < grant) {
+            let before_entries = s.entries_written;
+            let before_bytes = s.bytes_written;
+            process_entries(s, sys);
+            if s.entries_written == before_entries {
+                break;
+            }
+            records += 1;
+            consumed = consumed.saturating_add(
+                s.bytes_written.wrapping_sub(before_bytes).saturating_add(8),
+            );
+            if grant == 0 {
+                break;
+            }
+        }
+        s.pump_records = records as u8;
+        if records > 0 {
+            let poll = (sys.channel_poll)(s.in_entries, POLL_IN);
+            let effect = if poll > 0 && (poll as u32 & POLL_IN) != 0 {
+                step_effect::RUNNABLE_BACKLOG
+            } else {
+                step_effect::WORK_DONE
+            };
+            dev_report_step_effect(sys, effect);
+        }
 
         // 4. Service random-access read-back requests (replicator NACK retry).
         drain_entry_requests(s, sys);
@@ -619,13 +743,50 @@ unsafe fn serve_entry_request(
         }
     };
 
+    if s.no_fs {
+        let slot = (wal_index & ENTRY_RING_MASK) as usize;
+        let mem = s.memory_entries[slot];
+        if mem.index != wal_index {
+            s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
+            let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
+            wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
+            wire_channels::channel_write_msg(
+                sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr,
+            );
+            return;
+        }
+        let prev_term = if loc.index > 1 {
+            lookup_entry_loc(s, loc.index - 1).map_or(0, |p| p.term)
+        } else {
+            0
+        };
+        let body_len = mem.body_len as usize;
+        let total = wire::WAL_ENTRY_REPLY_HDR + body_len;
+        let mut reply = [0u8; 4096];
+        let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
+        wire::encode_wal_entry_reply_hdr(
+            &mut hdr, request_id, loc.term, loc.index, prev_term,
+        );
+        reply[..wire::WAL_ENTRY_REPLY_HDR].copy_from_slice(&hdr);
+        reply[wire::WAL_ENTRY_REPLY_HDR..total].copy_from_slice(&mem.body[..body_len]);
+        wire_channels::channel_write_msg(
+            sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &reply[..total],
+        );
+        s.entryreq_served = s.entryreq_served.saturating_add(1);
+        return;
+    }
+
     // Read the entry body from disk. The body that lands in the WAL is
     // `[term:u64][index:u64][body...]` (16-byte header + body). We pass
     // the whole payload back so the replicator can reconstruct an AE.
-    let mut body = [0u8; 2048];
+    // WAL payload = [term:u64][index:u64][body ≤ PROPOSAL_BATCH_CAP] —
+    // up to 2064 bytes, so this buffer must exceed that or a full
+    // batch entry falls into the NOT_FOUND branch below, which the
+    // replicator reads as needs-snapshot.
+    let mut body = [0u8; 4096];
     let payload_len = loc.payload_len as usize;
     if payload_len == 0 || payload_len > body.len() {
-        // Defensive: shouldn't happen given the 2048 cap in writes.
+        // Defensive: shouldn't happen given the write-path payload cap.
         s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
         let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
         wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
@@ -680,8 +841,7 @@ unsafe fn serve_entry_request(
     // on MSG_WAL_ENTRY_REPLY (`[request_id][term][index][body...]`).
     let rest = if payload_len > 16 { &body[16..payload_len] } else { &[][..] };
     let total = wire::WAL_ENTRY_REPLY_HDR + rest.len();
-    if total > 2048 { return; }
-    let mut reply = [0u8; 2048];
+    let mut reply = [0u8; 4096];
     let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
     // prev_term = term of the entry at index-1, so the replicator builds the
     // catch-up AE with the correct prev_log_term (guessing it triggers a
@@ -710,6 +870,16 @@ unsafe fn serve_entry_request(
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_compact_before(s: &mut ModuleState, sys: &SyscallTable) {
     if s.in_compact_before < 0 { return; }
+
+    // A truncate/compaction changes the file cursor and segment topology. Do
+    // not let it overtake records that are already accepted into the current
+    // durability batch but still live only in `write_buf`.
+    let ready = (sys.channel_poll)(s.in_compact_before, 0x01);
+    if ready > 0 && (ready as u32 & 0x01) != 0 && s.has_batch {
+        flush_batch(s, sys);
+        if s.has_batch { return; }
+    }
+
     for _ in 0..4 {
         let poll = (sys.channel_poll)(s.in_compact_before, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
@@ -767,6 +937,10 @@ unsafe fn truncate_after(s: &mut ModuleState, sys: &SyscallTable, keep_through_i
         let slot = (i & ENTRY_RING_MASK) as usize;
         if s.entry_ring[slot].index == i {
             s.entry_ring[slot].index = 0;
+        }
+        if s.memory_entries[slot].index == i {
+            s.memory_entries[slot].index = 0;
+            s.memory_entries[slot].body_len = 0;
         }
         i += 1;
     }
@@ -830,23 +1004,50 @@ unsafe fn compact_before(s: &mut ModuleState, sys: &SyscallTable, before_index: 
         }
     }
     if max_safe_seq_to_drop == 0 { return; }
-    // Delete segments [oldest_segment_seq .. max_safe_seq_to_drop].
+    // Delete segments [oldest_segment_seq .. max_safe_seq_to_drop] from
+    // disk via FS_UNLINK where the provider supports it (probed once via
+    // FS_CAPS — linux and fat32 both advertise `caps::UNLINK`; fat32's
+    // unlink tombstones the dirent synchronously and reclaims the cluster
+    // chain lazily in its own steps). On a provider without the cap — or
+    // on a per-file error — the floor still advances and the file is
+    // merely orphaned (the pre-unlink posture): compaction correctness
+    // never depends on physical deletion, only replay/entry-serving does.
     while s.oldest_segment_seq <= max_safe_seq_to_drop
         && s.oldest_segment_seq < s.segment_seq
     {
-        let mut path = [0u8; WAL_PATH_MAX];
-        let plen = encode_segment_path(s.partition_id, s.oldest_segment_seq, s.root_path != 0, &mut path);
-        // FS contract: no explicit unlink op exists in the current SDK.
-        // Open + truncate-on-write isn't a deletion either. Until the
-        // FS contract exposes an unlink/truncate, we mark the segment
-        // as compacted by emitting a metric and rely on operators to
-        // garbage-collect old files out-of-band. The on-disk segment
-        // remains until then but the WAL ring will not serve its
-        // entries.
-        let _ = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
-        dev_log(sys, 3, b"[wal] compacted".as_ptr(), 15);
+        if fs_unlink_supported(s, sys) {
+            let mut path = [0u8; WAL_PATH_MAX];
+            let plen = encode_segment_path(s.partition_id, s.oldest_segment_seq, s.root_path != 0, &mut path);
+            let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
+            if rc == 0 {
+                dev_log(sys, 3, b"[wal] compacted".as_ptr(), 15);
+            } else {
+                // ENOENT is expected after skip_replay orphaned a prior
+                // run's numbering, or when an operator GC'd out-of-band.
+                dev_log(sys, 3, b"[wal] compact orphan".as_ptr(), 20);
+            }
+        } else {
+            dev_log(sys, 3, b"[wal] compacted".as_ptr(), 15);
+        }
         s.oldest_segment_seq += 1;
     }
+}
+
+/// Lazily probe the FS provider's capability bitmap for `UNLINK` support.
+/// Cached after the first successful probe (`0` = unprobed, `1` = yes,
+/// `2` = no); a failed CAPS call (provider still initialising) stays
+/// unprobed and retries on the next compaction rather than caching a
+/// transient error as "unsupported".
+unsafe fn fs_unlink_supported(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    if s.fs_unlink_probe == 0 {
+        let mut caps = [0u8; 4];
+        let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+        if rc == 4 {
+            let bits = u32::from_le_bytes(caps);
+            s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
+        }
+    }
+    s.fs_unlink_probe == 1
 }
 
 // ── Replay phase ────────────────────────────────────────────
@@ -1168,6 +1369,12 @@ unsafe fn drain_key_updates(s: &mut ModuleState, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
+    // Once continuity is lost, consuming later records cannot repair it: Raft
+    // no longer retains the missing proposal body. Leave the input full so
+    // backpressure propagates, and never acknowledge a high-water across the
+    // hole.
+    if s.continuity_fault { return; }
+
     // Check input readiness
     let poll_in = (sys.channel_poll)(s.in_entries, 0x01);
     if poll_in <= 0 || (poll_in as u32 & 0x01) == 0 { return; }
@@ -1191,6 +1398,19 @@ unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
     let (term, index) = wire::decode_term_index(&s.msg_buf);
     let payload_len = plen as usize;
 
+    let expected = s.current_index.saturating_add(1);
+    if index != expected {
+        // Commit only the valid contiguous prefix already staged, then latch
+        // closed. This record is deliberately not reflected in cursor/index.
+        if s.has_batch {
+            flush_batch(s, sys);
+        }
+        s.continuity_errors = s.continuity_errors.saturating_add(1);
+        s.continuity_fault = true;
+        dev_log(sys, 3, b"[wal] continuity FAIL".as_ptr(), 21);
+        return;
+    }
+
     // Frame: [entry_len: u32 LE] [crc32c: u32 LE] [entry_data]. The CRC32C
     // covers the payload bytes so replay can distinguish a torn/corrupt
     // payload from a valid entry (RFC §5: "the current replay framing cannot
@@ -1203,42 +1423,63 @@ unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
     let entry_payload_offset = s.cursor.saturating_add(FRAME_HDR);
     ensure_segment_open(s, sys);
     if s.fd < 0 {
-        // Segment could not be opened: we cannot durably persist this entry.
-        // Do NOT count or ack it — leaving it un-acked keeps the commit index
-        // from advancing past data that isn't on disk.
+        if s.no_fs {
+            // Explicit ephemeral mode: retain the recent proposal body for
+            // the same random-access gap-refetch contract as the disk path,
+            // then acknowledge immediately (there is no durability barrier).
+            let body_len = payload_len.saturating_sub(16).min(MEMORY_ENTRY_BODY_CAP);
+            let slot = (index & ENTRY_RING_MASK) as usize;
+            s.memory_entries[slot].index = index;
+            s.memory_entries[slot].body_len = body_len as u16;
+            if body_len > 0 {
+                s.memory_entries[slot].body[..body_len]
+                    .copy_from_slice(&s.msg_buf[16..16 + body_len]);
+            }
+            s.current_term = term;
+            s.current_index = index;
+            s.cursor = s.cursor.saturating_add(FRAME_HDR + payload_len as u32);
+            s.entries_written = s.entries_written.saturating_add(1);
+            s.bytes_written = s.bytes_written.saturating_add(payload_len as u64);
+            record_entry_loc(s, index, term, 0, 0, payload_len as u32);
+            if s.out_flushed >= 0 {
+                let mut ack_buf = [0u8; 17];
+                wire::encode_fsync_ack(&mut ack_buf, term, index, s.self_id);
+                wire_channels::channel_write_msg(
+                    sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf,
+                );
+                // Ephemeral mode has no fsync barrier — the ack above
+                // IS the durability point (there is no disk state to
+                // wait on). Same external signal as the disk path in
+                // `flush_batch`.
+                dev_log(sys, 3, b"[wal] entry ok".as_ptr(), 14);
+            }
+            return;
+        }
+        // A configured filesystem exists but the segment could not be opened:
+        // fail closed rather than acknowledging data that was not persisted.
         s.write_errors = s.write_errors.saturating_add(1);
         dev_log(sys, 3, b"[wal] entry FAIL no-fd".as_ptr(), 22);
         return;
     }
-    // A correct FS_WRITE returns exactly the byte count requested. A short
-    // write or negative errno (e.g. disk full) means the entry is not on disk;
-    // rewind the segment cursor over the torn bytes so the next write
-    // overwrites them, and bail WITHOUT counting or acking.
+    // Stage a complete record contiguously so group mode coalesces
+    // several records into ONE provider write as well as one fsync,
+    // rather than issuing separate header and body writes per entry.
     let crc = {
         let mut c = Crc32c::new();
         c.update(&s.msg_buf[..payload_len]);
         c.finalize()
     };
-    let mut hdr = [0u8; FRAME_HDR as usize];
-    hdr[..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
-    hdr[4..].copy_from_slice(&crc.to_le_bytes());
-    let w_len = (sys.provider_call)(s.fd, FS_WRITE, hdr.as_ptr() as *mut u8, FRAME_HDR as usize);
-    let w_body = if w_len == FRAME_HDR as i32 {
-        (sys.provider_call)(s.fd, FS_WRITE, s.msg_buf.as_mut_ptr(), payload_len)
-    } else {
-        -1
-    };
-    let write_ok = w_len == FRAME_HDR as i32 && w_body == payload_len as i32;
-    // In group mode the FS_FSYNC is deferred to flush_batch; only the strict
-    // path fsyncs (and must confirm durability) before acking here.
-    let durable = write_ok && (s.fsync_mode != 0 || fsync_segment(s, sys) == 0);
-    if !durable {
-        s.write_errors = s.write_errors.saturating_add(1);
-        let seek = (s.cursor as i32).to_le_bytes();
-        (sys.provider_call)(s.fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
-        dev_log(sys, 3, b"[wal] entry FAIL write".as_ptr(), 22);
-        return;
+    let frame_len = FRAME_HDR as usize + payload_len;
+    if frame_len > WRITE_BUF_SIZE { return; }
+    if s.write_pos as usize + frame_len > WRITE_BUF_SIZE {
+        flush_batch(s, sys);
+        if s.has_batch { return; }
     }
+    let pos = s.write_pos as usize;
+    s.write_buf[pos..pos + 4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+    s.write_buf[pos + 4..pos + 8].copy_from_slice(&crc.to_le_bytes());
+    s.write_buf[pos + 8..pos + frame_len].copy_from_slice(&s.msg_buf[..payload_len]);
+    s.write_pos = (pos + frame_len) as u16;
 
     s.current_term = term;
     s.current_index = index;
@@ -1247,49 +1488,50 @@ unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
     s.bytes_written += payload_len as u64;
     record_entry_loc(s, index, term, s.segment_seq, entry_payload_offset, payload_len as u32);
 
-    // Trailing terminator: while a prior truncation has left stale frames
-    // ahead of the live tail (`cursor < seg_high_water`), re-stamp a
-    // zero-length frame at the new cursor and rewind the fd to it, so replay
-    // stops at this entry instead of reading into the stale suffix. Once
-    // fresh appends overwrite past the stale region the terminator stops
-    // being written and replay falls back to the EOF / CRC tail check.
+    if !s.has_batch {
+        s.batch_start_ms = dev_millis(sys);
+        s.has_batch = true;
+    }
+    s.batch_fsynced = false;
+    if index >= s.pending_max_index {
+        s.pending_max_index = index;
+        s.pending_max_term = term;
+    }
+    s.pending_count = s.pending_count.saturating_add(1);
+
+    // Per-append staging signal, mode-exclusive: `fsync_mode == 0`
+    // (per-entry) always flushes this same append immediately below,
+    // so "staged" and "durable" coincide — log `entry ok`. Group
+    // mode (`fsync_mode == 1`) may hold this entry in the pending
+    // batch for a while, so "staged" is a distinct, weaker claim —
+    // log `entry queued`; durability gets its own signal
+    // (`[wal] group fsync`) from `flush_batch` once the batch
+    // actually lands.
+    if s.fsync_mode == 0 {
+        dev_log(sys, 3, b"[wal] entry ok".as_ptr(), 14);
+    } else {
+        dev_log(sys, 3, b"[wal] entry queued".as_ptr(), 18);
+    }
+
+    // A truncate leaves stale bytes beyond the logical tail. Append a replay
+    // terminator to this staged write and flush it immediately; flush_batch
+    // restores the fd to `cursor` before the durability barrier.
     if s.cursor < s.seg_high_water {
-        let zero = [0u8; 4];
-        (sys.provider_call)(s.fd, FS_WRITE, zero.as_ptr() as *mut u8, 4);
-        if s.fsync_mode == 0 { fsync_segment(s, sys); }
-        let seek = (s.cursor as i32).to_le_bytes();
-        (sys.provider_call)(s.fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+        if s.write_pos as usize + 4 <= WRITE_BUF_SIZE {
+            let p = s.write_pos as usize;
+            s.write_buf[p..p + 4].fill(0);
+            s.write_pos += 4;
+            s.staged_terminator = true;
+        }
     } else {
         s.seg_high_water = s.cursor;
     }
 
-    if s.fsync_mode == 0 {
-        if s.out_flushed >= 0 {
-            dev_log(sys, 3, b"[wal] entry ok".as_ptr(), 14);
-            let mut ack_buf = [0u8; 17];
-            wire::encode_fsync_ack(&mut ack_buf, term, index, s.self_id);
-            wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17]);
-        } else {
-            dev_log(sys, 3, b"[wal] entry ok (no ack)".as_ptr(), 23);
-        }
-    } else {
-        if !s.has_batch {
-            s.batch_start_ms = dev_millis(sys);
-            s.has_batch = true;
-        }
-        // This entry's bytes are on disk but not yet fsynced: if a prior
-        // flush had already fsynced+marked the batch (ack still owed), the
-        // batch just grew, so it needs a fresh fsync before the next ack.
-        s.batch_fsynced = false;
-        if index >= s.pending_max_index {
-            s.pending_max_index = index;
-            s.pending_max_term = term;
-        }
-        s.pending_count = s.pending_count.saturating_add(1);
-        dev_log(sys, 3, b"[wal] entry queued".as_ptr(), 18);
-        if s.pending_count >= s.group_max_pending {
-            flush_batch(s, sys);
-        }
+    if s.fsync_mode == 0
+        || s.pending_count >= s.group_max_pending
+        || s.staged_terminator
+    {
+        flush_batch(s, sys);
     }
 
     // Segment rotation must flush any pending batch first so the ack
@@ -1297,6 +1539,7 @@ unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
     if s.cursor >= s.segment_limit {
         if s.has_batch {
             flush_batch(s, sys);
+            if s.has_batch { return; }
         }
         flush_block(s, sys);
         fsync_segment(s, sys);
@@ -1333,6 +1576,70 @@ unsafe fn flush_batch(s: &mut ModuleState, sys: &SyscallTable) {
     if !s.has_batch { return; }
 
     if !s.batch_fsynced {
+        // A fixed-capacity segment has no useful EOF: its directory size was
+        // persisted once at creation. Make the current live tail explicit in
+        // the same provider write as the records. Replay stops on this zero
+        // length even though STAT reports the full segment capacity.
+        if s.fixed_segment_active && !s.staged_terminator {
+            if s.write_pos as usize + 4 > WRITE_BUF_SIZE {
+                s.write_errors = s.write_errors.saturating_add(1);
+                dev_log(sys, 3, b"[wal] terminator overflow".as_ptr(), 25);
+                return;
+            }
+            let p = s.write_pos as usize;
+            s.write_buf[p..p + 4].fill(0);
+            s.write_pos += 4;
+            s.staged_terminator = true;
+        }
+        // `cursor` tracks the logical end of the staged records, while the
+        // optional four-byte replay terminator is deliberately outside that
+        // logical range. Seek explicitly because an entry-refetch read may
+        // have moved the shared descriptor since this batch was staged.
+        if s.write_pos > 0 {
+            let staged_len = s.write_pos as usize;
+            let terminator_len = if s.staged_terminator { 4usize } else { 0usize };
+            let logical_len = staged_len.saturating_sub(terminator_len);
+            let batch_start = s.cursor.saturating_sub(logical_len as u32);
+            let seek_arg = (batch_start as i32).to_le_bytes();
+            let seek_rc = (sys.provider_call)(
+                s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len(),
+            );
+            if seek_rc < 0 {
+                s.write_errors = s.write_errors.saturating_add(1);
+                dev_log(sys, 3, b"[wal] group seek FAIL".as_ptr(), 21);
+                return;
+            }
+
+            let written = (sys.provider_call)(
+                s.fd, FS_WRITE, s.write_buf.as_mut_ptr(), staged_len,
+            );
+            if written < 0 || written as usize != staged_len {
+                // Rewind so retrying the complete staged buffer overwrites a
+                // possible partial provider write instead of appending twice.
+                (sys.provider_call)(
+                    s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len(),
+                );
+                s.write_errors = s.write_errors.saturating_add(1);
+                dev_log(sys, 3, b"[wal] group write FAIL".as_ptr(), 22);
+                return;
+            }
+
+            if s.staged_terminator {
+                let logical_end = (s.cursor as i32).to_le_bytes();
+                let seek_rc = (sys.provider_call)(
+                    s.fd, FS_SEEK, logical_end.as_ptr() as *mut u8, logical_end.len(),
+                );
+                if seek_rc < 0 {
+                    s.write_errors = s.write_errors.saturating_add(1);
+                    dev_log(sys, 3, b"[wal] restore seek FAIL".as_ptr(), 23);
+                    return;
+                }
+            }
+
+            s.write_pos = 0;
+            s.staged_terminator = false;
+        }
+
         if fsync_segment(s, sys) != 0 {
             // Deferred group fsync failed — the batch is NOT durable. Withhold
             // the FsyncAck (commit must not advance past it) and keep the batch
@@ -1357,9 +1664,18 @@ unsafe fn flush_batch(s: &mut ModuleState, sys: &SyscallTable) {
             &mut ack_buf, s.pending_max_term, s.pending_max_index, s.self_id,
         );
         wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17]);
-        dev_log(sys, 3, b"[wal] group fsync".as_ptr(), 17);
-    } else {
-        dev_log(sys, 3, b"[wal] group fsync (no ack)".as_ptr(), 26);
+        // Batch-durability signal, group mode only: per-entry mode
+        // (`fsync_mode == 0`) also flows through this function (every
+        // append flushes its own singleton batch immediately — see
+        // the call site's condition), but its durability signal is
+        // already `[wal] entry ok` at stage time, which coincides
+        // exactly since the batch never holds more than that one
+        // entry. Logging `group fsync` there too would be redundant
+        // and would break the per-entry/group dichotomy the wal
+        // group-fsync test suite asserts on.
+        if s.fsync_mode != 0 {
+            dev_log(sys, 3, b"[wal] group fsync".as_ptr(), 17);
+        }
     }
 
     s.has_batch = false;
@@ -1386,6 +1702,39 @@ unsafe fn ensure_segment_open(s: &mut ModuleState, sys: &SyscallTable) {
     if s.fd >= 0 { return; }
     build_segment_path(s, s.segment_seq);
     s.fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), s.path_len as usize);
+    if s.fd >= 0 && s.fixed_segment != 0 {
+        // Reserve four bytes beyond the configured record limit for the live
+        // tail terminator. PREALLOCATE persists physical capacity + fixed file
+        // size and leaves the descriptor at offset zero.
+        let capacity = s.segment_limit.saturating_add(4);
+        let cap = capacity.to_le_bytes();
+        let prc = (sys.provider_call)(
+            s.fd, FS_PREALLOCATE, cap.as_ptr() as *mut u8, cap.len(),
+        );
+        if prc == 0 {
+            // Establish a durable empty-log terminator before admission. A
+            // crash after preallocation but before the first client append
+            // must replay zero entries, never stale preallocated data.
+            let zero = [0u8; 4];
+            let w = (sys.provider_call)(s.fd, FS_WRITE, zero.as_ptr() as *mut u8, zero.len());
+            let seek = 0i32.to_le_bytes();
+            let sr = (sys.provider_call)(s.fd, FS_SEEK, seek.as_ptr() as *mut u8, seek.len());
+            let fr = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
+            if w == 4 && sr == 0 && fr == 0 {
+                s.fixed_segment_active = true;
+                s.preallocate_ready_at_ms = dev_millis(sys)
+                    .saturating_add(s.preallocate_settle_ms as u64);
+            } else {
+                (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                s.fd = -1;
+                s.write_errors = s.write_errors.saturating_add(1);
+                dev_log(sys, 3, b"[wal] prealloc init FAIL".as_ptr(), 24);
+                return;
+            }
+        }
+        // ENOSYS/unsupported is an intentional compatibility fallback: this
+        // descriptor remains a normal EOF-sized append file.
+    }
     // DIAG: surface the create rc (E_AGAIN=-11 = fat32 not ready, retry;
     // a hard negative = no/failed FS provider; >=0 = disk-backed).
     if s.fd != s.dbg_last_open_rc {
@@ -1428,7 +1777,6 @@ unsafe fn flush_block(s: &mut ModuleState, sys: &SyscallTable) {
     }
 
     s.write_pos = 0;
-    s.needs_flush = false;
 }
 
 /// # Safety
@@ -1469,6 +1817,8 @@ unsafe fn close_segment(s: &mut ModuleState, sys: &SyscallTable) {
         (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
         s.fd = -1;
     }
+    s.fixed_segment_active = false;
+    s.preallocate_ready_at_ms = 0;
 }
 
 /// # Safety
@@ -1507,7 +1857,7 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
     let kc = wire::METRIC_KIND_COUNTER;
     let kg = wire::METRIC_KIND_GAUGE;
     let kh = wire::METRIC_KIND_HISTOGRAM;
-    let scalars: [(u16, u8, i64); 14] = [
+    let scalars: [(u16, u8, i64); 17] = [
         (wire::metric_ids::WAL_ENTRIES_WRITTEN, kc, i64::from(s.entries_written)),
         (wire::metric_ids::WAL_WRITE_ERRORS, kc, i64::from(s.write_errors)),
         (wire::metric_ids::WAL_CHECKSUM_FAILURES, kc, i64::from(s.checksum_failures)),
@@ -1524,6 +1874,9 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
         (wire::metric_ids::WAL_REPLAY_FSIZE, kg, i64::from(s.replay_first_size)),
         (wire::metric_ids::WAL_ENTRYREQ_SERVED, kc, i64::from(s.entryreq_served)),
         (wire::metric_ids::WAL_ENTRYREQ_NOTFOUND, kc, i64::from(s.entryreq_notfound)),
+        (wire::metric_ids::WAL_INPUT_BUDGET_BYTES, kg, i64::from(s.input_budget_bytes)),
+        (wire::metric_ids::WAL_PUMP_RECORDS, kg, i64::from(s.pump_records)),
+        (wire::metric_ids::WAL_CONTINUITY_ERRORS, kc, i64::from(s.continuity_errors)),
     ];
     for &(metric_id, kind, value) in scalars.iter() {
         emit_sample(s, sys, mid, pid, metric_id, kind, value);

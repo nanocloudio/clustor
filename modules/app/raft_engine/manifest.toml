@@ -1,4 +1,5 @@
 version = "0.1.0"
+timer_class = "wall_clock"
 type = "Transformer"
 entry = "mod.rs"
 hardware_targets = ["bcm2712"]
@@ -114,6 +115,10 @@ content_type = "OctetStream"
 name = "append_entries"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + AE header (49) + proposal batch (2048).
+max_record = 2100
+rate_class_max = "transaction"
 
 [[ports]]
 name = "rpc_out"
@@ -124,6 +129,10 @@ content_type = "OctetStream"
 name = "log_append"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + term/index (16) + proposal batch (2048).
+max_record = 2067
+rate_class_max = "transaction"
 
 [[ports]]
 name = "metrics"
@@ -150,6 +159,9 @@ content_type = "OctetStream"
 name = "log_observe"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 8192
+max_record = 2067
+rate_class_max = "transaction"
 
 # Periodic MSG_LEADER_HINT emission so client_codec (and any other
 # consumer that needs to short-circuit non-leader proposals) can know
@@ -169,6 +181,9 @@ content_type = "OctetStream"
 name = "admin_applied"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 8192
+max_record = 8
+rate_class_max = "transaction"
 
 # Follower commit-index advances. When this replica is a follower and
 # the leader's `leader_commit` in an AE moves our `commit_index`
@@ -180,6 +195,9 @@ content_type = "OctetStream"
 name = "commit_advanced"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 8192
+max_record = 19
+rate_class_max = "transaction"
 
 # Reply to a strict-ReadIndex probe. Payload (17 bytes):
 # `[correlation_id:u64 LE][confirmed_commit:u64 LE][confirmed:u8]`.

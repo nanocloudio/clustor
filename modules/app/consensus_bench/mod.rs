@@ -216,14 +216,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // that the whole framed proposal fits — and
                         // `channel_write_msg` is all-or-nothing (a short write
                         // lands NOTHING and returns < frame_len). Counting an
-                        // unchecked write as `sent` silently drops proposals
-                        // under disk-latency backpressure (raft suspends intake
-                        // at the inflight cap, the channel fills, writes start
-                        // failing) — observed as `sent=4000` but only 268
-                        // appended. Honor the write result: a failed write is
-                        // real backpressure — count it as blocked and retry the
-                        // SAME proposal next step. See
-                        // `[[reference_channel_framing_atomic]]`.
+                        // unchecked write as `sent` would silently drop
+                        // proposals under disk-latency backpressure (raft
+                        // suspends intake at the inflight cap, the channel
+                        // fills, writes start failing). Honor the write
+                        // result: a failed write is real backpressure — count
+                        // it as blocked and retry the SAME proposal next step.
                         let frame_len = (wire::ENVELOPE_HDR + payload.len()) as i32;
                         let wrote = wire_channels::channel_write_msg(
                             sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL, payload,

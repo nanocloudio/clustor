@@ -1,4 +1,5 @@
 version = "0.1.0"
+timer_class = "agnostic"
 type = "Transformer"
 entry = "mod.rs"
 hardware_targets = ["bcm2712"]
@@ -38,9 +39,28 @@ direction = "input"
 content_type = "OctetStream"
 
 [[ports]]
+name = "proposal_assigned"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "applied"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposal_rejected"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
 name = "response"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + response header (5) + metrics cache (7600).
+max_record = 7608
+rate_class_max = "transaction"
 
 [[ports]]
 name = "metric_sample"
@@ -51,8 +71,30 @@ content_type = "OctetStream"
 name = "admin_request"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + fixed admin command buffer (1024).
+max_record = 1027
+rate_class_max = "transaction"
+
+[[ports]]
+name = "proposal"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope + correlation id + maximum HTTP proposal body.
+max_record = 1035
+rate_class_max = "transaction"
+
+[[ports]]
+name = "ready_snapshot"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 64
+max_record = 8
+rate_class_max = "transaction"
 
 [observability]
-# Request translation + endpoint cache; mirrors requests_handled / requests_404
-# and self-emits a MSG_METRIC_SAMPLE.
-metrics = ["requests", "requests_404"]
+# Synchronous proposal-correlation health. Occupancy/high-water show whether
+# the bounded tables are approaching saturation; unmatched/no-slot/timeouts
+# distinguish overload amplification from downstream WAL latency.
+metrics = ["requests", "requests_404", "correlations_inflight", "indices_inflight", "inflight_high_water", "proposal_timeouts", "commit_timeouts", "assignments_unmatched", "assignments_no_slot", "applies_unmatched", "rejections", "queue_unavailable", "committed"]

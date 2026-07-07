@@ -114,6 +114,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+        let work_before = s.requests_routed.wrapping_add(s.responses_sent);
 
         // 1. Route inbound requests by message type.
         //    peer_router wraps each cleartext record in a MSG_CLIENT_FRAME
@@ -134,18 +135,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let conn_id = s.msg_buf[0];
             // Parse wire envelope from offset 1
             let msg_type = s.msg_buf[1];
-            // Debug: log first 6 bytes as hex
-            {
-                let hex = b"0123456789abcdef";
-                let mut dbg = [0u8; 20];
-                dbg[0] = b'['; dbg[1] = b'c'; dbg[2] = b']';
-                let show = len.min(6);
-                for bi in 0..show {
-                    dbg[3 + bi*2] = hex[(s.msg_buf[bi] >> 4) as usize];
-                    dbg[4 + bi*2] = hex[(s.msg_buf[bi] & 0xF) as usize];
-                }
-                dev_log(sys, 3, dbg.as_ptr(), 3 + show * 2);
-            }
             let payload_len = u16::from_le_bytes([s.msg_buf[2], s.msg_buf[3]]) as usize;
             let payload_start = 4usize; // 1 (conn_id) + 3 (envelope)
             let payload_end = (payload_start + payload_len).min(len);
@@ -192,7 +181,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         wire_channels::channel_write_msg(sys, out_chan, out_type, &framed[..1 + pl]);
                     }
                     s.requests_routed += 1;
-                    dev_log(sys, 3, b"[client] route".as_ptr(), 14);
                 }
             }
         }
@@ -212,6 +200,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         drain_input(sys, s.in_readyz, &mut s.msg_buf);
         drain_input(sys, s.in_why, &mut s.msg_buf);
         drain_input(sys, s.in_metrics, &mut s.msg_buf);
+        if s.requests_routed.wrapping_add(s.responses_sent) != work_before {
+            dev_report_step_effect(sys, step_effect::WORK_DONE);
+        }
 
         0
     }

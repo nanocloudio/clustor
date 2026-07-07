@@ -73,7 +73,7 @@ would have, with none of those fragilities:
 
 Each repo packs only what it owns:
 
-| Repo | `make modules TARGET=bcm2712` packs |
+| Repo | `fluxor modules build --target bcm2712` packs |
 |------|-------------------------------------|
 | `clustor` | The 23 substrate modules plus `example_consumer` — full map in [architecture/modules.md](architecture/modules.md) and the canonical edge set in [`../configs/single.yaml`](../configs/single.yaml). |
 | `quantum` | The quantum-specific app modules (codecs, session processing, topic/dedup engines, retained store, audit, DR, metrics, consumer groups, transactions, tenancy). |
@@ -91,12 +91,12 @@ manifests it discovers via search paths and resolves each module's
 To build a fresh quantum graph from scratch:
 
 ```sh
-cd clustor && make modules TARGET=bcm2712
-cd quantum && make modules TARGET=bcm2712
+cd clustor && fluxor modules build --target bcm2712
+cd quantum && fluxor modules build --target bcm2712
 fluxor run quantum/configs/quantum-linux-minimal.yaml
 ```
 
-The two `make modules` invocations are independent. Either order
+The two module builds are independent. Either order
 works; both have to run at least once on a clean tree.
 
 ## What lives where
@@ -120,7 +120,7 @@ works; both have to run at least once on a clean tree.
   Distinct from clustor's `common/wire.rs`.
 - `<consuming-project>/target/<silicon>/modules/<name>.fmod` —
   packed artifacts read at runtime. `fluxor sync` lands the
-  registry-resolved fmods here; `make modules` lands the ones the
+  registry-resolved fmods here; `fluxor modules build` lands the ones the
   consumer owns.
 
 ## PIC module pitfalls

@@ -85,6 +85,7 @@ shared with every fluxor application. The rest are clustor's own.
 
 | Module | Description |
 |--------|-------------|
+| `session_directory` | Session directory / reservation authority (fluxor rfc_protocols.md §8.3/§13.7): single-writer session bindings, quorum-committed counter-block grants, wrapped-key custody, fence-ordering, and unsafe-recovery voiding, as a replicated consumer over `modules/common/session_registry.rs`. Replies only from the committed-entry stream (R2/R5 ack boundary). See [session_directory.md](session_directory.md). |
 | `example_consumer` | Minimal downstream consumer module that `#[path]`-includes `modules/common/replica_facade.rs` and wires to `apply_pipeline.committed_entries`. Built alongside every clustor module on every `make ci` run — the gate that catches `no_std` regressions in the facade or in the per-entry emitter. See [consumer_facade.md](consumer_facade.md). |
 
 ---

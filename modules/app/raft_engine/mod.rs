@@ -42,10 +42,12 @@ const PROPOSAL_BATCH_CAP: usize = 2048;
 /// untagged port leave the slot zero and produce no MSG_PROPOSAL_ASSIGNED.
 const MAX_BATCH_PROPOSALS: usize = 256;
 
-/// In-flight strict-ReadIndex probes the leader tracks at once. Each
-/// probe is consumed in two ticks (broadcast then quorum + reply) so
-/// 8 is enough for a per-second read rate well into the thousands.
-const MAX_INFLIGHT_PROBES: usize = 8;
+/// In-flight strict-ReadIndex probes the leader tracks at once. With N
+/// mixed-load client connections each holding one fence, concurrent
+/// probes ≈ connection count, so the table must exceed the typical
+/// connection count or newcomers get rejected at the boundary. Slots
+/// are 48 bytes; 32 is cheap.
+const MAX_INFLIGHT_PROBES: usize = 32;
 
 /// How long a strict-ReadIndex probe may wait for majority replies
 /// before we give up and answer the read with fallback. Sized to the
@@ -105,6 +107,11 @@ struct ProbeSlot {
     /// Wall-clock deadline; if we don't reach majority by then we
     /// reply with confirmed=0.
     deadline_ms: u64,
+    /// The peer broadcast actually landed on `out_rpc`. Without this,
+    /// a probe whose broadcast hit backpressure becomes a zombie slot
+    /// (occupied, nothing in flight, guaranteed timeout-reject);
+    /// `expire_probes` re-attempts unsent broadcasts each step.
+    broadcast_sent: bool,
 }
 
 impl ProbeSlot {
@@ -116,6 +123,7 @@ impl ProbeSlot {
             term: 0,
             votes: NodeSet::empty(),
             deadline_ms: 0,
+            broadcast_sent: false,
         }
     }
 }
@@ -427,7 +435,7 @@ struct ModuleState {
     last_hint_term: Term,
 
     // ── Scratch ─────────────────────────────────────────────
-    msg_buf: [u8; 2048],
+    msg_buf: [u8; 4096],
 }
 
 // ── Simple PRNG for election jitter (xorshift32) ────────────
@@ -599,6 +607,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
         let now = dev_millis(sys);
+        let work_before = s.proposals_received.wrapping_add(s.entries_appended);
 
         // 0a. Boot-time metadata load retry. At cold boot the fat32 provider
         //     isn't ready when module_new ran (FS_OPEN -> E_AGAIN), so the
@@ -715,6 +724,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 7. Broadcast a leader-state hint on every change so client_codec
         //    can short-circuit non-leader proposals with CLIENT_REJECT_NOT_LEADER.
         emit_leader_hint(s, sys);
+        if s.proposals_received.wrapping_add(s.entries_appended) != work_before {
+            let poll = (sys.channel_poll)(s.in_proposals_tagged, 0x01);
+            let effect = if poll > 0 && (poll as u32 & 0x01) != 0 {
+                step_effect::RUNNABLE_BACKLOG
+            } else {
+                step_effect::WORK_DONE
+            };
+            dev_report_step_effect(sys, effect);
+        }
 
         0
     }
@@ -900,6 +918,7 @@ unsafe fn start_probe(
     // Not the leader: immediately reply with confirmed=0 so the apply
     // pipeline can fall back to rejecting the read.
     if s.role != ROLE_LEADER {
+        dev_log(sys, 3, b"[raft] probe nolead".as_ptr(), 19);
         emit_read_probe_reply(s, sys, correlation_id, 0, false);
         return;
     }
@@ -912,6 +931,7 @@ unsafe fn start_probe(
         Some(i) => i,
         None => {
             // Probe table full — reply with confirmed=0, caller retries.
+            dev_log(sys, 3, b"[raft] probe full".as_ptr(), 17);
             emit_read_probe_reply(s, sys, correlation_id, 0, false);
             return;
         }
@@ -928,6 +948,7 @@ unsafe fn start_probe(
         term: s.current_term,
         votes,
         deadline_ms: now + PROBE_TIMEOUT_MS,
+        broadcast_sent: false,
     };
 
     // Single-node cluster: we already have majority (self).
@@ -938,16 +959,30 @@ unsafe fn start_probe(
         return;
     }
 
-    // Broadcast the probe to all peers via routed broadcast.
-    if s.out_rpc < 0 { return; }
+    // Broadcast the probe to all peers. On backpressure the slot stays
+    // `broadcast_sent = false` and `expire_probes` retries every step
+    // until it lands or the deadline rejects it — never a zombie.
+    broadcast_probe(s, sys, slot_idx);
+}
+
+/// Attempt the routed peer broadcast for probe slot `i`; marks the slot
+/// sent on success. Safe to call repeatedly.
+unsafe fn broadcast_probe(s: &mut ModuleState, sys: &SyscallTable, i: usize) -> bool {
+    if s.out_rpc < 0 { return false; }
     let poll = (sys.channel_poll)(s.out_rpc, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if poll <= 0 || (poll as u32 & 0x02) == 0 { return false; }
     let mut buf = [0u8; 16];
-    wire::encode_read_index_probe(&mut buf, probe_id, s.current_term);
-    wire_channels::channel_write_routed_partitioned(
+    wire::encode_read_index_probe(&mut buf, s.probes[i].probe_id, s.probes[i].term);
+    let n = wire_channels::channel_write_routed_partitioned(
         sys, s.out_rpc, wire::TARGET_BROADCAST, s.partition_id,
         wire::MSG_READ_INDEX_PROBE, &buf,
     );
+    if n > 0 {
+        s.probes[i].broadcast_sent = true;
+        true
+    } else {
+        false
+    }
 }
 
 /// # Safety
@@ -963,6 +998,12 @@ unsafe fn expire_probes(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
         if now >= slot.deadline_ms {
             emit_read_probe_reply(s, sys, slot.correlation_id, 0, false);
             s.probes[i] = ProbeSlot::empty();
+            continue;
+        }
+        // Backpressured-at-issue broadcasts retry until they land
+        // (see ProbeSlot::broadcast_sent).
+        if !slot.broadcast_sent {
+            broadcast_probe(s, sys, i);
         }
     }
 }
@@ -1039,8 +1080,27 @@ unsafe fn drain_snapshot_installed(s: &mut ModuleState, sys: &SyscallTable) {
             };
         // Stale snapshot from an old term: ignore.
         if term < s.current_term { continue; }
-        // Already at or past this snapshot point: nothing to do.
-        if last_idx <= s.last_log_index { continue; }
+        // At or past this snapshot point already → this is a LOCAL
+        // snapshot of our own log (the leader/steady-state path: wal's
+        // rotation trigger → snapshot_engine → installed_local), not a
+        // peer install. No state fast-forward is owed — the log already
+        // covers the snapshot — but the WAL compaction floor is: without
+        // this leg a leader never retires segments (the follower-install
+        // path below is unreachable for own-log snapshots, so `[wal]
+        // compacted` never fired on a leader). Clamp the floor to
+        // `commit_index`: the trigger carries the rotation-time APPEND
+        // high-water, and an uncommitted suffix can still be truncated by
+        // conflict repair (§5.3) — compaction must never outrun commit.
+        // `compact_before` is idempotent/monotonic, so duplicate or
+        // out-of-order installs are harmless here.
+        if last_idx <= s.last_log_index {
+            let floor = if last_idx < s.commit_index { last_idx } else { s.commit_index };
+            if floor > 0 {
+                dev_log(sys, 3, b"[raft] snap local".as_ptr(), 17);
+                emit_wal_compact_before(s, sys, floor);
+            }
+            continue;
+        }
         dev_log(sys, 3, b"[raft] snap install".as_ptr(), 19);
         s.last_log_index = last_idx;
         s.last_log_term = last_term;
@@ -1658,7 +1718,10 @@ unsafe fn handle_append_entries(s: &mut ModuleState, sys: &SyscallTable, plen: u
     let (term, leader, prev_log_index, prev_log_term, leader_commit, entry_term, entry_index) =
         match wire::decode_append_entries(&s.msg_buf[..pl]) {
             Some(t) => t,
-            None => return,
+            None => {
+                dev_log(sys, 3, b"[raft] ae decode-fail".as_ptr(), 21);
+                return;
+            }
         };
 
     if term < s.current_term {
@@ -2155,10 +2218,14 @@ unsafe fn append_to_batch(
     s.correlation_ids[count] = correlation_id;
     s.proposal_batch_count += 1;
     s.proposals_received += 1;
+    // Acceptance signal — single choke point for all four proposal
+    // ingress paths (untagged/tagged/partitioned/partitioned+tagged)
+    // in `drain_proposals`. Fires once the proposal is genuinely
+    // batched, not merely received off the channel.
+    dev_log(sys, 3, b"[raft] prop".as_ptr(), 11);
 
     if s.proposal_batch_count == 1 {
         s.proposal_batch_start_ms = now;
-        dev_log(sys, 3, b"[raft] prop".as_ptr(), 11);
     }
 
     // Honour the count-based flush cap inside the drain pass.
@@ -2286,8 +2353,6 @@ unsafe fn flush_proposal_batch(s: &mut ModuleState, sys: &SyscallTable) {
     // ~33 ms dir walk that blows raft's step guard and wedges the pipeline.
     // (Durable term/vote on fat32 needs a root-level 8.3 meta path — see the
     // wal.root_path pattern — tracked separately.)
-    dev_log(sys, 3, b"[raft] flush".as_ptr(), 12);
-
     // All proposals in this batch share the same wal_index. Emit one
     // MSG_PROPOSAL_ASSIGNED per tagged proposal so the proposer can bind
     // its correlation_id to the durable log index.

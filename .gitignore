@@ -18,3 +18,9 @@ Cargo.lock
 /target/
 /tests/
 /benches/
+
+# Runtime WAL state (mutated by local runs, not source)
+/wal/
+
+# fluxor lockfile advisory-lock artifact
+/.fluxor.lock.lock

@@ -1,69 +1,94 @@
-# Clustor — single-node test cluster (template).
+# Pi 5 / CM5 bare-metal twin of `single-throughput.yaml`. Runs on
+# the rig (`fluxor rig test --rig pi5-a`).
 #
-# DEV/TEST ONLY. The `http_adapter.admin_request → admin_handler.requests`
-# edge below routes `POST /admin/<op>` straight into admin_handler
-# without going through `rbac`, so any client that can reach the
-# HTTP listener can issue FREEZE / THAW / TRANSFER_LEADER / SNAPSHOT.
-# Don't deploy this config to anywhere the HTTP port isn't already
-# behind an authenticated proxy. Routing HTTP admin through rbac is
-# tracked at docs/native_fluxor.md.
+# Observation rides `platform.debug.to: net` — every `dev_log(…)`
+# drains as a UDP datagram to port 6666. The pi5-a rig profile's
+# `[telemetry.monitor_udp]` captures it (see
+# `~/.config/fluxor/labs/default/rigs/pi5-a.toml`).
 #
-# This file is a TEMPLATE: it contains `__SELF_ID__` and
-# `__LISTEN_PORT__` placeholders that must be substituted before
-# `fluxor run`. Render with:
+# Ephemeral external-load profile: no FS provider is wired, so the WAL retains
+# recent entries in memory and acknowledges them without a durability barrier. There is
+# deliberately no on-DUT injector; drive POST /propose on the HTTP diagnostic
+# listener (`:19090`) from the load host. Port 9090 is the peer/client protocol
+# listener and is not the benchmark HTTP endpoint.
 #
-#   fluxor render-template configs/single.yaml \
-#       --var SELF_ID=0 --var LISTEN_PORT=9090 \
-#       --var HTTP_PORT=19090 > /tmp/n0.yaml
-#
-# Full pipeline with network via linux_net socket provider. With
-# voter_count=1, the lone node is its own quorum — proposals
-# commit at local durability without any peer traffic.
-target: linux
-tick_us: 1000
+# Driver: `tests/hardware/drive-cm5-rig.sh`.
 
-# The clustor module graph is intentionally cyclic — the consensus
-# loop (raft_engine → replicator → peer_router → raft_engine,
-# apply_pipeline → raft_engine.admin_committed, commit_tracker
-# → raft_engine.commit, etc.) only converges through these
-# feedback edges. accept_cycles tells fluxor's prepare_graph to
-# accept the graph and route the cycles via the end-of-tick fixed
-# point per RFC §5.1.
+target: cm5
+tick_us: 3500
+
+# Same cyclic-graph allowance as `single.yaml` — Raft's
+# raft_engine → replicator → peer_router → raft_engine feedback
+# converges via end-of-tick fixed point.
 scheduler:
   accept_cycles: true
 
+execution:
+  domains:
+    - name: main
+      cores: [0]
+      adaptive_flags: 2
+      tick_min_us: 1750
+      tick_max_us: 3500
+
 platform:
   net: {}
+  debug:
+    to: net
+    observe: true
+    export_telemetry: otlp
+    # Destination comes from ~/.config/fluxor/host.toml
+    # debug.collector_ip (192.168.1.10), shared with proven log_net routing.
+    export_dst_port: 4318
+    # Export in coarse batches: a 1 s cadence measurably contends with the
+    # request path on the single scheduler domain. Five seconds preserves
+    # useful operational telemetry without paying JSON/TCP work every second.
+    export_flush_ms: 60000
+    # OTLP requires a Unix-epoch boot anchor. Refresh this per deployment
+    # until the rig injects wall time or the DUT gains an RTC/NTP authority.
+    export_epoch_sec: 1783893839
 
 modules:
   - name: peer_router
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       peer_count: 1
-      listen_port: __LISTEN_PORT__
-      peer0_port: __LISTEN_PORT__
+      listen_port: 9090
+      peer0_port: 9090
   - name: client_codec
     params:
-      self_id: __SELF_ID__
+      self_id: 0
   - name: throttle_gate
   - name: raft_engine
+    step_deadline_us: 3500
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       voter_count: 1
       heartbeat_interval_ms: 150
   - name: replicator
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       peer_count: 1
   - name: commit_tracker
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       voter_count: 1
   - name: apply_pipeline
+    step_deadline_us: 3500
   - name: wal
+    step_deadline_us: 12000
+    step_deadline_burst_us: 28000
+    fault_policy: skip
+    params:
+      fsync_mode: 1
+      group_window_ms: 5
+      group_max_pending: 4
+      root_path: 0
+      segment_bytes: 67108864
+      skip_replay: 1
   - name: durability_ledger
     params:
-      self_id: __SELF_ID__
+      self_id: 0
       voter_count: 1
       partition_id: 0
   - name: cp_bridge
@@ -72,47 +97,64 @@ modules:
   - name: flow_controller
   - name: key_manager
   - name: telemetry_agg
+    # Bench profile (RFC §4.4): export /metrics every 250 ms so a short
+    # measurement window still captures fresh samples. Production configs
+    # omit this and default to 1 s.
+    params:
+      emit_interval_ms: 250
   - name: client_surface
   - name: rbac
   - name: admin_handler
   - name: snapshot_engine
   - name: placement_router
 
-  # Diagnostic HTTP surface. `http_ingress` frames inbound TCP as
-  # MSG_HTTP_REQUEST / MSG_HTTP_RESPONSE for `http_adapter`. See
-  # `docs/native_fluxor.md` for the dataflow. `http_ingress` binds
-  # `__HTTP_PORT__` on the same `linux_net` instance `peer_router`
-  # uses — linux_net's CMD_BIND supports concurrent listeners on
-  # distinct ports per fluxor's `modules/builtin/linux/linux_net/README.md`.
+  # HTTP diagnostic surface so the rig scenario can drive admin
+  # POSTs (raft doesn't propose a bootstrap no-op in single-node
+  # mode, so without a client surface wal stays idle).
   - name: http_adapter
   - name: http_ingress
     params:
-      listen_port: __HTTP_PORT__
+      listen_port: 19090
 
 wiring:
-  # ── linux_net ↔ peer_router (no TLS) ─────────────────────
-  - from: linux_net.net_out
+  # Foundation net manifests own their target-specific ring capacities. This
+  # graph declares traffic policy only; no duplicated buffer sizes are needed.
+  - from: conn_guard.frames_tx
+    to: ip.frames_rx
+  - from: ip.frames_tx
+    to: rp1_gem.frames_tx
+  - from: ip.net_out
+    to: log_net.net_in
+  - from: log_net.net_out
+    to: ip.net_in
+  - from: ip.net_out
+    to: otlp_http.net_in
+  - from: otlp_http.net_out
+    to: ip.net_in
+
+  # OpenTelemetry-native module signals. Clustor's richer typed Raft/WAL/apply
+  # table remains on /metrics; these Telemetry ports feed both the local
+  # observer and the direct OTLP/HTTP exporter.
+  - from: ip.telemetry
+    to: observe.telemetry
+  - from: ip.telemetry
+    to: otlp_http.telemetry
+
+  # ── ip ↔ peer_router (cleartext; no TLS) ─────────────────
+  - from: ip.net_out
     to: peer_router.net_in
   - from: peer_router.net_out
-    to: linux_net.net_in
+    to: ip.net_in
 
   # ── peer_router → application ────────────────────────────
   - from: peer_router.cleartext
     to: client_surface.requests
   - from: peer_router.peer_rx
     to: replicator.ack
-  # Inbound peer Raft RPCs (RequestVote/AppendEntries/heartbeat)
-  # land on peer_router.raft_rpc and must reach raft_engine for the
-  # cluster to elect a leader and replicate. Without this edge
-  # multi-node bring-up stalls in the `[raft] elect` loop because
-  # vote responses never reach the requester. `client_surface.raft_rpc`
-  # (HTTP-injected RPCs) is intentionally unwired to avoid a
-  # fan-in collision — see `configs/multi-2node-2p.yaml` for the
-  # historical rationale.
   - from: peer_router.raft_rpc
     to: raft_engine.rpc
 
-  # ── HTTP routing ─────────────────────────────────────────
+  # ── Client path ──────────────────────────────────────────
   - from: client_surface.client_req
     to: client_codec.raw
   - from: client_surface.admin_req
@@ -120,19 +162,25 @@ wiring:
   - from: client_surface.responses
     to: peer_router.client_resp
 
-  # ── Client pipeline ──────────────────────────────────────
   - from: client_codec.parsed
     to: throttle_gate.requests
   - from: throttle_gate.admitted
     to: raft_engine.proposals_tagged
-  # Correlation feedback so client_codec can map (correlation_id → wal_index)
-  # for response routing. See RFC §5.8.
   - from: raft_engine.proposal_assigned
     to: client_codec.proposal_assigned
+  - from: raft_engine.proposal_assigned
+    to: http_adapter.proposal_assigned
+    rate: transaction
   - from: raft_engine.leader_state
     to: client_codec.leader_state
   - from: throttle_gate.rejected
     to: client_codec.responses
+  - from: throttle_gate.rejected
+    to: http_adapter.proposal_rejected
+    rate: transaction
+  - from: http_adapter.proposal
+    to: throttle_gate.requests
+    rate: transaction
 
   # ── Flow control ──────────────────────────────────────────
   - from: flow_controller.credits
@@ -141,8 +189,7 @@ wiring:
     to: client_surface.throttle_status
 
   # ── Raft replication ──────────────────────────────────────
-  - from: raft_engine.append_entries
-    to: replicator.entries
+  # Genuine single voter: no remote AppendEntries fan-out is required.
   - from: replicator.net_out
     to: peer_router.peer_tx
   - from: replicator.match_indices
@@ -161,48 +208,46 @@ wiring:
   - from: wal.replay_complete
     to: raft_engine.wal_replay_complete
     rate: transaction
+    rate: transaction
   - from: wal.flushed
     to: durability_ledger.ack
-  # Spec §10.4.1: every replica tracks its own `local_wal_durable_index`
-  # in raft_engine so followers can stamp it into each AE response.
-  # The leader uses it only as its own progress[self] in
-  # durability_ledger; fan-out via fluxor's auto-inserted tee.
+    rate: transaction
   - from: wal.flushed
     to: raft_engine.wal_flushed
-  # Cross-node DurabilityAck fan-in (spec §10.4.1). Followers' durable
-  # indices land at the leader's durability_ledger via this edge so
-  # quorum-fsync `wal_committed_index` can advance.
+    rate: transaction
   - from: replicator.cross_durability_ack
     to: durability_ledger.ack
   - from: durability_ledger.quorum_durable
     to: commit_tracker.durable
+    rate: transaction
 
   # ── Commit → apply ────────────────────────────────────────
   - from: commit_tracker.committed
     to: apply_pipeline.entries
+    rate: transaction
   - from: commit_tracker.committed
     to: raft_engine.commit
+    rate: transaction
   - from: raft_engine.commit_advanced
     to: apply_pipeline.entries
-  # Per-entry body fan-out (see clustor-linux-minimal.yaml comment).
+    rate: transaction
   - from: raft_engine.log_observe
     to: apply_pipeline.log_entries
-  # Gap refetch: apply_pipeline pulls a durable entry's body back from
-  # the WAL by index when it's missing one (post-restart recovery, or
-  # a fan-out gap). Without this a restart advances commit_horizon via
-  # `commit_advanced` but apply_pipeline can never actually apply past
-  # it — it never received the entry bodies to apply.
+    rate: transaction
   - from: apply_pipeline.entry_request
     to: wal.entry_request
     rate: transaction
   - from: wal.entry_reply
     to: apply_pipeline.entry_reply
-  # Linearizable-read submissions (RFC §4.3): apply_pipeline
-  # holds reads until the ReadIndex point is reached.
+    rate: transaction
   - from: client_codec.reads
     to: apply_pipeline.read
   - from: apply_pipeline.applied
     to: client_codec.responses
+    rate: transaction
+  - from: apply_pipeline.applied
+    to: http_adapter.applied
+    rate: transaction
   - from: client_codec.responses_out
     to: client_surface.client_responses
 
@@ -215,7 +260,6 @@ wiring:
     to: peer_router.peer_tx
   - from: wal.compaction_signal
     to: snapshot_engine.trigger
-  # Snapshot install completion → raft_engine fast-forwards state.
   - from: snapshot_engine.installed_local
     to: raft_engine.snapshot_installed
 
@@ -232,35 +276,30 @@ wiring:
     to: read_gate.cache
   - from: cp_proof_cache.cache_state
     to: commit_tracker.cp_state
-  - from: cp_proof_cache.strict_fallback
-    to: raft_engine.fallback_signal
+  # This isolated load profile has no control-plane proof source. Wiring
+  # strict_fallback would age the empty proof cache after ~1 s and reject
+  # every subsequent proposal, measuring proof freshness rather than storage.
   - from: read_gate.permits
     to: apply_pipeline.read_permits
   - from: placement_router.routing
     to: client_codec.placement
 
-  # ── Admin ─────────────────────────────────────────────────
-  # FREEZE / THAW / TRANSFER_LEADER / DURABILITY_MODE / SNAPSHOT are
-  # applied locally by raft_engine; ADD/REMOVE_VOTER still return
-  # ADMIN_STATUS_UNSUPPORTED until joint consensus lands (RFC §14).
+  # ── Admin (wire-level only; no HTTP path on bare-metal) ───
   - from: rbac.authorized
     to: admin_handler.requests
   - from: rbac.denied
     to: client_surface.admin_responses
   - from: admin_handler.raft_commands
     to: raft_engine.admin_proposals
+    rate: transaction
   - from: raft_engine.admin_applied
     to: admin_handler.applied
+    rate: transaction
   - from: admin_handler.responses
     to: client_surface.admin_responses
-  # Replicable admin ops (FREEZE / THAW / DURABILITY_MODE) ride
-  # the client proposal path so every replica sees the entry.
-  # `admin_handler.raft_proposal` emits `MSG_CLIENT_PROPOSAL`
-  # with body `[ADMIN_MARKER][command_id:u32][op_code][op_body]`;
-  # `apply_pipeline` re-emits it as `MSG_ADMIN_COMMITTED` for
-  # `raft_engine` to apply on every replica.
   - from: admin_handler.raft_proposal
     to: raft_engine.proposals
+    rate: transaction
 
   # ── Telemetry ─────────────────────────────────────────────
   - from: raft_engine.metrics
@@ -285,6 +324,8 @@ wiring:
     to: telemetry_agg.ingest
   - from: apply_pipeline.metrics
     to: telemetry_agg.ingest
+  - from: http_adapter.metric_sample
+    to: telemetry_agg.ingest
   - from: telemetry_agg.readyz
     to: client_surface.readyz_data
   - from: telemetry_agg.why
@@ -292,29 +333,24 @@ wiring:
   - from: telemetry_agg.export
     to: client_surface.metrics_data
 
-  # ── HTTP diagnostic surface ──────────────────────────────────
-  # Shares the `linux_net` instance with `peer_router`; each anchor
-  # binds its own listen port via CMD_BIND. Telemetry fan-out from
-  # `telemetry_agg` to both `client_surface` and `http_adapter` rides
-  # the auto-tee.
-  - from: linux_net.net_out
+  # ── HTTP diagnostic listener → admin_handler bypass (DEV/TEST) ──
+  # POSTs route around rbac; same caveat as `configs/single.yaml`.
+  - from: ip.net_out
     to: http_ingress.net_in
   - from: http_ingress.net_out
-    to: linux_net.net_in
+    to: ip.net_in
   - from: http_ingress.request
     to: http_adapter.request
+    rate: transaction
   - from: http_adapter.response
     to: http_ingress.response
+    rate: transaction
   - from: telemetry_agg.readyz
     to: http_adapter.readyz
   - from: telemetry_agg.why
     to: http_adapter.why
   - from: telemetry_agg.export
     to: http_adapter.metrics
-  # POST /admin/<op> → http_adapter.admin_request →
-  # admin_handler.requests. DEV/TEST ONLY: this edge BYPASSES
-  # rbac entirely (see the file header). When http_adapter learns
-  # to route admin through rbac, this edge moves through
-  # rbac.authorized like the wire-side admin path already does.
   - from: http_adapter.admin_request
     to: admin_handler.requests
+    rate: transaction

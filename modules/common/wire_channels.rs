@@ -42,9 +42,9 @@ use crate::wire::{
 /// misaligned (the reader takes the next frame's bytes as this one's
 /// payload). At saturation a downstream that frees ~one frame per step
 /// keeps the ring in exactly that danger zone, so the tear is the common
-/// case, not a rare one — it was the root cause of the L2 consensus cliff
-/// (raft → wal entries silently shredded → garbage commit_index, RFC
-/// §13/§14). A single combined write is atomic against that: the whole
+/// case, not a rare one (raft → wal entries silently shredded → garbage
+/// commit_index, RFC §13/§14). A single combined write is atomic against
+/// that: the whole
 /// frame lands or nothing does, and the return value is a reliable
 /// "did it fit" backpressure signal. Mirrors the fluxor SDK's own
 /// `msg_write` (`runtime.rs`), which composes into one buffer for the
@@ -72,11 +72,10 @@ unsafe fn write_framed(
     // `channel_write` returns `total` (whole frame landed), a short
     // non-negative count (partial — shouldn't happen for the all-or-nothing
     // ring), or a NEGATIVE errno (CHAN_EAGAIN = -11 when the channel is full,
-    // CHAN_EINVAL, …). Compare SIGNED: the old `(w as usize) < total` test
-    // wrapped a negative errno to a huge usize, so a full-channel EAGAIN read
-    // as ">= total" and the caller was told the write SUCCEEDED — silently
-    // dropping the frame (the root cause of consensus_bench proposals vanishing
-    // under disk-latency backpressure: sent=4000 but only ~268 reached raft).
+    // CHAN_EINVAL, …). Compare SIGNED: an unsigned `(w as usize) < total`
+    // test wraps a negative errno to a huge usize, so a full-channel EAGAIN
+    // reads as ">= total" and the caller is told the write SUCCEEDED —
+    // silently dropping the frame under backpressure.
     // Anything that didn't fully land is a failure: pass a negative errno
     // through (so callers can distinguish full-vs-error) and collapse a short
     // count to 0.

@@ -16,13 +16,13 @@
 //!   clustor-loadgen --host 192.168.1.9:9090 --rate 2000 --duration 10 \
 //!       --conns 4 --path /propose --body 64
 //!
-//! std-only: one OS thread per shard, raw `http_post`. Fine for a Pi-class
+//! std-only: one OS thread and one persistent HTTP connection per shard. Fine for a Pi-class
 //! driver at the rates a 1 GbE link admits; for >~10k conns move to mio/tokio.
 
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use clustor_bench::{http_post, JsonObj, LatencyHist};
+use clustor_bench::{HttpClient, JsonObj, LatencyHist};
 
 struct Args {
     host: String,
@@ -92,6 +92,7 @@ fn run_shard(
     let mut ok = 0u64;
     let mut errors = 0u64;
     let interval = Duration::from_secs_f64(1.0 / per_shard_rate);
+    let mut client = HttpClient::new(&host, Duration::from_secs(5));
     let start = Instant::now();
     let mut i: u64 = 0;
     loop {
@@ -107,7 +108,7 @@ fn run_shard(
         // arrival, not the actual send — a slow server inflates the tail
         // rather than pacing our loop.
         let send_instant = Instant::now();
-        match http_post(&host, &path, &body, Duration::from_secs(5)) {
+        match client.post(&path, &body) {
             Ok((status, _)) => {
                 if (200..400).contains(&status) {
                     ok += 1;

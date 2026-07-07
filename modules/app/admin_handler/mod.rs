@@ -204,8 +204,10 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
         let conn_id = s.msg_buf[0];
         let op_code = s.msg_buf[1];
         // Receipt signal — paired with `[http_adapter] admin op=N
-        // conn_id=M`, lets cluster tests assert the POST-→admin
-        // path landed without depending on response framing yet.
+        // conn_id=M`, the only external proof the POST→admin path
+        // landed: admin ops reply 202 immediately (see http_adapter)
+        // and, unlike client proposals, have no async correlation-
+        // tracked reply to observe instead.
         let mut log = [0u8; 64];
         let n = format_recv_log(&mut log, op_code, conn_id);
         dev_log(sys, 3, log.as_ptr(), n);
@@ -225,12 +227,15 @@ unsafe fn drain_requests(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
             if s.out_proposal >= 0 && cmd_len > 1 {
                 let poll_out = (sys.channel_poll)(s.out_proposal, 0x02);
                 if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                    wire_channels::channel_write_msg(
+                    let written = wire_channels::channel_write_msg(
                         sys,
                         s.out_proposal,
                         wire::MSG_CLIENT_PROPOSAL,
                         &cmd[1..cmd_len],
                     );
+                    if written > 0 {
+                        dev_report_step_effect(sys, step_effect::WORK_DONE);
+                    }
                 }
             }
             continue;

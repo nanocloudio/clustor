@@ -5,7 +5,7 @@
 //! builds on an offline driver host.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -101,11 +101,10 @@ impl Snapshot {
     }
 }
 
-/// Minimal HTTP/1.1 GET. Returns the response body bytes. Honours
-/// `Content-Length`; falls back to read-to-EOF if absent. Binary-safe (the
-/// `/metrics` body is a binary record stream, not text).
+/// Minimal HTTP/1.1 GET. Returns the Content-Length-delimited response body.
+/// Binary-safe (the `/metrics` body is a binary record stream, not text).
 pub fn http_get(addr: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, String> {
-    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    let stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| format!("set_read_timeout: {e}"))?;
@@ -114,14 +113,12 @@ pub fn http_get(addr: &str, path: &str, timeout: Duration) -> Result<Vec<u8>, St
         .map_err(|e| format!("set_write_timeout: {e}"))?;
     let req =
         format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nAccept: */*\r\n\r\n");
-    stream
+    (&stream)
         .write_all(req.as_bytes())
         .map_err(|e| format!("write request: {e}"))?;
-    let mut raw = Vec::new();
-    stream
-        .read_to_end(&mut raw)
-        .map_err(|e| format!("read response: {e}"))?;
-    split_http_body(&raw)
+    let mut reader = BufReader::new(stream);
+    let (_status, body, _close) = read_http_response(&mut reader)?;
+    Ok(body)
 }
 
 /// Minimal HTTP/1.1 POST with a binary body. Returns the response status code
@@ -155,6 +152,117 @@ pub fn http_post(
     let status = parse_status(&raw)?;
     let body = split_http_body(&raw)?;
     Ok((status, body))
+}
+
+/// A minimal sequential HTTP/1.1 keep-alive client. Each worker owns one
+/// instance, so a load run measures Clustor request processing rather than a
+/// TCP handshake and teardown for every request.
+pub struct HttpClient {
+    addr: String,
+    timeout: Duration,
+    stream: Option<BufReader<TcpStream>>,
+}
+
+impl HttpClient {
+    pub fn new(addr: &str, timeout: Duration) -> Self {
+        Self {
+            addr: addr.to_string(),
+            timeout,
+            stream: None,
+        }
+    }
+
+    fn connect(&self) -> Result<BufReader<TcpStream>, String> {
+        let stream =
+            TcpStream::connect(&self.addr).map_err(|e| format!("connect {}: {e}", self.addr))?;
+        stream
+            .set_read_timeout(Some(self.timeout))
+            .map_err(|e| format!("set_read_timeout: {e}"))?;
+        stream
+            .set_write_timeout(Some(self.timeout))
+            .map_err(|e| format!("set_write_timeout: {e}"))?;
+        Ok(BufReader::new(stream))
+    }
+
+    /// Send one POST and consume exactly one Content-Length-delimited
+    /// response. A failed exchange invalidates the connection; the next call
+    /// reconnects, but the failed request is not replayed because its commit
+    /// outcome may be unknown.
+    pub fn post(&mut self, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), String> {
+        if self.stream.is_none() {
+            self.stream = Some(self.connect()?);
+        }
+        let stream = self.stream.as_mut().expect("stream initialized above");
+        let mut req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nConnection: keep-alive\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n",
+            self.addr,
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(body);
+        if let Err(e) = stream.get_mut().write_all(&req) {
+            self.stream = None;
+            return Err(format!("write request: {e}"));
+        }
+        match read_http_response(stream) {
+            Ok((status, response_body, close)) => {
+                if close {
+                    self.stream = None;
+                }
+                Ok((status, response_body))
+            }
+            Err(e) => {
+                self.stream = None;
+                Err(e)
+            }
+        }
+    }
+}
+
+fn read_http_response<R: BufRead>(reader: &mut R) -> Result<(u16, Vec<u8>, bool), String> {
+    let mut line = Vec::new();
+    reader
+        .read_until(b'\n', &mut line)
+        .map_err(|e| format!("read status: {e}"))?;
+    if line.is_empty() {
+        return Err("connection closed before HTTP status".to_string());
+    }
+    let status = parse_status(&line)?;
+    let mut content_length = None;
+    let mut close = false;
+    loop {
+        line.clear();
+        reader
+            .read_until(b'\n', &mut line)
+            .map_err(|e| format!("read header: {e}"))?;
+        if line.is_empty() {
+            return Err("connection closed in HTTP headers".to_string());
+        }
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
+        let header = std::str::from_utf8(&line).map_err(|_| "non-utf8 HTTP header")?;
+        if let Some((name, value)) = header.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|_| format!("invalid Content-Length: {value:?}"))?,
+                );
+            } else if name.eq_ignore_ascii_case("connection")
+                && value.trim().eq_ignore_ascii_case("close")
+            {
+                close = true;
+            }
+        }
+    }
+    let len = content_length.ok_or("keep-alive response omitted Content-Length")?;
+    let mut body = vec![0u8; len];
+    reader
+        .read_exact(&mut body)
+        .map_err(|e| format!("read response body: {e}"))?;
+    Ok((status, body, close))
 }
 
 fn parse_status(raw: &[u8]) -> Result<u16, String> {
@@ -433,5 +541,19 @@ mod tests {
     #[test]
     fn json_escapes() {
         assert_eq!(json_str("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn keep_alive_reader_consumes_exactly_one_response() {
+        let wire = b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\noneHTTP/1.1 503 Service Unavailable\r\nContent-Length: 3\r\nConnection: close\r\n\r\ntwo";
+        let mut reader = BufReader::new(&wire[..]);
+        assert_eq!(
+            read_http_response(&mut reader).unwrap(),
+            (200, b"one".to_vec(), false)
+        );
+        assert_eq!(
+            read_http_response(&mut reader).unwrap(),
+            (503, b"two".to_vec(), true)
+        );
     }
 }

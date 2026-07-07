@@ -213,6 +213,14 @@ wiring:
     to: durability_ledger_p0.ack
   - from: wal_p0.flushed
     to: raft_engine_p0.wal_flushed
+  # Gap refetch: a restarted follower's replayed entries reach the
+  # apply pipeline only by reading them back from the local WAL
+  # (raft log-matching means the leader never re-ships them).
+  - from: apply_pipeline_p0.entry_request
+    to: wal_p0.entry_request
+  - from: wal_p0.entry_reply
+    to: apply_pipeline_p0.entry_reply
+    buffer_bytes: 8192
   - from: replicator_p0.cross_durability_ack
     to: durability_ledger_p0.ack
   - from: durability_ledger_p0.quorum_durable
@@ -240,6 +248,14 @@ wiring:
     to: durability_ledger_p1.ack
   - from: wal_p1.flushed
     to: raft_engine_p1.wal_flushed
+  # Gap refetch: a restarted follower's replayed entries reach the
+  # apply pipeline only by reading them back from the local WAL
+  # (raft log-matching means the leader never re-ships them).
+  - from: apply_pipeline_p1.entry_request
+    to: wal_p1.entry_request
+  - from: wal_p1.entry_reply
+    to: apply_pipeline_p1.entry_reply
+    buffer_bytes: 8192
   - from: replicator_p1.cross_durability_ack
     to: durability_ledger_p1.ack
   - from: durability_ledger_p1.quorum_durable

@@ -19,7 +19,7 @@
 //!                                │ NCMD_SEND([conn_id][HTTP/1.1 200 OK\r\n...])
 //!                                ▼
 //!                           linux_net_http
-//!                                │ Connection: close
+//!                                │ HTTP/1.1 keep-alive
 //!                                ▼
 //!                            browser/curl
 //!
@@ -36,10 +36,9 @@
 //!   - Headers parsed up to `\r\n\r\n`; body ignored (no Content-Length
 //!     handling on the request side — the three diagnostic paths
 //!     `/readyz`, `/why`, `/metrics` have no request body).
-//!   - One request per connection: every response carries
-//!     `Connection: close` and `http_ingress` emits `NCMD_CLOSE`
-//!     after the write.
-//!   - 4 concurrent connections, 2 KiB receive buffer per connection.
+//!   - Sequential HTTP/1.1 keep-alive. Pipelining is intentionally not
+//!     supported: one adapter request may be in flight per connection.
+//!   - 32 concurrent connections, 2 KiB receive buffer per connection.
 //!
 //! Stderr signals emitted by this module (cluster tests assert on
 //! these):
@@ -75,21 +74,28 @@ mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
 
-const MAX_CONNS: usize = 4;
+/// Concurrent HTTP requests retained while their adapter responses are
+/// in flight. Must exceed the bench driver's worker count or load
+/// profiles reject connections at the boundary; thirty-two leaves
+/// headroom for operational `/metrics` and readiness probes alongside a
+/// 16-connection load sweep while keeping the fixed, allocation-free
+/// state bounded.
+const MAX_CONNS: usize = 32;
 const RX_BUF: usize = 2048;
 /// Response/TX-path buffer. Must hold the largest cached envelope the
 /// adapter can return — the `/metrics` export, capped at
 /// `telemetry_agg::SAFE_EXPORT_MAX` (7400 B) — plus the HTTP/1.1 status
-/// line + headers (~90 B). At 4 KB the previous value, `channel_read_msg`
-/// silently dropped any `/metrics` response larger than 4 KB (its
-/// payload-too-large path), so a grown export (fan-in records + per-module
-/// step histograms) never reached the wire and `/metrics` looked frozen on
-/// a stale small snapshot. 7680 covers the 7400 cap + headers and keeps the
-/// framed channel write (3 B net hdr + payload) under CHANNEL_BUFFER_SIZE
-/// (8192). Sits on the module step stack (64 KB EL0 / 1 MB EL1 on bcm2712,
-/// host thread stack on linux), so the few-KB bump is well within budget.
+/// line + headers (~90 B). `channel_read_msg` silently drops any frame
+/// larger than this buffer (its payload-too-large path), so undersizing
+/// it freezes `/metrics` on a stale small snapshot. 7680 covers the
+/// 7400 cap + headers and keeps the framed channel write (3 B net hdr +
+/// payload) under CHANNEL_BUFFER_SIZE (8192). Sits on the module step
+/// stack (64 KB EL0 / 1 MB EL1 on bcm2712, host thread stack on linux).
 const TX_BUF: usize = 7680;
 const MAX_PATH: usize = 64;
+/// Step-return code classifying this step as bursty work for the
+/// scheduler (same contract as wal's STEP_BURST).
+const STEP_BURST: i32 = 2;
 /// Maximum request body forwarded to `http_adapter` in the
 /// `MSG_HTTP_REQUEST` envelope. Bodies above this are truncated;
 /// the diagnostic / admin paths fit comfortably under 1 KiB.
@@ -123,6 +129,9 @@ struct Conn {
     /// `true` once we've parsed `\r\n\r\n` and emitted the request
     /// frame; the slot stays alive waiting for the response.
     sent_request: bool,
+    /// Honour an HTTP/1.1 client's explicit `Connection: close` request while
+    /// keeping persistent connections as the normal benchmark path.
+    close_after_response: bool,
     rx: [u8; RX_BUF],
 }
 
@@ -133,6 +142,7 @@ impl Conn {
             conn_id: 0,
             rx_len: 0,
             sent_request: false,
+            close_after_response: false,
             rx: [0u8; RX_BUF],
         }
     }
@@ -143,11 +153,18 @@ struct ModuleState {
     syscalls: *const SyscallTable,
     in_net: i32,         // in[0]: net_proto events from linux_net.net_out
     in_response: i32,    // in[1]: MSG_HTTP_RESPONSE from http_adapter.response
+    in_ready_snapshot: i32, // in[2]: replaceable readiness state mailbox
     out_net: i32,        // out[0]: net_proto commands to linux_net.net_in
     out_request: i32,    // out[1]: MSG_HTTP_REQUEST to http_adapter.request
 
     listen_port: u16,
     bound: bool,
+    /// Set when this pass advances an HTTP request or response. Returning
+    /// Burst then asks Fluxor's bounded multi-pass scheduler to converge the
+    /// downstream/return path without waiting for another cadence interval.
+    step_work: bool,
+    ready_seen: bool,
+    ready_byte: u8,
 
     conns: [Conn; MAX_CONNS],
     /// Scratch for the linux_net frame envelope writer.
@@ -155,6 +172,11 @@ struct ModuleState {
     /// Scratch for the MSG_HTTP_RESPONSE reader and HTTP/1.1
     /// response-builder.
     resp_buf: [u8; TX_BUF],
+    /// State-resident hot-path scratch. Keeping these here avoids constructing
+    /// and zeroing ~16 KiB of stack arrays for every small HTTP response.
+    http_buf: [u8; TX_BUF],
+    payload_buf: [u8; TX_BUF],
+    request_buf: [u8; 1 + 1 + 1 + MAX_PATH + MAX_BODY],
 }
 
 #[no_mangle]
@@ -198,12 +220,19 @@ pub extern "C" fn module_new(
         s.in_net = in_chan;
         s.out_net = out_chan;
         s.in_response = dev_channel_port(sys, 0, 1);
+        s.in_ready_snapshot = dev_channel_port(sys, 0, 2);
         s.out_request = dev_channel_port(sys, 1, 1);
         s.listen_port = 9090;
         s.bound = false;
+        s.step_work = false;
+        s.ready_seen = false;
+        s.ready_byte = 0;
         s.conns = [Conn::empty(); MAX_CONNS];
         s.net_buf = [0u8; TX_BUF];
         s.resp_buf = [0u8; TX_BUF];
+        s.http_buf = [0u8; TX_BUF];
+        s.payload_buf = [0u8; TX_BUF];
+        s.request_buf = [0u8; 1 + 1 + 1 + MAX_PATH + MAX_BODY];
         if !params.is_null() && params_len > 0 {
             parse_tlv(s, params, params_len);
         }
@@ -226,13 +255,52 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+        s.step_work = false;
 
         if !s.bound {
             try_bind(s, sys);
         }
+        drain_ready_snapshot(s, sys);
         drain_net_events(s, sys);
         drain_responses(s, sys);
-        0
+        if s.step_work { STEP_BURST } else { 0 }
+    }
+}
+
+/// `channel_read` consumes a complete mailbox publication atomically; this
+/// module never modifies the aliased buffer in place.
+#[no_mangle]
+#[link_section = ".text.module_mailbox_safe"]
+pub extern "C" fn module_mailbox_safe() -> i32 {
+    1
+}
+
+/// Consume the newest adapter readiness snapshot. The edge is a one-buffer
+/// mailbox because intermediate readiness publications are replaceable state,
+/// not ordered transactions.
+unsafe fn drain_ready_snapshot(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_ready_snapshot < 0 {
+        return;
+    }
+    let poll = (sys.channel_poll)(s.in_ready_snapshot, POLL_IN);
+    if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
+        return;
+    }
+    // A mailbox publication must be consumed in one read: unlike a FIFO, a
+    // mailbox hands ownership of the complete buffer to the consumer. The
+    // generic envelope helper performs separate header/payload reads and is
+    // therefore intentionally not used on this edge.
+    let n = (sys.channel_read)(
+        s.in_ready_snapshot,
+        s.resp_buf.as_mut_ptr(),
+        s.resp_buf.len(),
+    );
+    if n >= 4
+        && s.resp_buf[0] == wire::MSG_HTTP_READY_SNAPSHOT
+        && u16::from_le_bytes([s.resp_buf[1], s.resp_buf[2]]) > 0
+    {
+        s.ready_byte = s.resp_buf[3];
+        s.ready_seen = true;
     }
 }
 
@@ -336,11 +404,7 @@ unsafe fn ingest_data(
     data_start: usize,
     data_len: usize,
 ) {
-    // Copy out of net_buf first because resolve_conn re-borrows it.
-    let mut chunk = [0u8; RX_BUF];
     let take = data_len.min(RX_BUF);
-    chunk[..take].copy_from_slice(&s.net_buf[data_start..data_start + take]);
-
     let slot = match find_conn(s, conn_id) {
         Some(i) => i,
         None => return,
@@ -352,7 +416,8 @@ unsafe fn ingest_data(
     let conn = &mut s.conns[slot];
     let rx_len = conn.rx_len as usize;
     let copy_n = take.min(RX_BUF - rx_len);
-    conn.rx[rx_len..rx_len + copy_n].copy_from_slice(&chunk[..copy_n]);
+    conn.rx[rx_len..rx_len + copy_n]
+        .copy_from_slice(&s.net_buf[data_start..data_start + copy_n]);
     conn.rx_len = (rx_len + copy_n) as u16;
     // Look for end-of-headers `\r\n\r\n`. If found, also confirm the
     // body (if Content-Length advertised) has been fully received
@@ -385,6 +450,8 @@ unsafe fn emit_request(
     headers_end: usize,
     body_len: usize,
 ) {
+    s.conns[slot].close_after_response =
+        requests_connection_close(&s.conns[slot].rx[..headers_end]);
     let (conn_id, method_byte, path, path_len) = {
         let conn = &s.conns[slot];
         match parse_request_line(&conn.rx[..headers_end]) {
@@ -398,37 +465,53 @@ unsafe fn emit_request(
         }
     };
 
+    // The readiness body is replaceable state delivered by mailbox, so this
+    // high-rate diagnostic path can complete inside ingress without two FIFO
+    // hops through http_adapter. Ordered POST/admin/proposal requests continue
+    // through the adapter unchanged.
+    if method_byte == b'G' && &path[..path_len] == b"/readyz" {
+        let body = [s.ready_byte];
+        let status = if s.ready_seen && s.ready_byte != 0 { 200 } else { 503 };
+        send_http_response(s, sys, slot, status, &body);
+        return;
+    }
+
     // Build the MSG_HTTP_REQUEST envelope into a stack buffer big
     // enough for header overhead + path + body. The on-wire format
     // is `[conn_id:u8][method:u8][path_len:u8][path][body]`.
-    let mut env = [0u8; 1 + 1 + 1 + MAX_PATH + MAX_BODY];
-    env[0] = conn_id;
-    env[1] = method_byte;
-    env[2] = path_len as u8;
-    env[3..3 + path_len].copy_from_slice(&path[..path_len]);
+    s.request_buf[0] = conn_id;
+    s.request_buf[1] = method_byte;
+    s.request_buf[2] = path_len as u8;
+    s.request_buf[3..3 + path_len].copy_from_slice(&path[..path_len]);
     let body_capped = body_len.min(MAX_BODY);
     let body_start = headers_end;
-    env[3 + path_len..3 + path_len + body_capped]
+    s.request_buf[3 + path_len..3 + path_len + body_capped]
         .copy_from_slice(&s.conns[slot].rx[body_start..body_start + body_capped]);
     let total = 3 + path_len + body_capped;
     if s.out_request >= 0 {
         let poll = (sys.channel_poll)(s.out_request, POLL_OUT);
         if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
-            wire_channels::channel_write_msg(sys, s.out_request, wire::MSG_HTTP_REQUEST, &env[..total]);
+            wire_channels::channel_write_msg(
+                sys,
+                s.out_request,
+                wire::MSG_HTTP_REQUEST,
+                &s.request_buf[..total],
+            );
+            s.step_work = true;
+            dev_report_step_effect(sys, step_effect::WORK_DONE);
+            // Ordered POST/admin/proposal requests are low-frequency
+            // enough to log per-request (unlike `/readyz` above, which
+            // is intentionally silent — see the mailbox short-circuit
+            // note). This is the only external signal that a request
+            // actually reached http_adapter, gated on the write
+            // succeeding so it can't fire for a request that was
+            // silently dropped by backpressure.
+            let mut buf = [0u8; 128];
+            let n = format_request_line(&mut buf, method_byte, &path[..path_len], body_capped, conn_id);
+            dev_log(sys, 3, buf.as_ptr(), n);
         }
     }
     s.conns[slot].sent_request = true;
-
-    // Log: "[http_ingress] request M /path body=N conn_id=K"
-    let mut buf = [0u8; 128];
-    let n = format_request_line(
-        &mut buf,
-        method_byte,
-        &path[..path_len],
-        body_capped,
-        conn_id,
-    );
-    dev_log(sys, 3, buf.as_ptr(), n);
 }
 
 // ── Inbound: http_adapter responses ──────────────────────────
@@ -440,10 +523,16 @@ unsafe fn emit_request(
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_responses(s: &mut ModuleState, sys: &SyscallTable) {
-    if s.in_response < 0 {
+    if s.in_response < 0 || s.out_net < 0 {
         return;
     }
     for _ in 0..8 {
+        // Do not consume an adapter response unless the complete net command
+        // has somewhere to go. The write below is atomic.
+        let net_poll = (sys.channel_poll)(s.out_net, POLL_OUT);
+        if net_poll <= 0 || (net_poll as u32 & POLL_OUT) == 0 {
+            break;
+        }
         let poll = (sys.channel_poll)(s.in_response, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
             break;
@@ -487,27 +576,32 @@ unsafe fn send_http_response(
     body: &[u8],
 ) {
     let conn_id = s.conns[slot].conn_id;
-    // Frame an HTTP/1.1 response into a stack buffer, then push to
+    let close = s.conns[slot].close_after_response;
+    // Frame an HTTP/1.1 response into state-resident scratch, then push to
     // linux_net via NCMD_SEND with payload `[conn_id][http_bytes...]`.
-    let mut http = [0u8; TX_BUF];
-    let n = format_http_response(&mut http, status, body);
-    let mut payload = [0u8; TX_BUF];
-    payload[0] = conn_id;
+    let n = format_http_response(&mut s.http_buf, status, body, !close);
+    s.payload_buf[0] = conn_id;
     let n_body = n.min(TX_BUF - 1);
-    payload[1..1 + n_body].copy_from_slice(&http[..n_body]);
+    s.payload_buf[1..1 + n_body].copy_from_slice(&s.http_buf[..n_body]);
+    let mut sent = false;
     if s.out_net >= 0 {
         let poll = (sys.channel_poll)(s.out_net, POLL_OUT);
         if poll > 0 && (poll as u32 & POLL_OUT) != 0 {
-            net_write_frame(
+            sent = net_write_frame(
                 sys,
                 s.out_net,
                 NCMD_SEND,
-                payload.as_ptr(),
+                s.payload_buf.as_ptr(),
                 1 + n_body,
                 s.net_buf.as_mut_ptr(),
                 TX_BUF,
-            );
-            // Connection: close — tell linux_net we're done.
+            ) == NET_FRAME_HDR + 1 + n_body;
+        }
+    }
+    if sent {
+        s.step_work = true;
+        dev_report_step_effect(sys, step_effect::WORK_DONE);
+        if close {
             let close_payload = [conn_id];
             net_write_frame(
                 sys,
@@ -518,9 +612,14 @@ unsafe fn send_http_response(
                 s.net_buf.as_mut_ptr(),
                 TX_BUF,
             );
+            free_conn(s, conn_id);
+        } else {
+            // Keep the accepted socket and slot, but make it ready for the
+            // next sequential request. NMSG_CLOSED remains the teardown path.
+            s.conns[slot].rx_len = 0;
+            s.conns[slot].sent_request = false;
         }
     }
-    free_conn(s, conn_id);
 }
 
 // ── Connection slot bookkeeping ──────────────────────────────
@@ -602,6 +701,33 @@ fn parse_content_length(headers: &[u8]) -> usize {
     0
 }
 
+/// Whether the request explicitly asks the server to close after its
+/// response. HTTP/1.1 is persistent by default.
+fn requests_connection_close(headers: &[u8]) -> bool {
+    for line in headers.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let colon = match line.iter().position(|&b| b == b':') {
+            Some(i) => i,
+            None => continue,
+        };
+        if ascii_eq_ignore_case(&line[..colon], b"connection") {
+            let mut value = &line[colon + 1..];
+            while value.first() == Some(&b' ') || value.first() == Some(&b'\t') {
+                value = &value[1..];
+            }
+            return ascii_eq_ignore_case(value, b"close");
+        }
+    }
+    false
+}
+
+fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(&x, &y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+}
+
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     if buf.len() < 4 {
         return None;
@@ -651,7 +777,7 @@ fn parse_request_line(buf: &[u8]) -> Option<(u8, [u8; MAX_PATH], usize)> {
 }
 
 /// Frame an HTTP/1.1 response into `dst`. Returns bytes written.
-fn format_http_response(dst: &mut [u8], status: u16, body: &[u8]) -> usize {
+fn format_http_response(dst: &mut [u8], status: u16, body: &[u8], keep_alive: bool) -> usize {
     let reason: &[u8] = match status {
         200 => b"OK",
         400 => b"Bad Request",
@@ -667,7 +793,11 @@ fn format_http_response(dst: &mut [u8], status: u16, body: &[u8]) -> usize {
     out.push(reason);
     out.push(b"\r\nContent-Type: text/plain\r\nContent-Length: ");
     out.push_usize(body.len());
-    out.push(b"\r\nConnection: close\r\n\r\n");
+    if keep_alive {
+        out.push(b"\r\nConnection: keep-alive\r\n\r\n");
+    } else {
+        out.push(b"\r\nConnection: close\r\n\r\n");
+    }
     out.push(body);
     out.pos
 }
@@ -695,6 +825,11 @@ fn format_closed(dst: &mut [u8], conn_id: u8) -> usize {
     c.pos
 }
 
+/// `[http_ingress] request M /path body=N conn_id=K` — the only
+/// external signal that a non-`/readyz` request reached
+/// `http_adapter`. Never called for `/readyz`, which is answered
+/// in-ingress from mailbox state and is intentionally unlogged
+/// per-request (see the short-circuit in `emit_request`).
 fn format_request_line(
     dst: &mut [u8],
     method_byte: u8,

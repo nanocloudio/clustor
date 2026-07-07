@@ -217,6 +217,12 @@ wiring:
 
   - from: raft_engine.log_append
     to: wal.entries
+  # Dedicated boot handoff: Raft must resume its index at the exact WAL
+  # replay high-water before proposal intake opens. Never multiplex this onto
+  # wal.flushed, which also fans out durability acknowledgements.
+  - from: wal.replay_complete
+    to: raft_engine.wal_replay_complete
+    rate: transaction
   - from: wal.flushed
     to: durability_ledger.ack
   - from: wal.flushed

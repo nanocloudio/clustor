@@ -34,6 +34,28 @@ const FP_ONE: i32 = 1 << 16;
 
 const METRICS_INTERVAL_MS: u64 = 1000;
 
+define_params! {
+    ModuleState;
+
+    1, entry_credit_max, u16, 4096
+        => |s, d, len| { s.entry_credit_max = p_u16(d, len, 0, 4096) as i32; };
+
+    2, byte_credit_max_kib, u16, 64
+        => |s, d, len| {
+            s.byte_credit_max = i32::from(p_u16(d, len, 0, 64)) * 1024;
+        };
+
+    3, sample_period_ms, u16, 100
+        => |s, d, len| { s.sample_period_ms = p_u16(d, len, 0, 100).max(1); };
+
+    // Optional wall-clock admission rate. Zero preserves the legacy absolute
+    // pool publication contract; non-zero derives each published grant from
+    // actual elapsed milliseconds, so adaptive scheduler cadence cannot alter
+    // the configured requests/second.
+    4, entry_rate_per_sec, u16, 0
+        => |s, d, len| { s.entry_rate_per_sec = p_u16(d, len, 0, 0) as u32; };
+}
+
 fn fp_mul(a: i32, b: i32) -> i32 {
     ((a as i64 * b as i64) >> 16) as i32
 }
@@ -61,6 +83,8 @@ struct ModuleState {
     byte_credits: i32,
     entry_credit_max: i32,
     byte_credit_max: i32,
+    entry_rate_per_sec: u32,
+    entry_rate_remainder: u32,
 
     // Timing
     sample_period_ms: u16,
@@ -117,11 +141,11 @@ pub extern "C" fn module_new(
         s.entry_credits = 4096;
         s.byte_credits = 64 * 1024;
         s.sample_period_ms = 100;
+        s.entry_rate_per_sec = 0;
+        s.entry_rate_remainder = 0;
 
-        if !params.is_null() && params_len >= 6 {
-            s.entry_credit_max = p_u16(params, params_len, 0, 4096) as i32;
-            s.byte_credit_max = p_u16(params, params_len, 2, 64) as i32 * 1024;
-            s.sample_period_ms = p_u16(params, params_len, 4, 100);
+        if !params.is_null() && params_len > 0 {
+            parse_tlv(s, params, params_len);
             s.entry_credits = s.entry_credit_max;
             s.byte_credits = s.byte_credit_max;
         }
@@ -159,6 +183,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 2. Run PID at sample interval
         if now.wrapping_sub(s.last_sample_ms) >= s.sample_period_ms as u64 {
+            let elapsed_ms = now.wrapping_sub(s.last_sample_ms).max(1);
             s.last_sample_ms = now;
 
             // Error: positive = healthy headroom, negative = lagging
@@ -176,21 +201,60 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             let output = (p + i + d) >> 16; // scale back from Q16.16
 
-            // Apply to credits
-            s.entry_credits += output;
-            if s.entry_credits > s.entry_credit_max { s.entry_credits = s.entry_credit_max; }
-            if s.entry_credits < 0 { s.entry_credits = 0; }
+            if s.entry_rate_per_sec > 0 {
+                // Convert the wall-clock rate to this interval's absolute
+                // grant. Carry sub-token thousandths across intervals so the
+                // long-run rate is exact even for short/irregular samples.
+                let numer = u64::from(s.entry_rate_per_sec)
+                    .saturating_mul(elapsed_ms)
+                    .saturating_add(u64::from(s.entry_rate_remainder));
+                let base = (numer / 1000).min(i32::MAX as u64) as i32;
+                s.entry_rate_remainder = (numer % 1000) as u32;
+                s.entry_credits = base.saturating_add(output);
+                if s.entry_credits > s.entry_credit_max {
+                    s.entry_credits = s.entry_credit_max;
+                }
+                if s.entry_credits < 0 { s.entry_credits = 0; }
+                // Entry rate is the governing limiter for this profile. Keep
+                // enough byte credit for every admitted small request.
+                s.byte_credits = s.byte_credit_max;
+            } else {
+                // Legacy absolute-pool PID behaviour.
+                s.entry_credits += output;
+                if s.entry_credits > s.entry_credit_max {
+                    s.entry_credits = s.entry_credit_max;
+                }
+                if s.entry_credits < 0 { s.entry_credits = 0; }
 
-            s.byte_credits += output * 16; // scale bytes proportionally
-            if s.byte_credits > s.byte_credit_max { s.byte_credits = s.byte_credit_max; }
-            if s.byte_credits < 0 { s.byte_credits = 0; }
+                s.byte_credits += output * 16; // scale bytes proportionally
+                if s.byte_credits > s.byte_credit_max {
+                    s.byte_credits = s.byte_credit_max;
+                }
+                if s.byte_credits < 0 { s.byte_credits = 0; }
+            }
 
             // 3. Emit credit update
             let poll_out = (sys.channel_poll)(s.out_credits, 0x02);
             if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                let mut buf = [0u8; 8];
-                wire::encode_credits(&mut buf, s.entry_credits, s.byte_credits);
-                wire_channels::channel_write_msg(sys, s.out_credits, wire::MSG_THROTTLE_CREDITS, &buf[..8]);
+                if s.entry_rate_per_sec > 0 {
+                    let mut buf = [0u8; wire::THROTTLE_REFILL_LEN];
+                    wire::encode_throttle_refill(
+                        &mut buf,
+                        s.entry_credits,
+                        s.byte_credits,
+                        s.entry_credit_max,
+                        s.byte_credit_max,
+                    );
+                    wire_channels::channel_write_msg(
+                        sys, s.out_credits, wire::MSG_THROTTLE_REFILL, &buf,
+                    );
+                } else {
+                    let mut buf = [0u8; 8];
+                    wire::encode_credits(&mut buf, s.entry_credits, s.byte_credits);
+                    wire_channels::channel_write_msg(
+                        sys, s.out_credits, wire::MSG_THROTTLE_CREDITS, &buf,
+                    );
+                }
             }
         }
 

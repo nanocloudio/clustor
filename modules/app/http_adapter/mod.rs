@@ -58,11 +58,10 @@ const ENVELOPE_CACHE: usize = 1024;
 /// `SAFE_EXPORT_MAX` (7400 B) by the aggregator so a frame always fits
 /// the 8 KiB channel ring. This buffer MUST be >= that cap, or
 /// `channel_read_msg` drops every oversized export (its payload-too-large
-/// path drains and discards the frame), freezing `/metrics` on the last
-/// export small enough to fit — which is exactly what silently hid the
-/// metric fan-in once the per-module step histograms pushed the export
-/// past the old 4 KiB bound. 7600 clears the 7400 cap and still keeps the
-/// HTTP response frame (3 B envelope + 5 B header + body) under 8 KiB.
+/// path drains and discards the frame), silently freezing `/metrics` on
+/// the last export small enough to fit. 7600 clears the 7400 cap and
+/// still keeps the HTTP response frame (3 B envelope + 5 B header +
+/// body) under 8 KiB.
 const METRICS_CACHE: usize = 7600;
 
 /// Wire frame for a cached HTTP response handed to http_ingress:
@@ -72,6 +71,36 @@ const METRICS_CACHE: usize = 7600;
 /// the step stack (64 KB EL0 / 1 MB EL1 on bcm2712, host thread stack on
 /// linux), comfortably within budget.
 const RESP_FRAME_MAX: usize = 5 + METRICS_CACHE;
+// Two bounded phase tables (correlation→connection and index→connection).
+// Sized above ingress's 32 live connections so phase handoff and an
+// operational probe cannot exhaust the mapping space during a burst.
+const HTTP_INFLIGHT: usize = 64;
+const HTTP_PROPOSAL_TIMEOUT_MS: u64 = 10_000;
+const METRICS_INTERVAL_MS: u64 = 250;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CorrSlot {
+    correlation_id: u64,
+    started_ms: u64,
+    conn_id: u8,
+}
+
+impl CorrSlot {
+    const fn empty() -> Self { Self { correlation_id: 0, started_ms: 0, conn_id: 0 } }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct IndexSlot {
+    index: u64,
+    started_ms: u64,
+    conn_id: u8,
+}
+
+impl IndexSlot {
+    const fn empty() -> Self { Self { index: 0, started_ms: 0, conn_id: 0 } }
+}
 
 #[repr(C)]
 struct ModuleState {
@@ -80,15 +109,25 @@ struct ModuleState {
     in_why: i32,            // in[1]: MSG_WHY from telemetry_agg
     in_metrics: i32,        // in[2]: MSG_METRICS export from telemetry_agg
     in_request: i32,        // in[3]: MSG_HTTP_REQUEST from foundation/http
+    in_proposal_assigned: i32, // in[4]: correlation_id → WAL index from Raft
+    in_applied: i32,        // in[5]: per-index apply acknowledgements
+    in_proposal_rejected: i32, // in[6]: throttle rejection by correlation id
     out_response: i32,      // out[0]: MSG_HTTP_RESPONSE back to foundation/http
     out_metric_sample: i32, // out[1]: self-telemetry MSG_METRIC_SAMPLE
     out_admin: i32,         // out[2]: MSG_ADMIN_COMMAND → admin_handler.requests
+    out_proposal: i32,      // out[3]: tagged proposal → throttle_gate.requests
+    out_ready_snapshot: i32, // out[4]: replaceable ready state → http_ingress
+
+    next_correlation_id: u64,
+    correlations: [CorrSlot; HTTP_INFLIGHT],
+    indices: [IndexSlot; HTTP_INFLIGHT],
 
     /// Most recent envelope bytes from each cache slot. `*_len = 0`
     /// means "no value seen yet"; respond with a service-degraded
     /// default in that case.
     readyz_buf: [u8; ENVELOPE_CACHE],
     readyz_len: u16,
+    ready_snapshot_dirty: bool,
     why_buf: [u8; ENVELOPE_CACHE],
     why_len: u16,
     metrics_buf: [u8; METRICS_CACHE],
@@ -96,6 +135,16 @@ struct ModuleState {
 
     requests_handled: u32,
     requests_404: u32,
+    inflight_high_water: u8,
+    proposal_timeouts: u32,
+    commit_timeouts: u32,
+    assignments_unmatched: u32,
+    assignments_no_slot: u32,
+    applies_unmatched: u32,
+    proposal_rejections: u32,
+    queue_unavailable: u32,
+    committed: u32,
+    last_metrics_ms: u64,
     /// Count of `POST /admin/<op>` requests rejected because the
     /// downstream `out_admin` channel was unwired, back-pressured, or
     /// the body exceeded the 1 KiB envelope buffer. The HTTP client
@@ -150,14 +199,34 @@ pub extern "C" fn module_new(
         s.in_why = dev_channel_port(sys, 0, 1);
         s.in_metrics = dev_channel_port(sys, 0, 2);
         s.in_request = dev_channel_port(sys, 0, 3);
+        s.in_proposal_assigned = dev_channel_port(sys, 0, 4);
+        s.in_applied = dev_channel_port(sys, 0, 5);
+        s.in_proposal_rejected = dev_channel_port(sys, 0, 6);
         s.out_response = out_chan;
         s.out_metric_sample = dev_channel_port(sys, 1, 1);
         s.out_admin = dev_channel_port(sys, 1, 2);
+        s.out_proposal = dev_channel_port(sys, 1, 3);
+        s.out_ready_snapshot = dev_channel_port(sys, 1, 4);
+        s.next_correlation_id = 1;
+        s.correlations = [CorrSlot::empty(); HTTP_INFLIGHT];
+        s.indices = [IndexSlot::empty(); HTTP_INFLIGHT];
         s.readyz_len = 0;
+        s.ready_snapshot_dirty = false;
         s.why_len = 0;
         s.metrics_len = 0;
         s.requests_handled = 0;
         s.requests_404 = 0;
+        s.inflight_high_water = 0;
+        s.proposal_timeouts = 0;
+        s.commit_timeouts = 0;
+        s.assignments_unmatched = 0;
+        s.assignments_no_slot = 0;
+        s.applies_unmatched = 0;
+        s.proposal_rejections = 0;
+        s.queue_unavailable = 0;
+        s.committed = 0;
+        s.last_metrics_ms = 0;
+        s.admin_dropped = 0;
         dev_log(sys, 3, b"[http_adapter] init".as_ptr(), 19);
         0
     }
@@ -175,9 +244,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     unsafe {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
+        let handled_before = s.requests_handled;
 
         cache_latest(s, sys);
+        publish_ready_snapshot(s, sys);
+        drain_proposal_assignments(s, sys);
+        drain_proposal_rejections(s, sys);
+        drain_applied(s, sys);
+        expire_proposals(s, sys, dev_millis(sys));
         serve_requests(s, sys);
+        emit_metrics(s, sys);
+        if s.requests_handled != handled_before {
+            dev_report_step_effect(sys, step_effect::WORK_DONE);
+        }
 
         0
     }
@@ -235,6 +314,7 @@ unsafe fn cache_one(s: &mut ModuleState, sys: &SyscallTable, slot: u8) {
             0 => {
                 s.readyz_buf[..take].copy_from_slice(&s.msg_buf[..take]);
                 s.readyz_len = take as u16;
+                s.ready_snapshot_dirty = true;
             }
             1 => {
                 s.why_buf[..take].copy_from_slice(&s.msg_buf[..take]);
@@ -247,6 +327,181 @@ unsafe fn cache_one(s: &mut ModuleState, sys: &SyscallTable, slot: u8) {
             _ => {}
         }
     }
+}
+
+/// Publish replaceable readiness state over the mailbox edge. If the consumer
+/// still owns the previous snapshot, retain `dirty` and retry next step; an
+/// ordered queue is deliberately unnecessary because only the newest state is
+/// observable.
+unsafe fn publish_ready_snapshot(s: &mut ModuleState, sys: &SyscallTable) {
+    if !s.ready_snapshot_dirty || s.out_ready_snapshot < 0 {
+        return;
+    }
+    let poll = (sys.channel_poll)(s.out_ready_snapshot, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return;
+    }
+    let len = s.readyz_len as usize;
+    if wire_channels::channel_write_msg(
+        sys,
+        s.out_ready_snapshot,
+        wire::MSG_HTTP_READY_SNAPSHOT,
+        &s.readyz_buf[..len],
+    ) > 0
+    {
+        s.ready_snapshot_dirty = false;
+    }
+}
+
+unsafe fn drain_proposal_assignments(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_proposal_assigned < 0 { return; }
+    for _ in 0..16 {
+        let poll = (sys.channel_poll)(s.in_proposal_assigned, 0x01);
+        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+        let (msg_type, plen) =
+            wire_channels::channel_read_msg(sys, s.in_proposal_assigned, &mut s.msg_buf);
+        if msg_type != wire::MSG_PROPOSAL_ASSIGNED
+            || (plen as usize) < wire::PROPOSAL_ASSIGNED_LEN
+        {
+            continue;
+        }
+        let (correlation_id, _partition_id, index) =
+            wire::decode_proposal_assigned(&s.msg_buf);
+        let corr_pos = s.correlations.iter().position(|slot| {
+            slot.correlation_id == correlation_id && correlation_id != 0
+        });
+        let idx_pos = s.indices.iter().position(|slot| slot.index == 0);
+        match (corr_pos, idx_pos) {
+            (Some(c), Some(i)) => {
+                let corr = s.correlations[c];
+                s.correlations[c] = CorrSlot::empty();
+                s.indices[i] = IndexSlot {
+                    index,
+                    started_ms: corr.started_ms,
+                    conn_id: corr.conn_id,
+                };
+            }
+            (None, _) => {
+                s.assignments_unmatched = s.assignments_unmatched.saturating_add(1);
+            }
+            (Some(_), None) => {
+                // Keep the correlation resident so its eventual timeout is
+                // explicit; the consumed assignment cannot be reconstructed.
+                s.assignments_no_slot = s.assignments_no_slot.saturating_add(1);
+            }
+        }
+    }
+}
+
+unsafe fn drain_proposal_rejections(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_proposal_rejected < 0 { return; }
+    for _ in 0..8 {
+        let out = (sys.channel_poll)(s.out_response, 0x02);
+        if out <= 0 || (out as u32 & 0x02) == 0 { break; }
+        let poll = (sys.channel_poll)(s.in_proposal_rejected, 0x01);
+        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+        let (msg_type, plen) =
+            wire_channels::channel_read_msg(sys, s.in_proposal_rejected, &mut s.msg_buf);
+        if msg_type != wire::MSG_CLIENT_REJECT_INTERNAL { continue; }
+        let (correlation_id, _status, _retry, _entries, _bytes) =
+            match wire::decode_client_reject_internal(&s.msg_buf[..plen as usize]) {
+                Some(v) => v,
+                None => continue,
+            };
+        if let Some(pos) = s.correlations.iter().position(|slot| {
+            slot.correlation_id == correlation_id && correlation_id != 0
+        }) {
+            let conn_id = s.correlations[pos].conn_id;
+            s.correlations[pos] = CorrSlot::empty();
+            s.proposal_rejections = s.proposal_rejections.saturating_add(1);
+            emit_response(s, sys, conn_id, 503, b"proposal rejected");
+        }
+    }
+}
+
+unsafe fn drain_applied(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.in_applied < 0 { return; }
+    for _ in 0..16 {
+        let out = (sys.channel_poll)(s.out_response, 0x02);
+        if out <= 0 || (out as u32 & 0x02) == 0 { break; }
+        let poll = (sys.channel_poll)(s.in_applied, 0x01);
+        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_applied, &mut s.msg_buf);
+        let pl = plen as usize;
+        if msg_type != wire::MSG_CLIENT_RESPONSE || pl < 18 { continue; }
+        // `[partition:u16][term:u64][index:u64]` — index at offset 10.
+        let index_off = 10;
+        let index = u64::from_le_bytes([
+            s.msg_buf[index_off], s.msg_buf[index_off + 1],
+            s.msg_buf[index_off + 2], s.msg_buf[index_off + 3],
+            s.msg_buf[index_off + 4], s.msg_buf[index_off + 5],
+            s.msg_buf[index_off + 6], s.msg_buf[index_off + 7],
+        ]);
+        if let Some(pos) = s.indices.iter().position(|slot| slot.index == index) {
+            let conn_id = s.indices[pos].conn_id;
+            s.indices[pos] = IndexSlot::empty();
+            s.committed = s.committed.saturating_add(1);
+            emit_response(s, sys, conn_id, 200, b"committed");
+        } else {
+            s.applies_unmatched = s.applies_unmatched.saturating_add(1);
+        }
+    }
+}
+
+unsafe fn expire_proposals(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
+    let out = (sys.channel_poll)(s.out_response, 0x02);
+    if out <= 0 || (out as u32 & 0x02) == 0 { return; }
+    if let Some(pos) = s.correlations.iter().position(|slot| {
+        slot.correlation_id != 0
+            && now.wrapping_sub(slot.started_ms) >= HTTP_PROPOSAL_TIMEOUT_MS
+    }) {
+        let conn_id = s.correlations[pos].conn_id;
+        s.correlations[pos] = CorrSlot::empty();
+        s.proposal_timeouts = s.proposal_timeouts.saturating_add(1);
+        emit_response(s, sys, conn_id, 503, b"proposal timeout");
+        return;
+    }
+    if let Some(pos) = s.indices.iter().position(|slot| {
+        slot.index != 0 && now.wrapping_sub(slot.started_ms) >= HTTP_PROPOSAL_TIMEOUT_MS
+    }) {
+        let conn_id = s.indices[pos].conn_id;
+        s.indices[pos] = IndexSlot::empty();
+        s.commit_timeouts = s.commit_timeouts.saturating_add(1);
+        emit_response(s, sys, conn_id, 503, b"commit timeout");
+    }
+}
+
+unsafe fn emit_http_proposal(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    conn_id: u8,
+    body: &[u8],
+) -> bool {
+    if s.out_proposal < 0 || body.len() > 1024 { return false; }
+    let slot = match s.correlations.iter().position(|slot| slot.correlation_id == 0) {
+        Some(v) => v,
+        None => return false,
+    };
+    let poll = (sys.channel_poll)(s.out_proposal, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 { return false; }
+    let correlation_id = (1u64 << 63) | s.next_correlation_id;
+    s.next_correlation_id = s.next_correlation_id.wrapping_add(1).max(1);
+    let mut framed = [0u8; 1032];
+    framed[..8].copy_from_slice(&correlation_id.to_le_bytes());
+    framed[8..8 + body.len()].copy_from_slice(body);
+    let written = wire_channels::channel_write_msg(
+        sys, s.out_proposal, wire::MSG_CLIENT_PROPOSAL, &framed[..8 + body.len()],
+    );
+    if written <= 0 { return false; }
+    s.correlations[slot] = CorrSlot {
+        correlation_id,
+        started_ms: dev_millis(sys),
+        conn_id,
+    };
+    let occupied = s.correlations.iter().filter(|v| v.correlation_id != 0).count()
+        + s.indices.iter().filter(|v| v.index != 0).count();
+    s.inflight_high_water = s.inflight_high_water.max(occupied.min(u8::MAX as usize) as u8);
+    true
 }
 
 /// # Safety
@@ -287,24 +542,17 @@ unsafe fn serve_requests(s: &mut ModuleState, sys: &SyscallTable) {
         // (`MSG_ADMIN_RESPONSE`) goes to client_surface today;
         // wiring the sync reply back through http_adapter is a
         // follow-up slice.
-        // POST /propose — client-write bridge (RFC §8 stopgap). Wraps the
-        // request body as a RAW client proposal (op ADMIN_OP_PROPOSE; the
-        // admin_handler strips the admin framing and emits an unmarked
-        // MSG_CLIENT_PROPOSAL), replies 202 once it's on the wire. Lets an
-        // off-DUT generator drive real writes over HTTP without a dedicated
-        // native ingress. A synchronous commit-ack reply (correlation-tracked)
-        // is a follow-up; 202-on-accept suffices for open-loop load + the
-        // in-band commit-latency histogram.
+        // POST /propose — synchronous write bridge. A private correlation id
+        // follows the proposal through Raft assignment to its exact WAL index;
+        // the HTTP response is emitted only when apply acknowledges that index.
         if _method == b'P' && eq_path(path, b"/propose") {
             let body_off = 3 + path_len;
             let body_len = pl - body_off;
             let mut body_local = [0u8; 1024];
             let take = body_len.min(body_local.len());
             body_local[..take].copy_from_slice(&s.msg_buf[body_off..body_off + take]);
-            if emit_admin_command(s, sys, conn_id, wire::ADMIN_OP_PROPOSE, &body_local[..take]) {
-                emit_response(s, sys, conn_id, 202, b"accepted");
-            } else {
-                s.admin_dropped = s.admin_dropped.saturating_add(1);
+            if !emit_http_proposal(s, sys, conn_id, &body_local[..take]) {
+                s.queue_unavailable = s.queue_unavailable.saturating_add(1);
                 emit_response(s, sys, conn_id, 503, b"propose queue unavailable");
             }
             s.requests_handled = s.requests_handled.saturating_add(1);
@@ -329,6 +577,16 @@ unsafe fn serve_requests(s: &mut ModuleState, sys: &SyscallTable) {
                     // genuine failures the HTTP caller deserves to
                     // see, not silent successes.
                     if emit_admin_command(s, sys, conn_id, op_code, &body_local[..take]) {
+                        // Routing-decision signal, paired with
+                        // `[admin] op=N conn_id=M` on the admin_handler
+                        // side: the only external proof the POST
+                        // actually reached the admin path, since the
+                        // 202 below fires immediately and unlike the
+                        // client-proposal path (see `CorrSlot`) admin
+                        // ops have no async reply to observe instead.
+                        let mut log = [0u8; 48];
+                        let n = format_admin_route_log(&mut log, op_code, conn_id);
+                        dev_log(sys, 3, log.as_ptr(), n);
                         emit_response(s, sys, conn_id, 202, b"accepted");
                     } else {
                         s.admin_dropped = s.admin_dropped.saturating_add(1);
@@ -359,6 +617,46 @@ unsafe fn serve_requests(s: &mut ModuleState, sys: &SyscallTable) {
         };
         emit_response(s, sys, conn_id, status, body);
         s.requests_handled = s.requests_handled.saturating_add(1);
+    }
+}
+
+/// Emit absolute counters and current bounded-table occupancy. Telemetry is
+/// best-effort and never delays the HTTP transaction path.
+unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.out_metric_sample < 0 { return; }
+    let now = dev_millis(sys);
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    s.last_metrics_ms = now;
+
+    let correlations = s.correlations.iter().filter(|v| v.correlation_id != 0).count() as i64;
+    let indices = s.indices.iter().filter(|v| v.index != 0).count() as i64;
+    let kg = wire::METRIC_KIND_GAUGE;
+    let kc = wire::METRIC_KIND_COUNTER;
+    let samples: [(u16, u8, i64); 13] = [
+        (wire::metric_ids::HTTP_CORRELATIONS_INFLIGHT, kg, correlations),
+        (wire::metric_ids::HTTP_INDICES_INFLIGHT, kg, indices),
+        (wire::metric_ids::HTTP_INFLIGHT_HIGH_WATER, kg, i64::from(s.inflight_high_water)),
+        (wire::metric_ids::HTTP_PROPOSAL_TIMEOUTS, kc, i64::from(s.proposal_timeouts)),
+        (wire::metric_ids::HTTP_COMMIT_TIMEOUTS, kc, i64::from(s.commit_timeouts)),
+        (wire::metric_ids::HTTP_ASSIGNMENTS_UNMATCHED, kc, i64::from(s.assignments_unmatched)),
+        (wire::metric_ids::HTTP_ASSIGNMENTS_NO_SLOT, kc, i64::from(s.assignments_no_slot)),
+        (wire::metric_ids::HTTP_APPLIES_UNMATCHED, kc, i64::from(s.applies_unmatched)),
+        (wire::metric_ids::HTTP_REJECTIONS, kc, i64::from(s.proposal_rejections)),
+        (wire::metric_ids::HTTP_QUEUE_UNAVAILABLE, kc, i64::from(s.queue_unavailable)),
+        (wire::metric_ids::HTTP_COMMITTED, kc, i64::from(s.committed)),
+        (wire::metric_ids::HTTP_REQUESTS, kc, i64::from(s.requests_handled)),
+        (wire::metric_ids::HTTP_REQUESTS_404, kc, i64::from(s.requests_404)),
+    ];
+    for &(metric_id, kind, value) in samples.iter() {
+        let poll = (sys.channel_poll)(s.out_metric_sample, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
+        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
+        wire::encode_metric_sample(
+            &mut buf, wire::MODULE_ID_HTTP_ADAPTER, 0, metric_id, kind, value,
+        );
+        wire_channels::channel_write_msg(
+            sys, s.out_metric_sample, wire::MSG_METRIC_SAMPLE, &buf,
+        );
     }
 }
 
@@ -401,24 +699,22 @@ unsafe fn emit_admin_command(
     buf[1] = op_code;
     buf[2..2 + body.len()].copy_from_slice(body);
     wire_channels::channel_write_msg(sys, s.out_admin, wire::MSG_ADMIN_COMMAND, &buf[..2 + body.len()]);
-    // `[http_adapter] admin op=N conn_id=M` — receipt signal.
-    let mut log = [0u8; 64];
-    let n = format_admin_log(&mut log, op_code, conn_id);
-    dev_log(sys, 3, log.as_ptr(), n);
     true
 }
 
-fn format_admin_log(dst: &mut [u8], op_code: u8, conn_id: u8) -> usize {
+/// `[http_adapter] admin op=N conn_id=M` — see the call site's
+/// comment for why this stays a log line rather than a metric.
+fn format_admin_route_log(dst: &mut [u8], op_code: u8, conn_id: u8) -> usize {
     let mut pos = 0usize;
     let head = b"[http_adapter] admin op=";
-    let take = head.len().min(dst.len() - pos);
-    dst[pos..pos + take].copy_from_slice(&head[..take]);
-    pos += take;
+    let n = head.len().min(dst.len() - pos);
+    dst[pos..pos + n].copy_from_slice(&head[..n]);
+    pos += n;
     pos += push_usize(&mut dst[pos..], op_code as usize);
     let mid = b" conn_id=";
-    let take = mid.len().min(dst.len() - pos);
-    dst[pos..pos + take].copy_from_slice(&mid[..take]);
-    pos += take;
+    let n = mid.len().min(dst.len() - pos);
+    dst[pos..pos + n].copy_from_slice(&mid[..n]);
+    pos += n;
     pos += push_usize(&mut dst[pos..], conn_id as usize);
     pos
 }

@@ -69,6 +69,7 @@ struct ModuleState {
     in_voter_set: i32,   // in[3]: MSG_VOTER_SET_UPDATE from raft_engine (RFC §1.2)
     out_committed: i32,  // out[0]: CommittedBatch to apply_pipeline
     out_metrics: i32,    // out[1]: MSG_METRIC_SAMPLE to telemetry_agg
+    out_retention_floor: i32, // out[2]: MSG_COMPACTION_FLOOR to snapshot_engine.retention_floor
 
     // Configuration
     voter_count: u8,
@@ -90,6 +91,9 @@ struct ModuleState {
 
     // Per-replica match index tracking
     match_indices: [Index; MAX_NODES],
+
+    /// Last min-match retention floor emitted (see `emit_retention_floor`).
+    last_floor_emitted: Index,
 
     // Durability state
     durable_index: Index,
@@ -148,6 +152,7 @@ pub extern "C" fn module_new(
         s.in_cp_state = dev_channel_port(sys, 0, 2);
         s.in_voter_set = dev_channel_port(sys, 0, 3);
         s.out_metrics = dev_channel_port(sys, 1, 1);
+        s.out_retention_floor = dev_channel_port(sys, 1, 2);
         s.current_voters = NodeSet::empty();
         s.joint_voters = NodeSet::empty();
         s.joint_active = false;
@@ -202,13 +207,65 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 5. Recompute commit index if anything changed
         if changed {
             advance_commit(s, sys);
+            dev_report_step_effect(sys, step_effect::WORK_DONE);
         }
 
         // 6. Periodic metrics
         emit_metrics(s, sys);
 
+        // 7. Retention floor for snapshot/compaction gating.
+        emit_retention_floor(s, sys);
+
         0
     }
+}
+
+/// Publish min(match_indices over the active voter set) as a
+/// MSG_COMPACTION_FLOOR so `snapshot_engine` defers snapshot triggers —
+/// and therefore WAL compaction — past what the slowest LIVE voter has
+/// replicated. Without this floor a leader-local snapshot can compact
+/// entries a lagging follower still needs; with manifest-only snapshots
+/// (no state body yet) that follower can then NEVER catch up: its
+/// replicator NACK-refetches a compacted index forever, the permanent
+/// lag signal makes flow_controller strangle proposal credits, and the
+/// whole write path wedges. A DEAD follower
+/// pins the floor — the safe default until state-body snapshots make
+/// install-based catch-up lossless; operators drop dead voters via
+/// membership change.
+///
+/// Emitted only on change; dropped under backpressure (the next change
+/// or step re-emits — the gate degrades toward NOT compacting, which is
+/// always safe). Wire shape (10 bytes, shared with lattice):
+/// `[kpg_id:u16 LE][floor_revision:u64 LE]`.
+unsafe fn emit_retention_floor(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.out_retention_floor < 0 { return; }
+    let mut floor = Index::MAX;
+    let mut any = false;
+    for id in 0..MAX_NODES as u8 {
+        let in_set = if s.current_voters.count() > 0 {
+            s.current_voters.contains(id)
+                || (s.joint_active && s.joint_voters.contains(id))
+        } else {
+            // Pre-voter-set fallback: ids 0..voter_count (mirrors the
+            // quorum computation's fallback).
+            id < s.voter_count
+        };
+        if in_set {
+            any = true;
+            if s.match_indices[id as usize] < floor {
+                floor = s.match_indices[id as usize];
+            }
+        }
+    }
+    if !any || floor == Index::MAX { return; }
+    if floor == s.last_floor_emitted { return; }
+    let poll = (sys.channel_poll)(s.out_retention_floor, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    let mut buf = [0u8; 10];
+    buf[0..2].copy_from_slice(&s.partition_id.to_le_bytes());
+    buf[2..10].copy_from_slice(&floor.to_le_bytes());
+    wire_channels::channel_write_msg(sys, s.out_retention_floor, wire::MSG_COMPACTION_FLOOR, &buf);
+    s.last_floor_emitted = floor;
 }
 
 /// Emit commit-index gauge + commit-advance counter as typed samples
@@ -416,7 +473,6 @@ unsafe fn advance_commit(s: &mut ModuleState, sys: &SyscallTable) {
             let mut buf = [0u8; 16];
             wire::encode_term_index(&mut buf, s.committed_term, s.committed_index);
             wire_channels::channel_write_msg(sys, s.out_committed, wire::MSG_COMMITTED_BATCH, &buf[..16]);
-            dev_log(sys, 3, b"[commit] adv".as_ptr(), 12);
         }
     }
 }

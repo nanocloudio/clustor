@@ -6,7 +6,7 @@
 # `fluxor publish`; downstream projects reference clustor by this name.
 [project]
 name    = "clustor"
-version = "0.1.0"
+version = "0.0.1"
 
 # Cross-project dependencies (standards/dependencies.md §2.2).
 # Resolves to fluxor's published source crates and fmod palette via
@@ -14,7 +14,7 @@ version = "0.1.0"
 # the materialised SDK source at
 # `target/fluxor/fluxor-abi/sdk/<file>.rs` (populated by `fluxor sync`).
 [dependencies]
-fluxor = "0.1"
+fluxor = "0.0.1"
 
 [ci]
 # Module targets to build in CI phase 3. Clustor is host-only today;

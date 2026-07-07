@@ -68,6 +68,12 @@ const MAX_PENDING_WAL_REQS: usize = 16;
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PeerState {
+    /// Steps since the last catch-up ship without an ack. Transit is
+    /// lossy (a momentarily-full consumer channel drops the frame and
+    /// no ack ever comes), so `inflight` must decay or the catch-up
+    /// gate deadlocks. ~500 steps ≈ 0.5 s at the 1 kHz metadata
+    /// domain, comfortably past a healthy ack round-trip.
+    inflight_age: u16,
     next_index: Index,
     match_index: Index,
     inflight: u8,
@@ -91,6 +97,7 @@ impl PeerState {
             next_index: 1,
             match_index: 0,
             inflight: 0,
+            inflight_age: 0,
             active: false,
             voting: false,
             prev_log_index: 0,
@@ -187,6 +194,12 @@ struct ModuleState {
     rpcs_sent: u32,
     acks_received: u32,
     nacks_received: u32,
+    /// Tip probing: the raft entries stream is best-effort (its emit
+    /// drops silently when the channel is momentarily full and there
+    /// is no re-emit), so `last_emitted_index` can freeze behind the
+    /// WAL. A periodic read-back for tip+1 against the local WAL
+    /// advances the tip from the durable source instead.
+    tip_probe_cooldown: u16,
     /// Failure responses due to follower WAL backpressure (busy), counted
     /// separately from divergence NACKs so the in-flight gauge stays exact
     /// and a backpressure storm doesn't masquerade as log divergence.
@@ -195,7 +208,7 @@ struct ModuleState {
     last_metrics_ms: u64,
 
     // Scratch
-    msg_buf: [u8; 2048],
+    msg_buf: [u8; 4096],
 }
 
 #[no_mangle]
@@ -342,7 +355,6 @@ unsafe fn replicate_entries(s: &mut ModuleState, sys: &SyscallTable) {
         let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
         if msg_type != wire::MSG_APPEND_ENTRIES || (plen as usize) < wire::AE_HDR_LEN { continue; }
 
-        dev_log(sys, 3, b"[repl] ae in".as_ptr(), 12);
         // Snapshot the AE header so we can record the per-peer
         // prev_log_* tip for catch-up retries.
         if let Some((_term, _leader, prev_idx, prev_term, _lc, ent_term, ent_idx)) =
@@ -369,7 +381,6 @@ unsafe fn replicate_entries(s: &mut ModuleState, sys: &SyscallTable) {
             );
             if w > 0 {
                 s.rpcs_sent += 1;
-                dev_log(sys, 3, b"[repl] sent ok".as_ptr(), 14);
             } else {
                 dev_log(sys, 3, b"[repl] send fail".as_ptr(), 16);
             }
@@ -444,6 +455,7 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
                         let was_voting = s.peers[replica as usize].voting;
                         let peer = &mut s.peers[replica as usize];
                         if peer.inflight > 0 { peer.inflight -= 1; }
+                        peer.inflight_age = 0;
                         if index > peer.match_index {
                             peer.match_index = index;
                             peer.next_index = index + 1;
@@ -495,6 +507,7 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
                         // recovery under load.
                         let peer = &mut s.peers[replica as usize];
                         if peer.inflight > 0 { peer.inflight -= 1; }
+                        peer.inflight_age = 0;
                         s.backpressure_responses = s.backpressure_responses.saturating_add(1);
                         let _ = term;
                     } else {
@@ -511,6 +524,7 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
                         // fans the tip to every peer regardless of next_index).
                         let peer = &mut s.peers[replica as usize];
                         if peer.inflight > 0 { peer.inflight -= 1; }
+                        peer.inflight_age = 0;
                         s.nacks_received = s.nacks_received.saturating_add(1);
                         let new_next = index.saturating_add(1).max(1);
                         peer.next_index = new_next;
@@ -565,6 +579,23 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel routines per
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drive_catchup(s: &mut ModuleState, sys: &SyscallTable) {
+    // A genuine single-voter graph has no catch-up work. Avoid probing WAL
+    // tip+1 forever: those random reads move the shared descriptor and burn
+    // the same hot core as durable appends.
+    if !s.peers.iter().any(|peer| peer.active) {
+        return;
+    }
+
+    // Tip probe (see `tip_probe_cooldown`): every ~500 steps ask the WAL
+    // for tip+1. PROBE_PEER replies advance the tip; NotFound is the
+    // steady state at the true tip and costs one small round-trip.
+    if s.tip_probe_cooldown > 0 {
+        s.tip_probe_cooldown -= 1;
+    } else {
+        s.tip_probe_cooldown = 500;
+        let probe_idx = s.last_emitted_index.saturating_add(1);
+        issue_wal_request(s, sys, PROBE_PEER, probe_idx);
+    }
     let tip = s.last_emitted_index;
     if tip == 0 {
         return;
@@ -572,6 +603,14 @@ unsafe fn drive_catchup(s: &mut ModuleState, sys: &SyscallTable) {
     for i in 0..MAX_NODES {
         if i == s.self_id as usize {
             continue;
+        }
+        // Inflight decay (see PeerState::inflight_age).
+        if s.peers[i].inflight > 0 {
+            s.peers[i].inflight_age = s.peers[i].inflight_age.saturating_add(1);
+            if s.peers[i].inflight_age >= 500 {
+                s.peers[i].inflight = 0;
+                s.peers[i].inflight_age = 0;
+            }
         }
         if !s.peers[i].active {
             continue;
@@ -585,6 +624,9 @@ unsafe fn drive_catchup(s: &mut ModuleState, sys: &SyscallTable) {
     }
 }
 
+/// Pseudo peer id for tip probes (never a real replica slot).
+const PROBE_PEER: u8 = 0xFE;
+
 unsafe fn issue_wal_request(
     s: &mut ModuleState,
     sys: &SyscallTable,
@@ -592,6 +634,16 @@ unsafe fn issue_wal_request(
     wal_index: u64,
 ) {
     if s.out_wal_request < 0 || wal_index == 0 { return; }
+    // Catch-up gating: while a shipped catch-up AE is unacknowledged,
+    // don't reissue for this peer — the per-step renudge would
+    // otherwise re-read and re-ship the same entry every tick until
+    // the ack round-trips. Probes are exempt (they don't ship).
+    if peer != PROBE_PEER
+        && (peer as usize) < MAX_NODES
+        && s.peers[peer as usize].inflight >= 1
+    {
+        return;
+    }
 
     // Recycle the slot if we already had a pending request for this
     // (peer, index) — avoids piling up duplicate requests during
@@ -670,6 +722,7 @@ unsafe fn drain_voter_set_update(s: &mut ModuleState, sys: &SyscallTable) {
                         next_index: s.last_emitted_index.max(1),
                         match_index: 0,
                         inflight: 0,
+                        inflight_age: 0,
                         active: true,
                         voting: false,
                         prev_log_index: 0,
@@ -777,6 +830,15 @@ unsafe fn process_wal_replies(s: &mut ModuleState, sys: &SyscallTable) {
         let slot_idx = match slot_idx { Some(i) => i, None => continue };
         let peer = s.pending[slot_idx].peer;
         s.pending[slot_idx] = PendingWalReq::zero();
+        if peer == PROBE_PEER {
+            // Tip probe answered. NOT_FOUND echoes the requested index
+            // with term=0 and NO body, so it must never advance the
+            // tip. Only a FOUND reply (term != 0, body present) does.
+            if term != 0 && body_off < pl && index > s.last_emitted_index {
+                s.last_emitted_index = index;
+            }
+            continue;
+        }
         if peer as usize >= MAX_NODES || !s.peers[peer as usize].active { continue; }
 
         // Empty body means the WAL doesn't have the index any more —
@@ -804,7 +866,7 @@ unsafe fn process_wal_replies(s: &mut ModuleState, sys: &SyscallTable) {
         // term — those differ exactly in the cross-term failover catch-up
         // case. `entry_term` is the entry's own term (`term`).
         let ae_term = if s.last_emitted_term >= term { s.last_emitted_term } else { term };
-        let mut ae_buf = [0u8; 2048];
+        let mut ae_buf = [0u8; 4096];
         let total = wire::encode_append_entries(
             &mut ae_buf,
             ae_term,
@@ -832,6 +894,9 @@ unsafe fn process_wal_replies(s: &mut ModuleState, sys: &SyscallTable) {
         if w > 0 {
             s.catchup_sent = s.catchup_sent.saturating_add(1);
             s.rpcs_sent = s.rpcs_sent.saturating_add(1);
+            s.peers[peer as usize].inflight =
+                s.peers[peer as usize].inflight.saturating_add(1);
+            s.peers[peer as usize].inflight_age = 0;
             let peer_state = &mut s.peers[peer as usize];
             peer_state.prev_log_index = prev_idx;
             peer_state.prev_log_term = prev_term;

@@ -117,14 +117,18 @@ wiring:
   # `multi-2node-2p.yaml`.
   - from: peer_router.peer_rx
     to: replicator.ack
+    buffer_bytes: 16384
   - from: peer_router.raft_rpc
     to: raft_engine.rpc
+    buffer_bytes: 16384
 
   # ── Outbound peer traffic ──────────────────────────────────
   - from: raft_engine.rpc_out
     to: peer_router.peer_tx
+    buffer_bytes: 16384
   - from: replicator.net_out
     to: peer_router.repl_tx
+    buffer_bytes: 16384
 
   # ── HTTP/client routing ────────────────────────────────────
   - from: peer_router.cleartext
@@ -158,6 +162,7 @@ wiring:
   # ── Raft replication ───────────────────────────────────────
   - from: raft_engine.append_entries
     to: replicator.entries
+    buffer_bytes: 16384
   - from: replicator.match_indices
     to: commit_tracker.match
   - from: replicator.lag_signal
@@ -166,6 +171,13 @@ wiring:
   # ── Persistence ────────────────────────────────────────────
   - from: raft_engine.log_append
     to: wal.entries
+  # Dedicated boot handoff: Raft must resume its index at the exact WAL
+  # replay high-water before proposal intake opens. Never multiplex this onto
+  # wal.flushed, which also fans out durability acknowledgements.
+  - from: wal.replay_complete
+    to: raft_engine.wal_replay_complete
+    rate: transaction
+    buffer_bytes: 16384
   # Raft §5.3 conflict-repair: a leader-divergent follower truncates its WAL
   # suffix on this control edge (shares wal.compact_before; MSG_WAL_TRUNCATE_AFTER).
   - from: raft_engine.wal_compact
@@ -186,8 +198,23 @@ wiring:
     to: durability_ledger.ack
   - from: replicator.wal_request
     to: wal.entry_request
+    buffer_bytes: 8192
   - from: wal.entry_reply
     to: replicator.wal_reply
+    buffer_bytes: 8192
+  # apply_pipeline's gap-refetch shares the WAL's entry_request /
+  # entry_reply ports with the replicator (requests fan in; replies
+  # tee to both consumers, each matching on its own request ids /
+  # indices and ignoring the rest). A restarted follower NEEDS this
+  # path: its WAL replay restores the log — so raft log-matching
+  # succeeds and the leader never re-ships those entries — and the
+  # replayed bodies can only reach the apply pipeline by reading
+  # them back from the local WAL.
+  - from: apply_pipeline.entry_request
+    to: wal.entry_request
+  - from: wal.entry_reply
+    to: apply_pipeline.entry_reply
+    buffer_bytes: 8192
   - from: durability_ledger.quorum_durable
     to: commit_tracker.durable
 
@@ -200,6 +227,7 @@ wiring:
     to: apply_pipeline.entries
   - from: raft_engine.log_observe
     to: apply_pipeline.log_entries
+    buffer_bytes: 16384
   - from: client_codec.reads
     to: apply_pipeline.read
   - from: apply_pipeline.applied

@@ -1,4 +1,5 @@
 version = "0.1.0"
+timer_class = "agnostic"
 type = "Transformer"
 entry = "mod.rs"
 hardware_targets = ["bcm2712"]
@@ -10,8 +11,9 @@ hardware_targets = ["bcm2712"]
 # HTTP port — by convention `LISTEN_PORT + 10000`) and
 # `http_adapter`. Parses the GET request line, frames a
 # `MSG_HTTP_REQUEST` envelope for the adapter, and writes the
-# adapter's `MSG_HTTP_RESPONSE` back to the wire as an HTTP/1.1
-# `Connection: close` response.
+# adapter's `MSG_HTTP_RESPONSE` back to the wire as a sequential
+# HTTP/1.1 keep-alive response (`Connection: close` honored on
+# request).
 #
 # Wire shape:
 #   net_in   (in[0]):  net_proto events from linux_net.net_out
@@ -20,7 +22,7 @@ hardware_targets = ["bcm2712"]
 #                      `[conn_id:u8][status:u16 LE][body_len:u16 LE][body]`
 #   net_out  (out[0]): net_proto commands to linux_net.net_in
 #                      (NCMD_BIND on startup, NCMD_SEND per response,
-#                      NCMD_CLOSE on completion)
+#                      NCMD_CLOSE when the client requests close)
 #   request  (out[1]): MSG_HTTP_REQUEST to http_adapter.request
 #                      `[conn_id:u8][method:u8][path_len:u8][path][body]`
 #
@@ -35,6 +37,11 @@ hardware_targets = ["bcm2712"]
 name = "net_in"
 direction = "input"
 content_type = "OctetStream"
+# linux_net/ip net_out is NetProto, whose generic default (audio) is
+# calibrated for embedded slow NICs, not host HTTP admin loopback
+# traffic. Declare this edge's true shape once here instead of
+# relying on every consuming config to override per edge.
+rate_class_default = "transaction"
 
 [[ports]]
 name = "response"
@@ -42,14 +49,31 @@ direction = "input"
 content_type = "OctetStream"
 
 [[ports]]
+name = "ready_snapshot"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
 name = "net_out"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 8192
+# NCMD_SEND header (3) + the bounded 7680-byte response payload.
+max_record = 7683
+rate_class_max = "transaction"
+# See net_in above: this edge's consumer (linux_net.net_in / ip.net_in)
+# is NetProto, whose generic default (audio) would otherwise exceed
+# the rate_class_max cap above.
+rate_class_default = "transaction"
 
 [[ports]]
 name = "request"
 direction = "output"
 content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + conn/method/path-len (3) + path (64) + body (1024).
+max_record = 1094
+rate_class_max = "transaction"
 
 
 [observability]

@@ -141,6 +141,12 @@ wiring:
 
   - from: raft_engine.log_append
     to: wal.entries
+  # Dedicated boot handoff: Raft must resume its index at the exact WAL
+  # replay high-water before proposal intake opens. Never multiplex this onto
+  # wal.flushed, which also fans out durability acknowledgements.
+  - from: wal.replay_complete
+    to: raft_engine.wal_replay_complete
+    rate: transaction
   - from: wal.flushed
     to: durability_ledger.ack
   - from: wal.flushed
@@ -158,6 +164,16 @@ wiring:
     to: apply_pipeline.entries
   - from: raft_engine.log_observe
     to: apply_pipeline.log_entries
+  # Gap refetch: apply_pipeline pulls a durable entry's body back from
+  # the WAL by index when it's missing one (post-restart recovery, or
+  # a fan-out gap). Without this a restart advances commit_horizon via
+  # `commit_advanced` but apply_pipeline can never actually apply past
+  # it — it never received the entry bodies to apply.
+  - from: apply_pipeline.entry_request
+    to: wal.entry_request
+    rate: transaction
+  - from: wal.entry_reply
+    to: apply_pipeline.entry_reply
   - from: client_codec.reads
     to: apply_pipeline.read
   - from: apply_pipeline.applied
