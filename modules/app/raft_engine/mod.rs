@@ -67,7 +67,15 @@ const PROBE_TIMEOUT_MS: u64 = 1500;
 /// healthy load — it only caps the runaway. The injector/throttle_gate
 /// upstream then backpressure (their channel to raft fills), turning the
 /// cliff into a plateau at commit throughput.
-const MAX_UNCOMMITTED_INFLIGHT: u64 = 24;
+/// Little's Law sizing: sustained write throughput ≈ in-flight window /
+/// commit latency. 48 is the knee for the CM5 NVMe path — deep enough to
+/// hide fsync latency behind the WAL's pipelined durability fences (see wal
+/// `fence_depth`), while past it the device's serial fsync-barrier rate
+/// (~1000/s) dominates and a wider window only adds latency. Must stay ≤
+/// apply_pipeline's PENDING_ENTRY_SLOTS and within TAIL_TERM_RING /
+/// COMMIT_TS_RING (64). Uncommitted entries are WAL-fsynced-before-ack, so
+/// the window trades memory, not durability.
+const MAX_UNCOMMITTED_INFLIGHT: u64 = 48;
 
 /// Recent (index → term) ring for follower-side log matching and Raft §5.3
 /// conflict repair. Only the *uncommitted* tail can ever diverge (committed

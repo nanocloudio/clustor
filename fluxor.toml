@@ -22,6 +22,12 @@ fluxor = "0.0.1"
 # linux/aarch64. Add `rp2350` / `cm5` here when those backends land.
 targets = ["bcm2712"]
 
+[ci.test]
+# Runtime gate (CI phase 3.5, after the strict module build): the
+# sequential, thread-bounded e2e suite. Without this, `fluxor ci`
+# proves lint/build only — green would not mean behaviour.
+scripts = ["tools/ci-e2e.sh"]
+
 [ci.lints]
 # The single workspace member (`clustor`) is exempted from the
 # `[lints] workspace = true` opt-in audit because cargo doesn't

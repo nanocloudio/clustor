@@ -49,6 +49,20 @@ use collections::Crc32c;
 const WRITE_BUF_SIZE: usize = 16 * 1024;
 const METRICS_INTERVAL_MS: u64 = 1000;
 
+/// Max fence-pipelining depth. Bounds the outstanding-fence ring; the effective
+/// depth is `min(fence_depth config, FENCE_RING_MAX, nvme ASYNC_BULK_SLOTS)`.
+const FENCE_RING_MAX: usize = 8;
+
+/// The MSG_WAL_REPLAY_COMPLETE handshake to raft is re-emitted on this
+/// wall-clock cadence (not one-shot): across a cross-domain SPSC bridge
+/// the consumer's port may not be live at the instant the WAL first
+/// emits, and a lone message written before the first consumer pump can
+/// be missed — permanently wedging proposal intake (raft stays
+/// `awaiting_replay`). raft ignores duplicates once it has resumed, so
+/// re-emitting is idempotent. Bounded by REPLAY_REEMIT_MAX_ATTEMPTS.
+const REPLAY_REEMIT_MS: u64 = 20;
+const REPLAY_REEMIT_MAX_ATTEMPTS: u32 = 256;
+
 /// Power of two so `index % RING_SIZE` is a cheap mask. Sized to cover
 /// the last few seconds of a hot writer without inflating module state.
 const ENTRY_RING_SIZE: usize = 256;
@@ -160,6 +174,13 @@ define_params! {
     12, preallocate_settle_ms, u16, 0
         => |s, d, len| { s.preallocate_settle_ms = p_u16(d, len, 0, 0); };
 
+    // Fence-pipelining depth. 1 (default) = classic single-fence-at-a-time
+    // (throughput ≈ 1/fence-latency). >1 keeps up to N async fences in flight
+    // so write throughput becomes device-bandwidth-bound. Capped at
+    // FENCE_RING_MAX and the nvme async ring depth. Async FS backend only.
+    13, fence_depth, u16, 1
+        => |s, d, len| { s.fence_depth = p_u16(d, len, 0, 1); };
+
 }
 
 // FS opcodes (from abi::dev_fs)
@@ -179,6 +200,14 @@ const FS_OPEN_CREATE: u32 = 0x0909;
 /// Gated on the provider's `caps::UNLINK` bit — see `fs_unlink_supported`.
 const FS_UNLINK: u32 = 0x090A;
 const FS_PREALLOCATE: u32 = 0x090E;
+/// Async durable-write tier (`fs.rs::{WRITE_ASYNC, FSYNC_SUBMIT,
+/// FSYNC_POLL}` + `caps::FSYNC_ASYNC`). Used only when the FS provider
+/// advertises `FS_CAP_FSYNC_ASYNC`; otherwise the WAL keeps the
+/// synchronous FS_WRITE + FS_FSYNC path unchanged.
+const FS_WRITE_ASYNC: u32 = 0x090F;
+const FS_FSYNC_SUBMIT: u32 = 0x0910;
+const FS_FSYNC_POLL: u32 = 0x0911;
+const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
 /// FS capability-discovery opcode + the `UNLINK` bit
 /// (`modules/sdk/contracts/storage/fs.rs::{CAPS, caps::UNLINK}`).
 const FS_CAPS: u32 = 0x09FF;
@@ -369,13 +398,51 @@ struct ModuleState {
     /// acknowledgements).
     batch_fsynced: bool,
 
-    /// True until the one-shot MSG_WAL_REPLAY_COMPLETE has been emitted to
-    /// raft_engine. Set at module_new; cleared once the signal lands (or the
-    /// port is unwired). The signal carries `(current_term, current_index)` —
-    /// the exact on-disk high-water reconstructed by replay (or 0/0 for a
-    /// fresh `skip_replay` start) — so a recovering raft resumes there rather
-    /// than at its throttled metadata hint.
+    /// Async durable-write path (enabled iff the FS provider advertises
+    /// `FS_CAP_FSYNC_ASYNC`, probed once via `ensure_fs_caps` before the
+    /// first durable write). When set, `flush_batch` submits the batch with
+    /// `FS_WRITE_ASYNC` and fences with `FS_FSYNC_SUBMIT`/`FS_FSYNC_POLL` —
+    /// pipelining durability instead of spin-polling every write.
+    fs_async: bool,
+    /// A durability fence has been opened for the current batch and is
+    /// awaiting completion. While set, staging is held (see
+    /// `process_entries`) so the pending ack's coverage cannot drift.
+    fence_pending: bool,
+    /// The outstanding fence ticket (from `FS_FSYNC_SUBMIT`).
+    fence_ticket: u64,
+    /// Latched on the first fence failure (submit or poll). A failed fence
+    /// is a durability gap, which is FATAL for log integrity: fail-stop —
+    /// withhold acks (commit never advances past a non-durable entry), stop
+    /// issuing writes, log once. No silent downgrade to the sync path
+    /// (which, on a failing device, would fail identically). Recovery is a
+    /// node restart, which re-inits the device.
+    fence_failed: bool,
+
+    /// Fence-pipelining depth (config param 13, default 1). When >1 the WAL
+    /// keeps up to `fence_depth` async fences outstanding at once instead of
+    /// waiting for each to complete, decoupling write throughput from fence
+    /// (device) latency. Each in-flight fence snapshots its own covered
+    /// (ticket, high-water index/term) so later staging can't corrupt an
+    /// already-submitted fence's ack coverage. FIFO reap → in-order acks.
+    fence_depth: u16,
+    /// Ring of outstanding fences: (ticket, max_index, max_term). FIFO.
+    fence_ring: [(u64, Index, Term); FENCE_RING_MAX],
+    fence_ring_head: u8,
+    fence_ring_count: u8,
+
+    /// True while the WAL still owes raft_engine the MSG_WAL_REPLAY_COMPLETE
+    /// handshake. Set at module_new; cleared when the port is unwired or after
+    /// the bounded re-emit window (see REPLAY_REEMIT_MS). The signal carries
+    /// `(current_term, current_index)` — the exact on-disk high-water
+    /// reconstructed by replay (or 0/0 for a fresh `skip_replay` start) — so a
+    /// recovering raft resumes there rather than at its throttled metadata
+    /// hint.
     replay_complete_pending: bool,
+    /// Emit attempts so far (bounds the re-emit loop; see
+    /// REPLAY_REEMIT_MAX_ATTEMPTS).
+    replay_emit_attempts: u32,
+    /// Wall-clock ms of the last replay-complete emit (re-emit throttle).
+    last_replay_emit_ms: u64,
     /// Diagnostic: high-water emitted in the replay-complete signal (0 until).
     replay_hw_sent: u64,
     /// Diagnostic: count of entries re-emitted during boot replay.
@@ -437,6 +504,13 @@ pub extern "C" fn module_new(
         s.out_entry_reply = dev_channel_port(sys, 1, 3);
         s.out_replay_complete = dev_channel_port(sys, 1, 4);
         s.replay_complete_pending = true;
+        s.replay_emit_attempts = 0;
+        s.last_replay_emit_ms = 0;
+        // fence_depth is set by the param parser (default 1); the ring starts empty.
+        s.fence_failed = false;
+        s.fence_ring = [(0u64, 0, 0); FENCE_RING_MAX];
+        s.fence_ring_head = 0;
+        s.fence_ring_count = 0;
         s.replay_hw_sent = 0;
         s.replayed_count = 0;
         s.replay_first_size = 0;
@@ -543,15 +617,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // Hand raft_engine the exact on-disk high-water reconstructed by
-        // replay, exactly once, only after the write side is ready. Until this
-        // lands a recovering/fresh fixed graph holds proposal intake.
+        // replay, only after the write side is ready. Until this lands a
+        // recovering/fresh fixed graph holds proposal intake.
         maybe_emit_replay_complete(s, sys);
 
         // Time-based group flush: a quiescent writer drains its tail
         // batch within group_window_ms even when no new entries arrive.
-        if s.has_batch {
+        // An outstanding async fence is polled every step regardless of the
+        // window so a completed batch acks promptly (and staging can resume).
+        if s.fs_async && s.fence_depth > 1 {
+            // Pipelined mode: reap completed fences (and submit the staged
+            // batch) every step, independent of has_batch, so acks flow while
+            // more batches are still in flight.
+            flush_batch(s, sys);
+        } else if s.has_batch {
             let now = dev_millis(sys);
-            if now.wrapping_sub(s.batch_start_ms) >= s.group_window_ms as u64 {
+            if s.fence_pending || now.wrapping_sub(s.batch_start_ms) >= s.group_window_ms as u64 {
                 flush_batch(s, sys);
             }
         }
@@ -629,6 +710,15 @@ unsafe fn maybe_emit_replay_complete(s: &mut ModuleState, sys: &SyscallTable) {
         s.replay_complete_pending = false;
         return;
     }
+    // Re-emit on a bounded wall-clock cadence rather than one-shot: a lone
+    // handshake message can be lost across the cross-domain bridge if the
+    // consumer port is not yet live, permanently wedging raft's intake.
+    let now = dev_millis(sys);
+    if s.replay_emit_attempts > 0
+        && now.wrapping_sub(s.last_replay_emit_ms) < REPLAY_REEMIT_MS
+    {
+        return;
+    }
     let poll = (sys.channel_poll)(s.out_replay_complete, 0x02);
     if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
     let mut buf = [0u8; 16];
@@ -636,10 +726,20 @@ unsafe fn maybe_emit_replay_complete(s: &mut ModuleState, sys: &SyscallTable) {
     let w = wire_channels::channel_write_msg(
         sys, s.out_replay_complete, wire::MSG_WAL_REPLAY_COMPLETE, &buf,
     );
+    s.replay_emit_attempts = s.replay_emit_attempts.saturating_add(1);
     if w > 0 {
-        s.replay_complete_pending = false;
+        s.last_replay_emit_ms = now;
         s.replay_hw_sent = s.current_index;
-        dev_log(sys, 3, b"[wal] replay hw sent".as_ptr(), 20);
+        if s.replay_emit_attempts == 1 {
+            dev_log(sys, 3, b"[wal] replay hw sent".as_ptr(), 20);
+        }
+    }
+    // Stop re-emitting after a bounded window. By this point either raft has
+    // resumed (duplicates are harmless — it ignores them) or the edge is
+    // broken in a way re-emitting cannot fix; keeping the flag set forever
+    // would spin the throttle needlessly.
+    if s.replay_emit_attempts >= REPLAY_REEMIT_MAX_ATTEMPTS {
+        s.replay_complete_pending = false;
     }
 }
 
@@ -1039,15 +1139,27 @@ unsafe fn compact_before(s: &mut ModuleState, sys: &SyscallTable, before_index: 
 /// unprobed and retries on the next compaction rather than caching a
 /// transient error as "unsupported".
 unsafe fn fs_unlink_supported(s: &mut ModuleState, sys: &SyscallTable) -> bool {
-    if s.fs_unlink_probe == 0 {
-        let mut caps = [0u8; 4];
-        let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
-        if rc == 4 {
-            let bits = u32::from_le_bytes(caps);
-            s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
-        }
-    }
+    ensure_fs_caps(s, sys);
     s.fs_unlink_probe == 1
+}
+
+/// One-shot FS capability probe. Reads the provider's CAPS bitmap once
+/// and caches both the `UNLINK` disposition (`fs_unlink_probe`) and
+/// whether the async durable-write tier is available (`fs_async`). A
+/// failed CAPS call (provider still initialising) leaves everything
+/// unprobed and retries next call. Called at the top of `flush_batch`
+/// so `fs_async` is set before the first durable write is issued.
+unsafe fn ensure_fs_caps(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.fs_unlink_probe != 0 {
+        return;
+    }
+    let mut caps = [0u8; 4];
+    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+    if rc == 4 {
+        let bits = u32::from_le_bytes(caps);
+        s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
+        s.fs_async = bits & FS_CAP_FSYNC_ASYNC != 0;
+    }
 }
 
 // ── Replay phase ────────────────────────────────────────────
@@ -1375,6 +1487,23 @@ unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
     // hole.
     if s.continuity_fault { return; }
 
+    // An async durability fence is outstanding for the current batch. Do NOT
+    // stage new records: they would advance `pending_max_index` past what the
+    // fence covers, so the pending FsyncAck would falsely claim them durable.
+    // The record waits in the input channel (backpressure) until the fence
+    // resolves and the batch resets; `flush_batch` keeps polling it each step.
+    //
+    // Pipelined mode (`fence_depth > 1`) lifts this: each in-flight fence
+    // snapshots its own covered high-water into `fence_ring`, so staging past
+    // an outstanding fence is safe. Backpressure only when the ring is full.
+    if s.fence_failed { return; } // latched fail-stop: hold intake, no acks
+    if s.fs_async && s.fence_depth > 1 {
+        let depth = (s.fence_depth as usize).min(FENCE_RING_MAX);
+        if (s.fence_ring_count as usize) >= depth { return; }
+    } else if s.fence_pending {
+        return;
+    }
+
     // Check input readiness
     let poll_in = (sys.channel_poll)(s.in_entries, 0x01);
     if poll_in <= 0 || (poll_in as u32 & 0x01) == 0 { return; }
@@ -1557,6 +1686,148 @@ unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
     }
 }
 
+/// Fence-pipelined flush (config `fence_depth > 1`, async FS only).
+///
+/// Two phases per call:
+///   1. Reap completed fences from the head of `fence_ring` (FIFO). Each
+///      fence carries the (term, index) high-water it covers; on `durable`
+///      we emit that MSG_FSYNC_ACK. A fenced-write failure is FATAL (withhold
+///      the ack; commit never advances past a non-durable entry). If the ack
+///      channel is full we stop and retry next step (the fence stays queued).
+///   2. If a batch is staged and the ring has room (< effective depth), write
+///      it (FS_WRITE_ASYNC) and open a new fence (FS_FSYNC_SUBMIT), snapshotting
+///      the current cumulative high-water into the ring slot so subsequent
+///      staging can't corrupt this fence's coverage.
+///
+/// Durability invariant preserved: an entry is acked only after its write is
+/// on stable media, and acks are strictly in raft-log order (FIFO reap of a
+/// monotonic, cumulative fence sequence). The write/seek/terminator logic
+/// mirrors the single-fence `flush_batch` body exactly.
+///
+/// # Safety
+/// As `flush_batch`: exclusive `&mut ModuleState` + a live `&SyscallTable`.
+unsafe fn flush_batch_pipelined(s: &mut ModuleState, sys: &SyscallTable) {
+    // ── 1. Reap completed fences (oldest first → in-order acks). ──
+    while s.fence_ring_count > 0 {
+        let (ticket, max_index, max_term) = s.fence_ring[s.fence_ring_head as usize];
+        let mut tb = ticket.to_le_bytes();
+        let rc = (sys.provider_call)(s.fd, FS_FSYNC_POLL, tb.as_mut_ptr(), 8);
+        if rc == 1 {
+            break; // oldest fence still in flight; nothing newer can be acked
+        }
+        if rc != 0 {
+            // A fenced write FAILED — durability gap. Latch fail-stop (see
+            // `fence_failed`); the flush entry point holds all further work.
+            s.fence_failed = true;
+            s.write_errors = s.write_errors.saturating_add(1);
+            dev_log(sys, 1, b"[wal] FATAL async durable-write failed".as_ptr(), 37);
+            return;
+        }
+        // Durable. Emit this fence's FsyncAck (retry next step if channel full).
+        if s.out_flushed >= 0 {
+            let poll_out = (sys.channel_poll)(s.out_flushed, POLL_OUT);
+            if poll_out <= 0 || (poll_out as u32 & POLL_OUT) == 0 {
+                return; // ack channel full — keep the fence queued, retry later
+            }
+            let mut ack_buf = [0u8; 17];
+            wire::encode_fsync_ack(&mut ack_buf, max_term, max_index, s.self_id);
+            wire_channels::channel_write_msg(
+                sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17],
+            );
+        }
+        s.fence_ring_head = ((s.fence_ring_head as usize + 1) % FENCE_RING_MAX) as u8;
+        s.fence_ring_count -= 1;
+    }
+
+    // ── 2. Submit a new fence for the staged batch if the ring has room. ──
+    if !s.has_batch {
+        return;
+    }
+    let depth = (s.fence_depth as usize).min(FENCE_RING_MAX);
+    if (s.fence_ring_count as usize) >= depth {
+        return; // fence ring full → backpressure; batch stays staged
+    }
+
+    // Fixed-segment replay terminator (mirrors the single-fence body).
+    if s.fixed_segment_active && !s.staged_terminator {
+        if s.write_pos as usize + 4 > WRITE_BUF_SIZE {
+            s.write_errors = s.write_errors.saturating_add(1);
+            dev_log(sys, 3, b"[wal] terminator overflow".as_ptr(), 25);
+            return;
+        }
+        let p = s.write_pos as usize;
+        s.write_buf[p..p + 4].fill(0);
+        s.write_pos += 4;
+        s.staged_terminator = true;
+    }
+
+    if s.write_pos > 0 {
+        let staged_len = s.write_pos as usize;
+        let terminator_len = if s.staged_terminator { 4usize } else { 0usize };
+        let logical_len = staged_len.saturating_sub(terminator_len);
+        let batch_start = s.cursor.saturating_sub(logical_len as u32);
+        let seek_arg = (batch_start as i32).to_le_bytes();
+        let seek_rc =
+            (sys.provider_call)(s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len());
+        if seek_rc < 0 {
+            s.write_errors = s.write_errors.saturating_add(1);
+            dev_log(sys, 3, b"[wal] group seek FAIL".as_ptr(), 21);
+            return;
+        }
+        let written =
+            (sys.provider_call)(s.fd, FS_WRITE_ASYNC, s.write_buf.as_mut_ptr(), staged_len);
+        if written == FS_E_AGAIN || (written >= 0 && (written as usize) < staged_len) {
+            // Backpressure (nvme async ring full). Rewind, keep the batch staged,
+            // retry next step. Nothing acked → no durability impact.
+            (sys.provider_call)(s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len());
+            return;
+        }
+        if written < 0 {
+            (sys.provider_call)(s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len());
+            s.write_errors = s.write_errors.saturating_add(1);
+            dev_log(sys, 1, b"[wal] FATAL group write failed".as_ptr(), 30);
+            return;
+        }
+        if s.staged_terminator {
+            let logical_end = (s.cursor as i32).to_le_bytes();
+            let seek_rc = (sys.provider_call)(
+                s.fd, FS_SEEK, logical_end.as_ptr() as *mut u8, logical_end.len(),
+            );
+            if seek_rc < 0 {
+                s.write_errors = s.write_errors.saturating_add(1);
+                dev_log(sys, 3, b"[wal] restore seek FAIL".as_ptr(), 23);
+                return;
+            }
+        }
+        s.write_pos = 0;
+        s.staged_terminator = false;
+    }
+
+    // Open the durability fence covering everything written so far.
+    let mut tb = [0u8; 8];
+    let rc = (sys.provider_call)(s.fd, FS_FSYNC_SUBMIT, tb.as_mut_ptr(), 8);
+    if rc == FS_E_AGAIN {
+        // Scratch-flush ring-full backpressure; the batch write already landed
+        // (write_pos == 0). Retry the fence next step — the cumulative next
+        // fence still covers these records, so no ack is lost.
+        return;
+    }
+    if rc != 0 {
+        s.fence_failed = true;
+        s.write_errors = s.write_errors.saturating_add(1);
+        dev_log(sys, 1, b"[wal] FATAL fence submit failed".as_ptr(), 31);
+        return;
+    }
+    let ticket = u64::from_le_bytes(tb);
+    let tail = (s.fence_ring_head as usize + s.fence_ring_count as usize) % FENCE_RING_MAX;
+    s.fence_ring[tail] = (ticket, s.pending_max_index, s.pending_max_term);
+    s.fence_ring_count += 1;
+    // Batch consumed — clear so process_entries stages the next one.
+    s.has_batch = false;
+    s.pending_count = 0;
+    s.batch_fsynced = false;
+}
+
 /// Fsync the segment and emit one MSG_FSYNC_ACK for the batch high-water
 /// (term, index). No-op on an empty batch.
 ///
@@ -1573,82 +1844,166 @@ unsafe fn process_entries(s: &mut ModuleState, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn flush_batch(s: &mut ModuleState, sys: &SyscallTable) {
+    // Probe the FS provider's async durable-write capability once, before the
+    // first write is issued, so `fs_async` reflects the backend.
+    ensure_fs_caps(s, sys);
+
+    // A fence failure is a durability gap — latched fail-stop. No further
+    // writes, fences, or acks; only a restart recovers (see `fence_failed`).
+    if s.fence_failed { return; }
+
+    // Fence-pipelined async path (config `fence_depth > 1`): keeps multiple
+    // fences outstanding so throughput is device-bandwidth-bound rather than
+    // 1/fence-latency. Runs every step (reaps even with no staged batch).
+    if s.fs_async && s.fence_depth > 1 {
+        flush_batch_pipelined(s, sys);
+        return;
+    }
+
     if !s.has_batch { return; }
 
     if !s.batch_fsynced {
-        // A fixed-capacity segment has no useful EOF: its directory size was
-        // persisted once at creation. Make the current live tail explicit in
-        // the same provider write as the records. Replay stops on this zero
-        // length even though STAT reports the full segment capacity.
-        if s.fixed_segment_active && !s.staged_terminator {
-            if s.write_pos as usize + 4 > WRITE_BUF_SIZE {
-                s.write_errors = s.write_errors.saturating_add(1);
-                dev_log(sys, 3, b"[wal] terminator overflow".as_ptr(), 25);
+        // ── Async fence poll ──────────────────────────────────────────
+        // If a non-blocking durability fence is outstanding, poll it. This
+        // is the seam that lets the fsync leave the scheduler step: the
+        // write was submitted earlier; here we only observe completion.
+        if s.fence_pending {
+            let mut tb = s.fence_ticket.to_le_bytes();
+            let rc = (sys.provider_call)(s.fd, FS_FSYNC_POLL, tb.as_mut_ptr(), 8);
+            if rc == 1 {
+                // Still pending — the batch is not yet durable this step.
                 return;
             }
-            let p = s.write_pos as usize;
-            s.write_buf[p..p + 4].fill(0);
-            s.write_pos += 4;
-            s.staged_terminator = true;
+            if rc == 0 {
+                // Durable: every fenced write is on non-volatile media.
+                s.fence_pending = false;
+                s.batch_fsynced = true;
+                // fall through to emit the FsyncAck
+            } else {
+                // A fenced write FAILED — durability gap. Latch fail-stop
+                // (see `fence_failed`): withhold the ack and keep the fence
+                // outstanding so we do not re-write and mask it.
+                s.fence_failed = true;
+                s.write_errors = s.write_errors.saturating_add(1);
+                dev_log(sys, 1, b"[wal] FATAL async durable-write failed".as_ptr(), 37);
+                return;
+            }
         }
-        // `cursor` tracks the logical end of the staged records, while the
-        // optional four-byte replay terminator is deliberately outside that
-        // logical range. Seek explicitly because an entry-refetch read may
-        // have moved the shared descriptor since this batch was staged.
-        if s.write_pos > 0 {
-            let staged_len = s.write_pos as usize;
-            let terminator_len = if s.staged_terminator { 4usize } else { 0usize };
-            let logical_len = staged_len.saturating_sub(terminator_len);
-            let batch_start = s.cursor.saturating_sub(logical_len as u32);
-            let seek_arg = (batch_start as i32).to_le_bytes();
-            let seek_rc = (sys.provider_call)(
-                s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len(),
-            );
-            if seek_rc < 0 {
-                s.write_errors = s.write_errors.saturating_add(1);
-                dev_log(sys, 3, b"[wal] group seek FAIL".as_ptr(), 21);
-                return;
-            }
 
-            let written = (sys.provider_call)(
-                s.fd, FS_WRITE, s.write_buf.as_mut_ptr(), staged_len,
-            );
-            if written < 0 || written as usize != staged_len {
-                // Rewind so retrying the complete staged buffer overwrites a
-                // possible partial provider write instead of appending twice.
-                (sys.provider_call)(
-                    s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len(),
-                );
-                s.write_errors = s.write_errors.saturating_add(1);
-                dev_log(sys, 3, b"[wal] group write FAIL".as_ptr(), 22);
-                return;
+        if !s.batch_fsynced {
+            // A fixed-capacity segment has no useful EOF: its directory size was
+            // persisted once at creation. Make the current live tail explicit in
+            // the same provider write as the records. Replay stops on this zero
+            // length even though STAT reports the full segment capacity.
+            if s.fixed_segment_active && !s.staged_terminator {
+                if s.write_pos as usize + 4 > WRITE_BUF_SIZE {
+                    s.write_errors = s.write_errors.saturating_add(1);
+                    dev_log(sys, 3, b"[wal] terminator overflow".as_ptr(), 25);
+                    return;
+                }
+                let p = s.write_pos as usize;
+                s.write_buf[p..p + 4].fill(0);
+                s.write_pos += 4;
+                s.staged_terminator = true;
             }
-
-            if s.staged_terminator {
-                let logical_end = (s.cursor as i32).to_le_bytes();
+            // `cursor` tracks the logical end of the staged records, while the
+            // optional four-byte replay terminator is deliberately outside that
+            // logical range. Seek explicitly because an entry-refetch read may
+            // have moved the shared descriptor since this batch was staged.
+            if s.write_pos > 0 {
+                let staged_len = s.write_pos as usize;
+                let terminator_len = if s.staged_terminator { 4usize } else { 0usize };
+                let logical_len = staged_len.saturating_sub(terminator_len);
+                let batch_start = s.cursor.saturating_sub(logical_len as u32);
+                let seek_arg = (batch_start as i32).to_le_bytes();
                 let seek_rc = (sys.provider_call)(
-                    s.fd, FS_SEEK, logical_end.as_ptr() as *mut u8, logical_end.len(),
+                    s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len(),
                 );
                 if seek_rc < 0 {
                     s.write_errors = s.write_errors.saturating_add(1);
-                    dev_log(sys, 3, b"[wal] restore seek FAIL".as_ptr(), 23);
+                    dev_log(sys, 3, b"[wal] group seek FAIL".as_ptr(), 21);
                     return;
                 }
+
+                // Async mode submits via FS_WRITE_ASYNC (pipelined, copied
+                // into device DMA slots so `write_buf` is free on return);
+                // durability is proven later by the FSYNC_SUBMIT/POLL fence.
+                let write_op = if s.fs_async { FS_WRITE_ASYNC } else { FS_WRITE };
+                let written = (sys.provider_call)(
+                    s.fd, write_op, s.write_buf.as_mut_ptr(), staged_len,
+                );
+                if written == FS_E_AGAIN || (written >= 0 && (written as usize) < staged_len) {
+                    // BACKPRESSURE (async ring full mid-batch), NOT an error.
+                    // Rewind and retry the whole batch next step; in-flight
+                    // writes drain within a step or two. The batch stays
+                    // staged (`write_pos` not reset). No error count, no
+                    // durability impact — nothing was acked.
+                    (sys.provider_call)(
+                        s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len(),
+                    );
+                    return;
+                }
+                if written < 0 {
+                    // A genuine write error. Rewind, count, and surface it.
+                    (sys.provider_call)(
+                        s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len(),
+                    );
+                    s.write_errors = s.write_errors.saturating_add(1);
+                    dev_log(sys, 1, b"[wal] FATAL group write failed".as_ptr(), 30);
+                    return;
+                }
+
+                if s.staged_terminator {
+                    let logical_end = (s.cursor as i32).to_le_bytes();
+                    let seek_rc = (sys.provider_call)(
+                        s.fd, FS_SEEK, logical_end.as_ptr() as *mut u8, logical_end.len(),
+                    );
+                    if seek_rc < 0 {
+                        s.write_errors = s.write_errors.saturating_add(1);
+                        dev_log(sys, 3, b"[wal] restore seek FAIL".as_ptr(), 23);
+                        return;
+                    }
+                }
+
+                s.write_pos = 0;
+                s.staged_terminator = false;
             }
 
-            s.write_pos = 0;
-            s.staged_terminator = false;
-        }
+            // ── Durability fence ──────────────────────────────────────
+            if s.fs_async {
+                // Open a non-blocking fence and hand off; the ack is emitted
+                // on a later step once the poll (above) reports durable.
+                let mut tb = [0u8; 8];
+                let rc = (sys.provider_call)(s.fd, FS_FSYNC_SUBMIT, tb.as_mut_ptr(), 8);
+                if rc == 0 {
+                    s.fence_ticket = u64::from_le_bytes(tb);
+                    s.fence_pending = true;
+                    return;
+                }
+                if rc == FS_E_AGAIN {
+                    // The final scratch flush hit ring-full backpressure — no
+                    // fence opened. Retry the fence next step (the write above
+                    // already succeeded; write_pos is 0 so we re-enter here).
+                    return;
+                }
+                // A genuine error opening the fence — latch fail-stop and
+                // withhold the ack (see `fence_failed`).
+                s.fence_failed = true;
+                s.write_errors = s.write_errors.saturating_add(1);
+                dev_log(sys, 1, b"[wal] FATAL fence submit failed".as_ptr(), 31);
+                return;
+            }
 
-        if fsync_segment(s, sys) != 0 {
-            // Deferred group fsync failed — the batch is NOT durable. Withhold
-            // the FsyncAck (commit must not advance past it) and keep the batch
-            // intact so a later flush retries instead of losing durability.
-            s.write_errors = s.write_errors.saturating_add(1);
-            dev_log(sys, 3, b"[wal] group fsync FAIL".as_ptr(), 22);
-            return;
+            if fsync_segment(s, sys) != 0 {
+                // Deferred group fsync failed — the batch is NOT durable. Withhold
+                // the FsyncAck (commit must not advance past it) and keep the batch
+                // intact so a later flush retries instead of losing durability.
+                s.write_errors = s.write_errors.saturating_add(1);
+                dev_log(sys, 3, b"[wal] group fsync FAIL".as_ptr(), 22);
+                return;
+            }
+            s.batch_fsynced = true;
         }
-        s.batch_fsynced = true;
     }
 
     if s.out_flushed >= 0 {
@@ -1680,6 +2035,7 @@ unsafe fn flush_batch(s: &mut ModuleState, sys: &SyscallTable) {
 
     s.has_batch = false;
     s.batch_fsynced = false;
+    s.fence_pending = false;
     s.pending_count = 0;
     s.pending_max_index = 0;
     s.pending_max_term = 0;

@@ -123,13 +123,25 @@ struct PendingWalReq {
     peer: u8,
     /// Index requested (= peer.next_index - 1 at issue time).
     wal_index: u64,
+    /// Steps this request has been outstanding. The WAL round-trip can
+    /// span several steps (module scheduling is not same-step), so an
+    /// in-flight slot must keep its `request_id` stable until the reply
+    /// arrives or the TTL expires — see `issue_wal_request`.
+    age: u16,
 }
 
 impl PendingWalReq {
     const fn zero() -> Self {
-        Self { request_id: 0, peer: 0xFF, wal_index: 0 }
+        Self { request_id: 0, peer: 0xFF, wal_index: 0, age: 0 }
     }
 }
+
+/// Steps before an unanswered WAL request slot is freed for reissue.
+/// Covers a lost round-trip (request or reply dropped on a full
+/// channel) without letting the per-step catch-up renudge invalidate a
+/// reply that is merely still in transit. Matches the inflight-decay
+/// horizon (`PeerState::inflight_age`).
+const PENDING_WAL_REQ_TTL: u16 = 500;
 
 #[repr(C)]
 struct ModuleState {
@@ -579,6 +591,20 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel routines per
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drive_catchup(s: &mut ModuleState, sys: &SyscallTable) {
+    // TTL sweep: free request slots whose round-trip evidently died
+    // (request or reply dropped on a full channel) so the renudge below
+    // can reissue them. In-transit replies keep their slot — and its
+    // request_id — untouched. Runs before every early return so slots
+    // age even while no peer is active.
+    for slot in s.pending.iter_mut() {
+        if slot.peer != 0xFF {
+            slot.age = slot.age.saturating_add(1);
+            if slot.age >= PENDING_WAL_REQ_TTL {
+                *slot = PendingWalReq::zero();
+            }
+        }
+    }
+
     // A genuine single-voter graph has no catch-up work. Avoid probing WAL
     // tip+1 forever: those random reads move the shared descriptor and burn
     // the same hot core as durable appends.
@@ -645,20 +671,21 @@ unsafe fn issue_wal_request(
         return;
     }
 
-    // Recycle the slot if we already had a pending request for this
-    // (peer, index) — avoids piling up duplicate requests during
-    // multi-round catch-up.
-    let mut slot_idx: Option<usize> = None;
-    for (i, slot) in s.pending.iter().enumerate() {
+    // A request for this (peer, index) is already in flight: leave it
+    // alone. Reassigning a fresh `request_id` here would invalidate the
+    // reply currently in transit — the WAL round-trip spans steps, and
+    // this function is renudged every step, so recycling live slots
+    // livelocks catch-up (every reply arrives with a stale id and is
+    // dropped). A lost round-trip is recovered by the slot TTL sweep in
+    // `drive_catchup`.
+    for slot in s.pending.iter() {
         if slot.peer == peer && slot.wal_index == wal_index {
-            slot_idx = Some(i);
-            break;
+            return;
         }
     }
-    if slot_idx.is_none() {
-        for (i, slot) in s.pending.iter().enumerate() {
-            if slot.peer == 0xFF { slot_idx = Some(i); break; }
-        }
+    let mut slot_idx: Option<usize> = None;
+    for (i, slot) in s.pending.iter().enumerate() {
+        if slot.peer == 0xFF { slot_idx = Some(i); break; }
     }
     let slot_idx = match slot_idx {
         Some(i) => i,
@@ -667,7 +694,7 @@ unsafe fn issue_wal_request(
 
     let request_id = s.next_request_id;
     s.next_request_id = s.next_request_id.wrapping_add(1).max(1);
-    s.pending[slot_idx] = PendingWalReq { request_id, peer, wal_index };
+    s.pending[slot_idx] = PendingWalReq { request_id, peer, wal_index, age: 0 };
 
     let poll_out = (sys.channel_poll)(s.out_wal_request, 0x02);
     if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {

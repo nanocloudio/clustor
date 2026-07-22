@@ -94,7 +94,10 @@ const PENDING_BODY_CAP: usize = 2048;
 /// un-emitted slot is evicted — observers fail open. The eviction is
 /// safe because consumers MUST tolerate gaps and recover from the
 /// monotonic index in the per-entry stream.
-const PENDING_ENTRY_SLOTS: usize = 32;
+/// Sized above raft's uncommitted-inflight window (MAX_UNCOMMITTED_INFLIGHT
+/// = 48) so a full in-flight backlog never forces an eviction under
+/// sustained load.
+const PENDING_ENTRY_SLOTS: usize = 64;
 
 /// Bounded linearizable-read queue. Sized to absorb the
 /// read-submission window between client_codec submit and the moment
