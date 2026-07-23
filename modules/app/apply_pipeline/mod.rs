@@ -811,8 +811,9 @@ unsafe fn emit_committed_entry(s: &mut ModuleState, sys: &SyscallTable, slot_idx
     // actually reached the state machine, distinct from `[wal] entry
     // ok` (durable-but-not-yet-applied) and `[raft] prop` (proposed-
     // but-not-yet-committed). Fires once per applied entry regardless
-    // of which downstream ports are wired.
-    dev_log(sys, 3, b"[apply] ok".as_ptr(), 10);
+    // of which downstream ports are wired. Debug level: per-entry
+    // hot-path syscall (test harnesses opt in via RUST_LOG=debug).
+    dev_log(sys, 4, b"[apply] ok".as_ptr(), 10);
     s.pending[slot_idx] = PendingEntry::empty();
 }
 

@@ -56,7 +56,12 @@ struct ModuleState {
 
     requests_routed: u32,
     responses_sent: u32,
-    msg_buf: [u8; 2048],
+    /// Must hold peer_router's largest MSG_CLIENT_FRAME payload:
+    /// conn_id byte + a full 4 KiB client record. `channel_read_msg`
+    /// silently discards any payload larger than this buffer, so
+    /// undersizing it drops big client records with no error at
+    /// exactly the hop after peer_router accepted them.
+    msg_buf: [u8; 4097],
 }
 
 #[no_mangle]
@@ -222,7 +227,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 /// Wire bytes written to `dst`: `[conn_id:u8] [msg_type:u8] [len:u16 LE] [payload-without-conn-id]`.
 unsafe fn forward_responses_tagged(
     sys: &SyscallTable, src: i32, dst: i32,
-    buf: &mut [u8; 2048], count: &mut u32,
+    buf: &mut [u8], count: &mut u32,
 ) {
     if src < 0 || dst < 0 { return; }
     for _ in 0..4 {
@@ -262,7 +267,7 @@ unsafe fn forward_responses_tagged(
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn drain_input(sys: &SyscallTable, chan: i32, buf: &mut [u8; 2048]) {
+unsafe fn drain_input(sys: &SyscallTable, chan: i32, buf: &mut [u8]) {
     if chan < 0 { return; }
     for _ in 0..4 {
         let poll = (sys.channel_poll)(chan, 0x01);

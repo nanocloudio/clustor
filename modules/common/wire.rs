@@ -762,6 +762,15 @@ pub const MSG_HTTP_READY_SNAPSHOT: u8 = 0x79;
 /// `wire::MSG_CLIENT_FRAME` so the envelope is identical on both sides.
 pub const MSG_CLIENT_FRAME: u8        = 0xEA;
 
+/// Transport-level connection-closed notice on the cleartext lane.
+/// Payload `[conn_id:u8]`. peer_router emits it when a CLIENT socket
+/// closes so downstream consumers (quantum's protocol_router → codecs →
+/// session state) can release per-connection state deterministically
+/// rather than leaking it until a timeout. Value matches quantum's
+/// `wire::MSG_CONN_CLOSED` so the envelope is identical on both sides.
+/// Consumers that don't care ignore the msg_type (client_surface).
+pub const MSG_CONN_CLOSED: u8         = 0xEB;
+
 /// Metric kinds for `MSG_METRIC_SAMPLE`.
 pub const METRIC_KIND_COUNTER: u8     = 0;
 pub const METRIC_KIND_GAUGE: u8       = 1;

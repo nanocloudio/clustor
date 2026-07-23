@@ -425,7 +425,8 @@ unsafe fn process_acks(s: &mut ModuleState, sys: &SyscallTable) {
 
         match msg_type {
             wire::MSG_APPEND_ENTRIES_RESP => {
-                dev_log(sys, 3, b"[repl] ack".as_ptr(), 10);
+                // Debug level: fires per AppendEntries response — hot path.
+                dev_log(sys, 4, b"[repl] ack".as_ptr(), 10);
                 let (term, index, replica, success, durable_index, busy) =
                     match wire::decode_append_entries_resp(&s.msg_buf[..plen as usize]) {
                         Some(v) => v,

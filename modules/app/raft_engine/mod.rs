@@ -151,12 +151,14 @@ define_params! {
     4, heartbeat_interval_ms, u16, 150
         => |s, d, len| { s.heartbeat_interval_ms = p_u16(d, len, 0, 150); };
 
-    // Parsed for compatibility with existing configs, but currently
-    // forced to 1 in module_new so one proposal maps to one log index.
-    // Multi-proposal batching can return once apply responses carry a
-    // per-proposal sub-index or correlation id.
-    5, proposal_batch_max, u16, 64
-        => |s, d, len| { s.proposal_batch_max = p_u16(d, len, 0, 64); };
+    // Group commit: pack up to N client proposals into ONE raft log entry =
+    // ONE WAL fsync. Default 1 — one proposal per log index, which every
+    // consumer handles. Raising it REQUIRES the committed-entry consumer to
+    // split the entry body back into its N self-delimiting proposals
+    // (lattice does this in lattice_apply_bridge; clustor-native configs
+    // whose responses route by unique wal_index must leave it at 1).
+    5, proposal_batch_max, u16, 1
+        => |s, d, len| { s.proposal_batch_max = p_u16(d, len, 0, 256); };
 
     6, proposal_batch_timeout_ms, u16, 10
         => |s, d, len| { s.proposal_batch_timeout_ms = p_u16(d, len, 0, 10); };
@@ -564,11 +566,16 @@ pub extern "C" fn module_new(
             s.voter_count = MAX_NODES as u8;
         }
 
-        // Until the public response path carries per-proposal sub-indexes,
-        // one proposal must map to exactly one log index. Otherwise several
-        // correlation_ids can be assigned the same wal_index and client_codec
-        // cannot route successful apply responses without ambiguity.
-        s.proposal_batch_max = 1;
+        // Group commit is config-gated via `proposal_batch_max` (see the
+        // param table for the consumer contract N>1 imposes). Clamp to the
+        // correlation-slot capacity so a batch always fits downstream; 0 is
+        // meaningless and reads as "no batching".
+        if s.proposal_batch_max == 0 {
+            s.proposal_batch_max = 1;
+        }
+        if s.proposal_batch_max as usize > MAX_BATCH_PROPOSALS {
+            s.proposal_batch_max = MAX_BATCH_PROPOSALS as u16;
+        }
 
         // Initial voter set (RFC §1.2). `voter_count` came from
         // parse_tlv just above; seed `current_voters` with ids
@@ -2229,8 +2236,11 @@ unsafe fn append_to_batch(
     // Acceptance signal — single choke point for all four proposal
     // ingress paths (untagged/tagged/partitioned/partitioned+tagged)
     // in `drain_proposals`. Fires once the proposal is genuinely
-    // batched, not merely received off the channel.
-    dev_log(sys, 3, b"[raft] prop".as_ptr(), 11);
+    // batched, not merely received off the channel. Debug level: this
+    // is a per-proposal hot-path syscall (and a per-message UDP frame
+    // on the bare-metal rig) — at info it throttles the very intake
+    // path it instruments once rates pass a few hundred per second.
+    dev_log(sys, 4, b"[raft] prop".as_ptr(), 11);
 
     if s.proposal_batch_count == 1 {
         s.proposal_batch_start_ms = now;

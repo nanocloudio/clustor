@@ -74,12 +74,15 @@ use types::*;
 // and those clients never get a CONNACK. 64 covers a 7-node cluster's
 // peer links with ample client headroom.
 const MAX_CONNS: usize = 64;
-// Must hold the largest peer frame: a full proposal batch (2 KiB)
-// plus AE/envelope headers. Undersizing this silently drops batched
-// entries at every hop on the replication path (channel_read_msg
-// discards oversized payloads; encoders return 0) and followers wedge
-// at that index forever.
-const BUF_SIZE: usize = 4096;
+// Must hold the largest frame on ANY lane through this module:
+// peer side, a full proposal batch (2 KiB) plus AE/envelope headers;
+// client side, the largest single client response (Kafka Fetch builds
+// up to ~7.7 KiB against the 8 KiB channel ceiling). Undersizing this
+// silently drops frames at every hop (channel_read_msg discards
+// oversized payloads; encoders return 0) — followers wedge on the
+// replication path, clients time out on the response path. 8192
+// matches CHANNEL_BUFFER_SIZE: nothing larger can transit a channel.
+const BUF_SIZE: usize = 8192;
 const METRICS_INTERVAL_MS: u64 = 1000;
 const RECONNECT_MS: u64 = 2000;
 /// A `connected` peer silent this long is deemed a dead/half-open link and
@@ -755,8 +758,17 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                         // as a MSG_CLIENT_FRAME envelope so records from
                         // different conn_ids don't coalesce on the byte FIFO
                         // (see wire::MSG_CLIENT_FRAME).
-                        if s.cleartext >= 0 && cl < 511 {
-                            let mut tagged = [0u8; 512];
+                        //
+                        // Sized to pass the full inbound copy (`local`,
+                        // 4 KiB). Any cap below that silently drops the
+                        // larger client records (a Kafka produce batch, a
+                        // >0.5 KiB publish) while small control packets
+                        // still pass — an undersized buffer here looks
+                        // healthy right up until real payloads vanish.
+                        // client_surface's msg_buf must hold conn_id +
+                        // this full record.
+                        if s.cleartext >= 0 && cl <= 4096 {
+                            let mut tagged = [0u8; 4097];
                             tagged[0] = conn_id;
                             tagged[1..1 + cl].copy_from_slice(&local[..cl]);
                             wire_channels::channel_write_msg(
@@ -772,6 +784,16 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                     let slot = find_conn(s, conn_id);
                     if slot < MAX_CONNS {
                         let rid = s.conns[slot].replica_id;
+                        // Client socket closed: tell the app layer so it can
+                        // release per-connection state (protocol_router sniff,
+                        // codec reassembly, session consumers/group members).
+                        // Peers (rid >= 0) are handled by the Raft liveness
+                        // machinery below, not this notice.
+                        if rid < 0 && s.cleartext >= 0 {
+                            wire_channels::channel_write_msg(
+                                sys, s.cleartext, wire::MSG_CONN_CLOSED, &[conn_id],
+                            );
+                        }
                         s.conns[slot] = Conn::empty();
                         // Only mark the peer disconnected if NO other
                         // identified link to it survives. `handle_identity`'s
@@ -848,8 +870,11 @@ unsafe fn handle_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize, 
         // Prepend conn_id for response routing. Frame as MSG_CLIENT_FRAME so
         // concurrent first-data records from different conn_ids stay
         // demarcated on the byte FIFO (see wire::MSG_CLIENT_FRAME).
-        if s.cleartext >= 0 && data.len() < 511 {
-            let mut tagged = [0u8; 512];
+        // Sized to pass the caller's full 4 KiB record: the FIRST record
+        // on a client conn can be large (a pipelined client's opening
+        // burst coalesces), and a smaller cap drops it silently.
+        if s.cleartext >= 0 && data.len() <= 4096 {
+            let mut tagged = [0u8; 4097];
             tagged[0] = s.conns[slot].conn_id;
             tagged[1..1 + data.len()].copy_from_slice(data);
             wire_channels::channel_write_msg(
@@ -1016,7 +1041,10 @@ unsafe fn send_to_conn(
 unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
     if s.client_resp < 0 || s.net_out < 0 { return; }
 
-    for _ in 0..4 {
+    // 32/tick: durability acks resolve in bursts (one group fsync covers
+    // many publishes); at 4/tick the egress quota — not the pipeline —
+    // capped client response throughput.
+    for _ in 0..32 {
         let poll = (sys.channel_poll)(s.client_resp, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
 
@@ -1037,9 +1065,14 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         if data_len == 0 { continue; }
 
         // CMD_SEND payload: [conn_id:1] [data]
-        let mut payload = [0u8; 256];
+        //
+        // Sized to BUF_SIZE, the largest response a channel can carry:
+        // any smaller cap silently drops (`continue`) the big client
+        // responses — a Kafka Fetch, an MQTT delivery — while small acks
+        // still pass, which reads as healthy until real payloads vanish.
+        let mut payload = [0u8; BUF_SIZE];
         let payload_len = 1 + data_len;
-        if payload_len > 256 { continue; }
+        if payload_len > BUF_SIZE { continue; }
         payload[0] = conn_id;
         payload[1..1 + data_len].copy_from_slice(data);
 

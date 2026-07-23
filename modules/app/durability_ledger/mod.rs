@@ -201,7 +201,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         wire::MSG_DURABILITY_PROOF,
                         &proof,
                     );
-                    dev_log(sys, 3, b"[dur] quorum".as_ptr(), 12);
+                    // Debug level: fires per quorum event — hot path.
+                    dev_log(sys, 4, b"[dur] quorum".as_ptr(), 12);
                 }
             }
         }

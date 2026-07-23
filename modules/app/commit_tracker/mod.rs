@@ -70,6 +70,7 @@ struct ModuleState {
     out_committed: i32,  // out[0]: CommittedBatch to apply_pipeline
     out_metrics: i32,    // out[1]: MSG_METRIC_SAMPLE to telemetry_agg
     out_retention_floor: i32, // out[2]: MSG_COMPACTION_FLOOR to snapshot_engine.retention_floor
+    out_raft_commit: i32, // out[3]: CommittedBatch to raft_engine.commit (dedicated)
 
     // Configuration
     voter_count: u8,
@@ -101,6 +102,17 @@ struct ModuleState {
     // Commit state
     committed_index: Index,
     committed_term: Term,
+    // Highest committed_index actually DELIVERED per output channel. Commit
+    // delivery must be retried, not fire-and-forget: `out_committed` fans out
+    // to raft.commit and apply.entries, and a group-commit burst can leave it
+    // full exactly when the horizon advances. A dropped, never-retried emit
+    // means raft never learns the new commit, its uncommitted-inflight window
+    // fills, and the pipeline deadlocks. `emit_committed` re-sends every step
+    // until each channel has caught up, with raft additionally served by a
+    // dedicated channel (`out_raft_commit`) that apply backpressure cannot
+    // block.
+    last_emitted_index: Index,   // delivered on out_committed (→ apply_pipeline)
+    last_emitted_raft: Index,    // delivered on out_raft_commit (→ raft_engine)
 
     // CP state
     cp_cache_state: u8,
@@ -153,6 +165,7 @@ pub extern "C" fn module_new(
         s.in_voter_set = dev_channel_port(sys, 0, 3);
         s.out_metrics = dev_channel_port(sys, 1, 1);
         s.out_retention_floor = dev_channel_port(sys, 1, 2);
+        s.out_raft_commit = dev_channel_port(sys, 1, 3);
         s.current_voters = NodeSet::empty();
         s.joint_voters = NodeSet::empty();
         s.joint_active = false;
@@ -208,6 +221,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if changed {
             advance_commit(s, sys);
             dev_report_step_effect(sys, step_effect::WORK_DONE);
+        } else {
+            // Retry delivery of the commit horizon even on quiet steps, so a
+            // drop under backpressure is re-sent once the channel drains.
+            emit_committed(s, sys);
         }
 
         // 6. Periodic metrics
@@ -466,13 +483,42 @@ unsafe fn advance_commit(s: &mut ModuleState, sys: &SyscallTable) {
         let advanced = (new_commit - s.committed_index).min(u32::MAX as Index) as u32;
         s.committed_index = new_commit;
         s.commit_advances = s.commit_advances.saturating_add(advanced);
+    }
+    // Delivery is handled by emit_committed(), called every step so a drop
+    // under backpressure is retried rather than lost (see last_emitted_index).
+    emit_committed(s, sys);
+}
 
-        // Emit committed batch
+/// Deliver the current commit horizon on both output channels, retrying every
+/// step until each has received it. Idempotent: the message carries the
+/// absolute committed high-water, so duplicates are harmless and only the
+/// per-channel `last_emitted_*` gate decides whether a send is due. A single
+/// dropped, unretried emit under a group-commit burst would stall raft's
+/// commit forever — see `last_emitted_index`.
+unsafe fn emit_committed(s: &mut ModuleState, sys: &SyscallTable) {
+    let mut buf = [0u8; 16];
+    wire::encode_term_index(&mut buf, s.committed_term, s.committed_index);
+
+    // raft.commit — dedicated channel, delivered independently of apply. raft
+    // drains it promptly (tiny horizon message), so commit advances even
+    // while apply.entries is backpressured by a group-commit burst.
+    if s.committed_index > s.last_emitted_raft && s.out_raft_commit >= 0 {
+        let poll = (sys.channel_poll)(s.out_raft_commit, 0x02);
+        if poll > 0 && (poll as u32 & 0x02) != 0
+            && wire_channels::channel_write_msg(sys, s.out_raft_commit, wire::MSG_COMMITTED_BATCH, &buf[..16]) > 0
+        {
+            s.last_emitted_raft = s.committed_index;
+        }
+    }
+
+    // apply.entries — may backpressure under bursts; retried until delivered.
+    // Never blocks raft (separate channel above).
+    if s.committed_index > s.last_emitted_index && s.out_committed >= 0 {
         let poll = (sys.channel_poll)(s.out_committed, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
-            let mut buf = [0u8; 16];
-            wire::encode_term_index(&mut buf, s.committed_term, s.committed_index);
-            wire_channels::channel_write_msg(sys, s.out_committed, wire::MSG_COMMITTED_BATCH, &buf[..16]);
+        if poll > 0 && (poll as u32 & 0x02) != 0
+            && wire_channels::channel_write_msg(sys, s.out_committed, wire::MSG_COMMITTED_BATCH, &buf[..16]) > 0
+        {
+            s.last_emitted_index = s.committed_index;
         }
     }
 }

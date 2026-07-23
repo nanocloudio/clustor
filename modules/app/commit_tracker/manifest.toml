@@ -73,3 +73,17 @@ metrics = ["commit_index", "commit_advances"]
 name = "retention_floor"
 direction = "output"
 content_type = "OctetStream"
+
+# Dedicated commit-horizon channel to raft_engine.commit, SEPARATE from the
+# `committed` output that also feeds apply_pipeline. raft's commit (a tiny
+# 19-byte horizon) must never be blocked by apply/response backpressure — when
+# a group-commit burst fills apply's side, a shared fan-out would starve raft's
+# commit and deadlock the inflight window. This channel is drained promptly by
+# raft, so commit always advances.
+[[ports]]
+name = "raft_commit"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+max_record = 19
+rate_class_max = "transaction"
