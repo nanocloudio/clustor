@@ -4,8 +4,8 @@
 //!
 //! Loam, Lattice, and future replicated consumers all integrate with a Clustor
 //! replica group through the same set of channel ports on the consensus graph
-//! (`raft_engine.proposals_tagged`, `raft_engine.proposal_assigned`,
-//! `commit_tracker.committed`, `snapshot_engine.import/export`, etc.). The
+//! (`consensus.proposals_tagged`, `consensus.proposal_assigned`,
+//! `consensus.committed_entries`, `durability.import/export`, etc.). The
 //! wire envelopes are defined in `modules/common/wire.rs`; the per-message
 //! payload layouts are defined in the producing module.
 //!
@@ -29,7 +29,7 @@
 //!
 //! - `build_tagged_proposal` encodes a `MSG_CLIENT_PROPOSAL` body bound to a
 //!   non-zero `correlation_id`. The caller sends it on
-//!   `raft_engine.proposals_tagged` (or its partitioned form). Bodies above
+//!   `consensus.proposals_tagged` (or its partitioned form). Bodies above
 //!   [`MAX_COMMAND_BYTES`] are rejected with [`ProposeError::CommandTooLarge`]
 //!   and never reach the WAL.
 //! - [`InflightTable`] tracks the round trip `register` → `MSG_PROPOSAL_ASSIGNED`
@@ -40,7 +40,7 @@
 //!   single-replica group and on a 5-replica group; the commit horizon
 //!   advances as soon as the local durability ledger acks.
 //! - [`SnapshotInstaller`] / [`SnapshotExporter`] frame snapshot chunks for
-//!   `snapshot_engine.import_chunks` / `snapshot_engine.export_chunks` and
+//!   `durability.import_chunks` / `durability.export_chunks` and
 //!   verify the trailing manifest matches the advertised commit index.
 //! - [`MembershipView`] and [`ReadGateInputs`] are read-only state accessors
 //!   the consumer maintains by watching telemetry / cache-state channels.
@@ -89,13 +89,13 @@ pub const COMMITTED_BATCH_LEN: usize = 16;
 /// MSG_COMMITTED_ENTRY header size: term(8) + index(8). The body
 /// follows immediately and can be 0..MAX_COMMAND_BYTES + tagged-prefix
 /// (for proposal batches the per-entry envelope carries the coalesced
-/// batch body produced by `raft_engine.flush_proposal_batch`).
+/// batch body produced by `consensus.flush_proposal_batch`).
 pub const COMMITTED_ENTRY_HDR: usize = 16;
 
 /// MSG_SNAPSHOT_CHUNK envelope prefix size: seq(4) + len(4).
 pub const SNAPSHOT_CHUNK_HDR: usize = 8;
 
-/// MSG_SNAPSHOT_MANIFEST length (matches `snapshot_engine`'s record).
+/// MSG_SNAPSHOT_MANIFEST length (matches `durability`'s record).
 pub const SNAPSHOT_MANIFEST_LEN: usize = 32;
 
 /// Snapshot manifest magic: ASCII "SNAP" little-endian.
@@ -128,9 +128,9 @@ pub struct CommitAck {
 
 /// Decoded MSG_COMMITTED_ENTRY payload: the term + index at which the
 /// entry committed, plus the opaque body bytes the proposer originally
-/// submitted. Emitted on `apply_pipeline.committed_entries` in strict
-/// commit-index order. Consumers wired only to `commit_tracker.committed`
-/// see horizon-only updates and never receive a `CommittedEntry`; for
+/// submitted. Emitted on `consensus.committed_entries` in strict
+/// commit-index order. Consumers that ingest only MSG_COMMITTED_BATCH
+/// horizon updates never receive a `CommittedEntry`; for
 /// those, see [`CommittedSubscriber::ingest_committed_batch`] which
 /// returns a [`CommitAck`] watermark instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -212,7 +212,7 @@ pub enum CommitOrderError {
     MalformedBatch { len: usize },
     /// A per-entry committed envelope arrived with an index that
     /// skipped past `cursor + 1`. The consumer SHOULD react by
-    /// requesting a snapshot install — the apply_pipeline observer
+    /// requesting a snapshot install — the consensus observer
     /// ring evicted entries before the consumer could read them.
     /// `expected` is `cursor + 1`; `observed` is the missing index.
     GapInPerEntryStream { expected: u64, observed: u64 },
@@ -540,8 +540,8 @@ impl<const N: usize> Default for InflightTable<N> {
 // ── Committed subscriber ───────────────────────────────────────────────────
 
 /// Consumes `MSG_COMMITTED_BATCH` payloads (16 bytes, `[term:u64][index:u64]`)
-/// and enforces monotonic commit-order delivery. `commit_tracker.committed`
-/// emits the *current commit horizon*, not per-entry envelopes — so this
+/// and enforces monotonic commit-order delivery. MSG_COMMITTED_BATCH
+/// carries the *current commit horizon*, not per-entry envelopes — so this
 /// subscriber tracks the watermark, not individual entries.
 ///
 /// Same code path on single-replica and multi-replica clusters.
@@ -563,7 +563,7 @@ impl CommittedSubscriber {
     }
 
     /// Ingest a `MSG_COMMITTED_BATCH` payload. Returns the [`CommitAck`]
-    /// reported by `commit_tracker`. If the horizon advanced strictly
+    /// reported by `consensus`. If the horizon advanced strictly
     /// past the cursor, the advance is recorded; if it equals the cursor
     /// (idempotent retransmit) the call is a no-op. A horizon that
     /// regresses BELOW the cursor returns
@@ -620,7 +620,7 @@ impl CommittedSubscriber {
     }
 
     /// Ingest a `MSG_COMMITTED_ENTRY` payload (per-entry envelope from
-    /// `apply_pipeline.committed_entries`). Decodes into a borrowed
+    /// `consensus.committed_entries`). Decodes into a borrowed
     /// [`CommittedEntry`] view of the payload and advances the cursor.
     ///
     /// Per-entry stream invariants enforced here:
@@ -631,7 +631,7 @@ impl CommittedSubscriber {
     ///   returns [`CommitOrderError::NonMonotonicIndex`] — the
     ///   consumer's deterministic handler MUST NOT see the same entry
     ///   twice.
-    /// - `index == cursor + 1` (no gaps). The apply_pipeline observer
+    /// - `index == cursor + 1` (no gaps). The consensus observer
     ///   ring is bounded and evicts oldest entries under sustained
     ///   backpressure; if the consumer falls behind it may observe a
     ///   gap. Gaps return [`CommitOrderError::GapInPerEntryStream`]
@@ -799,7 +799,7 @@ impl SnapshotInstaller {
 }
 
 /// Stateful exporter that frames snapshot chunks for a peer. Used by
-/// the leader / snapshot_engine when it answers a follower's snapshot
+/// the leader / durability when it answers a follower's snapshot
 /// install request.
 pub struct SnapshotExporter {
     partition_id: u16,
@@ -881,7 +881,7 @@ impl SnapshotExporter {
 
 /// Read-only view of the replica group from the consumer's perspective.
 /// The consumer maintains this by watching telemetry / leader-changed
-/// signals (currently emitted by `raft_engine.metrics`).
+/// signals (currently emitted by `consensus.metrics`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MembershipView {
     leader_id: i8,
@@ -942,19 +942,19 @@ impl MembershipView {
 
 /// Inputs the read-gate evaluator needs to decide whether a consistent
 /// read can be served. Mirrors the structure consumed by
-/// `read_gate.permits` — the consumer maintains the same fields locally
+/// `admission.permits` — the consumer maintains the same fields locally
 /// and asks the gate before answering a read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadGateInputs {
-    /// CP cache state observed from `cp_proof_cache.cache_state`
+    /// CP cache state observed from `admission.cache_state`
     /// (`CACHE_FRESH` / `CACHE_CACHED` / `CACHE_STALE` / `CACHE_EXPIRED`).
     pub cache_state: u8,
-    /// `commit_tracker`'s most recent commit horizon.
+    /// `consensus`'s most recent commit horizon.
     pub raft_commit_index: u64,
     /// Local durability ledger's last fsynced index.
     pub durable_index: u64,
     /// True when the runtime has been told to fall back to Strict
-    /// mode (e.g. via `cp_proof_cache.strict_fallback`). Blocks reads.
+    /// mode (e.g. via `admission.strict_fallback`). Blocks reads.
     pub strict_fallback: bool,
 }
 
@@ -1437,13 +1437,13 @@ mod tests {
         let _ = build_tagged_proposal(&mut buf, 0xABCD, body).unwrap();
         inflight.register(0xABCD).unwrap();
 
-        // 2) raft_engine assigns wal_index=1 and emits MSG_PROPOSAL_ASSIGNED.
+        // 2) consensus assigns wal_index=1 and emits MSG_PROPOSAL_ASSIGNED.
         let assigned = make_proposal_assigned(0xABCD, 0, 1);
         let (cid, _pid, wal_index) = decode_proposal_assigned(&assigned).unwrap();
         assert_eq!(cid, 0xABCD);
         inflight.record_assignment(cid, wal_index);
 
-        // 3) Local durability_ledger acks; commit_tracker advances to 1.
+        // 3) Local durability acks; consensus advances to 1.
         let batch = make_committed_batch(1, 1);
         let ack = subscriber.ingest_committed_batch(&batch).unwrap();
         assert_eq!(ack, CommitAck { term: 1, index: 1 });
@@ -1476,7 +1476,7 @@ mod tests {
         inflight.record_assignment(0xA2, 11);
         inflight.record_assignment(0xA3, 12);
 
-        // commit_tracker emits horizon=10 first.
+        // consensus emits horizon=10 first.
         sub.ingest_committed_batch(&make_committed_batch(1, 10))
             .unwrap();
         inflight.record_commit(1, 10);
@@ -1584,7 +1584,7 @@ mod tests {
         let mut sub = CommittedSubscriber::new(0);
         let buf = make_committed_entry(1, 1, b"x");
         sub.ingest_committed_entry(&buf[..17]).unwrap();
-        // Skip index 2 — apply_pipeline ring evicted it.
+        // Skip index 2 — consensus ring evicted it.
         let buf3 = make_committed_entry(1, 3, b"x");
         let err = sub.ingest_committed_entry(&buf3[..17]).unwrap_err();
         assert_eq!(

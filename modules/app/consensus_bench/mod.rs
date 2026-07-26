@@ -1,12 +1,12 @@
 //! Consensus load injector (L2) — `.context/rfc_performance_benchmarking.md` §6.
 //!
 //! Injects `MSG_CLIENT_PROPOSAL` bodies straight into
-//! `raft_engine.proposals` (the untagged proposal port), bypassing the
+//! `consensus.proposals` (the untagged proposal port), bypassing the
 //! client codec / throttle gate so the measurement isolates the
-//! consensus + durability path: `raft_engine → wal → durability_ledger
-//! → commit_tracker`. The numbers we care about — propose→commit
+//! consensus + durability path (propose → append → fsync →
+//! commit). The numbers we care about — propose→commit
 //! latency and commit throughput — come from the already-instrumented
-//! producers (`clustor.raft.commit_latency_ms`, commit_tracker's
+//! producers (`clustor.raft.commit_latency_ms`, the commit component's
 //! `commit_advances`, the WAL fsync histogram). This module only drives
 //! offered load and reports how much it injected.
 //!
@@ -69,13 +69,13 @@ define_params! {
     // tick this rate-limits offered load: batch_per_step / inject_period
     // per ms. Keep offered rate at or below sustainable WAL throughput so
     // the raft→wal channel doesn't overflow (raft has no backpressure on
-    // this path — it is normally fronted by throttle_gate, which this
+    // this path — it is normally fronted by the gateway's throttle, which this
     // direct-injection bench deliberately bypasses to isolate consensus).
     5, inject_period, u16, 1
         => |s, d, len| { s.inject_period = p_u16(d, len, 0, 1); };
-    // 0 = untagged body straight to raft_engine.proposals (isolates
+    // 0 = untagged body straight to consensus.proposals (isolates
     // consensus). 1 = tagged `[correlation_id:u64 LE][body]` for
-    // throttle_gate.requests (exercises admission control on the way in).
+    // gateway.proposals (exercises admission control on the way in).
     6, tagged, u16, 0
         => |s, d, len| { s.tagged = p_u16(d, len, 0, 0); };
 }
@@ -84,8 +84,8 @@ define_params! {
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_trigger: i32,   // in[0]: unused start trigger
-    out_proposals: i32, // out[0]: MSG_CLIENT_PROPOSAL → raft_engine.proposals
-    out_metrics: i32,   // out[1]: MSG_METRIC_SAMPLE → telemetry_agg
+    out_proposals: i32, // out[0]: MSG_CLIENT_PROPOSAL → consensus.proposals
+    out_metrics: i32,   // out[1]: MSG_METRIC_SAMPLE → operations
 
     total: u32,
     body_size: u16,
@@ -259,7 +259,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 }
 
 /// Emit injector phase + counters as typed samples (RFC §4.3). The
-/// interesting consensus metrics live in raft_engine/commit_tracker.
+/// interesting consensus metrics live in the consensus module's raft
+/// and commit components.
 ///
 /// # Safety
 /// `sys` must be a live syscall table.
@@ -268,7 +269,7 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
     s.last_metrics_ms = now;
 
-    let mid = wire::MODULE_ID_CONSENSUS_BENCH;
+    let mid = wire::SOURCE_ID_CONSENSUS_BENCH;
     let samples: [(u16, u8, i64); 3] = [
         (wire::metric_ids::CBENCH_PHASE, wire::METRIC_KIND_GAUGE, i64::from(s.phase)),
         (wire::metric_ids::CBENCH_PROPOSALS_SENT, wire::METRIC_KIND_COUNTER, i64::from(s.sent)),

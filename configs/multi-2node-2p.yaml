@@ -21,8 +21,8 @@
 #
 # peer_router demuxes the 5-byte partitioned wire envelope:
 #   APPEND_ENTRIES_RESP                  → peer_rx → replicator_pN
-#   votes / heartbeats / AE / snapshot   → raft_rpc → raft_engine_pN
-#   non-Raft (HTTP admin)                → cleartext → client_surface
+#   votes / heartbeats / AE / snapshot   → raft_rpc → consensus_pN
+#   non-Raft (HTTP admin)                → cleartext → gateway
 # Each per-partition consumer filters by partition_id, so a frame
 # for p0 cannot be applied to p1's state. Run from per-node working
 # directories so `wal/` and `raft/` don't collide.
@@ -30,8 +30,8 @@
 target: linux
 tick_us: 1000
 
-# Cyclic feedback edges (e.g. cp_proof_cache → commit_tracker.cp_state
-# → raft_engine.commit → … back into the cp loop) are intentional —
+# Cyclic feedback edges (e.g. admission → consensus.cp_state
+# → … back into the cp loop) are intentional —
 # they're how the substrate converges in one tick. Tell fluxor not
 # to reject the graph for these structural cycles.
 scheduler:
@@ -50,95 +50,45 @@ modules:
       peer1_port: __PEER1_PORT__
 
   # Hash-route incoming MSG_CLIENT_PROPOSAL by body.
-  - name: client_codec
+  - name: gateway
     params:
       self_id: __SELF_ID__
-  - name: throttle_gate
   - name: partition_router
     params:
       num_partitions: 2
 
   # ── Partition 0 ───────────────────────────────────────────
-  - name: raft_engine_p0
-    type: raft_engine
+  - name: consensus_p0
+    type: consensus
     params:
       self_id: __SELF_ID__
       voter_count: 2
       heartbeat_interval_ms: 150
       partition_id: 0
-
-  - name: replicator_p0
-    type: replicator
-    params:
-      self_id: __SELF_ID__
       peer_count: 2
-      partition_id: 0
-
-  - name: wal_p0
-    type: wal
-    params:
-      partition_id: 0
-  - name: durability_ledger_p0
-    type: durability_ledger
+  - name: durability_p0
+    type: durability
     params:
       self_id: __SELF_ID__
       voter_count: 2
       partition_id: 0
-  - name: commit_tracker_p0
-    type: commit_tracker
-    params:
-      self_id: __SELF_ID__
-      voter_count: 2
-      partition_id: 0
-  - name: apply_pipeline_p0
-    type: apply_pipeline
-    params:
-      partition_id: 0
-
-  # ── Partition 1 ───────────────────────────────────────────
-  - name: raft_engine_p1
-    type: raft_engine
+  - name: consensus_p1
+    type: consensus
     params:
       self_id: __SELF_ID__
       voter_count: 2
       heartbeat_interval_ms: 150
       partition_id: 1
-
-  - name: replicator_p1
-    type: replicator
-    params:
-      self_id: __SELF_ID__
       peer_count: 2
-      partition_id: 1
-
-  - name: wal_p1
-    type: wal
-    params:
-      partition_id: 1
-  - name: durability_ledger_p1
-    type: durability_ledger
+  - name: durability_p1
+    type: durability
     params:
       self_id: __SELF_ID__
       voter_count: 2
       partition_id: 1
-  - name: commit_tracker_p1
-    type: commit_tracker
-    params:
-      self_id: __SELF_ID__
-      voter_count: 2
-      partition_id: 1
-  - name: apply_pipeline_p1
-    type: apply_pipeline
-    params:
-      partition_id: 1
-
-  # ── Shared substrate ──────────────────────────────────────
-  - name: cp_bridge
-  - name: cp_proof_cache
-  - name: flow_controller
-  - name: telemetry_agg
-  - name: client_surface
-
+  - name: control_plane
+  - name: admission
+  - name: operations
 wiring:
   # ── Transport ─────────────────────────────────────────────
   - from: linux_net.net_out
@@ -148,167 +98,119 @@ wiring:
 
   # ── Inbound peer demux ────────────────────────────────────
   - from: peer_router.peer_rx
-    to: replicator_p0.ack
+    to: consensus_p0.ack
   - from: peer_router.peer_rx
-    to: replicator_p1.ack
+    to: consensus_p1.ack
   - from: peer_router.raft_rpc
-    to: raft_engine_p0.rpc
+    to: consensus_p0.rpc
   - from: peer_router.raft_rpc
-    to: raft_engine_p1.rpc
+    to: consensus_p1.rpc
 
   # ── Outbound to peer ──────────────────────────────────────
-  - from: raft_engine_p0.rpc_out
+  - from: consensus_p0.rpc_out
     to: peer_router.peer_tx
-  - from: raft_engine_p1.rpc_out
+  - from: consensus_p1.rpc_out
     to: peer_router.peer_tx
-  - from: replicator_p0.net_out
+  - from: consensus_p0.net_out
     to: peer_router.repl_tx
-  - from: replicator_p1.net_out
+  - from: consensus_p1.net_out
     to: peer_router.repl_tx
 
   # ── HTTP / client proposals ──────────────────────────────
   - from: peer_router.cleartext
-    to: client_surface.requests
-  # client_surface.raft_rpc is intentionally unwired here: peer_router
-  # already delivers all peer Raft RPCs to raft_engine_pN.rpc via
-  # the partition-aware demux, and adding client_surface.raft_rpc would
+    to: gateway.requests
+  # gateway.raft_rpc is intentionally unwired here: peer_router
+  # already delivers all peer Raft RPCs to consensus_pN.rpc via
+  # the partition-aware demux, and adding gateway.raft_rpc would
   # create a fan-in/fan-out collision at p0.rpc (a tee from
-  # peer_router fanning into a merge that also takes client_surface)
+  # peer_router fanning into a merge that also takes gateway)
   # which fluxor's automatic fan insertion can't resolve cleanly.
   # HTTP-injected Raft RPCs are not part of this test path.
-  - from: client_surface.responses
+  - from: gateway.responses
     to: peer_router.client_resp
 
   # Route client proposals through the canonical facade path:
-  # client_surface → client_codec → throttle_gate → partition_router.
-  - from: client_surface.client_req
-    to: client_codec.raw
-  - from: client_codec.parsed
-    to: throttle_gate.requests
-  - from: throttle_gate.rejected
-    to: client_codec.responses
-  - from: throttle_gate.admitted
+  # gateway → gateway → gateway → partition_router.
+  - from: gateway.proposals_tagged
     to: partition_router.proposals_tagged
   - from: partition_router.proposals_tagged_p0
-    to: raft_engine_p0.proposals_partitioned_tagged
+    to: consensus_p0.proposals_partitioned_tagged
   - from: partition_router.proposals_tagged_p1
-    to: raft_engine_p1.proposals_partitioned_tagged
-  - from: raft_engine_p0.proposal_assigned
-    to: client_codec.proposal_assigned
-  - from: raft_engine_p1.proposal_assigned
-    to: client_codec.proposal_assigned
-  - from: client_codec.responses_out
-    to: client_surface.client_responses
+    to: consensus_p1.proposals_partitioned_tagged
+  - from: consensus_p0.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus_p1.proposal_assigned
+    to: gateway.proposal_assigned
 
   # ── Per-partition Raft pipeline ──────────────────────────
-  - from: raft_engine_p0.append_entries
-    to: replicator_p0.entries
-  - from: replicator_p0.match_indices
-    to: commit_tracker_p0.match
-  - from: replicator_p0.lag_signal
-    to: flow_controller.lag
-  - from: raft_engine_p0.log_append
-    to: wal_p0.entries
-  - from: wal_p0.flushed
-    to: durability_ledger_p0.ack
-  - from: wal_p0.flushed
-    to: raft_engine_p0.wal_flushed
+  - from: consensus_p0.lag_signal
+    to: admission.lag
+  - from: consensus_p0.log_append
+    to: durability_p0.entries
+  - from: durability_p0.flushed
+    to: consensus_p0.wal_flushed
   # Gap refetch: a restarted follower's replayed entries reach the
   # apply pipeline only by reading them back from the local WAL
   # (raft log-matching means the leader never re-ships them).
-  - from: apply_pipeline_p0.entry_request
-    to: wal_p0.entry_request
-  - from: wal_p0.entry_reply
-    to: apply_pipeline_p0.entry_reply
+  - from: consensus_p0.entry_request
+    to: durability_p0.entry_request
+  - from: durability_p0.entry_reply
+    to: consensus_p0.entry_reply
     buffer_bytes: 8192
-  - from: replicator_p0.cross_durability_ack
-    to: durability_ledger_p0.ack
-  - from: durability_ledger_p0.quorum_durable
-    to: commit_tracker_p0.durable
-  - from: commit_tracker_p0.committed
-    to: apply_pipeline_p0.entries
-  - from: commit_tracker_p0.committed
-    to: raft_engine_p0.commit
-  - from: raft_engine_p0.commit_advanced
-    to: apply_pipeline_p0.entries
-  - from: raft_engine_p0.log_observe
-    to: apply_pipeline_p0.log_entries
-  - from: apply_pipeline_p0.applied
-    to: client_codec.responses
+  - from: consensus_p0.cross_durability_ack
+    to: durability_p0.ack
+  - from: durability_p0.quorum_durable
+    to: consensus_p0.durable
+  - from: consensus_p0.applied
+    to: gateway.applied
 
-  - from: raft_engine_p1.append_entries
-    to: replicator_p1.entries
-  - from: replicator_p1.match_indices
-    to: commit_tracker_p1.match
-  - from: replicator_p1.lag_signal
-    to: flow_controller.lag
-  - from: raft_engine_p1.log_append
-    to: wal_p1.entries
-  - from: wal_p1.flushed
-    to: durability_ledger_p1.ack
-  - from: wal_p1.flushed
-    to: raft_engine_p1.wal_flushed
+  - from: consensus_p1.lag_signal
+    to: admission.lag
+  - from: consensus_p1.log_append
+    to: durability_p1.entries
+  - from: durability_p1.flushed
+    to: consensus_p1.wal_flushed
   # Gap refetch: a restarted follower's replayed entries reach the
   # apply pipeline only by reading them back from the local WAL
   # (raft log-matching means the leader never re-ships them).
-  - from: apply_pipeline_p1.entry_request
-    to: wal_p1.entry_request
-  - from: wal_p1.entry_reply
-    to: apply_pipeline_p1.entry_reply
+  - from: consensus_p1.entry_request
+    to: durability_p1.entry_request
+  - from: durability_p1.entry_reply
+    to: consensus_p1.entry_reply
     buffer_bytes: 8192
-  - from: replicator_p1.cross_durability_ack
-    to: durability_ledger_p1.ack
-  - from: durability_ledger_p1.quorum_durable
-    to: commit_tracker_p1.durable
-  - from: commit_tracker_p1.committed
-    to: apply_pipeline_p1.entries
-  - from: commit_tracker_p1.committed
-    to: raft_engine_p1.commit
-  - from: raft_engine_p1.commit_advanced
-    to: apply_pipeline_p1.entries
-  - from: raft_engine_p1.log_observe
-    to: apply_pipeline_p1.log_entries
-  - from: apply_pipeline_p1.applied
-    to: client_codec.responses
+  - from: consensus_p1.cross_durability_ack
+    to: durability_p1.ack
+  - from: durability_p1.quorum_durable
+    to: consensus_p1.durable
+  - from: consensus_p1.applied
+    to: gateway.applied
 
   # ── Control plane ─────────────────────────────────────────
-  - from: cp_bridge.proof
-    to: cp_proof_cache.proof
-  - from: cp_proof_cache.cache_state
-    to: commit_tracker_p0.cp_state
-  - from: cp_proof_cache.cache_state
-    to: commit_tracker_p1.cp_state
-  - from: cp_proof_cache.strict_fallback
-    to: raft_engine_p0.fallback_signal
-  - from: cp_proof_cache.strict_fallback
-    to: raft_engine_p1.fallback_signal
+  - from: control_plane.proof
+    to: admission.proof
+  - from: admission.cache_state
+    to: consensus_p0.cp_state
+  - from: admission.cache_state
+    to: consensus_p1.cp_state
+  - from: admission.strict_fallback
+    to: consensus_p0.cp_state
+  - from: admission.strict_fallback
+    to: consensus_p1.cp_state
 
   # ── Metrics ───────────────────────────────────────────────
-  - from: raft_engine_p0.metrics
-    to: telemetry_agg.ingest
-  - from: raft_engine_p1.metrics
-    to: telemetry_agg.ingest
-  - from: wal_p0.metrics
-    to: telemetry_agg.ingest
-  - from: wal_p1.metrics
-    to: telemetry_agg.ingest
-  - from: replicator_p0.metrics
-    to: telemetry_agg.ingest
-  - from: replicator_p1.metrics
-    to: telemetry_agg.ingest
+  - from: consensus_p0.metrics
+    to: operations.ingest
+  - from: consensus_p1.metrics
+    to: operations.ingest
+  - from: durability_p0.metrics
+    to: operations.ingest
+  - from: durability_p1.metrics
+    to: operations.ingest
   - from: peer_router.metrics
-    to: telemetry_agg.ingest
-  - from: throttle_gate.metrics
-    to: telemetry_agg.ingest
-  - from: commit_tracker_p0.metrics
-    to: telemetry_agg.ingest
-  - from: commit_tracker_p1.metrics
-    to: telemetry_agg.ingest
-  - from: apply_pipeline_p0.metrics
-    to: telemetry_agg.ingest
-  - from: apply_pipeline_p1.metrics
-    to: telemetry_agg.ingest
-  - from: telemetry_agg.readyz
-    to: client_surface.readyz_data
-  - from: telemetry_agg.export
-    to: client_surface.metrics_data
+    to: operations.ingest
+  - from: gateway.metrics
+    to: operations.ingest
+  - from: operations.readyz
+    to: gateway.readyz_data
+  - from: operations.export
+    to: gateway.metrics_data

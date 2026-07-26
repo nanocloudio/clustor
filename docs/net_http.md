@@ -11,29 +11,42 @@ allocator.
 
 Two `linux_net` instances run per node — one bound to the clustor
 wire socket (`peer_router`), one bound to the HTTP listener
-(`http_ingress`). Fluxor supports the multi-instance pattern by
-design (see fluxor's `src/platform/linux/providers.rs` and the YAML
-loader in `tools/src/config.rs`).
+(`operations.net_in` / `operations.net_out`). Fluxor supports the
+multi-instance pattern by design (see fluxor's
+`src/platform/linux/providers.rs` and the YAML loader in
+`tools/src/config.rs`).
 
 ```
-curl ──tcp──▶ linux_net_http ──▶ http_ingress ──MSG_HTTP_REQUEST──▶ http_adapter
-                                                                       │
-              linux_net_http ◀── http_ingress ◀──MSG_HTTP_RESPONSE──── │
-                  │
-                  ▼
-                curl
+                                 ┌───────── operations ─────────┐
+curl ──tcp──▶ linux_net_http ──▶ │ ingress ──request──▶ http    │
+                                 │                        │     │
+      curl ◀── linux_net_http ◀──│ ingress ◀──response────┘     │
+                                 └──────────────────────────────┘
 ```
 
-`http_ingress` is a clustor module, not a fluxor foundation
-primitive — the `MSG_HTTP_REQUEST` / `MSG_HTTP_RESPONSE` envelopes
-(msg types `0x74` / `0x75`) are a private protocol between
-`http_ingress` and `http_adapter`. Foundation modules stay
-app-agnostic.
+HTTP framing is clustor's, not a fluxor foundation primitive —
+the request/response exchange (`MSG_HTTP_REQUEST` /
+`MSG_HTTP_RESPONSE`, msg types `0x74` / `0x75`) is a private
+protocol between the `ingress` and `http` components of
+`operations`, carried in-module rather than over the graph.
+Foundation modules stay app-agnostic.
+
+The two components ship only in the `diag` variant. A deployment
+that must not expose an HTTP surface selects
+`variant: headless` on `operations`, which compiles them out and
+omits `net_in` / `net_out` from the module's port set; readiness
+and metrics still publish on `readyz`, `why` and `export`.
 
 The endpoint surface today is GET-only diagnostics (`/readyz`,
-`/why`, `/metrics`) plus the admin POST path. Other methods on
-diagnostic routes return 405 via the adapter; requests are one-shot
-(`Connection: close`).
+`/why`, `/metrics`) plus the `POST /admin/<op>` and `POST /propose`
+paths. Other methods on diagnostic routes return 405 from the
+`http` component; requests are one-shot (`Connection: close`).
+
+`POST /admin/<op>` is admitted through the `rbac` component like
+every other admin command. HTTP carries no peer identity, so it
+evaluates as `default_role` and is denied with 403 when that role
+is insufficient — a property of the module's dispatch table, not of
+the graph wiring.
 
 ## Parser limits
 
@@ -68,10 +81,11 @@ The assertion vocabulary HTTP-gated tests rely on:
 | Signal | Meaning |
 |---|---|
 | `[linux_net] listening on port 19090` | second `linux_net` instance bound |
-| `[http_ingress] init listen_port=19090` | module brought up |
-| `[http_ingress] accepted conn_id=N` | client connected |
-| `[http_ingress] request <METHOD> <PATH> conn_id=N` | request parsed |
-| `[http_ingress] closed conn_id=N` | connection torn down |
+| `[ingress] init listen_port=19090` | listener brought up |
+| `[ingress] accepted conn_id=N` | client connected |
+| `[ingress] request <METHOD> <PATH> conn_id=N` | request parsed |
+| `[ingress] closed conn_id=N` | connection torn down |
+| `[http] admin op=N conn_id=M` | admin request accepted for dispatch |
 
 ## See also
 
@@ -79,7 +93,7 @@ The assertion vocabulary HTTP-gated tests rely on:
   the `/readyz`, `/why`, `/metrics` endpoints this surface exposes
   and what they assert about node state.
 - [architecture/modules.md](architecture/modules.md) —
-  `http_ingress` and `http_adapter` in the four-domain module map.
+  `operations` and its components in the four-domain module map.
 - [`../modules/common/http_admin.rs`](../modules/common/http_admin.rs)
-  — the canonical path → op-code mapping shared between
-  `http_adapter` and host tests.
+  — the canonical path → op-code mapping shared between the `http`
+  component and host tests.

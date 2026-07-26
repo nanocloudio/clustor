@@ -30,8 +30,8 @@ pub const MSG_PRE_VOTE: u8            = 0x05;
 pub const MSG_PRE_VOTE_RESP: u8       = 0x06; // reuse slot: high bit unused
 pub const MSG_HEARTBEAT: u8           = 0x07;
 pub const MSG_HEARTBEAT_RESP: u8      = 0x08;
-/// Periodic leader-state hint emitted by `raft_engine.leader_state` so
-/// downstream modules (notably `client_codec`) can short-circuit
+/// Periodic leader-state hint emitted by `consensus.leader_state` so
+/// downstream modules (notably `gateway`) can short-circuit
 /// proposals with an explicit `CLIENT_REJECT_NOT_LEADER` when the local
 /// node is not the leader. Payload: `[leader_id:u8 (0xFF = unknown)][term:u64 LE]`.
 pub const MSG_LEADER_HINT: u8         = 0x09;
@@ -49,11 +49,11 @@ pub const MSG_READ_INDEX_PROBE: u8    = 0x0B;
 /// majority before answering the read. Payload (17 bytes):
 /// `[probe_id:u64 LE][term:u64 LE][replica:u8]`.
 pub const MSG_READ_INDEX_PROBE_RESP: u8 = 0x0C;
-/// Internal apply_pipeline → raft_engine: "I have a read with this
+/// Internal consensus seam, apply → raft: "I have a read with this
 /// correlation id, please confirm a read-index for me." Payload (8 bytes):
 /// `[correlation_id:u64 LE]`.
 pub const MSG_READ_PROBE_REQ: u8      = 0x0D;
-/// Internal raft_engine → apply_pipeline: reply to `MSG_READ_PROBE_REQ`.
+/// Internal consensus seam, raft → apply: reply to `MSG_READ_PROBE_REQ`.
 /// Payload (17 bytes):
 /// `[correlation_id:u64 LE][confirmed_commit:u64 LE][confirmed:u8]`.
 /// `confirmed == 0` means "not leader" or "probe timed out" — the
@@ -110,7 +110,7 @@ pub const MSG_CLIENT_PROPOSAL: u8     = 0x10;
 pub const MSG_CLIENT_RESPONSE: u8     = 0x11;
 pub const MSG_ADMIN_COMMAND: u8       = 0x12;
 pub const MSG_ADMIN_RESPONSE: u8      = 0x13;
-/// Structured client rejection on the wire (after client_codec stamps
+/// Structured client rejection on the wire (after gateway stamps
 /// `conn_id`). Wire payload (11 bytes):
 /// `[conn_id:u8][status:u8][reserved:u8][retry_after_ms:u16 LE][entry_credits:i16 LE][byte_credits:i32 LE]`
 /// Surfaced when a request is denied before it can be replicated —
@@ -118,19 +118,19 @@ pub const MSG_ADMIN_RESPONSE: u8      = 0x13;
 /// See RFC §5.8/§5.9.
 pub const MSG_CLIENT_REJECT: u8       = 0x15;
 /// Linearizable read request from a client. Payload after the conn_id
-/// prefix supplied by client_surface: `[read_id:u64 LE][body]`. The
+/// prefix supplied by gateway: `[read_id:u64 LE][body]`. The
 /// substrate does not yet implement linearizable reads end-to-end —
-/// client_codec answers every read with `CLIENT_REJECT_READ_UNSUPPORTED`.
+/// gateway answers every read with `CLIENT_REJECT_READ_UNSUPPORTED`.
 /// See RFC §4.3.
 pub const MSG_CLIENT_READ_REQUEST: u8 = 0x16;
-/// Internal rejection envelope used between `throttle_gate.rejected`
-/// and `client_codec.responses`. Carries the correlation_id assigned
-/// by client_codec so the codec can map it back to a conn_id.
+/// Internal rejection envelope used between the gateway's throttle
+/// reject path and its response egress. Carries the correlation_id assigned
+/// by gateway so the codec can map it back to a conn_id.
 /// Payload (18 bytes):
 /// `[correlation_id:u64 LE][status:u8][reserved:u8][retry_after_ms:u16 LE][entry_credits:i16 LE][byte_credits:i32 LE]`
 pub const MSG_CLIENT_REJECT_INTERNAL: u8 = 0x17;
-/// Linearizable read response from `apply_pipeline.applied` to
-/// `client_codec.responses`. Emitted when a queued read has reached its
+/// Linearizable read response from `consensus.applied` to
+/// `gateway.responses`. Emitted when a queued read has reached its
 /// ReadIndex linearization point (apply_index ≥ submission-time commit
 /// horizon) AND the CP cache is still Fresh/Cached. The body is empty —
 /// downstream consumers MUST query their state machine via the per-entry
@@ -138,9 +138,9 @@ pub const MSG_CLIENT_REJECT_INTERNAL: u8 = 0x17;
 /// RFC §4.3.
 /// Payload: `[correlation_id:u64 LE]` (8 bytes).
 pub const MSG_CLIENT_READ_RESPONSE: u8 = 0x18;
-/// Admin-command apply confirmation from `raft_engine.admin_applied` to
-/// `admin_handler.applied_in`. Carries the per-admin command_id that
-/// `admin_handler` stamped onto the request, plus the status the engine
+/// Admin-command apply confirmation from `consensus.admin_applied` to
+/// the admin component's `applied` input. Carries the per-admin command_id that
+/// the admin component stamped onto the request, plus the status the engine
 /// decided. Payload (5 bytes):
 /// `[command_id:u32 LE][status:u8]`.
 pub const MSG_ADMIN_APPLIED: u8       = 0x19;
@@ -148,8 +148,8 @@ pub const MSG_ADMIN_APPLIED: u8       = 0x19;
 /// `MSG_ADMIN_RESPONSE` payload status codes (first byte).
 ///
 /// `OK` and `DUPLICATE` are reserved for the day admin commands actually
-/// apply through Raft. Until then `admin_handler` returns `UNSUPPORTED`
-/// for every request — see RFC §4.4 / §5.12 and `admin_handler/mod.rs`.
+/// apply through Raft. Until then the admin component returns `UNSUPPORTED`
+/// for every request — see RFC §4.4 / §5.12 and `operations/admin.rs`.
 pub const ADMIN_STATUS_OK: u8          = 0x00;
 pub const ADMIN_STATUS_DUPLICATE: u8   = 0x01;
 pub const ADMIN_STATUS_UNSUPPORTED: u8 = 0x80;
@@ -158,7 +158,7 @@ pub const ADMIN_STATUS_NOT_LEADER: u8  = 0x82;
 
 /// Admin op codes (first body byte of an admin command). FREEZE / THAW /
 /// TRANSFER_LEADER / DURABILITY_MODE / SNAPSHOT are local-only effects
-/// applied by `raft_engine`. Membership ops (ADD/REMOVE voter) require
+/// applied by `consensus`. Membership ops (ADD/REMOVE voter) require
 /// joint consensus and are intentionally still `ADMIN_STATUS_UNSUPPORTED`
 /// — see RFC §14.
 pub const ADMIN_OP_FREEZE: u8           = 0x01;
@@ -169,7 +169,7 @@ pub const ADMIN_OP_SNAPSHOT: u8         = 0x05;
 pub const ADMIN_OP_ADD_VOTER: u8        = 0x06;
 pub const ADMIN_OP_REMOVE_VOTER: u8     = 0x07;
 /// `POST /propose` client-write bridge (RFC §8 stopgap). Carried on the admin
-/// command channel for wiring reuse, but admin_handler emits it as a RAW
+/// command channel for wiring reuse, but the admin component emits it as a RAW
 /// (un-marked) `MSG_CLIENT_PROPOSAL` — the op_body is opaque application data,
 /// NOT an admin op, so it is never applied at commit time. Lets an off-DUT
 /// generator drive real client writes over HTTP without a dedicated ingress.
@@ -183,13 +183,13 @@ pub const ADMIN_OP_PROPOSE: u8          = 0x08;
 /// remain opaque per the RFC and are passed through unchanged.
 pub const ADMIN_MARKER: u8              = 0xAD;
 
-/// `apply_pipeline` → `raft_engine` admin commit signal. Emitted when a
-/// committed entry's body begins with `ADMIN_MARKER` so raft_engine
+/// `consensus` → `consensus` admin commit signal. Emitted when a
+/// committed entry's body begins with `ADMIN_MARKER` so consensus
 /// can apply the op locally. Payload: same body bytes that landed in
 /// the WAL minus the marker byte:
 /// `[command_id:u32 LE][op_code:u8][op_body...]`.
 pub const MSG_ADMIN_COMMITTED: u8     = 0x1A;
-/// `apply_pipeline` → `raft_engine` config-change commit. Emitted
+/// `consensus` → `consensus` config-change commit. Emitted
 /// when a committed entry's body begins with `CONFIG_CHANGE_MARKER`.
 /// Payload mirrors the body bytes (minus the marker): see
 /// `decode_config_change`. See RFC §1.2 / phase-3 plan §1.2.
@@ -247,7 +247,7 @@ pub fn decode_config_change(buf: &[u8]) -> Option<(u8, usize, usize)> {
     Some((op_code, 3, n))
 }
 
-/// `raft_engine` → `commit_tracker` / `durability_ledger` voter-set
+/// `consensus` → `consensus` / `durability` voter-set
 /// update. Sent every time the current or joint voter set changes so
 /// the downstream quorum tracker can adjust. Payload (3 bytes):
 ///   `[current_set:u8][joint_set:u8][joint_active:u8]`
@@ -377,7 +377,7 @@ pub fn encode_client_reject(
 ) {
     encode_client_reject_body(buf, status, 0, retry_after_ms, entry_credits, byte_credits);
 }
-/// Emitted by raft_engine on its `proposal_assigned` output port for every
+/// Emitted by consensus on its `proposal_assigned` output port for every
 /// tagged proposal once the leader has assigned it a log index. Lets the
 /// proposer (e.g. quantum/session_processor) bind a per-message correlation
 /// id to the durable wal_index without relying on FIFO heuristics.
@@ -401,18 +401,18 @@ pub const MSG_WAL_ENTRY_REQUEST: u8   = 0x29;
 /// `[request_id:u32 LE][term:u64 LE][index:u64 LE][body...]`. When
 /// `body.is_empty()` the entry was not found at this WAL.
 pub const MSG_WAL_ENTRY_REPLY: u8     = 0x2A;
-/// Apply-pipeline reset notification emitted by `raft_engine` after a
+/// Apply-pipeline reset notification emitted by `consensus` after a
 /// snapshot install fast-forwards `commit_index`. Payload (16 bytes):
 /// `[term:u64 LE][index:u64 LE]`. The pipeline must drop any pending
 /// observer entries whose index <= reset index and bump its own
 /// `apply_index` to the reset point. See §2.3 of the phase-3 RFC.
 pub const MSG_APPLY_PIPELINE_RESET: u8 = 0x2B;
-/// WAL compaction request emitted by `raft_engine` after a snapshot
+/// WAL compaction request emitted by `consensus` after a snapshot
 /// install or post-snapshot trim. Payload (8 bytes):
 /// `[before_index:u64 LE]`. WAL deletes segments whose max-index <
 /// `before_index` and trims its in-memory offset map.
 pub const MSG_WAL_COMPACT_BEFORE: u8  = 0x2C;
-/// WAL → raft_engine boot-time replay-complete signal. Emitted exactly
+/// WAL → consensus boot-time replay-complete signal. Emitted exactly
 /// once after the WAL finishes its replay scan (PHASE_REPLAY → NORMAL),
 /// carrying the EXACT on-disk high-water it reconstructed. Payload
 /// (16 bytes): `[term:u64 LE][high_water_index:u64 LE]` (encoded via
@@ -422,12 +422,12 @@ pub const MSG_WAL_COMPACT_BEFORE: u8  = 0x2C;
 /// hint makes new post-recovery appends collide with the replayed index
 /// space. raft HOLDS proposal intake until this signal arrives, then
 /// resumes `last_log_index` at `high_water_index` and re-seeds
-/// apply_pipeline. This needs its OWN dedicated edge — it CANNOT ride
-/// the shared `wal.flushed` fan-out (which also feeds durability_ledger;
+/// consensus. This needs its OWN dedicated edge — it CANNOT ride
+/// the shared `wal.flushed` fan-out (which also feeds durability;
 /// a one-shot signal there is consumed by the wrong consumer and the
 /// boot deadlocks). See the L4 recovery follow-up (RFC §14 item 3b).
 pub const MSG_WAL_REPLAY_COMPLETE: u8 = 0x2D;
-/// raft_engine → WAL log-suffix truncation (Raft §5.3 conflict repair).
+/// consensus → WAL log-suffix truncation (Raft §5.3 conflict repair).
 /// Emitted by a follower when an AppendEntries reveals a divergent suffix:
 /// every entry strictly AFTER `keep_through_index` must be discarded before
 /// the leader's entries can be appended. Payload (8 bytes):
@@ -494,7 +494,7 @@ pub fn decode_wal_entry_reply(buf: &[u8]) -> Option<(u32, u64, u64, u64, usize)>
     ]);
     Some((request_id, term, index, prev_term, WAL_ENTRY_REPLY_HDR))
 }
-/// Per-entry committed envelope emitted on `apply_pipeline.committed_entries`.
+/// Per-entry committed envelope emitted on `consensus.committed_entries`.
 /// Payload: `[term:u64 LE][index:u64 LE][body...]`. Same body bytes the
 /// proposer originally submitted via `MSG_CLIENT_PROPOSAL` (or, for
 /// tagged proposals, after the 8-byte correlation_id is stripped). The
@@ -528,14 +528,14 @@ pub const MSG_SNAPSHOT_TRIGGER: u8    = 0x52;
 pub const MSG_INSTALL_SNAPSHOT: u8    = 0x53;
 /// Follower → leader response. Payload (9 bytes): `[term:u64][success:u8]`.
 pub const MSG_INSTALL_SNAPSHOT_RESP: u8 = 0x54;
-/// Internal signal `snapshot_engine` → `raft_engine` when an install
+/// Internal signal `durability` → `consensus` when an install
 /// finishes locally. Payload (24 bytes):
 /// `[term:u64][last_included_index:u64][last_included_term:u64]`.
 pub const MSG_SNAPSHOT_INSTALLED: u8  = 0x55;
-/// `replicator` → `snapshot_engine` on-demand catch-up trigger. The
+/// `replicator` → `durability` on-demand catch-up trigger. The
 /// replicator emits this when a follower's `next_index` falls below
 /// the leader's WAL retention floor (a NOT_FOUND `MSG_WAL_ENTRY_REPLY`
-/// is the canonical signal). `snapshot_engine` responds by emitting
+/// is the canonical signal). `durability` responds by emitting
 /// `MSG_INSTALL_SNAPSHOT` chunks at the most recent snapshot point.
 /// Payload (1 byte): `[target_replica_id:u8]` (0xFF = broadcast).
 /// See RFC §4.2 of the phase-3 plan.
@@ -601,20 +601,20 @@ pub fn decode_peer_identity(buf: &[u8]) -> Option<(u8, u8, bool, usize)> {
     Some((conn_id, replica_id, verified, PEER_IDENTITY_HDR))
 }
 /// State-machine snapshot chunk sent from a downstream consumer to
-/// `snapshot_engine` (export path) or from `snapshot_engine` to the
+/// `durability` (export path) or from `durability` to the
 /// downstream consumer (install path). Payload (28+ bytes):
 /// `[term:u64 LE][last_included_index:u64 LE][offset:u64 LE]
 ///  [done:u8][reserved:u8;3][body...]`. The body is opaque — only
 /// the producing consumer knows how to interpret it. See RFC §2.1.
 pub const MSG_APP_SNAPSHOT_CHUNK: u8  = 0x57;
-/// Snapshot-export trigger from `snapshot_engine` to a downstream
+/// Snapshot-export trigger from `durability` to a downstream
 /// consumer. Payload (16 bytes):
 /// `[term:u64 LE][last_included_index:u64 LE]`. The consumer
 /// responds by emitting one or more `MSG_APP_SNAPSHOT_CHUNK` messages
 /// back on its `snapshot_export_out` port, terminated by `done = 1`.
 pub const MSG_APP_SNAPSHOT_REQUEST: u8 = 0x58;
 /// "Discard current state, replay from incoming chunks" signal from
-/// `snapshot_engine` to a downstream consumer after `MSG_APP_SNAPSHOT_CHUNK`
+/// `durability` to a downstream consumer after `MSG_APP_SNAPSHOT_CHUNK`
 /// install begins for a snapshot ahead of the consumer's current
 /// `apply_index`. Payload (16 bytes):
 /// `[term:u64 LE][last_included_index:u64 LE]`.
@@ -720,7 +720,7 @@ pub const MSG_READYZ: u8              = 0x71;
 pub const MSG_WHY: u8                 = 0x72;
 /// Typed metric sample envelope (RFC §4.3). Replaces ad-hoc
 /// per-module `MSG_METRICS` payloads with a uniform shape so
-/// `telemetry_agg` can aggregate without per-module parse code.
+/// `operations` can aggregate without per-module parse code.
 ///
 /// Payload (14 bytes):
 /// `[module_id:u8]
@@ -745,7 +745,7 @@ pub const MSG_HTTP_REQUEST: u8        = 0x74;
 /// text/plain with a short error string. The HTTP server module
 /// frames the wire-level HTTP response itself.
 pub const MSG_HTTP_RESPONSE: u8       = 0x75;
-/// Replaceable readiness snapshot from `http_adapter` to `http_ingress`.
+/// Replaceable readiness snapshot from the http component to the ingress component.
 /// Payload: the latest `MSG_READYZ` body (currently one byte). This travels
 /// through a mailbox edge: only the newest state matters, unlike ordered HTTP
 /// requests and TCP events which remain FIFO.
@@ -757,7 +757,7 @@ pub const MSG_HTTP_READY_SNAPSHOT: u8 = 0x79;
 /// conn_ids never coalesce on the byte-FIFO channel (a raw write per
 /// record loses the per-record boundary and the next conn_id byte is
 /// misread as stream data, silently dropping that connection). Consumers
-/// (client_surface, quantum's protocol_router) demarcate with
+/// (gateway, quantum's protocol_router) demarcate with
 /// `channel_read_msg`. The msg_type value matches quantum's
 /// `wire::MSG_CLIENT_FRAME` so the envelope is identical on both sides.
 pub const MSG_CLIENT_FRAME: u8        = 0xEA;
@@ -768,7 +768,7 @@ pub const MSG_CLIENT_FRAME: u8        = 0xEA;
 /// session state) can release per-connection state deterministically
 /// rather than leaking it until a timeout. Value matches quantum's
 /// `wire::MSG_CONN_CLOSED` so the envelope is identical on both sides.
-/// Consumers that don't care ignore the msg_type (client_surface).
+/// Consumers that don't care ignore the msg_type (gateway).
 pub const MSG_CONN_CLOSED: u8         = 0xEB;
 
 /// Metric kinds for `MSG_METRIC_SAMPLE`.
@@ -778,35 +778,35 @@ pub const METRIC_KIND_HISTOGRAM: u8   = 2;
 
 /// Module id space (RFC §4.3). Stable across releases — never
 /// re-number an existing entry. Add new modules at the end.
-pub const MODULE_ID_RAFT_ENGINE: u8       = 0x01;
-pub const MODULE_ID_WAL: u8               = 0x02;
-pub const MODULE_ID_REPLICATOR: u8        = 0x03;
-pub const MODULE_ID_COMMIT_TRACKER: u8    = 0x04;
-pub const MODULE_ID_DURABILITY_LEDGER: u8 = 0x05;
-pub const MODULE_ID_APPLY_PIPELINE: u8    = 0x06;
-pub const MODULE_ID_SNAPSHOT_ENGINE: u8   = 0x07;
-pub const MODULE_ID_CP_PROOF_CACHE: u8    = 0x08;
-pub const MODULE_ID_READ_GATE: u8         = 0x09;
-pub const MODULE_ID_THROTTLE_GATE: u8     = 0x0A;
-pub const MODULE_ID_FLOW_CONTROLLER: u8   = 0x0B;
-pub const MODULE_ID_CLIENT_CODEC: u8      = 0x0C;
-pub const MODULE_ID_CLIENT_SURFACE: u8    = 0x0D;
-pub const MODULE_ID_PEER_ROUTER: u8       = 0x0E;
-pub const MODULE_ID_PARTITION_ROUTER: u8  = 0x0F;
-pub const MODULE_ID_PLACEMENT_ROUTER: u8  = 0x10;
-pub const MODULE_ID_ADMIN_HANDLER: u8     = 0x11;
-pub const MODULE_ID_RBAC: u8              = 0x12;
-pub const MODULE_ID_KEY_MANAGER: u8       = 0x13;
-pub const MODULE_ID_CP_BRIDGE: u8         = 0x14;
-pub const MODULE_ID_TELEMETRY_AGG: u8     = 0x15;
-pub const MODULE_ID_NVME_BENCH: u8        = 0x16;
-pub const MODULE_ID_CONSENSUS_BENCH: u8   = 0x17;
-pub const MODULE_ID_HTTP_ADAPTER: u8      = 0x18;
+pub const SOURCE_ID_RAFT: u8       = 0x01;
+pub const SOURCE_ID_WAL: u8               = 0x02;
+pub const SOURCE_ID_REPLICATOR: u8        = 0x03;
+pub const SOURCE_ID_COMMIT: u8    = 0x04;
+pub const SOURCE_ID_LEDGER: u8 = 0x05;
+pub const SOURCE_ID_APPLY: u8    = 0x06;
+pub const SOURCE_ID_SNAPSHOT: u8   = 0x07;
+pub const SOURCE_ID_PROOF_CACHE: u8    = 0x08;
+pub const SOURCE_ID_READ_GATE: u8         = 0x09;
+pub const SOURCE_ID_THROTTLE: u8     = 0x0A;
+pub const SOURCE_ID_FLOW: u8   = 0x0B;
+pub const SOURCE_ID_CODEC: u8      = 0x0C;
+pub const SOURCE_ID_SURFACE: u8    = 0x0D;
+pub const SOURCE_ID_PEER_ROUTER: u8       = 0x0E;
+pub const SOURCE_ID_PARTITION_ROUTER: u8  = 0x0F;
+pub const SOURCE_ID_PLACEMENT: u8  = 0x10;
+pub const SOURCE_ID_ADMIN: u8     = 0x11;
+pub const SOURCE_ID_RBAC: u8              = 0x12;
+pub const SOURCE_ID_KEYS: u8       = 0x13;
+pub const SOURCE_ID_CP: u8         = 0x14;
+pub const SOURCE_ID_TELEMETRY: u8     = 0x15;
+pub const SOURCE_ID_NVME_BENCH: u8        = 0x16;
+pub const SOURCE_ID_CONSENSUS_BENCH: u8   = 0x17;
+pub const SOURCE_ID_HTTP: u8      = 0x18;
 
 /// Per-module metric ids. Each module owns a small private space
 /// (0x00..0xFF). Documented next to the module's metric emission.
 pub mod metric_ids {
-    // raft_engine (module_id = 0x01)
+    // consensus — raft component (source_id = 0x01)
     pub const RAFT_ROLE: u16                   = 0x0001;
     pub const RAFT_CURRENT_TERM: u16           = 0x0002;
     pub const RAFT_PROPOSALS_RECEIVED: u16     = 0x0003;
@@ -831,7 +831,7 @@ pub mod metric_ids {
     /// the persisted metadata (high) or restarted fresh (low) — the L4
     /// recovery-coherence diagnostic.
     pub const RAFT_LAST_LOG_INDEX: u16         = 0x000C;
-    /// Gauge: raft's own `commit_index` view (fed from commit_tracker).
+    /// Gauge: raft's own `commit_index` view (fed from consensus).
     pub const RAFT_COMMIT_INDEX: u16           = 0x000D;
     /// Gauge: 1 while raft is holding proposal intake awaiting the WAL's
     /// replay-complete high-water (recovery boot), else 0. Diagnostic.
@@ -847,7 +847,7 @@ pub mod metric_ids {
     pub const RAFT_LOG_TRUNCATIONS: u16        = 0x0011;
     /// Gauge (readiness sub-signal): 1 once boot replay is complete, metadata
     /// is loaded, and consensus is established (we are leader, or we know the
-    /// leader). Consumed by telemetry_agg to drive a real `/readyz` instead of
+    /// leader). Consumed by operations to drive a real `/readyz` instead of
     /// a fixed boot timer. 0 until all three hold.
     pub const RAFT_READY: u16                  = 0x0012;
 
@@ -908,11 +908,11 @@ pub mod metric_ids {
     /// rolling next_index back.
     pub const REPL_BACKPRESSURE: u16           = 0x0006;
 
-    // commit_tracker (module_id = 0x04)
+    // consensus — commit component (source_id = 0x04)
     pub const COMMIT_INDEX: u16                = 0x0001;
     pub const COMMIT_ADVANCES: u16             = 0x0002;
 
-    // snapshot_engine (module_id = 0x07)
+    // durability (module_id = 0x07)
     pub const SNAP_SNAPSHOTS_TAKEN: u16        = 0x0001;
     pub const SNAP_CHUNKS_IMPORTED: u16        = 0x0002;
     pub const SNAP_TRIGGERS_DEFERRED: u16      = 0x0003;
@@ -922,7 +922,7 @@ pub mod metric_ids {
     /// install signal was withheld so consensus never trusts a torn body.
     pub const SNAP_INSTALL_FAILURES: u16       = 0x0005;
 
-    // apply_pipeline (module_id = 0x06)
+    // consensus — apply component (source_id = 0x06)
     pub const APPLY_ENTRIES_APPLIED: u16       = 0x0001;
     pub const APPLY_DEDUP_DROPS: u16           = 0x0002;
     /// UpDownCounter: committed entries queued, not yet delivered.
@@ -934,7 +934,7 @@ pub mod metric_ids {
     pub const APPLY_REFETCHED: u16             = 0x0004;
     /// Gauge (readiness sub-signal): 1 when the apply cursor has caught up to
     /// the committed horizon (`apply_index >= commit_horizon`). Consumed by
-    /// telemetry_agg's real `/readyz`.
+    /// the operations module's real `/readyz`.
     pub const APPLY_CAUGHT_UP: u16             = 0x0005;
     /// Counter: pending committed entries evicted from the body buffer before
     /// they could be applied (overdrive backpressure surfaced as a drop).
@@ -942,7 +942,7 @@ pub mod metric_ids {
     /// Counter: refetch read-back slots evicted before consumption.
     pub const APPLY_READS_EVICTED: u16         = 0x0007;
 
-    // http_adapter (module_id = 0x18)
+    // the http component (module_id = 0x18)
     pub const HTTP_CORRELATIONS_INFLIGHT: u16   = 0x0001;
     pub const HTTP_INDICES_INFLIGHT: u16        = 0x0002;
     pub const HTTP_INFLIGHT_HIGH_WATER: u16     = 0x0003;
@@ -957,11 +957,11 @@ pub mod metric_ids {
     pub const HTTP_REQUESTS: u16                = 0x000C;
     pub const HTTP_REQUESTS_404: u16            = 0x000D;
 
-    // throttle_gate (module_id = 0x0A)
+    // the gateway's throttle (module_id = 0x0A)
     pub const THROTTLE_ADMITTED: u16           = 0x0001;
     pub const THROTTLE_REJECTED: u16           = 0x0002;
 
-    // flow_controller (module_id = 0x0B)
+    // admission (module_id = 0x0B)
     /// UpDownCounter: remaining entry-credit pool.
     pub const FLOW_ENTRY_CREDITS: u16          = 0x0001;
     /// UpDownCounter: remaining byte-credit pool.
@@ -975,7 +975,7 @@ pub mod metric_ids {
     /// Counter: total data bytes sent to the network.
     pub const PEER_BYTES_OUT: u16              = 0x0003;
 
-    // telemetry_agg (module_id = 0x15) — the aggregator's self-metrics.
+    // operations (module_id = 0x15) — the aggregator's self-metrics.
     pub const TELE_MESSAGES_INGESTED: u16      = 0x0001;
     pub const TELE_TYPED_SAMPLES: u16          = 0x0002;
     pub const TELE_METRIC_SLOTS_USED: u16      = 0x0003;
@@ -1023,9 +1023,9 @@ pub mod hist {
     /// scalar `metric_ids` space so the two never collide within a module.
     pub const HIST_BASE: u16 = 0x1000;
 
-    /// First `metric_id` for telemetry_agg's PER-MODULE kernel step-timing
+    /// First `metric_id` for the operations module's PER-MODULE kernel step-timing
     /// histogram (RFC §4.3). Each scheduler module's 8 step buckets are
-    /// emitted under `module_id = MODULE_ID_TELEMETRY_AGG`,
+    /// emitted under `module_id = SOURCE_ID_TELEMETRY`,
     /// `partition_id = scheduler_module_idx`, `metric_id = STEP_PERMOD_BASE + i`
     /// — distinct from the global step histogram (which uses HIST_BASE,
     /// partition 0) so the two never collide.
@@ -1067,7 +1067,7 @@ pub mod hist {
     }
 }
 
-/// `/metrics` export payload (telemetry_agg → http_adapter → `GET /metrics`).
+/// `/metrics` export payload (operations → the http component → `GET /metrics`).
 ///
 /// Layout: `[magic:u8=0xC7][version:u8=1][record_count:u16 LE]` followed by
 /// `record_count` 14-byte records, each identical to the
@@ -1133,7 +1133,7 @@ pub const MSG_SR_REPLY: u8            = 0x91;
 // Routing
 pub const MSG_PLACEMENT_UPDATE: u8    = 0x80;
 
-/// `placement_router` → downstream session-bearing modules
+/// `control_plane` → downstream session-bearing modules
 /// (lattice's `watch_registry`, `lease_manager`, `kv_state_worker`,
 /// future quantum equivalents): a kpg's placement has changed and
 /// any session bound to that kpg should advance its session_epoch
@@ -1153,8 +1153,8 @@ pub const MSG_PLACEMENT_UPDATE: u8    = 0x80;
 pub const MSG_PLACEMENT_EPOCH_EVENT: u8 = 0xD5;
 
 /// `compaction_coordinator` (downstream substrate consumer, e.g.
-/// lattice) → `snapshot_engine`: aggregated per-kpg retention floor.
-/// `snapshot_engine` must not advance compaction past `floor_revision`
+/// lattice) → `durability`: aggregated per-kpg retention floor.
+/// `durability` must not advance compaction past `floor_revision`
 /// for that `kpg_id` — otherwise a watcher whose `start_revision` is
 /// below the new floor cannot be satisfied by replay-after-rebind.
 ///
@@ -1245,7 +1245,7 @@ pub fn decode_partitioned_header(buf: &[u8]) -> (u16, u8, u16) {
 
 // ── Routed message helpers (for peer_tx channel) ────────────────────────────
 //
-// Messages on the peer_tx channel between raft_engine/replicator and
+// Messages on the peer_tx channel between consensus/replicator and
 // peer_router carry a 1-byte target_replica prefix BEFORE the standard
 // envelope so peer_router can route to the correct peer connection.
 //
@@ -1261,7 +1261,7 @@ pub const TARGET_BROADCAST: u8 = 0xFF;
 //
 // Like the routed envelope above, but with a 2-byte `partition_id` between
 // `target_replica` and the standard 3-byte envelope. Used on the channel
-// between per-partition raft_engines / replicators and peer_router.
+// between per-partition consensus instances and peer_router.
 //
 // `target_replica` semantics become "replica id within the named partition";
 // a single physical node may hold replica 0 of partition A and replica 3
@@ -1398,11 +1398,11 @@ pub fn decode_vote_response(buf: &[u8]) -> (u64, bool, u8) {
 ///
 /// Emitted by `wal` directly on `wal.flushed` (one `wal` per
 /// partition). The `replica` byte must be the WAL's `self_id` so
-/// `durability_ledger` keys per-replica progress correctly — see
+/// `durability` keys per-replica progress correctly — see
 /// RFC §4.1. For cross-partition fan-in to `ack_tracker` see
 /// `encode_durability_proof` below.
 ///
-/// On the leader, `durability_ledger` also receives FsyncAck frames
+/// On the leader, `durability` also receives FsyncAck frames
 /// synthesized by `replicator` from follower AppendEntriesResponse
 /// envelopes (see `AE_RESP_LEN`), so the per-replica progress array
 /// covers every voter — the spec §10.4.1 quorum-fsync semantic.
@@ -1424,11 +1424,11 @@ pub fn decode_fsync_ack(buf: &[u8]) -> (u64, u64, u8) {
 /// `durable_index` is the follower's `local_wal_durable_index` at the
 /// moment the response is sent (spec §10.4.1). The leader's
 /// `replicator` decodes this field and forwards a synthesized
-/// `MSG_FSYNC_ACK` to `durability_ledger.ack` so the leader can
+/// `MSG_FSYNC_ACK` to `durability.ack` so the leader can
 /// compute quorum durability across replicas.
 ///
 /// The first 17 bytes are the legacy `[term][last_log_index][replica_byte]`
-/// shape so older readers (e.g. `commit_tracker.drain_match_indices`,
+/// shape so older readers (e.g. `consensus.drain_match_indices`,
 /// which only needs `(term, last_log_index, replica)`) keep working
 /// without code change.
 /// Byte 25 is a `busy` flag: a failure (`success == 0`) that means the
@@ -1455,7 +1455,7 @@ pub fn encode_append_entries_resp(
 
 /// Decode an AppendEntriesResponse payload. Accepts the 26-byte modern shape,
 /// the 25-byte shape (busy defaults to 0), or the legacy 17-byte shape
-/// (durable_index defaults to 0, which leaves the leader's `durability_ledger`
+/// (durable_index defaults to 0, which leaves the leader's `durability`
 /// progress slot for that replica unchanged).
 /// Returns `(term, last_log_index, replica, success, durable_index, busy)`.
 #[inline]
@@ -1481,9 +1481,9 @@ pub const DURABILITY_PROOF_LEN: usize = 19;
 
 /// Encode a DurabilityProof payload. The `partition_id` prefix lets
 /// downstream consumers (especially `ack_tracker`, which fans in
-/// proofs from every per-partition `durability_ledger`) disambiguate
+/// proofs from every per-partition `durability`) disambiguate
 /// the same `wal_index` across partitions. Per-partition consumers
-/// like `commit_tracker` ignore the prefix — it always matches their
+/// like `consensus` ignore the prefix — it always matches their
 /// own configured slot.
 #[inline]
 pub fn encode_durability_proof(
@@ -1593,12 +1593,12 @@ pub fn fnv1a_64(bytes: &[u8]) -> u64 {
 //
 // Two MSG_CLIENT_PROPOSAL payload shapes coexist on the leader's intake:
 //
-// 1. Legacy (untagged) — sent on raft_engine.proposals (in[1]):
+// 1. Legacy (untagged) — sent on consensus.proposals (in[1]):
 //        payload = body
 //    No correlation back to the proposer; ack-on-durability has to be
 //    inferred (e.g. by FIFO heuristics in ack_tracker).
 //
-// 2. Tagged — sent on raft_engine.proposals_tagged (in[4]):
+// 2. Tagged — sent on consensus.proposals_tagged (in[4]):
 //        payload = [correlation_id: u64 LE][body]
 //    correlation_id MUST be non-zero. The leader stores the id alongside
 //    the proposal in its batch and, once the batch is flushed and gets a

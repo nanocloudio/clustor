@@ -67,14 +67,14 @@ behind it.
 
 The module replies to a request **only from the committed-entry
 stream**: request → tagged proposal → WAL fsync → quorum commit →
-`apply_pipeline.committed_entries` → `registry.apply` → reply. There is
+`consensus.committed_entries` → `registry.apply` → reply. There is
 no fast-path ack, so anything acknowledged through this module —
 a counter-block grant, an auth-relevant `KEY_*`/`BIND` transition — is
 quorum-durable first. That is the RFC's "quorum-durable before emit"
 (R2) and "RPO-zero before acted upon" (R5) boundary, held structurally.
 
 Reply attribution is by **assigned wal index**, not content:
-`raft_engine` strips the tagged-proposal header before the WAL and
+`consensus` strips the tagged-proposal header before the WAL and
 reports `correlation → wal_index` on `proposal_assigned`. Content
 matching would misattribute byte-identical commands from concurrent
 proposers — for `RESERVE` that means two anchors believing they own the

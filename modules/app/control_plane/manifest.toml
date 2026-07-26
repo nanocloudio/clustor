@@ -1,0 +1,43 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# control_plane — CP proof source and placement routing as one
+# composite module (standards fluxor-modules.md §8).
+#
+# Components: cp (periodic CP proofs + tenant records + capability
+# manifests) and placement (placement epochs + kpg-keyed epoch
+# events). Both are pure sources; the module has no inputs.
+#
+# tenant_records / capabilities / epoch_events are optional ports —
+# graphs without tenancy or session fencing leave them unwired.
+
+[[ports]]
+name = "proof"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "tenant_records"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "capabilities"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "routing"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "epoch_events"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+exempt = "pure source components — CP proofs, tenant records, capability manifests, placement epochs; originates no data-plane telemetry"

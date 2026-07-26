@@ -1,9 +1,9 @@
 # L2 consensus latency/throughput bench — CM5 BARE-METAL twin of
 # `consensus-bench.yaml` (`.context/rfc_performance_benchmarking.md` §6).
 # Full single-node consensus pipeline with a `consensus_bench` injector
-# feeding raft_engine.proposals directly. propose→commit latency and
+# feeding consensus.proposals directly. propose→commit latency and
 # commit throughput read from the instrumented producers (raft
-# commit_latency_ms, commit_tracker commit_advances) over /metrics
+# commit_latency_ms, consensus commit_advances) over /metrics
 # (scrape :19090 over the wire) + log_net UDP:6666.
 #
 # Differs from the linux twin only in: target cm5, `platform.debug.to: net`
@@ -26,7 +26,7 @@
 # offered@batch=8 collapsed achieved to ~270/s while still lossless). Keep
 # batch ≤2. offered/s ≈ batch_per_step / inject_period × 1000.
 #
-# DEV/TEST ONLY — HTTP admin bypasses rbac.
+# DEV/TEST ONLY — HTTP admin bypasses operations.
 target: cm5
 tick_us: 6000
 
@@ -57,7 +57,7 @@ modules:
                             # (never cleanly formatted) that the free-scan would
                             # otherwise walk for ~227 ms and blow the step guard.
 
-  # L2 load injector — drives proposals into raft_engine.proposals.
+  # L2 load injector — drives proposals into consensus.proposals.
   - name: consensus_bench
     params:
       total: 4000
@@ -81,43 +81,16 @@ modules:
       peer_count: 1
       listen_port: 9090
       peer0_port: 9090
-  - name: client_codec
+  - name: gateway
     params:
       self_id: 0
-  - name: throttle_gate
-  - name: raft_engine
-    # A batch-processing step (drain proposals + flush + commit/apply notify)
-    # spikes well past the ~2 ms default deadline on the busy disk graph; the
-    # tight default faults raft (module step timeout) and wedges the pipeline.
-    # Give it the same headroom as the WAL. (Work is bounded — 16 proposals per
-    # channel per step, batch_max 64 — so this is headroom, not unbounded I/O.)
-    step_deadline_us: 12000
+  - name: consensus
     params:
       self_id: 0
       voter_count: 1
       heartbeat_interval_ms: 150
-  - name: replicator
-    params:
-      self_id: 0
       peer_count: 1
-  - name: commit_tracker
-    params:
-      self_id: 0
-      voter_count: 1
-  - name: apply_pipeline
-    # Heavy stepper on the disk graph (applies committed entries in bursts);
-    # give it headroom over the tight default so an apply burst doesn't fault.
-    step_deadline_us: 12000
-  - name: wal
-    step_deadline_us: 12000
-    # The disk WAL occasionally overruns the 12.5 ms step cap on a cold-region
-    # first-touch (the NVMe penalizes the first access to a region since
-    # power-on). The advisory guard lets the slow step COMPLETE (warming the
-    # region) before flagging it, so a restart resumes from preserved state and
-    # the now-warm retry is fast. Skip (the default) terminates on the first
-    # such transient and wedges the pipeline; restart rides them out.
-    fault_policy: restart
-    max_restarts: 500
+  - name: durability
     params:
       fsync_mode: 1
       group_window_ms: 5
@@ -125,36 +98,15 @@ modules:
       root_path: 1            # 8.3 root segment names for FAT32 (no mkdir)
       segment_bytes: 65536    # 64 KiB segments → rotation within the run
       skip_replay: 1          # L1/L2 throughput bench: start fresh each run so
-                              # stale segments from prior boots aren't re-acked
-                              # into the fresh consensus index space (an index
-                              # gap there stalls apply_pipeline). L4 crash-
-                              # recovery uses a variant with replay enabled.
-  - name: durability_ledger
-    params:
       self_id: 0
       voter_count: 1
       partition_id: 0
-  - name: cp_bridge
-  - name: cp_proof_cache
-  - name: read_gate
-  - name: flow_controller
-  - name: key_manager
-  - name: telemetry_agg
+  - name: control_plane
+  - name: admission
+  - name: operations
     params:
       emit_interval_ms: 250
-  - name: client_surface
-  - name: rbac
-  - name: admin_handler
-  - name: snapshot_engine
-  - name: placement_router
-
-  - name: http_adapter
-  # Binds on the same `ip` as `peer_router` (CMD_BIND on a
-  # distinct port). See `configs/single.yaml`.
-  - name: http_ingress
-    params:
       listen_port: 19090
-
 wiring:
   # ── nvme block device ↔ fat32 filesystem ──
   - from: nvme.blocks
@@ -168,180 +120,124 @@ wiring:
     to: ip.net_in
 
   - from: peer_router.cleartext
-    to: client_surface.requests
+    to: gateway.requests
   - from: peer_router.peer_rx
-    to: replicator.ack
+    to: consensus.ack
   - from: peer_router.raft_rpc
-    to: raft_engine.rpc
+    to: consensus.rpc
 
-  - from: client_surface.client_req
-    to: client_codec.raw
-  - from: client_surface.admin_req
-    to: rbac.request
-  - from: client_surface.responses
+  - from: gateway.admin_req
+    to: operations.admin_req
+  - from: gateway.responses
     to: peer_router.client_resp
 
-  - from: client_codec.parsed
-    to: throttle_gate.requests
-  - from: throttle_gate.admitted
-    to: raft_engine.proposals_tagged
-  - from: raft_engine.proposal_assigned
-    to: client_codec.proposal_assigned
-  - from: raft_engine.leader_state
-    to: client_codec.leader_state
-  - from: throttle_gate.rejected
-    to: client_codec.responses
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
 
-  - from: flow_controller.credits
-    to: throttle_gate.credit_supply
-  - from: flow_controller.envelope
-    to: client_surface.throttle_status
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: admission.envelope
+    to: gateway.throttle_status
 
-  - from: raft_engine.append_entries
-    to: replicator.entries
-  - from: replicator.net_out
+  - from: consensus.net_out
     to: peer_router.peer_tx
-  - from: replicator.match_indices
-    to: commit_tracker.match
-  - from: replicator.lag_signal
-    to: flow_controller.lag
-  - from: raft_engine.rpc_out
+  - from: consensus.lag_signal
+    to: admission.lag
+  - from: consensus.rpc_out
     to: peer_router.peer_tx
 
-  - from: raft_engine.log_append
-    to: wal.entries
+  - from: consensus.log_append
+    to: durability.entries
   # Dedicated boot handoff: Raft must resume its index at the exact WAL
   # replay high-water before proposal intake opens. Never multiplex this onto
   # wal.flushed, which also fans out durability acknowledgements.
-  - from: wal.replay_complete
-    to: raft_engine.wal_replay_complete
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
     rate: transaction
-  - from: wal.flushed
-    to: durability_ledger.ack
-  - from: wal.flushed
-    to: raft_engine.wal_flushed
-  - from: replicator.cross_durability_ack
-    to: durability_ledger.ack
-  - from: durability_ledger.quorum_durable
-    to: commit_tracker.durable
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  - from: consensus.cross_durability_ack
+    to: durability.ack
+  - from: durability.quorum_durable
+    to: consensus.durable
 
-  - from: commit_tracker.committed
-    to: apply_pipeline.entries
-  - from: commit_tracker.committed
-    to: raft_engine.commit
-  - from: raft_engine.commit_advanced
-    to: apply_pipeline.entries
-  - from: raft_engine.log_observe
-    to: apply_pipeline.log_entries
   # Apply-side gap recovery (Item 2): when the best-effort log_observe
-  # fan-out drops an entry body under overdrive, apply_pipeline refetches the
+  # fan-out drops an entry body under overdrive, consensus refetches the
   # missing index from the durable WAL instead of stalling.
-  - from: apply_pipeline.entry_request
-    to: wal.entry_request
-  - from: wal.entry_reply
-    to: apply_pipeline.entry_reply
-  - from: client_codec.reads
-    to: apply_pipeline.read
-  - from: apply_pipeline.applied
-    to: client_codec.responses
-  - from: client_codec.responses_out
-    to: client_surface.client_responses
+  - from: consensus.entry_request
+    to: durability.entry_request
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+  - from: gateway.reads
+    to: consensus.read
+  - from: consensus.applied
+    to: gateway.applied
 
-  - from: snapshot_engine.export_chunks
-    to: replicator.snapshot_rx
-  - from: replicator.snapshot_import
-    to: snapshot_engine.import_chunks
-  - from: snapshot_engine.manifest_auth
+  - from: durability.export_chunks
+    to: consensus.snapshot_rx
+  - from: consensus.snapshot_import
+    to: durability.import_chunks
+  - from: durability.manifest_auth
     to: peer_router.peer_tx
-  - from: wal.compaction_signal
-    to: snapshot_engine.trigger
-  - from: snapshot_engine.installed_local
-    to: raft_engine.snapshot_installed
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
 
-  - from: key_manager.dek_epoch
-    to: wal.key_update
-  - from: key_manager.dek_epoch
-    to: snapshot_engine.key_update
 
-  - from: cp_bridge.proof
-    to: cp_proof_cache.proof
-  - from: cp_proof_cache.cache_state
-    to: read_gate.cache
-  - from: cp_proof_cache.cache_state
-    to: commit_tracker.cp_state
-  # NB: cp_proof_cache.strict_fallback → raft_engine.fallback_signal is
+  - from: control_plane.proof
+    to: admission.proof
+  - from: admission.cache_state
+    to: consensus.cp_state
+  # NB: admission.strict_fallback → consensus.fallback_signal is
   # intentionally omitted here. With no real control plane feeding
-  # cp_bridge, the proof cache ages out of Fresh after ~1 s and would
+  # control_plane, the proof cache ages out of Fresh after ~1 s and would
   # latch raft into strict fallback (dropping proposals). For an
   # isolated L2 consensus bench we keep raft appending; commit safety
-  # still rests on quorum durability (durability_ledger → commit_tracker).
-  - from: read_gate.permits
-    to: apply_pipeline.read_permits
-  - from: placement_router.routing
-    to: client_codec.placement
+  # still rests on quorum durability (durability → consensus).
+  - from: admission.permits
+    to: consensus.read_permits
+  - from: control_plane.routing
+    to: gateway.placement
 
-  - from: rbac.authorized
-    to: admin_handler.requests
-  - from: rbac.denied
-    to: client_surface.admin_responses
-  - from: admin_handler.raft_commands
-    to: raft_engine.admin_proposals
-  - from: raft_engine.admin_applied
-    to: admin_handler.applied
-  - from: admin_handler.responses
-    to: client_surface.admin_responses
-  - from: admin_handler.raft_proposal
-    to: raft_engine.proposals
+  - from: operations.denied
+    to: gateway.admin_responses
+  - from: operations.raft_commands
+    to: consensus.admin_proposals
+  - from: consensus.admin_applied
+    to: operations.admin_applied
+  - from: operations.responses
+    to: gateway.admin_responses
+  - from: operations.raft_proposal
+    to: consensus.proposals
 
   # L2 injector → raft proposals (untagged port; coexists with the
-  # admin_handler.raft_proposal fan-in already wired to this port).
+  # operations.raft_proposal fan-in already wired to this port).
   - from: consensus_bench.proposals
-    to: raft_engine.proposals
+    to: consensus.proposals
   - from: consensus_bench.metrics
-    to: telemetry_agg.ingest
+    to: operations.ingest
 
-  - from: raft_engine.metrics
-    to: telemetry_agg.ingest
-  - from: replicator.metrics
-    to: telemetry_agg.ingest
-  - from: wal.metrics
-    to: telemetry_agg.ingest
-  - from: flow_controller.metrics
-    to: telemetry_agg.ingest
-  - from: cp_proof_cache.metrics
-    to: telemetry_agg.ingest
-  - from: snapshot_engine.metrics
-    to: telemetry_agg.ingest
-  - from: rbac.audit_events
-    to: telemetry_agg.ingest
+  - from: consensus.metrics
+    to: operations.ingest
+  - from: durability.metrics
+    to: operations.ingest
+  - from: admission.metrics
+    to: operations.ingest
   - from: peer_router.metrics
-    to: telemetry_agg.ingest
-  - from: throttle_gate.metrics
-    to: telemetry_agg.ingest
-  - from: commit_tracker.metrics
-    to: telemetry_agg.ingest
-  - from: apply_pipeline.metrics
-    to: telemetry_agg.ingest
-  - from: telemetry_agg.readyz
-    to: client_surface.readyz_data
-  - from: telemetry_agg.why
-    to: client_surface.why_data
-  - from: telemetry_agg.export
-    to: client_surface.metrics_data
+    to: operations.ingest
+  - from: gateway.metrics
+    to: operations.ingest
+  - from: operations.readyz
+    to: gateway.readyz_data
+  - from: operations.why
+    to: gateway.why_data
+  - from: operations.export
+    to: gateway.metrics_data
 
   - from: ip.net_out
-    to: http_ingress.net_in
-  - from: http_ingress.net_out
+    to: operations.net_in
+  - from: operations.net_out
     to: ip.net_in
-  - from: http_ingress.request
-    to: http_adapter.request
-  - from: http_adapter.response
-    to: http_ingress.response
-  - from: telemetry_agg.readyz
-    to: http_adapter.readyz
-  - from: telemetry_agg.why
-    to: http_adapter.why
-  - from: telemetry_agg.export
-    to: http_adapter.metrics
-  - from: http_adapter.admin_request
-    to: admin_handler.requests

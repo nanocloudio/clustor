@@ -4,7 +4,7 @@
 # no WAL, no Raft — to establish the raw storage floor. Results surface
 # two ways:
 #   - `[nvbench] ...` lines over log_net (UDP:6666 via platform.debug),
-#   - typed metrics at `GET /metrics` (telemetry_agg + http surface),
+#   - typed metrics at `GET /metrics` (operations + http surface),
 #     including the fsync-latency histogram (same buckets as the WAL).
 #
 # TARGET = linux on purpose. The bare-metal cm5 build has no filesystem
@@ -23,7 +23,7 @@
 target: linux
 tick_us: 1000
 
-# The http_ingress ↔ net ↔ http_adapter pair is a bidirectional
+# The operations ↔ net ↔ operations pair is a bidirectional
 # feedback cycle (request in / response out over the same net handle);
 # accept it like the other diagnostic-surface configs do.
 scheduler:
@@ -43,32 +43,17 @@ modules:
       rand_blocks: 4096     # 16 MiB random
       step_batch: 64        # blocks per cooperative step
 
-  - name: telemetry_agg
+  - name: operations
     params:
       emit_interval_ms: 250
-
-  - name: http_adapter
-  - name: http_ingress
-    params:
       listen_port: 19090
-
 wiring:
   # Bench metrics → aggregator.
   - from: nvme_bench.metrics
-    to: telemetry_agg.ingest
+    to: operations.ingest
 
   # Diagnostic HTTP surface for GET /metrics, /readyz, /why.
   - from: linux_net.net_out
-    to: http_ingress.net_in
-  - from: http_ingress.net_out
+    to: operations.net_in
+  - from: operations.net_out
     to: linux_net.net_in
-  - from: http_ingress.request
-    to: http_adapter.request
-  - from: http_adapter.response
-    to: http_ingress.response
-  - from: telemetry_agg.readyz
-    to: http_adapter.readyz
-  - from: telemetry_agg.why
-    to: http_adapter.why
-  - from: telemetry_agg.export
-    to: http_adapter.metrics

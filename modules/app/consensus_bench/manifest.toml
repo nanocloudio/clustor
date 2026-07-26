@@ -10,7 +10,7 @@ name = "trigger"
 direction = "input"
 content_type = "OctetStream"
 
-# MSG_CLIENT_PROPOSAL bodies into raft_engine.proposals (untagged port).
+# MSG_CLIENT_PROPOSAL bodies into consensus.proposals (untagged port).
 [[ports]]
 name = "proposals"
 direction = "output"
@@ -24,7 +24,8 @@ content_type = "OctetStream"
 [observability]
 # L2 consensus load injector (RFC §6): emits proposals at a saturating
 # rate and reports phase / proposals_sent / blocked. The propose→commit
-# latency + throughput it drives are captured by raft_engine
-# (commit_latency_ms) and commit_tracker (commit_advances). Not a
+# latency + throughput it drives are captured by the consensus
+# module's raft (commit_latency_ms) and commit (commit_advances)
+# components. Not a
 # data-mover, so exempt from the instrumentation contract.
 exempt = "L2 consensus load injector; drives offered load + reports inject counts, not data-plane telemetry"

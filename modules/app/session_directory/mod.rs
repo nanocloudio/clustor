@@ -10,7 +10,7 @@
 //!   `[request_id:u64][SR_OP_* command body]`) arrive from anchors /
 //!   orchestrators on `requests`. Each is wrapped in a tagged raft
 //!   proposal (`replica_facade::build_tagged_proposal`) and written to
-//!   `raft_engine.proposals_tagged` as `MSG_CLIENT_PROPOSAL`.
+//!   `consensus.proposals_tagged` as `MSG_CLIENT_PROPOSAL`.
 //! - **Committed entries** arrive back on `committed_entries` in
 //!   strict order; every entry is applied to the registry. If the
 //!   entry's correlation matches one of OUR pending requests, the
@@ -119,15 +119,15 @@ const SMOKE_WORKER: [u8; SR_PEER_ID] = *b"SMOKE-W0";
 struct ModuleState {
     syscalls: *const SyscallTable,
 
-    in_entries: i32,          // in[0]: MSG_COMMITTED_ENTRY from apply_pipeline
+    in_entries: i32,          // in[0]: MSG_COMMITTED_ENTRY from consensus
     in_requests: i32,         // in[1]: MSG_SR_REQUEST from anchors/orchestrators
     in_snapshot_chunk: i32,   // in[2]: MSG_APP_SNAPSHOT_CHUNK / RESET (install)
     in_snapshot_request: i32, // in[3]: MSG_APP_SNAPSHOT_REQUEST
-    in_proposal_assigned: i32, // in[4]: MSG_PROPOSAL_ASSIGNED from raft_engine
-    out_proposals: i32,       // out[0]: MSG_CLIENT_PROPOSAL to raft_engine.proposals_tagged
+    in_proposal_assigned: i32, // in[4]: MSG_PROPOSAL_ASSIGNED from consensus
+    out_proposals: i32,       // out[0]: MSG_CLIENT_PROPOSAL to consensus.proposals_tagged
     out_replies: i32,         // out[1]: MSG_SR_REPLY to requester
-    out_metrics: i32,         // out[2]: MSG_METRICS to telemetry_agg
-    out_snapshot_export: i32, // out[3]: MSG_APP_SNAPSHOT_CHUNK to snapshot_engine
+    out_metrics: i32,         // out[2]: MSG_METRICS to operations
+    out_snapshot_export: i32, // out[3]: MSG_APP_SNAPSHOT_CHUNK to durability
 
     // Params
     replica_id: u8,

@@ -14,7 +14,7 @@ name = "committed_entries"
 direction = "input"
 content_type = "OctetStream"
 
-# State-machine snapshot install from snapshot_engine.snapshot_chunk_out.
+# State-machine snapshot install from durability.export_chunks.
 # Carries `MSG_APP_SNAPSHOT_CHUNK` and `MSG_APP_SNAPSHOT_RESET`. Optional;
 # leave unwired in graphs that don't run snapshot installs. See RFC §2.1.
 [[ports]]
@@ -22,7 +22,7 @@ name = "snapshot_chunk"
 direction = "input"
 content_type = "OctetStream"
 
-# State-machine snapshot export trigger from snapshot_engine.app_snapshot_request.
+# State-machine snapshot export trigger from durability.app_snapshot_ctl.
 # Payload: `[term:u64 LE][last_included_index:u64 LE]`. Optional; unwired
 # in graphs that don't generate state-machine snapshots.
 [[ports]]
@@ -35,7 +35,7 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
-# State-machine snapshot export to snapshot_engine.app_snapshot_chunk_in.
+# State-machine snapshot export to durability.app_snapshot_body.
 # Carries one or more `MSG_APP_SNAPSHOT_CHUNK` envelopes terminated by
 # `done = 1`. Emitted in response to a `MSG_APP_SNAPSHOT_REQUEST`. See
 # RFC §2.1.
@@ -45,5 +45,5 @@ direction = "output"
 content_type = "OctetStream"
 
 [observability]
-# Minimal downstream demo consumer of apply_pipeline.committed_entries.
-exempt = "minimal downstream demo consumer; applied-entry throughput is observed upstream at apply_pipeline (entries_applied) — it rides the substrate as fluxor echo_worker rides its transport"
+# Minimal downstream demo consumer of consensus.committed_entries.
+exempt = "minimal downstream demo consumer; applied-entry throughput is observed upstream at consensus (entries_applied) — it rides the substrate as fluxor echo_worker rides its transport"

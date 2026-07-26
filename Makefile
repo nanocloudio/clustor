@@ -16,7 +16,7 @@ help:
 	@echo "clustor lifecycle:"
 	@echo "  make build     cargo build --workspace --all-targets"
 	@echo "  make test      cargo test --workspace (TEST_THREADS=$(TEST_THREADS))"
-	@echo "  make lint      rustfmt --check + clippy -D warnings"
+	@echo "  make lint      rustfmt --check + clippy -D warnings + palette lint"
 	@echo "  make ci        fluxor ci — the full gate (lints, hygiene,"
 	@echo "                 tests, strict module build, lockfile checks)"
 	@echo "  make publish   fluxor publish — canonical registry publish"
@@ -54,6 +54,7 @@ bench:
 lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
+	tools/palette-lint.sh
 
 ci:
 	fluxor ci

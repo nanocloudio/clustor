@@ -112,13 +112,13 @@ Leaders serve ReadIndex requests only when **all** of:
 
 Violations emit `ControlPlaneUnavailable{reason}` with the priority
 order in [errors.md](errors.md#controlplaneunavailable). Telemetry
-exposes `read_gate.can_serve_readindex` and
-`read_gate.failed_clause`.
+exposes `readgate.can_serve_readindex` and
+`readgate.failed_clause`.
 
 ### Reference predicate
 
 ```rust
-fn read_gate_predicate(state: &LeaderState) -> (bool, FailedClause) {
+fn can_serve_readindex(state: &LeaderState) -> (bool, FailedClause) {
     if state.controlplane.cache_state == CacheState::Expired {
         return (false, FailedClause::ControlPlaneCacheExpired);
     }

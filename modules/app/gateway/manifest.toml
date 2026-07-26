@@ -1,0 +1,146 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# gateway — client envelope routing, framing/correlation and
+# admission as one composite module (standards fluxor-modules.md §8).
+#
+# Components: surface (peer_router frame demux + response framing),
+# codec (correlation hub, tagged proposals, leader redirect, epoch
+# fencing), throttle (credit-based admission).
+#
+# The client path runs surface → codec → throttle inside the module;
+# admitted proposals leave on `proposals_tagged`, rejections return
+# to the wire through the surface and tee on `rejected`.
+
+[[ports]]
+name = "requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "throttle_status"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_responses"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "readyz_data"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "why_data"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics_data"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "applied"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "placement"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposal_assigned"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "leader_state"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "credit_supply"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals"
+direction = "input"
+content_type = "OctetStream"
+# Tagged proposals injected by external producers (bench drivers, the
+# operations module's /propose and admin-PROPOSE bridges). Admitted
+# through the same throttle as wire-side client traffic.
+
+[[ports]]
+name = "client_requests"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + conn_id (1) + client record (up to 2044).
+max_record = 2048
+rate_class_max = "transaction"
+# Pre-demuxed client traffic: `[conn_id:u8][body]` framed as
+# MSG_CLIENT_PROPOSAL or MSG_CLIENT_READ_REQUEST, from a producer that
+# already owns the connection namespace and does its own request
+# routing. `requests` (in[0]) carries peer_router's MSG_CLIENT_FRAME
+# envelope and is demuxed by the surface; this port bypasses that and
+# feeds the codec directly. Responses return on `responses` through
+# the codec's existing correlation rings, identical to wire traffic.
+
+[[ports]]
+name = "raft_rpc"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "responses"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_req"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + conn_id (1) + admin command body (up to 2044).
+max_record = 2048
+rate_class_max = "transaction"
+
+[[ports]]
+name = "proposals_tagged"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + correlation id (8) + client record (up to 2037).
+max_record = 2048
+rate_class_max = "transaction"
+
+[[ports]]
+name = "rejected"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "reads"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+max_record = 2048
+rate_class_max = "transaction"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+# Admission counters from the throttle component. Surface/codec
+# publish flow on data ports, not telemetry.
+metrics = ["requests_admitted", "requests_rejected"]

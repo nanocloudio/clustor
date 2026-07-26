@@ -7,7 +7,7 @@
 //! `[correlation_id:u64 LE][body]`. Each proposal is hashed
 //! (FNV-1a-64 over the body, never over the correlation_id prefix) to
 //! a `partition_id` and re-emitted on the partitioned envelope to the
-//! per-partition `raft_engine` instance.
+//! per-partition `consensus` instance.
 //!
 //! Per-partition outputs come in pairs: `proposals_out_p<i>` for
 //! untagged proposals (raft side: `proposals_partitioned`) and
@@ -15,7 +15,7 @@
 //! `proposals_partitioned_tagged`). With four partitions per router
 //! instance that's eight output ports total — exactly the fluxor
 //! 8-port-per-direction budget. Larger fan-out needs the multi-tenant
-//! raft_engine RFC follow-up (or a tree of partition_routers).
+//! consensus RFC follow-up (or a tree of partition_routers).
 //!
 //! See `clustor/.context/rfc_partition_groups.md` step 4 for the design.
 
@@ -245,7 +245,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
                 // Forward the tagged payload as-is (correlation_id +
                 // body), wrapped in the partitioned envelope. The
-                // recipient (raft_engine.proposals_partitioned_tagged)
+                // recipient (consensus.proposals_partitioned_tagged)
                 // strips the correlation prefix on the way into its
                 // batch.
                 wire_channels::channel_write_partitioned(

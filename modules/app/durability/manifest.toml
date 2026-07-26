@@ -1,0 +1,174 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# durability — WAL, quorum durability ledger, snapshots and key
+# epochs as one composite module (standards fluxor-modules.md §8).
+#
+# Components: wal (segment WAL: CRC32C framing, replay, group/async
+# fenced fsync, truncation, compaction, gap-refetch serving), ledger
+# (per-replica durable indices → quorum proofs), snapshot (manifest
+# persistence + chunked install transfer + retention floors + app
+# snapshot round-trip), keys (DEK epoch rotation).
+#
+# Variants:
+#   disk (default) — durable composition; FS-backed segments and
+#     snapshots; quorum proofs on `quorum_durable`.
+#   volatile — in-memory retention selected at compile time; the
+#     ledger component is compiled out, so `ack` and `quorum_durable`
+#     are absent and the composition is structurally incapable of
+#     emitting a durability proof. Acknowledgements on `flushed` mean
+#     replicated-volatile at best.
+#
+# Deployment note (disk): `wal/` must exist and be writable in the
+# process working directory unless `root_path = 1` (bare-metal FAT32
+# 8.3 layout at the FS root, shared by segments and snapshots).
+
+permissions = []
+
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+[[variant]]
+name = "volatile"
+features = ["volatile"]
+omit_ports = ["ack", "quorum_durable"]
+
+[[variant]]
+name = "disk"
+# Marker feature: the durable path is the base component set; the
+# marker satisfies the variant-is-a-feature-set rule without gating
+# any code of its own.
+features = ["disk"]
+default = true
+
+# ── inputs ───────────────────────────────────────────────────
+
+[[ports]]
+name = "entries"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "entry_request"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "compact_before"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ack"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "import_chunks"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "trigger"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "install_request"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "retention_floor"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "app_snapshot_body"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 4124
+rate_class_max = "transaction"
+
+# ── outputs ──────────────────────────────────────────────────
+
+[[ports]]
+name = "flushed"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + fsync ack (17).
+max_record = 20
+rate_class_max = "transaction"
+
+[[ports]]
+name = "replay_complete"
+direction = "output"
+content_type = "OctetStream"
+# Dedicated boot handoff — never multiplexed onto `flushed`, which
+# also fans out durability acknowledgements.
+
+[[ports]]
+name = "entry_reply"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + reply header (28) + entry body (2048).
+max_record = 2079
+rate_class_max = "transaction"
+
+[[ports]]
+name = "compaction_signal"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "quorum_durable"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + durability proof (19).
+max_record = 22
+rate_class_max = "transaction"
+
+[[ports]]
+name = "export_chunks"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "manifest_auth"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "installed_local"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "app_snapshot_ctl"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 16384
+max_record = 4124
+rate_class_max = "transaction"
+
+[[ports]]
+name = "cert_refresh"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+metrics = ["entries_written", "bytes_written", "segment_seq", "pending_depth", "write_errors", "checksum_failures", "truncations", "input_budget_bytes", "pump_records", "continuity_errors", "durable_index", "quorum_transitions", "snapshots_taken", "chunks_imported", "triggers_deferred", "install_failures", "app_bodies_received", "app_captures_timed_out"]
+histograms = ["fsync_latency_ms", "transfer_seconds"]

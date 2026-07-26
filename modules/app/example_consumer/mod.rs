@@ -7,7 +7,7 @@
 //!
 //! What it does:
 //!
-//! - Subscribes to `apply_pipeline.committed_entries` and processes
+//! - Subscribes to `consensus.committed_entries` and processes
 //!   each `MSG_COMMITTED_ENTRY` in strict commit-index order, using
 //!   `CommittedSubscriber::ingest_committed_entry`.
 //! - Maintains a tiny xor-accumulator over each committed command
@@ -21,8 +21,8 @@
 //!
 //! Wire shape:
 //!
-//!   in[0]  committed_entries     ← apply_pipeline.committed_entries
-//!   out[0] metrics               → telemetry_agg.ingest
+//!   in[0]  committed_entries     ← consensus.committed_entries
+//!   out[0] metrics               → operations.ingest
 //!
 //! This module is intentionally non-essential to the cluster's
 //! correctness — it never proposes, never participates in quorum,
@@ -67,11 +67,11 @@ const SCRATCH_BUF_BYTES: usize = 2048 + 32;
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_entries: i32,            // in[0]: MSG_COMMITTED_ENTRY from apply_pipeline.committed_entries
+    in_entries: i32,            // in[0]: MSG_COMMITTED_ENTRY from consensus.committed_entries
     in_snapshot_chunk: i32,     // in[1]: MSG_APP_SNAPSHOT_CHUNK / MSG_APP_SNAPSHOT_RESET
     in_snapshot_request: i32,   // in[2]: MSG_APP_SNAPSHOT_REQUEST
-    out_metrics: i32,           // out[0]: MSG_METRICS to telemetry_agg
-    out_snapshot_export: i32,   // out[1]: MSG_APP_SNAPSHOT_CHUNK back to snapshot_engine
+    out_metrics: i32,           // out[0]: MSG_METRICS to operations
+    out_snapshot_export: i32,   // out[1]: MSG_APP_SNAPSHOT_CHUNK back to durability
 
     /// Strict-commit-order subscriber for the per-entry stream.
     subscriber: CommittedSubscriber,
@@ -83,7 +83,7 @@ struct ModuleState {
     applied_count: u32,
 
     /// Count of gaps observed on the per-entry stream. Non-zero is a
-    /// signal that the consumer fell behind apply_pipeline's ring;
+    /// signal that the consumer fell behind consensus's ring;
     /// the right recovery is a snapshot install (out of scope for
     /// this example).
     stream_gaps: u32,
@@ -254,7 +254,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // 1c) Honour export requests by emitting our trivial accumulator
-        //     as a single chunk back to snapshot_engine.
+        //     as a single chunk back to durability.
         if s.in_snapshot_request >= 0 && s.out_snapshot_export >= 0 {
             for _ in 0..2 {
                 let poll = (sys.channel_poll)(s.in_snapshot_request, 0x01);

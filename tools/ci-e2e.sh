@@ -5,4 +5,8 @@
 # the human-run suite can never drift. `fluxor ci` runs this from the
 # project root after the strict module build.
 set -euo pipefail
+
+# Palette lint: shipped artefacts must describe the module palette as
+# it is. Cheap and fail-fast, so it runs before the expensive suites.
+"$(dirname "$0")/palette-lint.sh" "$(dirname "$0")/.."
 make e2e

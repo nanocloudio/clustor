@@ -1,5 +1,5 @@
-//! HTTP admin path / op-code mapping, shared between the
-//! `http_adapter` module and host-side tests.
+//! HTTP admin path / op-code mapping, shared between the operations
+//! module's http component and host-side tests.
 //!
 //! Pulled in from both sides via `#[path = "../common/http_admin.rs"]`,
 //! so the wire constant for each `/admin/<op>` path is defined in
@@ -39,7 +39,7 @@ pub const ADMIN_OP_PROPOSE: u8 = 0x08;
 pub const ADMIN_BODY_MAX: usize = 1022;
 
 /// Map a path-tail (everything after `/admin/`) to the admin op byte
-/// expected by `admin_handler`. Returns `None` for unknown op names so
+/// expected by the admin component. Returns `None` for unknown op names so
 /// the adapter can reply 400.
 pub fn admin_op_code(name: &[u8]) -> Option<u8> {
     if name == b"freeze" {
@@ -58,7 +58,7 @@ pub fn admin_op_code(name: &[u8]) -> Option<u8> {
 }
 
 /// Whether a body of `body_len` bytes fits inside the admin envelope's
-/// fixed-size buffer. The `http_adapter` enqueue path checks this
+/// fixed-size buffer. The http component's enqueue path checks this
 /// before doing any work and short-circuits with `false` (→ HTTP 503)
 /// when it doesn't fit.
 #[inline]

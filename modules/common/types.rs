@@ -31,7 +31,7 @@ pub const CP_CACHED: u8 = 1;
 pub const CP_STALE: u8 = 2;
 pub const CP_EXPIRED: u8 = 3;
 
-/// Per-replica replication progress (used by commit_tracker, durability_ledger, replicator).
+/// Per-replica replication progress (used by consensus, durability, replicator).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ReplicaProgress {

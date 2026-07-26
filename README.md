@@ -6,10 +6,15 @@ consensus kernel with durable log replication, quorum tracking,
 diagnostic surfaces, and a typed consumer facade for replicated
 state machines.
 
-The implementation is Fluxor-native: 23 substrate modules plus
-`example_consumer` (24 buildable `.fmod` artifacts) ship as
-position-independent ELFs and run cooperatively on the Fluxor
-runtime.
+The implementation is Fluxor-native: a palette of seven substrate
+modules — `peer_router`, `consensus`, `durability`, `gateway`,
+`admission`, `control_plane`, `operations` — ships as
+position-independent ELFs and runs cooperatively on the Fluxor
+runtime, alongside the standalone `session_directory` and
+`partition_router`, two bench drivers, and `example_consumer`.
+Each module is one source tree composed of named components;
+`durability` and `operations` each build a second variant fmod
+(`volatile`, `headless`) with a narrowed port set.
 
 The architecture docs — every wire byte, durability invariant, and
 operational guardrail — live under
@@ -85,7 +90,7 @@ through the same registry mechanism by declaring `clustor = "X.Y"`
 in their `fluxor.toml::[dependencies]`. From clustor's checkout:
 
 ```sh
-make publish               # publish clustor-common + 24 substrate fmods
+make publish               # publish clustor-common + the substrate fmod palette
 ```
 
 This populates `~/.fluxor/registry/cargo/clustor-common-X.Y.Z.crate`
@@ -101,12 +106,12 @@ new release; `fluxor publish` rejects mismatches at publish time.
 ## Quick start
 
 ```sh
-make modules              # build .fmod for bcm2712 (default target)
-make up                   # render+run configs/single.yaml
-make up CONFIG=configs/multi-3node.yaml NODE_ID=0  # node 0 of a 3-node cluster
-make test                 # host-side test suite (~20 s)
-make ci                   # full pipeline (fmt + test + clippy + modules)
-make help                 # everything else
+fluxor modules build --all   # build .fmod for bcm2712 (default target)
+fluxor up configs/single.yaml
+make test                    # host-side test suite (~20 s)
+make e2e                     # strict cluster/chaos/partition/wal e2e
+make ci                      # full pipeline (fmt + test + clippy + modules)
+make help                    # everything else
 ```
 
 The cluster harness needs `fluxor` on PATH (defaults to
@@ -127,7 +132,7 @@ behaviour.
 
 | Path           | Contents |
 |----------------|----------|
-| `modules/app/`    | 24 `no_std` PIC modules — 23 substrate modules (`raft_engine`, `wal`, …) plus `example_consumer`, the minimal downstream module that exercises the per-entry stream. `make modules` packs each `mod.rs` + `manifest.toml` into a `.fmod`. |
+| `modules/app/`    | `no_std` PIC modules — the seven substrate modules (`consensus`, `durability`, …), the standalone `session_directory` and `partition_router`, the `consensus_bench` / `nvme_bench` drivers, and `example_consumer`, the minimal downstream module that exercises the per-entry stream. `fluxor modules build` packs each `mod.rs` + `manifest.toml` into a `.fmod`, one per module plus one per declared variant. |
 | `modules/common/` | Shared types, wire constants, the consumer facade, and the HTTP admin mapping. Pulled into each app module via `#[path]` and into host tests via the same mechanism. |
 | `configs/`     | `fluxor run` graph templates. `single.yaml` (1 node), `multi-2node.yaml` (2 replicas), `multi-3node.yaml` (3 replicas, canonical Raft availability shape), `multi-2node-2p*.yaml` (partition-group experiments), `single-minimal.yaml` (commit-pipeline only). Each carries `__SELF_ID__` / `__LISTEN_PORT__` / `__PEER{0,1,2}_PORT__` placeholders that `fluxor render-template` (and the cluster harness) substitute per node. |
 | `tests/`       | Host-side integration tests: `facade.rs`, `facade_stress.rs`, `cluster.rs`, `chaos.rs`, `sandbox.rs`. The cluster harness at `tests/support/cluster.rs` spawns multi-node `fluxor-linux` processes. |
@@ -139,19 +144,23 @@ behaviour.
 
 ## Module map
 
-The 23 substrate modules (`example_consumer` is wired only into the
-minimal smoke graph) sit in four execution domains on a Pi 5 / CM5:
+The seven substrate modules (`example_consumer` is wired only into
+the minimal smoke graph) sit in four execution domains on a
+Pi 5 / CM5:
 
-| Domain     | Tick   | Modules                                                                                             |
-|------------|--------|------------------------------------------------------------------------------------------------------|
-| consensus  | poll   | `raft_engine`, `wal`, `durability_ledger`, `commit_tracker`                                          |
-| network    | poll   | `peer_router`, `replicator` (with platform `nic`/`ip`/`tls`)                                         |
-| apply      | 250 µs | `client_codec`, `throttle_gate`, `partition_router`, `flow_controller`, `read_gate`, `apply_pipeline`, `placement_router` |
-| ops        | 1 ms   | `client_surface`, `cp_bridge`, `cp_proof_cache`, `rbac`, `admin_handler`, `snapshot_engine`, `telemetry_agg`, `key_manager`, `http_ingress`, `http_adapter` |
+| Domain     | Tick   | Modules | Components |
+|------------|--------|---------|------------|
+| consensus  | poll   | `consensus`, `durability` | raft, replicator, commit, apply · wal, ledger, snapshot, keys |
+| network    | poll   | `peer_router` (with platform `nic`/`ip`/`tls`) | — |
+| apply      | 250 µs | `gateway`, `admission` | surface, codec, throttle · proof_cache, read gate, flow |
+| ops        | 1 ms   | `operations`, `control_plane` | rbac, admin, telemetry, http, ingress · cp, placement |
 
-Cross-domain edges run over fluxor mailbox channels with SEV/WFE
-hardware wake (~200 ns on coherent L3). The full wiring graph is
-canonical in [`configs/single.yaml`](configs/single.yaml); see
+Each module is one scheduler entity with one arena; components are
+source subtrees inside it, stepped by an explicit dispatch table so
+intra-tick ordering is owned in one place. Cross-domain edges run
+over fluxor mailbox channels with SEV/WFE hardware wake (~200 ns on
+coherent L3). The full wiring graph is canonical in
+[`configs/single.yaml`](configs/single.yaml); see
 [`docs/architecture/modules.md`](docs/architecture/modules.md) for the rationale.
 
 ## Consumer facade
@@ -180,15 +189,15 @@ unit and integration coverage lives in
 
 | Surface              | State |
 |----------------------|-------|
-| `raft_engine`        | Leader election, AE, log matching, conflict-repair retry, joint consensus, leadership transfer — passing in `cluster.rs`. |
-| `wal` / `durability_ledger` | Per-partition WAL, fsync ack, quorum durability — passing. |
-| `apply_pipeline`     | Strict commit-order delivery, snapshot reset, per-entry fan-out — passing. |
-| `snapshot_engine`    | Manifest auth, chunked install/export, follower catch-up — passing. |
-| `read_gate` / `cp_proof_cache` | Fresh→Cached→Stale state machine, strict-fallback transitions — passing. |
-| `admin_handler`      | `FREEZE`, `THAW`, `TRANSFER_LEADER`, `DURABILITY_MODE`, `SNAPSHOT_TRIGGER` route through. `ADD/REMOVE_VOTER` returns `ADMIN_STATUS_UNSUPPORTED` — the `raft_engine` joint-consensus state machine (`CONFIG_CHANGE_OP_JOINT/_NEW`, voter-set overlay, auto-C_new on commit) exists and applies entries correctly, but `commit_tracker` and `durability_ledger` don't yet enforce *union* quorum during the joint phase. Accepting membership changes without that enforcement risks losing committed entries; the safe gate stays closed until learner + union-quorum lands (see [`docs/architecture/lifecycle.md#membership-changes-and-joint-consensus`](docs/architecture/lifecycle.md#membership-changes-and-joint-consensus)). |
+| `consensus` (raft)   | Leader election, AE, log matching, conflict-repair retry, joint consensus, leadership transfer — passing in `cluster.rs`. |
+| `durability` (wal / ledger) | Per-partition WAL, fsync ack, quorum durability — passing. |
+| `consensus` (apply)  | Strict commit-order delivery, snapshot reset, per-entry fan-out — passing. |
+| `durability` (snapshot) | Manifest auth, chunked install/export, follower catch-up — passing. |
+| `admission`          | Fresh→Cached→Stale proof ladder, strict-fallback transitions, standing read permits — passing. |
+| `operations` (admin) | `FREEZE`, `THAW`, `TRANSFER_LEADER`, `DURABILITY_MODE`, `SNAPSHOT_TRIGGER` route through. `ADD/REMOVE_VOTER` returns `ADMIN_STATUS_UNSUPPORTED` — the joint-consensus state machine in `consensus`'s raft component (`CONFIG_CHANGE_OP_JOINT/_NEW`, voter-set overlay, auto-C_new on commit) exists and applies entries correctly, but the commit component and the durability ledger don't yet enforce *union* quorum during the joint phase. Accepting membership changes without that enforcement risks losing committed entries; the safe gate stays closed until learner + union-quorum lands (see [`docs/architecture/lifecycle.md#membership-changes-and-joint-consensus`](docs/architecture/lifecycle.md#membership-changes-and-joint-consensus)). |
 | `partition_router`   | FNV-1a partition routing, 2-partition smoke working ([configs/multi-2node-2p.yaml](configs/multi-2node-2p.yaml), exercised by [tests/partition.rs](tests/partition.rs)). N-partition + per-partition admin still in flight. |
-| `cp_bridge`          | HTTP fetcher polls a host control plane; production CP integration is the next milestone. |
-| Telemetry            | `GET /readyz` / `/why` / `/metrics` reachable on each node's `listen_port + 10000` HTTP socket via `http_ingress` + `http_adapter`; histograms and incidents in place; full Prometheus pull is pending. |
+| `control_plane`      | The CP component polls a host control plane over HTTP; production CP integration is the next milestone. |
+| Telemetry            | `GET /readyz` / `/why` / `/metrics` reachable on each node's `listen_port + 10000` HTTP socket via `operations`; histograms and incidents in place; full Prometheus pull is pending. |
 
 ## Performance
 

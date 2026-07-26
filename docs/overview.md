@@ -6,14 +6,17 @@ fsync it durably, gate reads on quorum durability, and expose the
 result through a typed consumer facade so downstream products
 (Lattice, Loam, Quantum) attach without reimplementing consensus.
 
-Where most Raft libraries are monolithic, clustor is a wired graph:
-`raft_engine` runs elections, `wal` writes segments,
-`durability_ledger` tracks per-replica fsync watermarks,
-`commit_tracker` enforces the ACK contract, `apply_pipeline` emits
-committed entries to consumers. Every module is `no_std` PIC,
-position-independent, and lives behind explicit channels — so the
-substrate looks the same whether the graph is a single-node smoke
-test or a three-node production deployment.
+Where most Raft libraries are monolithic, clustor is a wired graph
+of seven modules: `consensus` runs elections and orders the apply
+stream, `durability` writes segments and tracks per-replica fsync
+watermarks, `gateway` frames and admits client traffic,
+`admission` gates it, `peer_router` moves bytes between replicas,
+`control_plane` publishes proofs and placement, `operations`
+carries admin and telemetry. Each module is one source tree of
+named components with an explicit dispatch table; every module is
+`no_std` PIC, position-independent, and lives behind explicit
+channels — so the substrate looks the same whether the graph is a
+single-node smoke test or a three-node production deployment.
 
 ## Start Here
 
@@ -44,7 +47,7 @@ Subsystem deep-dives and operational guidance.
 
 - [proposal_correlation.md](proposal_correlation.md) — tagged-proposal correlation across the propose/commit boundary
 - [net_http.md](net_http.md) — diagnostic HTTP surface, parser limits, stderr signals
-- [substrate_sharing.md](substrate_sharing.md) — sharing one clustor substrate across consumer products
+- [substrate_sharing.md](substrate_sharing.md) — the published attach surface downstream graphs wire, and how one clustor substrate is shared across consumer products
 - [consuming_fluxor.md](consuming_fluxor.md) — day-to-day workflow for pulling fluxor in via the local registry
 - [dependencies.md](dependencies.md) — fluxor consumption + `[dev-dependencies]` inventory
 - [test_catalog.md](test_catalog.md) — test inventory and what each scenario asserts

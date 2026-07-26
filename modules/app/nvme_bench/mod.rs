@@ -16,7 +16,7 @@
 //!
 //! Results are emitted two ways: parseable `[nvbench] ...` lines over
 //! `dev_log` (the rig's UDP `log_net` channel) and typed
-//! `MSG_METRIC_SAMPLE` to telemetry_agg so `/metrics` carries the floor.
+//! `MSG_METRIC_SAMPLE` to operations so `/metrics` carries the floor.
 //!
 //! The benchmark is a phased state machine advanced a bounded number of
 //! blocks per `module_step` so it never overruns the cooperative step
@@ -168,7 +168,7 @@ define_params! {
 struct ModuleState {
     syscalls: *const SyscallTable,
     in_trigger: i32,  // in[0]: unused start trigger (may be unwired)
-    out_metrics: i32, // out[0]: MSG_METRIC_SAMPLE to telemetry_agg
+    out_metrics: i32, // out[0]: MSG_METRIC_SAMPLE to operations
 
     // Params
     block_size: u32,
@@ -396,12 +396,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // — it is "ready" the instant it is stepped — so we advertise Ready on
         // the first step, mirroring `foundation/ip` signalling Ready once
         // `ip_configured`. Without this, a downstream aggregator whose ONLY
-        // forward upstream is this bench (telemetry_agg in nvme-bench-cm5)
+        // forward upstream is this bench (operations in nvme-bench-cm5)
         // would stay ready-gated forever — its `/metrics` export never fills.
         // The bit is sticky (the scheduler clears it only on module restart),
         // so this fires exactly once; we still emit metrics this tick — only
         // the StepOutcome differs. (The busy consensus graph is unaffected: its
-        // telemetry_agg upstreams are non-deferred, so they are ready by
+        // operations upstreams are non-deferred, so they are ready by
         // default and never gate it.)
         if s.steps == 1 {
             emit_metrics(s, sys);
@@ -759,7 +759,7 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
     }
 
     if s.out_metrics < 0 { return; }
-    let mid = wire::MODULE_ID_NVME_BENCH;
+    let mid = wire::SOURCE_ID_NVME_BENCH;
     emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_PHASE, wire::METRIC_KIND_GAUGE, i64::from(s.phase));
     emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_BYTES_WRITTEN, wire::METRIC_KIND_COUNTER, s.bytes_written as i64);
     emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_SEQ_KBPS, wire::METRIC_KIND_GAUGE, i64::from(s.seq_kbps));

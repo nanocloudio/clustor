@@ -1,38 +1,38 @@
 //! Peer Router — Multi-peer connection routing for Raft clusters.
 //!
 //! Sits on the cleartext side of the foundation tls module. Routes
-//! inbound connections to either client_surface (clients) or
-//! per-partition raft_engine/replicator instances (peers) based on an
+//! inbound connections to either the gateway (clients) or
+//! per-partition consensus instances (peers) based on an
 //! identity handshake plus a partition_id stamped into the on-wire
-//! envelope. Outbound messages from raft_engine/replicator arrive as
+//! envelope. Outbound messages from consensus arrive as
 //! 6-byte routed-partitioned frames (`[target:u8][partition_id:u16 LE]
 //! [msg_type:u8][len:u16 LE]`) and are forwarded to the named peer with
 //! the 5-byte partitioned envelope `[partition_id:u16 LE][msg_type:u8]
 //! [len:u16 LE]` on the wire.
 //!
 //! Graph position:
-//!   ip ↔ tls (foundation) ↔ peer_router ↔ { client_surface,
-//!                                           replicator_pN,
-//!                                           raft_engine_pN }
+//!   ip ↔ tls (foundation) ↔ peer_router ↔ { gateway,
+//!                                           consensus_pN }
 //!
 //! Ports:
 //!   net_in      (in[0]):  cleartext from tls (net_proto events)
 //!   peer_tx     (in[1]):  routed-partitioned outbound from
-//!                         raft_engine.rpc_out (votes, AE, heartbeats)
+//!                         consensus.rpc_out (votes, AE, heartbeats)
 //!   repl_tx     (in[2]):  routed-partitioned outbound from
-//!                         replicator.net_out (AE bodies, snapshot
+//!                         consensus.net_out (AE bodies, snapshot
 //!                         chunks)
-//!   client_resp (in[3]):  conn_id-tagged responses from client_surface
+//!   client_resp (in[3]):  conn_id-tagged responses from the gateway
 //!   net_out     (out[0]): cleartext to tls (net_proto commands)
-//!   cleartext   (out[1]): non-Raft client data → client_surface
+//!   cleartext   (out[1]): non-Raft client data → gateway
 //!   peer_rx     (out[2]): MSG_APPEND_ENTRIES_RESP frames →
-//!                         replicator_pN.ack_in (each filters by its
-//!                         own partition_id; fluxor inserts a tee
-//!                         when more than one consumer is wired in)
+//!                         consensus_pN.ack (each instance's
+//!                         replicator component filters by its own
+//!                         partition_id; fluxor inserts a tee when
+//!                         more than one consumer is wired in)
 //!   raft_rpc    (out[3]): MSG_APPEND_ENTRIES / MSG_REQUEST_VOTE /
 //!                         MSG_PRE_VOTE / MSG_HEARTBEAT (and their
 //!                         _RESP siblings other than AE_RESP) →
-//!                         raft_engine_pN.rpc_in (each filters by
+//!                         consensus_pN.rpc (each filters by
 //!                         partition_id)
 
 #![no_std]
@@ -281,15 +281,15 @@ struct ModuleState {
 
     // Channels
     net_in: i32,        // in[0]: cleartext net_proto events from tls/ip
-    peer_tx: i32,       // in[1]: routed-partitioned outbound from raft_engine
+    peer_tx: i32,       // in[1]: routed-partitioned outbound from consensus
     repl_tx: i32,       // in[2]: routed-partitioned outbound from replicator
-    client_resp: i32,   // in[3]: conn_id-tagged responses from client_surface
+    client_resp: i32,   // in[3]: conn_id-tagged responses from the gateway
     tls_identity: i32,  // in[4]: MSG_PEER_IDENTITY from foundation tls
     net_out: i32,       // out[0]: net_proto commands to tls/ip
-    cleartext: i32,     // out[1]: non-Raft client data → client_surface
+    cleartext: i32,     // out[1]: non-Raft client data → gateway
     peer_rx: i32,       // out[2]: AppendEntries acks → replicator_pN
-    raft_rpc: i32,      // out[3]: votes/AE/heartbeats → raft_engine_pN
-    out_metrics: i32,   // out[4]: MSG_METRIC_SAMPLE to telemetry_agg
+    raft_rpc: i32,      // out[3]: votes/AE/heartbeats → consensus_pN
+    out_metrics: i32,   // out[4]: MSG_METRIC_SAMPLE to operations
 
     // Config
     self_id: ReplicaId,
@@ -310,7 +310,7 @@ struct ModuleState {
     /// Set once we've warned that a `MSG_ACCEPTED` arrived WITHOUT a
     /// stamped listener port (`payload_len < 3`). On a shared
     /// linux_net/ip provider that means we cannot tell our own client
-    /// conns from another anchor's (e.g. http_ingress's diagnostic
+    /// conns from another anchor's (e.g. the operations HTTP diagnostic
     /// port) and fall back to claiming everything — which silently
     /// misroutes the other anchor's bytes here as bogus client
     /// proposals. The modern provider stamps the port (fluxor
@@ -427,7 +427,7 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     for c in s.conns.iter() {
         if c.active { open += 1; }
     }
-    let mid = wire::MODULE_ID_PEER_ROUTER;
+    let mid = wire::SOURCE_ID_PEER_ROUTER;
     let samples: [(u16, u8, i64); 3] = [
         (wire::metric_ids::PEER_CONNECTIONS_OPEN, wire::METRIC_KIND_GAUGE, open),
         (wire::metric_ids::PEER_BYTES_IN, wire::METRIC_KIND_COUNTER, s.bytes_in as i64),
@@ -638,21 +638,21 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                 // payload: [conn_id: u8][local_port: u16 LE]
                 //
                 // We share `net_in` (linux_net / ip `net_out`) with the
-                // other anchors on this node — `http_ingress` binds its
+                // other anchors on this node — the operations ingress binds its
                 // own diagnostic port on the same provider. The provider
                 // tees every MSG_ACCEPTED to all anchors and stamps the
                 // accepting listener's port so each anchor claims only
                 // the conns its own CMD_BIND accepted (see fluxor
                 // `ip::net_send_accepted` / `linux_net` providers). Without
                 // this filter peer_router would alloc a slot for an
-                // http_ingress connection and forward its raw HTTP bytes
-                // to client_surface as a bogus client proposal.
+                // diagnostic HTTP connection and forward its raw HTTP
+                // bytes to the gateway as a bogus client proposal.
                 let local_port = if payload_len >= 3 {
                     u16::from_le_bytes([s.buf[NET_FRAME_HDR + 1], s.buf[NET_FRAME_HDR + 2]])
                 } else {
                     // Legacy providers that omit the port: claim as before.
                     // On a shared provider this misroutes other anchors'
-                    // conns (e.g. http_ingress) here as bogus client
+                    // conns (e.g. the HTTP diagnostic port) here as bogus client
                     // proposals — warn once so a stale runtime is visible
                     // rather than a silent double-processing bug.
                     if !s.legacy_accept_warned {
@@ -717,7 +717,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                         // Peer traffic: parse 5-byte partitioned envelope
                         // [partition_id:u16 LE][msg_type:u8][len:u16 LE]
                         // - APPEND_ENTRIES_RESP        → peer_rx (replicator_pN)
-                        // - Other Raft control RPCs    → raft_rpc (raft_engine_pN)
+                        // - Other Raft control RPCs    → raft_rpc (consensus_pN)
                         // - Anything else from a peer  → drop (untrusted shape)
                         if cl < wire::PARTITIONED_HDR { continue; }
                         let peer_msg_type = local[2];
@@ -736,7 +736,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                             | wire::MSG_HEARTBEAT_RESP
                             // ReadIndex leadership-confirm round (RFC §1.3):
                             // follower receives the leader's PROBE, leader
-                            // receives the follower's RESP — raft_engine
+                            // receives the follower's RESP — consensus
                             // handles both on its rpc input. Omitting these
                             // silently killed multi-node linearizable reads
                             // (every probe timed out → LIN-BOUND reject);
@@ -754,7 +754,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                             }
                         }
                     } else {
-                        // Client traffic → client_surface. Frame each record
+                        // Client traffic → gateway. Frame each record
                         // as a MSG_CLIENT_FRAME envelope so records from
                         // different conn_ids don't coalesce on the byte FIFO
                         // (see wire::MSG_CLIENT_FRAME).
@@ -765,7 +765,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                         // >0.5 KiB publish) while small control packets
                         // still pass — an undersized buffer here looks
                         // healthy right up until real payloads vanish.
-                        // client_surface's msg_buf must hold conn_id +
+                        // gateway's msg_buf must hold conn_id +
                         // this full record.
                         if s.cleartext >= 0 && cl <= 4096 {
                             let mut tagged = [0u8; 4097];
@@ -1035,7 +1035,7 @@ unsafe fn send_to_conn(
 /// `&ModuleState` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-/// Read conn_id-tagged responses from client_surface and send back to
+/// Read conn_id-tagged responses from the gateway and send back to
 /// the originating TCP connection.
 /// Format: [conn_id: u8] [msg_type: u8] [len: u16 LE] [payload]
 unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {

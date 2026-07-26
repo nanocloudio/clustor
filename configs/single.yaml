@@ -1,12 +1,10 @@
 # Clustor — single-node test cluster (template).
 #
-# DEV/TEST ONLY. The `http_adapter.admin_request → admin_handler.requests`
-# edge below routes `POST /admin/<op>` straight into admin_handler
-# without going through `rbac`, so any client that can reach the
-# HTTP listener can issue FREEZE / THAW / TRANSFER_LEADER / SNAPSHOT.
-# Don't deploy this config to anywhere the HTTP port isn't already
-# behind an authenticated proxy. Routing HTTP admin through rbac is
-# tracked at docs/native_fluxor.md.
+# DEV/TEST NOTE. `POST /admin/<op>` on the HTTP port is admitted
+# through the operations module's rbac component as `default_role`
+# (HTTP carries no peer identity), which defaults to operator. A
+# deployment that must not accept HTTP admin sets an observer
+# `default_role` or selects `variant: headless` on `operations`.
 #
 # This file is a TEMPLATE: it contains `__SELF_ID__` and
 # `__LISTEN_PORT__` placeholders that must be substituted before
@@ -23,10 +21,9 @@ target: linux
 tick_us: 1000
 
 # The clustor module graph is intentionally cyclic — the consensus
-# loop (raft_engine → replicator → peer_router → raft_engine,
-# apply_pipeline → raft_engine.admin_committed, commit_tracker
-# → raft_engine.commit, etc.) only converges through these
-# feedback edges. accept_cycles tells fluxor's prepare_graph to
+# feedback loop (consensus → peer_router → consensus, plus the
+# admission/durability feedback edges) only converges through these
+# cycles. accept_cycles tells fluxor's prepare_graph to
 # accept the graph and route the cycles via the end-of-tick fixed
 # point per RFC §5.1.
 scheduler:
@@ -42,53 +39,25 @@ modules:
       peer_count: 1
       listen_port: __LISTEN_PORT__
       peer0_port: __LISTEN_PORT__
-  - name: client_codec
+  - name: gateway
     params:
       self_id: __SELF_ID__
-  - name: throttle_gate
-  - name: raft_engine
+  - name: consensus
     params:
       self_id: __SELF_ID__
       voter_count: 1
       heartbeat_interval_ms: 150
-  - name: replicator
-    params:
-      self_id: __SELF_ID__
       peer_count: 1
-  - name: commit_tracker
-    params:
-      self_id: __SELF_ID__
-      voter_count: 1
-  - name: apply_pipeline
-  - name: wal
-  - name: durability_ledger
+  - name: durability
     params:
       self_id: __SELF_ID__
       voter_count: 1
       partition_id: 0
-  - name: cp_bridge
-  - name: cp_proof_cache
-  - name: read_gate
-  - name: flow_controller
-  - name: key_manager
-  - name: telemetry_agg
-  - name: client_surface
-  - name: rbac
-  - name: admin_handler
-  - name: snapshot_engine
-  - name: placement_router
-
-  # Diagnostic HTTP surface. `http_ingress` frames inbound TCP as
-  # MSG_HTTP_REQUEST / MSG_HTTP_RESPONSE for `http_adapter`. See
-  # `docs/native_fluxor.md` for the dataflow. `http_ingress` binds
-  # `__HTTP_PORT__` on the same `linux_net` instance `peer_router`
-  # uses — linux_net's CMD_BIND supports concurrent listeners on
-  # distinct ports per fluxor's `modules/builtin/linux/linux_net/README.md`.
-  - name: http_adapter
-  - name: http_ingress
+  - name: control_plane
+  - name: admission
+  - name: operations
     params:
       listen_port: __HTTP_PORT__
-
 wiring:
   # ── linux_net ↔ peer_router (no TLS) ─────────────────────
   - from: linux_net.net_out
@@ -98,223 +67,162 @@ wiring:
 
   # ── peer_router → application ────────────────────────────
   - from: peer_router.cleartext
-    to: client_surface.requests
+    to: gateway.requests
   - from: peer_router.peer_rx
-    to: replicator.ack
+    to: consensus.ack
   # Inbound peer Raft RPCs (RequestVote/AppendEntries/heartbeat)
-  # land on peer_router.raft_rpc and must reach raft_engine for the
+  # land on peer_router.raft_rpc and must reach consensus for the
   # cluster to elect a leader and replicate. Without this edge
   # multi-node bring-up stalls in the `[raft] elect` loop because
-  # vote responses never reach the requester. `client_surface.raft_rpc`
+  # vote responses never reach the requester. `gateway.raft_rpc`
   # (HTTP-injected RPCs) is intentionally unwired to avoid a
   # fan-in collision — see `configs/multi-2node-2p.yaml` for the
   # historical rationale.
   - from: peer_router.raft_rpc
-    to: raft_engine.rpc
+    to: consensus.rpc
 
   # ── HTTP routing ─────────────────────────────────────────
-  - from: client_surface.client_req
-    to: client_codec.raw
-  - from: client_surface.admin_req
-    to: rbac.request
-  - from: client_surface.responses
+  - from: gateway.admin_req
+    to: operations.admin_req
+  - from: gateway.responses
     to: peer_router.client_resp
 
   # ── Client pipeline ──────────────────────────────────────
-  - from: client_codec.parsed
-    to: throttle_gate.requests
-  - from: throttle_gate.admitted
-    to: raft_engine.proposals_tagged
-  # Correlation feedback so client_codec can map (correlation_id → wal_index)
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  # Correlation feedback so gateway can map (correlation_id → wal_index)
   # for response routing. See RFC §5.8.
-  - from: raft_engine.proposal_assigned
-    to: client_codec.proposal_assigned
-  - from: raft_engine.leader_state
-    to: client_codec.leader_state
-  - from: throttle_gate.rejected
-    to: client_codec.responses
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
 
   # ── Flow control ──────────────────────────────────────────
-  - from: flow_controller.credits
-    to: throttle_gate.credit_supply
-  - from: flow_controller.envelope
-    to: client_surface.throttle_status
+  - from: admission.credits
+    to: gateway.credit_supply
+  - from: admission.envelope
+    to: gateway.throttle_status
 
   # ── Raft replication ──────────────────────────────────────
-  - from: raft_engine.append_entries
-    to: replicator.entries
-  - from: replicator.net_out
+  - from: consensus.net_out
     to: peer_router.peer_tx
-  - from: replicator.match_indices
-    to: commit_tracker.match
-  - from: replicator.lag_signal
-    to: flow_controller.lag
-  - from: raft_engine.rpc_out
+  - from: consensus.lag_signal
+    to: admission.lag
+  - from: consensus.rpc_out
     to: peer_router.peer_tx
 
   # ── Persistence ───────────────────────────────────────────
-  - from: raft_engine.log_append
-    to: wal.entries
+  - from: consensus.log_append
+    to: durability.entries
   # Dedicated boot handoff: Raft must resume its index at the exact WAL
   # replay high-water before proposal intake opens. Never multiplex this onto
   # wal.flushed, which also fans out durability acknowledgements.
-  - from: wal.replay_complete
-    to: raft_engine.wal_replay_complete
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
     rate: transaction
-  - from: wal.flushed
-    to: durability_ledger.ack
   # Spec §10.4.1: every replica tracks its own `local_wal_durable_index`
-  # in raft_engine so followers can stamp it into each AE response.
+  # in consensus so followers can stamp it into each AE response.
   # The leader uses it only as its own progress[self] in
-  # durability_ledger; fan-out via fluxor's auto-inserted tee.
-  - from: wal.flushed
-    to: raft_engine.wal_flushed
+  # durability; fan-out via fluxor's auto-inserted tee.
+  - from: durability.flushed
+    to: consensus.wal_flushed
   # Cross-node DurabilityAck fan-in (spec §10.4.1). Followers' durable
-  # indices land at the leader's durability_ledger via this edge so
+  # indices land at the leader's durability via this edge so
   # quorum-fsync `wal_committed_index` can advance.
-  - from: replicator.cross_durability_ack
-    to: durability_ledger.ack
-  - from: durability_ledger.quorum_durable
-    to: commit_tracker.durable
+  - from: consensus.cross_durability_ack
+    to: durability.ack
+  - from: durability.quorum_durable
+    to: consensus.durable
 
   # ── Commit → apply ────────────────────────────────────────
-  - from: commit_tracker.committed
-    to: apply_pipeline.entries
-  - from: commit_tracker.committed
-    to: raft_engine.commit
-  - from: raft_engine.commit_advanced
-    to: apply_pipeline.entries
   # Per-entry body fan-out (see clustor-linux-minimal.yaml comment).
-  - from: raft_engine.log_observe
-    to: apply_pipeline.log_entries
-  # Gap refetch: apply_pipeline pulls a durable entry's body back from
+  # Gap refetch: consensus pulls a durable entry's body back from
   # the WAL by index when it's missing one (post-restart recovery, or
   # a fan-out gap). Without this a restart advances commit_horizon via
-  # `commit_advanced` but apply_pipeline can never actually apply past
+  # `commit_advanced` but consensus can never actually apply past
   # it — it never received the entry bodies to apply.
-  - from: apply_pipeline.entry_request
-    to: wal.entry_request
+  - from: consensus.entry_request
+    to: durability.entry_request
     rate: transaction
-  - from: wal.entry_reply
-    to: apply_pipeline.entry_reply
-  # Linearizable-read submissions (RFC §4.3): apply_pipeline
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+  # Linearizable-read submissions (RFC §4.3): consensus
   # holds reads until the ReadIndex point is reached.
-  - from: client_codec.reads
-    to: apply_pipeline.read
-  - from: apply_pipeline.applied
-    to: client_codec.responses
-  - from: client_codec.responses_out
-    to: client_surface.client_responses
+  - from: gateway.reads
+    to: consensus.read
+  - from: consensus.applied
+    to: gateway.applied
 
   # ── Snapshots ─────────────────────────────────────────────
-  - from: snapshot_engine.export_chunks
-    to: replicator.snapshot_rx
-  - from: replicator.snapshot_import
-    to: snapshot_engine.import_chunks
-  - from: snapshot_engine.manifest_auth
+  - from: durability.export_chunks
+    to: consensus.snapshot_rx
+  - from: consensus.snapshot_import
+    to: durability.import_chunks
+  - from: durability.manifest_auth
     to: peer_router.peer_tx
-  - from: wal.compaction_signal
-    to: snapshot_engine.trigger
-  # Snapshot install completion → raft_engine fast-forwards state.
-  - from: snapshot_engine.installed_local
-    to: raft_engine.snapshot_installed
+  # Snapshot install completion → consensus fast-forwards state.
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
 
   # ── Keys ──────────────────────────────────────────────────
-  - from: key_manager.dek_epoch
-    to: wal.key_update
-  - from: key_manager.dek_epoch
-    to: snapshot_engine.key_update
 
   # ── Control plane ─────────────────────────────────────────
-  - from: cp_bridge.proof
-    to: cp_proof_cache.proof
-  - from: cp_proof_cache.cache_state
-    to: read_gate.cache
-  - from: cp_proof_cache.cache_state
-    to: commit_tracker.cp_state
-  - from: cp_proof_cache.strict_fallback
-    to: raft_engine.fallback_signal
-  - from: read_gate.permits
-    to: apply_pipeline.read_permits
-  - from: placement_router.routing
-    to: client_codec.placement
+  - from: control_plane.proof
+    to: admission.proof
+  - from: admission.cache_state
+    to: consensus.cp_state
+  - from: admission.strict_fallback
+    to: consensus.cp_state
+  - from: admission.permits
+    to: consensus.read_permits
+  - from: control_plane.routing
+    to: gateway.placement
 
   # ── Admin ─────────────────────────────────────────────────
   # FREEZE / THAW / TRANSFER_LEADER / DURABILITY_MODE / SNAPSHOT are
-  # applied locally by raft_engine; ADD/REMOVE_VOTER still return
+  # applied locally by consensus; ADD/REMOVE_VOTER still return
   # ADMIN_STATUS_UNSUPPORTED until joint consensus lands (RFC §14).
-  - from: rbac.authorized
-    to: admin_handler.requests
-  - from: rbac.denied
-    to: client_surface.admin_responses
-  - from: admin_handler.raft_commands
-    to: raft_engine.admin_proposals
-  - from: raft_engine.admin_applied
-    to: admin_handler.applied
-  - from: admin_handler.responses
-    to: client_surface.admin_responses
+  - from: operations.denied
+    to: gateway.admin_responses
+  - from: operations.raft_commands
+    to: consensus.admin_proposals
+  - from: consensus.admin_applied
+    to: operations.admin_applied
+  - from: operations.responses
+    to: gateway.admin_responses
   # Replicable admin ops (FREEZE / THAW / DURABILITY_MODE) ride
   # the client proposal path so every replica sees the entry.
-  # `admin_handler.raft_proposal` emits `MSG_CLIENT_PROPOSAL`
+  # `operations.raft_proposal` emits `MSG_CLIENT_PROPOSAL`
   # with body `[ADMIN_MARKER][command_id:u32][op_code][op_body]`;
-  # `apply_pipeline` re-emits it as `MSG_ADMIN_COMMITTED` for
-  # `raft_engine` to apply on every replica.
-  - from: admin_handler.raft_proposal
-    to: raft_engine.proposals
+  # `consensus` re-emits it as `MSG_ADMIN_COMMITTED` for
+  # `consensus` to apply on every replica.
+  - from: operations.raft_proposal
+    to: consensus.proposals
 
   # ── Telemetry ─────────────────────────────────────────────
-  - from: raft_engine.metrics
-    to: telemetry_agg.ingest
-  - from: replicator.metrics
-    to: telemetry_agg.ingest
-  - from: wal.metrics
-    to: telemetry_agg.ingest
-  - from: flow_controller.metrics
-    to: telemetry_agg.ingest
-  - from: cp_proof_cache.metrics
-    to: telemetry_agg.ingest
-  - from: snapshot_engine.metrics
-    to: telemetry_agg.ingest
-  - from: rbac.audit_events
-    to: telemetry_agg.ingest
+  - from: consensus.metrics
+    to: operations.ingest
+  - from: durability.metrics
+    to: operations.ingest
+  - from: admission.metrics
+    to: operations.ingest
   - from: peer_router.metrics
-    to: telemetry_agg.ingest
-  - from: throttle_gate.metrics
-    to: telemetry_agg.ingest
-  - from: commit_tracker.metrics
-    to: telemetry_agg.ingest
-  - from: apply_pipeline.metrics
-    to: telemetry_agg.ingest
-  - from: telemetry_agg.readyz
-    to: client_surface.readyz_data
-  - from: telemetry_agg.why
-    to: client_surface.why_data
-  - from: telemetry_agg.export
-    to: client_surface.metrics_data
+    to: operations.ingest
+  - from: gateway.metrics
+    to: operations.ingest
+  - from: operations.readyz
+    to: gateway.readyz_data
+  - from: operations.why
+    to: gateway.why_data
+  - from: operations.export
+    to: gateway.metrics_data
 
   # ── HTTP diagnostic surface ──────────────────────────────────
   # Shares the `linux_net` instance with `peer_router`; each anchor
   # binds its own listen port via CMD_BIND. Telemetry fan-out from
-  # `telemetry_agg` to both `client_surface` and `http_adapter` rides
+  # `operations` to both `gateway` and `operations` rides
   # the auto-tee.
   - from: linux_net.net_out
-    to: http_ingress.net_in
-  - from: http_ingress.net_out
+    to: operations.net_in
+  - from: operations.net_out
     to: linux_net.net_in
-  - from: http_ingress.request
-    to: http_adapter.request
-  - from: http_adapter.response
-    to: http_ingress.response
-  - from: telemetry_agg.readyz
-    to: http_adapter.readyz
-  - from: telemetry_agg.why
-    to: http_adapter.why
-  - from: telemetry_agg.export
-    to: http_adapter.metrics
-  # POST /admin/<op> → http_adapter.admin_request →
-  # admin_handler.requests. DEV/TEST ONLY: this edge BYPASSES
-  # rbac entirely (see the file header). When http_adapter learns
-  # to route admin through rbac, this edge moves through
-  # rbac.authorized like the wire-side admin path already does.
-  - from: http_adapter.admin_request
-    to: admin_handler.requests

@@ -57,18 +57,18 @@ histogram:
 
 | Histogram | Producer | Timed at |
 |---|---|---|
-| `clustor.wal.fsync_latency_ms` | `wal` | every `FS_FSYNC` |
-| `clustor.raft.commit_latency_ms` | `raft_engine` | leader append→commit, via a per-index timestamp ring |
-| `clustor.flow.apply_batch_latency_ms` | `apply_pipeline` | per commit-apply pass that delivers ≥1 entry |
-| `clustor.snapshot.transfer_seconds` | `snapshot_engine` | first install chunk → `done` |
-| kernel scheduler step-time | `telemetry_agg` | scraped over the monitor ABI, exported under the telemetry module id |
+| `clustor.wal.fsync_latency_ms` | `durability` (wal) | every `FS_FSYNC` |
+| `clustor.raft.commit_latency_ms` | `consensus` (raft) | leader append→commit, via a per-index timestamp ring |
+| `clustor.flow.apply_batch_latency_ms` | `consensus` (apply) | per commit-apply pass that delivers ≥1 entry |
+| `clustor.snapshot.transfer_seconds` | `durability` (snapshot) | first install chunk → `done` |
+| kernel scheduler step-time | `operations` (telemetry) | scraped over the monitor ABI, exported under the telemetry component id |
 
 ### Export wire format
 
-`telemetry_agg` keeps a latest-value table keyed by
-`(module_id, partition_id, metric_id)` and serializes it into the
-`MSG_METRICS` export that `http_adapter` caches and serves verbatim at
-`GET /metrics`. The payload is a fixed-width binary record stream
+The telemetry component of `operations` keeps a latest-value table
+keyed by `(module_id, partition_id, metric_id)` and serializes it into
+the `MSG_METRICS` export that the module's http component caches and
+serves verbatim at `GET /metrics`. The payload is a fixed-width binary record stream
 (`wire::METRICS_EXPORT_MAGIC`):
 
 ```
@@ -96,7 +96,7 @@ that omit any:
 strict_fallback_state
 strict_fallback_blocking_read_index
 strict_fallback_pending_entries
-read_gate.*
+readgate.*
 io_writer_mode_gate_state
 lease_gate_runtime_state
 clock_guard_alarm*

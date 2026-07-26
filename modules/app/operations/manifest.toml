@@ -1,0 +1,220 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# operations — admin admission (rbac), admin workflows, telemetry
+# aggregation and the HTTP diagnostic surface, as one composite module
+# (standards fluxor-modules.md §8).
+#
+# Components: rbac, admin, telemetry, and — behind the `http`
+# feature — http (request handling) + ingress (HTTP/1.1 listener on a
+# dedicated linux_net port, by convention LISTEN_PORT + 10000).
+#
+# Every admin command is admitted through rbac: wire commands on
+# `admin_req` (evaluated against identity bindings), HTTP
+# `POST /admin/<op>` as `default_role` (HTTP carries no peer
+# identity). `admin_requests` accepts pre-authorized commands from a
+# graph that runs its own admission upstream.
+#
+# Variants:
+#   diag (default, feature http) — full HTTP diagnostic surface:
+#     /readyz, /why, /metrics, POST /admin/<op>, POST /propose.
+#   headless — no HTTP components, HTTP ports absent; readiness and
+#     metrics still publish on readyz/why/export.
+
+# Pulls the kernel-scope step-time histogram over the monitor syscall
+# (`STEP_HISTOGRAM_QUERY`, RFC §4.3) — requires the `monitor` capability.
+# Without it, bare-metal EL0 capability enforcement denies the call
+# (`[cap] module called 0x0c55 without permissions = ["monitor"]`) and the
+# step histogram is silently empty. Mirrors foundation/observe's grant.
+permissions = ["monitor"]
+
+[[variant]]
+name = "headless"
+# Marker feature: the headless surface is the base component set; the
+# marker satisfies the variant-is-a-feature-set rule without gating
+# any code of its own.
+features = ["headless"]
+omit_ports = ["net_in", "proposal_assigned", "applied", "proposal_rejected", "request", "net_out", "proposal", "response"]
+
+[[variant]]
+name = "diag"
+features = ["http"]
+default = true
+
+# ── inputs ───────────────────────────────────────────────────
+
+[[ports]]
+name = "admin_req"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "identity"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_applied"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ingest"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_in"
+direction = "input"
+content_type = "OctetStream"
+# linux_net/ip net_out is NetProto, whose generic default (audio) is
+# calibrated for embedded slow NICs, not host HTTP admin loopback
+# traffic. Declare this edge's true shape once here instead of
+# relying on every consuming config to override per edge.
+rate_class_default = "transaction"
+
+[[ports]]
+name = "proposal_assigned"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "applied"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposal_rejected"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "request"
+direction = "input"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + `[conn_id][method][path_len][path:64][body:1024]` = 1094;
+# matches the reader's 1091-byte payload buffer (MAX_EXT_REQUEST) —
+# a larger declared cap would let producers send frames the reader
+# silently discards.
+max_record = 1094
+rate_class_max = "transaction"
+# HTTP requests parsed by a consumer that serves HTTP over its own
+# shared client port instead of this module's dedicated listener
+# (`net_in`). Feeds the same request handling the listener does; the
+# reply leaves on `response` rather than the listener's wire path.
+
+# ── outputs ──────────────────────────────────────────────────
+
+[[ports]]
+name = "responses"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + `[conn_id][status]` (2).
+max_record = 5
+rate_class_max = "transaction"
+
+[[ports]]
+name = "denied"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "audit_events"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "raft_commands"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + fixed admin command buffer (1024).
+max_record = 1027
+rate_class_max = "transaction"
+
+[[ports]]
+name = "raft_proposal"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+max_record = 1027
+rate_class_max = "transaction"
+
+[[ports]]
+name = "readyz"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "why"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "export"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# NCMD_SEND header (3) + the bounded 7680-byte response payload.
+max_record = 7683
+rate_class_max = "transaction"
+# See net_in above: this edge's consumer (linux_net.net_in / ip.net_in)
+# is NetProto, whose generic default (audio) would otherwise exceed
+# the rate_class_max cap above.
+rate_class_default = "transaction"
+
+[[ports]]
+name = "proposal"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope + correlation id + maximum HTTP proposal body.
+max_record = 1035
+rate_class_max = "transaction"
+
+[[ports]]
+name = "authorized"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + the admin command envelope (1024).
+max_record = 1027
+rate_class_max = "transaction"
+# Optional tee of admission decisions that passed: the same
+# `MSG_ADMIN_COMMAND` `[conn_id][op_code][body]` bytes delivered to
+# the admin component, for consumers that observe or mirror the
+# authorized stream. Best-effort — dropped on backpressure, never
+# gating the in-module delivery. `denied` is its negative counterpart.
+
+[[ports]]
+name = "response"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + `[conn_id][status:u16][body_len:u16]` (5) + the
+# bounded 7600-byte response body.
+max_record = 7608
+rate_class_max = "transaction"
+# Replies to requests that arrived on `request`. See that port.
+
+[observability]
+# Admission + workflow + synchronous proposal-correlation health, plus
+# the aggregator's own drop/eviction accounting (self-metrics under the
+# telemetry component id inside the export it serves).
+metrics = ["evaluations", "denials", "break_glass_grants", "requests", "duplicates", "unsupported", "requests_404", "correlations_inflight", "indices_inflight", "inflight_high_water", "proposal_timeouts", "commit_timeouts", "assignments_unmatched", "assignments_no_slot", "applies_unmatched", "rejections", "queue_unavailable", "committed", "bytes_in", "bytes_out"]
+spans = ["http.server.request"]

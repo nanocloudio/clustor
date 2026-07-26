@@ -62,15 +62,10 @@ modules:
       start_delay_ms: 20000 # defer create+write past log_net history-skip
                             # (~30 s TAIL seed) so bracket logs survive
 
-  - name: telemetry_agg
+  - name: operations
     params:
       emit_interval_ms: 250
-
-  - name: http_adapter
-  - name: http_ingress
-    params:
       listen_port: 19090
-
 wiring:
   # ── nvme block device ↔ fat32 filesystem ────────────────
   - from: nvme.blocks
@@ -80,20 +75,10 @@ wiring:
 
   # ── bench metrics → aggregator ──────────────────────────
   - from: nvme_bench.metrics
-    to: telemetry_agg.ingest
+    to: operations.ingest
 
   # ── diagnostic HTTP surface (GET /metrics, /readyz, /why) ─
   - from: ip.net_out
-    to: http_ingress.net_in
-  - from: http_ingress.net_out
+    to: operations.net_in
+  - from: operations.net_out
     to: ip.net_in
-  - from: http_ingress.request
-    to: http_adapter.request
-  - from: http_adapter.response
-    to: http_ingress.response
-  - from: telemetry_agg.readyz
-    to: http_adapter.readyz
-  - from: telemetry_agg.why
-    to: http_adapter.why
-  - from: telemetry_agg.export
-    to: http_adapter.metrics

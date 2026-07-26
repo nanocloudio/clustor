@@ -30,7 +30,7 @@ capabilities = [
   "durable.rpo_zero",
 ]
 
-# Committed entries from apply_pipeline (strict order).
+# Committed entries from consensus (strict order).
 [[ports]]
 name = "committed_entries"
 direction = "input"
@@ -59,7 +59,7 @@ index = 3
 direction = "input"
 content_type = "OctetStream"
 
-# MSG_PROPOSAL_ASSIGNED from raft_engine: [correlation:8][partition:2]
+# MSG_PROPOSAL_ASSIGNED from consensus: [correlation:8][partition:2]
 # [wal_index:8]. Attribution for reply routing — the committed entry at
 # `wal_index` is the proposal with that correlation.
 [[ports]]
@@ -68,7 +68,7 @@ index = 4
 direction = "input"
 content_type = "OctetStream"
 
-# Tagged proposals (MSG_CLIENT_PROPOSAL) to raft_engine.proposals_tagged.
+# Tagged proposals (MSG_CLIENT_PROPOSAL) to consensus.proposals_tagged.
 [[ports]]
 name = "proposals"
 direction = "output"

@@ -1,0 +1,330 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# consensus — Raft leader election, log replication, quorum commit and
+# ordered apply as one composite module (standards fluxor-modules.md §8).
+#
+# Components: raft (elections with pre-vote, proposal batching,
+# follower log matching + §5.3 conflict repair, admin/config apply,
+# RAFT<pppp>.MET metadata persistence), replicator (AppendEntries
+# pipelining, ack processing, WAL read-back catch-up, snapshot chunk
+# transfer), commit (quorum match/durability fusion → commit horizon),
+# apply (ordered dedup delivery of committed entries + the
+# linearizable-read queue).
+#
+# The hot-path edges between these components — AppendEntries fan-out,
+# log-body observation, match indices, commit horizons, read probes,
+# committed admin/config bodies, voter-set updates — are interior seams
+# drained by the module's dispatch table, not ports.
+
+permissions = []
+
+# raft persists term + voted_for + durable-index metadata via the FS
+# contract (root-level RAFT<pppp>.MET when root_path = 1, raft/meta
+# otherwise). Without this declaration check_contract_grant returns
+# ENOSYS and the cluster silently degrades to non-persistent.
+[[resources]]
+requires_contract = "fs"
+access = "write"
+
+# ── inputs ───────────────────────────────────────────────────
+
+[[ports]]
+name = "rpc"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposals"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_proposals"
+direction = "input"
+content_type = "OctetStream"
+
+# Tagged proposals carry an 8-byte correlation_id prefix so the leader
+# can emit MSG_PROPOSAL_ASSIGNED on the proposal_assigned port once a
+# log index is assigned. See modules/common/wire.rs::encode_tagged_proposal.
+[[ports]]
+name = "proposals_tagged"
+direction = "input"
+content_type = "OctetStream"
+
+# Partitioned proposals: 5-byte envelope `[partition_id:u16][msg_type:u8][len:u16]`.
+# The leader rejects misrouted entries (partition_id != self partition).
+# See .context/rfc_partition_groups.md.
+[[ports]]
+name = "proposals_partitioned"
+direction = "input"
+content_type = "OctetStream"
+
+# Partitioned + tagged proposals: same 5-byte envelope as above, but the
+# payload is `[correlation_id:u64 LE][body]`. MSG_PROPOSAL_ASSIGNED is
+# emitted back via `proposal_assigned` once the index is allocated.
+[[ports]]
+name = "proposals_partitioned_tagged"
+direction = "input"
+content_type = "OctetStream"
+
+# Snapshot install completion signal from durability's installed_local.
+# Carries `[term:u64][last_included_index:u64][last_included_term:u64]`.
+# raft fast-forwards `last_log_*` and `commit_index` and seeds apply's
+# horizon so the state machine catches up.
+[[ports]]
+name = "snapshot_installed"
+direction = "input"
+content_type = "OctetStream"
+
+# Local MSG_FSYNC_ACK frames from `wal.flushed`. Followers stamp the
+# resulting `local_wal_durable_index` into every AppendEntriesResponse
+# so the leader's durability ledger can compute quorum-fsync
+# durability across replicas (spec §10.4.1).
+[[ports]]
+name = "wal_flushed"
+direction = "input"
+content_type = "OctetStream"
+
+# Boot-time replay-complete signal from `wal.replay_complete`
+# (MSG_WAL_REPLAY_COMPLETE `[term:u64][high_water:u64]`). On a
+# crash-recovery boot raft loads only a THROTTLED durable hint from
+# RAFT0000.MET; resuming at it makes new post-recovery appends collide
+# with the replayed index space. raft holds proposal intake until this
+# arrives, then resumes `last_log_index` at the WAL's exact on-disk
+# high-water and re-seeds the apply horizon. A DEDICATED edge — must
+# NOT share `wal.flushed` (which also fans out to the durability
+# ledger; a one-shot signal there deadlocks the boot). Optional; leave
+# unwired for non-recovery graphs.
+[[ports]]
+name = "wal_replay_complete"
+direction = "input"
+content_type = "OctetStream"
+
+# Peer responses (AppendEntriesResponse et al.) from peer_router, in
+# the 5-byte partitioned envelope.
+[[ports]]
+name = "ack"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "snapshot_rx"
+direction = "input"
+content_type = "OctetStream"
+
+# DurabilityProof stream from durability's quorum_durable.
+[[ports]]
+name = "durable"
+direction = "input"
+content_type = "OctetStream"
+
+# Admission fan-in: carries BOTH MSG_CACHE_STATE (CP cache freshness →
+# the commit component's strict gate) and MSG_FALLBACK_SIGNAL (→ the
+# raft component's proposal-intake gate). The dispatch table demuxes by
+# frame type; wire both admission outputs here (fan-in auto-merge).
+[[ports]]
+name = "cp_state"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "read_permits"
+direction = "input"
+content_type = "OctetStream"
+
+# Linearizable read submissions. Payload shape:
+# MSG_CLIENT_READ_REQUEST `[correlation_id:u64 LE][body...]`. The body
+# is opaque — the read blocks until the local apply_index has caught up
+# to the strict-ReadIndex linearization point and the CP read permit is
+# Fresh/Cached. A response with the same correlation_id is emitted on
+# `applied` as MSG_CLIENT_READ_RESPONSE. Optional; leave unwired in
+# configs that have no read path.
+[[ports]]
+name = "read"
+direction = "input"
+content_type = "OctetStream"
+
+# WAL random-access replies from `wal.entry_reply` (MSG_WAL_ENTRY_REPLY
+# `[request_id:u32][term:u64][index:u64][body...]`) for BOTH read-back
+# consumers. The dispatch table demuxes on the request-id namespace:
+# bit 31 set → the apply component's gap refetch, clear → the
+# replicator's catch-up read-back.
+[[ports]]
+name = "entry_reply"
+direction = "input"
+content_type = "OctetStream"
+
+# ── outputs ──────────────────────────────────────────────────
+
+[[ports]]
+name = "rpc_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "net_out"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "log_append"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + term/index (16) + proposal batch (2048).
+max_record = 2067
+rate_class_max = "transaction"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+# Per-proposal correlation feedback: emits MSG_PROPOSAL_ASSIGNED
+# `[correlation_id:u64 LE][partition_id:u16][wal_index:u64 LE]` once a
+# tagged proposal has been assigned a log index. Optional — leave
+# unwired for graphs that don't need ack-on-durability correlation.
+[[ports]]
+name = "proposal_assigned"
+direction = "output"
+content_type = "OctetStream"
+
+# MSG_LEADER_HINT emission so the client codec (and any other consumer
+# that needs to short-circuit non-leader proposals) can know the
+# current `(leader_id, term)`. Payload is 9 bytes:
+# `[leader_id:u8 (0xFF = unknown)][term:u64 LE]`. Emitted on state
+# changes; consumers must tolerate missed updates.
+[[ports]]
+name = "leader_state"
+direction = "output"
+content_type = "OctetStream"
+
+# Apply-confirmation feedback for admin commands consumed on
+# `admin_proposals`. Carries `[command_id:u32][status:u8]` so the
+# admin surface can route the response back to the originating
+# conn_id. See RFC §14.
+[[ports]]
+name = "admin_applied"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+max_record = 8
+rate_class_max = "transaction"
+
+# Post-snapshot trim signal. After a snapshot install fast-forwards
+# `commit_index`, raft emits MSG_WAL_COMPACT_BEFORE
+# `[before_index:u64 LE]` so the WAL can drop segments whose max-index
+# is strictly below `before_index`. Also carries MSG_WAL_TRUNCATE_AFTER
+# for §5.3 conflict repair.
+[[ports]]
+name = "wal_compact"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "lag_signal"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "snapshot_import"
+direction = "output"
+content_type = "OctetStream"
+
+# On-demand snapshot install request. Payload: `[target:u8]`
+# (0xFF = broadcast). Emitted when WAL read-back returns NOT_FOUND for
+# the index a lagging follower needs.
+[[ports]]
+name = "snapshot_request"
+direction = "output"
+content_type = "OctetStream"
+
+# Synthesized MSG_FSYNC_ACK frames extracted from AppendEntriesResponse
+# envelopes (spec §10.4.1). The leader's durability ledger consumes
+# this fan-in alongside local `wal.flushed` so its per-replica
+# progress array reflects every voter's `local_wal_durable_index`,
+# enabling quorum-fsync `wal_committed_index` computation.
+[[ports]]
+name = "cross_durability_ack"
+direction = "output"
+content_type = "OctetStream"
+
+# Min-match retention floor (MSG_COMPACTION_FLOOR): gates snapshot
+# triggers — and therefore WAL compaction — behind the slowest live
+# voter's replicated index, so a leader-local snapshot can never
+# compact entries a lagging follower still needs. Optional; leave
+# unwired on followers and single-voter graphs.
+[[ports]]
+name = "retention_floor"
+direction = "output"
+content_type = "OctetStream"
+
+# Per-entry committed stream consumed by downstream replicated apps
+# (loam, lattice, example_consumer, ...). Envelope:
+# MSG_COMMITTED_ENTRY `[term:u64][index:u64][body...]`. Strict
+# commit-index order, fail-open on backpressure (consumer recovers
+# via snapshot install). See docs/architecture/consumer_facade.md.
+[[ports]]
+name = "committed_entries"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + term/index (16) + proposal body (2048).
+max_record = 2067
+rate_class_max = "transaction"
+
+[[ports]]
+name = "applied"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Largest ack/reject envelope is bounded well below this 64-byte contract.
+max_record = 64
+rate_class_max = "transaction"
+# Internal client ack/reject stream to the codec. Successful apply
+# responses use MSG_CLIENT_RESPONSE with payload
+# `[partition_id:u16 LE][term:u64 LE][index:u64 LE]`; the codec strips
+# the partition id before writing the external client response.
+
+# WAL random-access requests to `wal.entry_request` (MSG_WAL_ENTRY_REQUEST
+# `[request_id:u32][wal_index:u64]`) from BOTH read-back producers on
+# one shared handle: the apply component's gap refetch (request ids
+# carry bit 31) and the replicator's follower catch-up read-backs
+# (bit-31-clear half). The disjoint id spaces keep the replies
+# separable on the shared `entry_reply` return path.
+[[ports]]
+name = "entry_request"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + request id/index (12).
+max_record = 15
+rate_class_max = "transaction"
+
+[observability]
+# Exactly what the code emits as typed MSG_METRIC_SAMPLE, per
+# component: raft (18 — `ready` is emitted FIRST so it is the last
+# casualty under metric-channel backpressure), replicator (6),
+# commit (2), apply (6). Partition-stamped for multi-Raft graphs.
+metrics = [
+  # raft
+  "ready", "last_log_index", "commit_index", "role", "current_term",
+  "proposals_received", "entries_appended", "elections_started",
+  "proposals_dropped_frozen", "proposals_dropped_strict",
+  "frozen_flag", "strict_fallback_flag",
+  "flushes_deferred", "uncommitted_inflight",
+  "awaiting_replay", "replay_hw", "meta_hint", "log_truncations",
+  # replicator
+  "rpcs_sent", "acks_received", "nacks_received", "catchup_sent",
+  "inflight_depth", "backpressure",
+  # commit
+  "commit_index", "commit_advances",
+  # apply
+  "entries_applied", "queue_depth", "refetched", "caught_up",
+  "entries_evicted", "reads_evicted",
+]
+histograms = ["commit_latency_ms", "apply_batch_latency_ms"]

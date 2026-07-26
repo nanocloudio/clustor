@@ -97,7 +97,7 @@ mutations on the consumer side.
 **Substrate guarantees:**
 - Monotone by `index`, gap-free across snapshot boundaries.
 - Delivered in commit order; an entry is never re-delivered on
-  the leader unless `apply_pipeline_reset` (§7) precedes it.
+  the leader unless the apply reset (§7) precedes it.
 - `entry_body` is byte-identical to the body the proposer
   submitted (or `[correlation_id][body]` for tagged proposals
   — consumers strip the correlation prefix using the same wire
@@ -133,22 +133,23 @@ and any newly-placed replica that needs to skip log replay.
   covering all apply-derived state.
 - **Install hook** fires when the substrate has received a
   snapshot (from peer or disk). The consumer re-creates state
-  from the payload, then receives `apply_pipeline_reset` (§7)
+  from the payload, then receives the apply reset (§7)
   with the new apply index, then resumes consuming
   `committed_entries` from `reset_index + 1`.
 - Snapshot ordering is consistent with the committed-entry
   stream: a snapshot at index N reflects exactly the state a
   consumer would have after applying entries 0..=N.
 
-### 7. `apply_pipeline_reset`
+### 7. Apply reset
 
 **Direction.** Substrate → consumer.
-**Shape.** `MSG_APPLY_PIPELINE_RESET` with body
-`[term:u64 LE][index:u64 LE]` — same envelope as
+**Shape.** The apply-reset envelope (opcode `0x2B` in
+[`../../modules/common/wire.rs`](../../modules/common/wire.rs)) with
+body `[term:u64 LE][index:u64 LE]` — same body shape as
 `MSG_COMMITTED_BATCH`, distinct opcode.
 **Used by.** Every apply-derived arena in the consumer.
-**Substrate guarantees.** Emitted when the apply pipeline's
-notion of "next index" has rewound — snapshot install, leader-
+**Substrate guarantees.** Emitted when the substrate's notion of
+"next apply index" has rewound — snapshot install, leader-
 driven log truncation, or any other event that invalidates
 already-applied state. After this signal, every consumer module
 must:
@@ -177,7 +178,7 @@ diagnostics, never for replicated state.
   consumed by routers. Not authoritative state.
 - `MSG_CP_PROOF`, `MSG_CACHE_STATE`, `MSG_FALLBACK_SIGNAL`,
   `MSG_EPOCH_EVENT` — control-plane freshness signals from
-  `cp_bridge` / `cp_proof_cache`. These gate read responses and
+  `control_plane` and `admission`. These gate read responses and
   fence in-flight state on epoch flips, but they carry no durable
   payload — see [consumer_facade.md §Read-gate inputs](consumer_facade.md#read-gate-inputs)
   for the predicate consumers evaluate against them.
@@ -204,7 +205,7 @@ follows:
 | `committed_entries` | Pass-through from the local WAL append, in WAL order. |
 | `quorum_durable` | Fired the moment the WAL fsync returns (local fsync *is* the durability for a single-node deployment). |
 | Snapshot hooks | Read / write a single file at a configured path. |
-| `apply_pipeline_reset` | Fired on cold start after snapshot install. |
+| Apply reset | Fired on cold start after snapshot install. |
 
 A consumer binary that runs against a 3-replica clustor cluster
 runs against this stand-in unchanged — only the YAML wiring
@@ -214,7 +215,7 @@ exists to defend.
 ## Versioning
 
 The surface above is **v1**. Additions are allowed; removals and
-shape changes require a version bump and a documented migration
+shape changes require a version bump and a documented upgrade
 path. The surface version is independent of:
 
 - The wire-protocol version (per-opcode envelope shapes, see
@@ -237,13 +238,13 @@ lands here directly. The mapping for in-tree consumers:
 
 | Primitive | Where it's consumed in clustor |
 |---|---|
-| `proposals` | `client_codec` (untagged op intake) |
-| `proposals_tagged` | `client_codec` (correlation-bound intake) |
-| `proposal_assigned` | `client_codec`, `replica_facade::InflightTable` |
-| `committed_entries` | `apply_pipeline.committed_entries` → downstream consumer modules |
-| `quorum_durable` | `durability_ledger` → `commit_tracker` → consumer ack paths |
-| Snapshot hooks | `snapshot_engine` (orchestration); consumer modules implement the install/export callbacks |
-| `apply_pipeline_reset` | Every apply-derived arena in the consumer |
+| `proposals` | `gateway`'s codec component (untagged op intake) |
+| `proposals_tagged` | `gateway`'s codec component (correlation-bound intake) |
+| `proposal_assigned` | `gateway`'s codec component, `replica_facade::InflightTable` |
+| `committed_entries` | `consensus.committed_entries` → downstream consumer modules |
+| `quorum_durable` | `durability`'s ledger component → `consensus`'s commit component → consumer ack paths |
+| Snapshot hooks | `durability`'s snapshot component (orchestration); consumer modules implement the install/export callbacks |
+| Apply reset | Every apply-derived arena in the consumer |
 
 Downstream projects (Lattice, Loam, Quantum, Chronicle, …) carry
 their own mapping table inside whichever doc anchors their adapter

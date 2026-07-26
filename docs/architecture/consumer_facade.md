@@ -64,7 +64,7 @@ pub trait ReplicaGroup {
         -> impl Stream<Item = Result<SnapshotChunk, SnapshotError>>;
     fn members(&self) -> Vec<ReplicaId>;
     fn leader(&self) -> Option<ReplicaId>;
-    fn read_gate_inputs(&self) -> ReadGateInputs;
+    fn read_inputs(&self) -> ReadGateInputs;
 }
 ```
 
@@ -91,7 +91,7 @@ consumer's step observes the matching wire message — but the
 - Snapshot install is atomic: chunk receipt is observable, but the
   consumer's commit cursor only jumps after
   `SnapshotInstaller::finalize` returns success.
-- `read_gate_inputs` reflects the consumer's most recent view of
+- `read_inputs` reflects the consumer's most recent view of
   the CP cache state and durability / commit indexes.
 
 ---
@@ -101,7 +101,7 @@ consumer's step observes the matching wire message — but the
 The maximum opaque command size is `MAX_COMMAND_BYTES = 4096` bytes,
 enforced by `replica_facade::build_tagged_proposal`. Bodies above
 this cap are rejected at the consumer boundary; oversized commands
-never reach `raft_engine`'s proposal port.
+never reach `consensus`'s proposal ports.
 
 The cap is intentionally small — clustor orders identity-bearing
 metadata, never bulk content. Object bodies, EC shards, cache
@@ -109,13 +109,13 @@ contents, and other bulk data travel out-of-band. (Cross-reference:
 Loam's BODY-OUT-OF-RAFT invariant.)
 
 Empty commands and `correlation_id == 0` are rejected. Zero is
-reserved by `raft_engine` as the "untagged" marker that suppresses
+reserved by `consensus` as the "untagged" marker that suppresses
 `MSG_PROPOSAL_ASSIGNED` emission.
 
-Command bytes are opaque to clustor. `raft_engine`, `wal`,
-`commit_tracker`, and `apply_pipeline` do not inspect, parse, or
-schema-validate command bodies. Consumers own their own command
-schema.
+Command bytes are opaque to clustor. Neither `consensus` nor
+`durability` inspects, parses, or schema-validates a command body at
+any stage — proposal intake, replication, WAL framing, commit, or
+apply. Consumers own their own command schema.
 
 ---
 
@@ -129,7 +129,7 @@ The consumer calls `build_tagged_proposal(buf, correlation_id, body)`
 to encode an `8-byte correlation_id || body` payload. The payload
 is wrapped in `MSG_CLIENT_PROPOSAL` (3-byte envelope) or its
 partitioned variant (5-byte) and written to
-`raft_engine.proposals_tagged` (or `proposals_partitioned_tagged`).
+`consensus.proposals_tagged` (or `consensus.proposals_partitioned_tagged`).
 
 The consumer also calls `InflightTable::register(correlation_id)`
 so the result can be matched later. Capacity exhaustion returns
@@ -147,11 +147,11 @@ a leader change) is silently dropped.
 
 ### 3) Commit
 
-`commit_tracker.committed` emits
-`MSG_COMMITTED_BATCH { term, index }` whenever its commit horizon
-advances. The consumer feeds it to
-`CommittedSubscriber::ingest_committed_batch`, which enforces
-monotonic ordering, then calls
+`consensus.committed_entries` emits
+`MSG_COMMITTED_ENTRY { term, index, body }` per committed entry as
+the commit horizon advances. The consumer feeds each payload to
+`CommittedSubscriber::ingest_committed_entry`, which enforces
+gap-free monotonic ordering, then calls
 `InflightTable::record_commit(term, index)` to promote any
 in-flight whose `assigned_index ≤ index` to `Committed`.
 
@@ -169,24 +169,23 @@ own API surface.
 `(term, index)` and never the command bytes. A consumer that needs
 to **apply** entries deterministically (i.e. transform local state
 by interpreting the command) wires its own input to
-`apply_pipeline.committed_entries`, which emits
+`consensus.committed_entries`, which emits
 `MSG_COMMITTED_ENTRY { term, index, body }` per committed entry in
 strict commit-index order.
 
-The fanout chain:
+The fanout chain is interior to `consensus` up to the last hop:
 
 ```
-raft_engine.log_observe ──► apply_pipeline.log_entries
-                                        │
-                            commit_tracker.committed ──► apply_pipeline.entries
-                                        │
-                            apply_pipeline.committed_entries ──► consumer
+raft ──body ring──► apply
+commit ──horizon latch──► apply
+                            consensus.committed_entries ──► consumer
 ```
 
-`raft_engine` writes every appended entry to **both** `log_append`
-(to WAL, durability-load-bearing) and `log_observe` (fanout to
-observers, non-load-bearing). `apply_pipeline` buffers up to
-`PENDING_ENTRY_SLOTS = 32` entries by index and drains them onto
+The raft component writes every appended entry to `log_append` (to
+`durability`, durability-load-bearing) and, in the same step, into
+the apply component's body ring (fanout to observers,
+non-load-bearing). The apply component buffers up to
+`PENDING_ENTRY_SLOTS = 64` entries by index and drains them onto
 `committed_entries` once the commit horizon advances past their
 index.
 
@@ -210,14 +209,16 @@ The per-entry method enforces:
 
 ### Choosing a delivery mode
 
-| Delivery | Channel | Use case |
+| Delivery | Source | Use case |
 |---|---|---|
-| Horizon-only | `commit_tracker.committed` (`MSG_COMMITTED_BATCH`) | Consumer only needs commit watermarks (e.g. ack-on-commit RPCs) |
-| Per-entry | `apply_pipeline.committed_entries` (`MSG_COMMITTED_ENTRY`) | Consumer applies bodies to a state machine |
+| Per-entry | `consensus.committed_entries` (`MSG_COMMITTED_ENTRY`) | Consumer applies bodies to a state machine, or needs commit watermarks with the bodies attached |
+| Horizon-only | A `MSG_COMMITTED_BATCH` payload from the consumer's own upstream | Consumer only needs commit watermarks (e.g. ack-on-commit RPCs) and gets them from something other than the substrate's per-entry stream |
 
-A consumer may wire both. `CommittedSubscriber` permits interleaved
-calls to `ingest_committed_batch` and `ingest_committed_entry`,
-with the cursor advancing monotonically across both call paths.
+The commit horizon is fused and raised inside `consensus`, so the
+graph-visible committed feed is the per-entry stream.
+`CommittedSubscriber` nonetheless permits interleaved calls to
+`ingest_committed_batch` and `ingest_committed_entry`, with the
+cursor advancing monotonically across both call paths.
 
 ---
 
@@ -226,7 +227,8 @@ with the cursor advancing monotonically across both call paths.
 `MembershipView::voter_count` and `MembershipView::self_id` are
 static configuration. `MembershipView::leader` is mutated by the
 consumer when it observes a leader-changed signal (e.g. a new term
-in `raft_engine.metrics`). `members()` returns the configured voter
+on `consensus.leader_state`, or a term change in
+`consensus.metrics`). `members()` returns the configured voter
 set; dynamic membership reconfiguration is out of scope for this
 surface.
 
@@ -241,7 +243,8 @@ path. Consumer code does not branch on cluster size.
 ## Leader change
 
 When a consumer observes a term jump on its leader (via
-`raft_engine.metrics`), the safe protocol is:
+`consensus.leader_state` or `consensus.metrics`), the safe protocol
+is:
 
 1. Call `InflightTable::cancel_all()` to drop the entire pending
    set.
@@ -298,15 +301,16 @@ its `CommittedSubscriber`.
 
 ## Read-gate inputs
 
-`ReadGateInputs` mirrors the inputs `read_gate` consumes. Consumers
-populate the four fields from the following sources:
+`ReadGateInputs` mirrors the inputs the read gate inside
+`admission` consumes. Consumers populate the four fields from the
+following sources:
 
 | Field | Source |
 |---|---|
-| `cache_state` | Most recent `MSG_CACHE_STATE` from `cp_proof_cache` (`CACHE_FRESH` / `CACHE_CACHED` / `CACHE_STALE` / `CACHE_EXPIRED`) |
+| `cache_state` | Most recent `MSG_CACHE_STATE` from `admission.cache_state` (or `admission.fresh_state`) — `CACHE_FRESH` / `CACHE_CACHED` / `CACHE_STALE` / `CACHE_EXPIRED` |
 | `raft_commit_index` | The consumer's `CommittedSubscriber::cursor()` |
-| `durable_index` | Most recent `MSG_DURABILITY_PROOF` index from `durability_ledger` |
-| `strict_fallback` | Latched true on `MSG_FALLBACK_SIGNAL` |
+| `durable_index` | Most recent `MSG_DURABILITY_PROOF` index from `durability.quorum_durable` |
+| `strict_fallback` | Latched true on `MSG_FALLBACK_SIGNAL` from `admission.strict_fallback` |
 
 `ReadGateInputs::can_read()` returns the read-gate verdict:
 
@@ -316,10 +320,10 @@ can_read = !strict_fallback
         && raft_commit_index == durable_index
 ```
 
-This is the same predicate `read_gate` evaluates locally. The
-duplicate copy in the consumer lets reads be admitted without a
-cross-core permit round-trip when the consumer is co-located on the
-same core as `read_gate`.
+This is the same predicate the read gate evaluates inside
+`admission`. The duplicate copy in the consumer lets reads be
+admitted without a cross-core permit round-trip when the consumer is
+co-located with `admission`.
 
 ---
 
@@ -349,7 +353,7 @@ same core as `read_gate`.
 - **Real fluxor module integration** is proved by
   `modules/example_consumer/`, a minimal `no_std` module that
   `#[path]`-includes `replica_facade.rs` and wires to
-  `apply_pipeline.committed_entries`. `make modules` rebuilds it
+  `consensus.committed_entries`. `fluxor modules build` rebuilds it
   alongside every clustor module on every CI run — the gate that
   catches `no_std` regressions in the facade or in the per-entry
   emitter.
@@ -368,23 +372,19 @@ same core as `read_gate`.
 ## Per-entry stream configuration
 
 To receive `MSG_COMMITTED_ENTRY` on the consumer side, the
-deployment graph wires two edges:
+deployment graph wires one edge:
 
 ```yaml
-- from: raft_engine.log_observe
-  to: apply_pipeline.log_entries
-  edge_class: cross_core
-
-- from: apply_pipeline.committed_entries
+- from: consensus.committed_entries
   to: <consumer-module>.committed_entries
   edge_class: cross_core
 ```
 
-Without the first edge, `apply_pipeline` never sees the entry
-bodies and `committed_entries` stays silent. Without the second,
-the fanout has no destination. Both edges are optional from the
-consensus core's standpoint — omitting them does not affect quorum,
-durability, or read-gate behaviour. `configs/clustor.yaml` wires
-the first edge into `apply_pipeline.log_entries` by default; the
-second is consumer-specific and lives in the downstream graph
-(see `modules/example_consumer/manifest.toml` for the port shape).
+The entry-body fanout that feeds it — appended bodies from the raft
+component into the apply component's ring — is interior to
+`consensus` and every deployment gets it by construction. The edge
+above is optional from the consensus core's standpoint: omitting it
+does not affect quorum, durability, or read-gate behaviour, it
+simply leaves the per-entry stream with no destination. It is
+consumer-specific and lives in the downstream graph (see
+`modules/app/example_consumer/manifest.toml` for the port shape).

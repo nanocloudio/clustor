@@ -439,20 +439,19 @@ it replicated with the correct signature.
 ## Membership changes and joint consensus
 
 > **Status note.** The phases below describe the design target. The
-> current substrate has the `raft_engine` joint state machine
-> (`CONFIG_CHANGE_OP_JOINT`/`_NEW`, voter-set overlay, auto-`C_new` on
-> commit) and the `commit_tracker` joint-aware quorum logic, but two
-> downstream pieces are unfinished:
+> current substrate has the joint state machine in `consensus`'s raft
+> component (`CONFIG_CHANGE_OP_JOINT`/`_NEW`, voter-set overlay,
+> auto-`C_new` on commit) and joint-aware quorum logic in its commit
+> component — the voter-set update is delivered between them inside
+> the module, in the same step raft applies the configuration change.
+> One downstream piece is unfinished: the ledger component of
+> `durability` does not consume `MSG_VOTER_SET_UPDATE` and uses the
+> fixed-`voter_count` quorum median, so union quorum is not enforced
+> on the durability side during the joint phase.
 >
-> - `durability_ledger` does not yet consume `MSG_VOTER_SET_UPDATE`
->   and still uses the fixed-`voter_count` quorum median.
-> - None of the shipped graphs in `configs/` route
->   `raft_engine.voter_set` to `commit_tracker.voter_set`.
->
-> `admin_handler` accordingly returns `ADMIN_STATUS_UNSUPPORTED` for
-> `ADD_VOTER` / `REMOVE_VOTER`. The safe gate stays closed until the
-> union-quorum implementation in `durability_ledger` and the
-> end-to-end wiring land.
+> The admin component of `operations` accordingly returns
+> `ADMIN_STATUS_UNSUPPORTED` for `ADD_VOTER` / `REMOVE_VOTER`. The
+> safe gate stays closed until union quorum reaches the ledger.
 
 Reconfigurations walk through four phases.
 

@@ -1,0 +1,72 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712"]
+
+# admission — CP proof freshness, linearizable-read gating and flow
+# control as one composite module (standards fluxor-modules.md §8).
+#
+# Components: proof_cache (proof-age ladder → cache_state /
+# fresh_state / strict_fallback), read_gate (standing read permits
+# while Fresh/Cached), flow (PID admission controller → credits /
+# envelope).
+#
+# `proof`/`input` are the same contract on two attach points, as are
+# `cache_state`/`fresh_state` — deployments differ in which name they
+# wire; all four are part of the published surface.
+
+[[ports]]
+name = "proof"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "input"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "lag"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cache_state"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "fresh_state"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "strict_fallback"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "permits"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "credits"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "envelope"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+# Credit-pool gauges from the flow component. The proof ladder and
+# read gate publish state transitions on data ports, not telemetry.
+metrics = ["entry_credits", "byte_credits"]
