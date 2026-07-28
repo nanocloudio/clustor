@@ -76,6 +76,23 @@ const REPLAY_REEMIT_MAX_ATTEMPTS: u32 = 256;
 /// the last few seconds of a hot writer without inflating module state.
 const ENTRY_RING_SIZE: usize = 256;
 const ENTRY_RING_MASK: u64 = (ENTRY_RING_SIZE as u64) - 1;
+
+/// Slots in the index->offset map (`entry_ring`). Deliberately separate
+/// from `ENTRY_RING_SIZE`, which also sizes `memory_entries` — those
+/// carry full 2 KiB bodies, so the two cannot share a bound.
+///
+/// This bounds how long a log can be and still RECOVER: on restart,
+/// apply restarts at index 0 and refetches every entry, and any index
+/// below `entry_ring_min_index` answers NOT_FOUND — a node whose log
+/// outgrows the map cannot rebuild its state machine from it.
+/// Locations are 32 B, so 8192 slots cost ~256 KiB and cover
+/// realistic recovery windows between snapshots.
+///
+/// The bound is a hard ceiling: past it, local recovery fails loudly
+/// (`[wal] entry req below ring floor`) and snapshot install is the
+/// only way back.
+const ENTRY_LOC_RING_SIZE: usize = 8192;
+const ENTRY_LOC_RING_MASK: u64 = (ENTRY_LOC_RING_SIZE as u64) - 1;
 const MEMORY_ENTRY_BODY_CAP: usize = 2048;
 
 /// WCET/fairness backstop for the transaction-budgeted input pump. The byte
@@ -215,13 +232,15 @@ pub struct Wal {
     pub encoding: u8,           // 0=binary
 
     /// Ring buffer of recent entry locations for random-access lookup
-    /// (replicator NACK retry, etc.). `ENTRY_RING_SIZE` covers the
-    /// last 256 indices; older indices fall through to a NOT_FOUND
-    /// reply and snapshot fallback.
-    entry_ring: [EntryLoc; ENTRY_RING_SIZE],
+    /// (replicator NACK retry, apply gap refetch, crash recovery).
+    /// `ENTRY_LOC_RING_SIZE` covers the last 8192 indices; older
+    /// indices fall through to a NOT_FOUND reply and snapshot fallback.
+    entry_ring: [EntryLoc; ENTRY_LOC_RING_SIZE],
     /// Proposal bodies retained by the explicit no-filesystem fallback.
-    /// Uses the same index mask and retention horizon as `entry_ring`, so
-    /// apply/replication gap refetch remains correct in ephemeral graphs.
+    /// Bodies are 2 KiB each, so this keeps the smaller
+    /// `ENTRY_RING_SIZE` bound: in ephemeral graphs only the last 256
+    /// indices are refetchable; older ones answer NOT_FOUND even when
+    /// their location slot is still live.
     memory_entries: [MemoryEntry; ENTRY_RING_SIZE],
     entry_ring_max_index: u64,
     entry_ring_min_index: u64,
@@ -393,6 +412,15 @@ pub struct Wal {
     /// component. Monotone latest-wins — the ledger's per-replica
     /// progress only ever advances, so collapsing multiple acks per
     /// step to the max is semantics-preserving.
+    /// One-shot latch for the below-ring-floor diagnostic (see the
+    /// NOT_FOUND path in the entry-request handler).
+    pub entryreq_floor_logged: bool,
+    /// Durable high-water frozen at replay completion, and its term.
+    /// Distinct from `current_index`, which advances on STAGED writes.
+    pub replay_recovered_index: Index,
+    pub replay_recovered_term: Term,
+    /// One-shot: the recovered high-water is acked to the ledger once.
+    pub replay_ledger_seeded: bool,
     pub ledger_ack: (Term, Index),
     pub ledger_dirty: bool,
     /// Latest segment-rotation snapshot trigger, for the snapshot
@@ -483,8 +511,12 @@ pub unsafe fn init(s: &mut Wal) {
     s.replay_misses = 0;
     s.replay_first_found = 0;
     s.replay_last_found = 0;
-    s.entry_ring = [EntryLoc::zero(); ENTRY_RING_SIZE];
+    s.entry_ring = [EntryLoc::zero(); ENTRY_LOC_RING_SIZE];
     s.memory_entries = [MemoryEntry::zero(); ENTRY_RING_SIZE];
+    s.entryreq_floor_logged = false;
+    s.replay_recovered_index = 0;
+    s.replay_recovered_term = 0;
+    s.replay_ledger_seeded = false;
     s.ledger_ack = (0, 0);
     s.ledger_dirty = false;
     s.snap_trigger = (0, 0);
@@ -643,6 +675,28 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
 /// per `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn maybe_emit_replay_complete(s: &mut Wal, sys: &SyscallTable) {
     if !s.replay_complete_pending { return; }
+    // Re-seed the ledger with the locally recovered durable high-water.
+    //
+    // The ledger only ever advances through `on_ack`, which fires on the
+    // fsync completion of a NEW write. Replay produces no such ack, so
+    // after a restart the ledger sits at 0 even though `current_index`
+    // entries are on disk and fsynced. No durability proof is emitted,
+    // `commit` never advances past 0, and raft's uncommitted-inflight
+    // gate (`last_log_index - commit_index >= MAX_UNCOMMITTED_INFLIGHT`)
+    // holds proposal intake closed permanently: a recovered node accepts
+    // no writes at all, and — because apply's recovery horizon raise is
+    // likewise never satisfied — its state machine is never rebuilt from
+    // the log either.
+    //
+    // Asserting this replica's own durable index is exactly what a
+    // DurabilityAck means, so quorum semantics are unchanged: a
+    // multi-voter cluster still needs the other replicas' acks before
+    // `commit` moves. `note_ledger_ack` is monotone, so a duplicate
+    // seed would be harmless anyway.
+    if !s.replay_ledger_seeded && s.replay_recovered_index > 0 {
+        s.replay_ledger_seeded = true;
+        note_ledger_ack(s, s.replay_recovered_term, s.replay_recovered_index);
+    }
     if s.out_replay_complete < 0 {
         // No consumer wired — nothing to hand off.
         s.replay_complete_pending = false;
@@ -698,13 +752,13 @@ unsafe fn record_entry_loc(
     payload_len: u32,
 ) {
     if index == 0 { return; }
-    let slot = (index & ENTRY_RING_MASK) as usize;
+    let slot = (index & ENTRY_LOC_RING_MASK) as usize;
     s.entry_ring[slot] = EntryLoc { index, term, seg_seq, payload_offset, payload_len };
     if index > s.entry_ring_max_index {
         s.entry_ring_max_index = index;
     }
-    let floor = if s.entry_ring_max_index > ENTRY_RING_SIZE as u64 {
-        s.entry_ring_max_index - ENTRY_RING_SIZE as u64 + 1
+    let floor = if s.entry_ring_max_index > ENTRY_LOC_RING_SIZE as u64 {
+        s.entry_ring_max_index - ENTRY_LOC_RING_SIZE as u64 + 1
     } else {
         1
     };
@@ -722,7 +776,7 @@ unsafe fn record_entry_loc(
 unsafe fn lookup_entry_loc(s: &Wal, index: u64) -> Option<EntryLoc> {
     if index == 0 || index > s.entry_ring_max_index { return None; }
     if index < s.entry_ring_min_index { return None; }
-    let slot = (index & ENTRY_RING_MASK) as usize;
+    let slot = (index & ENTRY_LOC_RING_MASK) as usize;
     let loc = s.entry_ring[slot];
     if loc.index != index { return None; }
     Some(loc)
@@ -772,6 +826,18 @@ unsafe fn serve_entry_request(
             // NOT_FOUND — reply with header only, empty body. The leader
             // takes this as a signal to fall through to snapshot install.
             s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
+            // Below-floor miss: every index under `entry_ring_min_index`
+            // is unserveable (see ENTRY_LOC_RING_SIZE). For a FOLLOWER
+            // that is benign — the leader falls through to snapshot
+            // install. For LOCAL CRASH RECOVERY it is fatal: apply asks
+            // for an index below the floor, gets NOT_FOUND forever, and
+            // the state machine is never rebuilt — there is no snapshot
+            // to fall through to. Log it once so the failure names
+            // itself instead of presenting as an unexplained hang.
+            if wal_index < s.entry_ring_min_index && !s.entryreq_floor_logged {
+                s.entryreq_floor_logged = true;
+                dev_log(sys, 2, b"[wal] entry req below ring floor".as_ptr(), 32);
+            }
             let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
             wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
             wire_channels::channel_write_msg(
@@ -972,10 +1038,11 @@ unsafe fn truncate_after(s: &mut Wal, sys: &SyscallTable, keep_through_index: u6
     // entry-request serves no longer surface the discarded suffix.
     let mut i = keep_through_index + 1;
     while i <= s.entry_ring_max_index {
-        let slot = (i & ENTRY_RING_MASK) as usize;
-        if s.entry_ring[slot].index == i {
-            s.entry_ring[slot].index = 0;
+        let loc_slot = (i & ENTRY_LOC_RING_MASK) as usize;
+        if s.entry_ring[loc_slot].index == i {
+            s.entry_ring[loc_slot].index = 0;
         }
+        let slot = (i & ENTRY_RING_MASK) as usize;
         if s.memory_entries[slot].index == i {
             s.memory_entries[slot].index = 0;
             s.memory_entries[slot].body_len = 0;
@@ -1171,6 +1238,12 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             // `[wal] no fs` if `OPEN_CREATE` fails. So replay just
             // reports completion either way and lets the writer make
             // the fallback call.
+            // Freeze the durable high-water reconstructed by replay.
+            // Everything up to here is ON DISK; `current_index` keeps
+            // moving as new entries are STAGED, so it must never be
+            // used to assert durability.
+            s.replay_recovered_index = s.current_index;
+            s.replay_recovered_term = s.current_term;
             dev_log(sys, 3, b"[wal] replay done".as_ptr(), 17);
             if s.replay_last_found == 0 {
                 // No segments found: start writes at seq 1.
@@ -1197,6 +1270,12 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         };
         if size == 0 {
             (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            // Freeze the durable high-water reconstructed by replay.
+            // Everything up to here is ON DISK; `current_index` keeps
+            // moving as new entries are STAGED, so it must never be
+            // used to assert durability.
+            s.replay_recovered_index = s.current_index;
+            s.replay_recovered_term = s.current_term;
             dev_log(sys, 3, b"[wal] replay done".as_ptr(), 17);
             s.phase = PHASE_NORMAL;
             if s.replay_last_found == 0 {

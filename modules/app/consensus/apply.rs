@@ -711,20 +711,22 @@ unsafe fn emit_committed_entry(s: &mut Apply, sys: &SyscallTable, slot_idx: usiz
     let slot = s.pending[slot_idx];
     let body_len = slot.body_len as usize;
 
-    // Admin-replicated entries (RFC §3.1) start with `ADMIN_MARKER`.
-    // Config-change entries (RFC §1.2) start with `CONFIG_CHANGE_MARKER`.
+    // Admin-replicated entries (RFC §3.1) start with `ADMIN_MAGIC`.
+    // Config-change entries (RFC §1.2) start with `CONFIG_CHANGE_MAGIC`.
+    // Both magics are 8 bytes so opaque application payloads cannot
+    // collide into them — see `wire::ADMIN_MAGIC`.
     // Both fan out on the admin seam ring back to raft (E9);
     // the distinct msg_type tells the engine which path applies.
-    // Drop-on-full preserved from the channel these writes replace.
-    if body_len >= 1 {
-        let marker = slot.body[0];
-        if marker == wire::ADMIN_MARKER && body_len >= 6 {
+    // Drop-on-full: a full ring drops the frame whole.
+    if body_len >= 8 {
+        let head = &slot.body[..body_len];
+        if wire::has_admin_magic(head) && body_len >= 13 {
             let _ = s.admin_out.push(
                 wire::MSG_ADMIN_COMMITTED,
-                &slot.body[1..body_len],
+                &slot.body[8..body_len],
             );
-        } else if marker == wire::CONFIG_CHANGE_MARKER && body_len >= 3 {
-            // Re-emit the body verbatim — the marker stays so
+        } else if wire::has_config_change_magic(head) && body_len >= 10 {
+            // Re-emit the body verbatim — the magic stays so
             // raft can validate with `decode_config_change`.
             let _ = s.admin_out.push(
                 wire::MSG_CONFIG_COMMITTED,

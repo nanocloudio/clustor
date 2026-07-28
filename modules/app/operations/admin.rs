@@ -49,7 +49,7 @@ pub struct Admin {
     pub in_requests: i32,  // in: pre-authorized AdminCommand (direct inject)
     pub out_raft: i32,     // out: admin envelopes to consensus.admin_proposals (local-only path)
     pub out_responses: i32, // out: MSG_ADMIN_RESPONSE
-    pub out_proposal: i32, // out: ADMIN_MARKER-prefixed MSG_CLIENT_PROPOSAL for replicable ops
+    pub out_proposal: i32, // out: ADMIN_MAGIC-prefixed MSG_CLIENT_PROPOSAL for replicable ops
 
     // Idempotency collapses only a *rapid retransmit* — a command
     // identical to the one immediately preceding it within the in-flight
@@ -276,7 +276,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     //   FREEZE / THAW / DURABILITY_MODE — replicate through Raft so
     //     every replica's state stays consistent. Send as a
     //     MSG_CLIENT_PROPOSAL with body
-    //     `[ADMIN_MARKER:u8][command_id:u32 LE][op_code:u8][op_body]`.
+    //     `[ADMIN_MAGIC:8][command_id:u32 LE][op_code:u8][op_body]`.
     //   TRANSFER_LEADER / SNAPSHOT — keep the local-only path; both
     //     have per-leader semantics and don't benefit from
     //     replication.
@@ -287,10 +287,10 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
 
     if replicable && a.out_proposal >= 0 {
         let mut env = [0u8; 1024];
-        env[0] = wire::ADMIN_MARKER;
-        env[1..5].copy_from_slice(&command_id.to_le_bytes());
-        env[5..5 + cmd_len].copy_from_slice(&cmd[..cmd_len]);
-        let total = 5 + cmd_len;
+        env[..8].copy_from_slice(&wire::ADMIN_MAGIC);
+        env[8..12].copy_from_slice(&command_id.to_le_bytes());
+        env[12..12 + cmd_len].copy_from_slice(&cmd[..cmd_len]);
+        let total = 12 + cmd_len;
         let poll_out = (sys.channel_poll)(a.out_proposal, 0x02);
         if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
             wire_channels::channel_write_msg(

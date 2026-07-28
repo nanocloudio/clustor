@@ -2021,7 +2021,7 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
                 let poll = (sys.channel_poll)(chan, 0x01);
                 if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
                 let (msg_type, plen) = wire_channels::channel_read_msg(sys, chan, &mut s.msg_buf);
-                // Replicable admin envelopes (ADMIN_MARKER-prefixed, spec
+                // Replicable admin envelopes (ADMIN_MAGIC-prefixed, spec
                 // §3.1) are exempt from the FREEZE gate: freeze blocks
                 // client writes, and the THAW that lifts it rides this
                 // very path — dropping it would make freeze permanent by
@@ -2033,8 +2033,8 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
                     && !s.strict_fallback
                     && chan == s.in_proposals
                     && msg_type == wire::MSG_CLIENT_PROPOSAL
-                    && plen >= 1
-                    && s.msg_buf[0] == wire::ADMIN_MARKER
+                    && plen >= 8
+                    && wire::has_admin_magic(&s.msg_buf[..plen as usize])
                     && !s.flush_deferred
                     && s.last_log_index.saturating_sub(s.commit_index) < MAX_UNCOMMITTED_INFLIGHT
                 {

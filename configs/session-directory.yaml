@@ -202,7 +202,7 @@ wiring:
   # Replicable admin ops (FREEZE / THAW / DURABILITY_MODE) ride
   # the client proposal path so every replica sees the entry.
   # `operations.raft_proposal` emits `MSG_CLIENT_PROPOSAL`
-  # with body `[ADMIN_MARKER][command_id:u32][op_code][op_body]`;
+  # with body `[ADMIN_MAGIC:8][command_id:u32][op_code][op_body]`;
   # `consensus` re-emits it as `MSG_ADMIN_COMMITTED` for
   # `consensus` to apply on every replica.
   - from: operations.raft_proposal

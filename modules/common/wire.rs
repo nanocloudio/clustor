@@ -175,24 +175,41 @@ pub const ADMIN_OP_REMOVE_VOTER: u8     = 0x07;
 /// generator drive real client writes over HTTP without a dedicated ingress.
 pub const ADMIN_OP_PROPOSE: u8          = 0x08;
 
-/// Body-prefix byte for an admin entry replicated through the Raft log
-/// (RFC §3.1). When a committed entry's body starts with this byte,
-/// the substrate interprets the remainder as
+/// Magic prefix of an admin entry replicated through the Raft log
+/// (RFC §3.1). When a committed entry's body starts with these eight
+/// bytes, the substrate interprets the remainder as
 /// `[command_id:u32 LE][op_code:u8][op_body...]` and applies the op
-/// at commit time on every replica. Plain proposal bodies (no marker)
+/// at commit time on every replica. Plain proposal bodies (no magic)
 /// remain opaque per the RFC and are passed through unchanged.
-pub const ADMIN_MARKER: u8              = 0xAD;
+///
+/// Sizing: entry TYPE is inferred from the head of a body that is
+/// otherwise opaque application data, so the magic must be wide enough
+/// that no real payload collides into it. Application bodies routinely
+/// lead with dense counters (lattice's KV payload starts with a
+/// `corr_id` whose low byte cycles through all 256 values), so any
+/// short tag is forged within a few hundred entries — and a forged
+/// config change can apply a C_new that removes the node from its own
+/// voter set. Eight bytes put accidental collision at ~2^-64 and cost
+/// application entries nothing: only clustor's own admin/config
+/// entries carry a magic.
+pub const ADMIN_MAGIC: [u8; 8] = [0xAD, 0x4D, 0x4E, 0x21, 0x9E, 0x1F, 0x5C, 0xA7];
+
+/// True when `buf` begins with [`ADMIN_MAGIC`].
+#[inline]
+pub fn has_admin_magic(buf: &[u8]) -> bool {
+    buf.len() >= 8 && buf[..8] == ADMIN_MAGIC
+}
 
 /// `consensus` → `consensus` admin commit signal. Emitted when a
-/// committed entry's body begins with `ADMIN_MARKER` so consensus
+/// committed entry's body begins with `ADMIN_MAGIC` so consensus
 /// can apply the op locally. Payload: same body bytes that landed in
-/// the WAL minus the marker byte:
+/// the WAL minus the 8-byte magic:
 /// `[command_id:u32 LE][op_code:u8][op_body...]`.
 pub const MSG_ADMIN_COMMITTED: u8     = 0x1A;
 /// `consensus` → `consensus` config-change commit. Emitted
-/// when a committed entry's body begins with `CONFIG_CHANGE_MARKER`.
-/// Payload mirrors the body bytes (minus the marker): see
-/// `decode_config_change`. See RFC §1.2 / phase-3 plan §1.2.
+/// when a committed entry's body begins with `CONFIG_CHANGE_MAGIC`.
+/// Payload is the entry body verbatim — the magic STAYS, so the
+/// consumer validates with `decode_config_change`. See RFC §1.2.
 pub const MSG_CONFIG_COMMITTED: u8    = 0x1B;
 
 /// Body-prefix byte for a Raft-replicated configuration change (joint
@@ -201,14 +218,22 @@ pub const MSG_CONFIG_COMMITTED: u8    = 0x1B;
 ///  [voter_id_0:u8]...[voter_id_{n-1}:u8]` for the "new" voter set.
 /// For `C_old,new` entries the old set is recoverable from the
 /// follower's persisted `current_voters`. Joint consensus is not yet
-/// fully implemented; the marker is reserved so the wire format
+/// fully implemented; the magic is reserved so the log format
 /// stays stable while the engine work lands.
-pub const CONFIG_CHANGE_MARKER: u8    = 0xCC;
+/// Magic prefix of a Raft config-change entry body. See [`ADMIN_MAGIC`]
+/// for the sizing rationale.
+pub const CONFIG_CHANGE_MAGIC: [u8; 8] = [0xCC, 0x46, 0x47, 0x21, 0x9E, 0x1F, 0x5C, 0xA7];
+
+/// True when `buf` begins with [`CONFIG_CHANGE_MAGIC`].
+#[inline]
+pub fn has_config_change_magic(buf: &[u8]) -> bool {
+    buf.len() >= 8 && buf[..8] == CONFIG_CHANGE_MAGIC
+}
 pub const CONFIG_CHANGE_OP_JOINT: u8  = 0x01;
 pub const CONFIG_CHANGE_OP_NEW: u8    = 0x02;
 
 /// Encode a config-change entry body for the WAL log. Layout:
-///   `[CONFIG_CHANGE_MARKER][op_code:u8][voter_count:u8][voter_id_0..n-1:u8]`
+///   `[CONFIG_CHANGE_MAGIC:8][op_code:u8][voter_count:u8][voter_id_0..n-1:u8]`
 /// Returns total bytes written or 0 on buffer-too-small.
 #[inline]
 pub fn encode_config_change(
@@ -217,34 +242,31 @@ pub fn encode_config_change(
     voters: &[u8],
 ) -> usize {
     let n = voters.len().min(0xFF);
-    let total = 3 + n;
+    let total = 10 + n;
     if buf.len() < total {
         return 0;
     }
-    buf[0] = CONFIG_CHANGE_MARKER;
-    buf[1] = op_code;
-    buf[2] = n as u8;
-    buf[3..3 + n].copy_from_slice(&voters[..n]);
+    buf[..8].copy_from_slice(&CONFIG_CHANGE_MAGIC);
+    buf[8] = op_code;
+    buf[9] = n as u8;
+    buf[10..10 + n].copy_from_slice(&voters[..n]);
     total
 }
 
 /// Decode a config-change body. Returns `(op_code, voter_ids_offset, voter_count)`
-/// or `None` if the body doesn't start with `CONFIG_CHANGE_MARKER` or is
+/// or `None` if the body doesn't start with `CONFIG_CHANGE_MAGIC` or is
 /// truncated.
 #[inline]
 pub fn decode_config_change(buf: &[u8]) -> Option<(u8, usize, usize)> {
-    if buf.len() < 3 {
+    if !has_config_change_magic(buf) || buf.len() < 10 {
         return None;
     }
-    if buf[0] != CONFIG_CHANGE_MARKER {
+    let op_code = buf[8];
+    let n = buf[9] as usize;
+    if buf.len() < 10 + n {
         return None;
     }
-    let op_code = buf[1];
-    let n = buf[2] as usize;
-    if buf.len() < 3 + n {
-        return None;
-    }
-    Some((op_code, 3, n))
+    Some((op_code, 10, n))
 }
 
 /// `consensus` → `consensus` / `durability` voter-set
