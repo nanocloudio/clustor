@@ -1,4 +1,4 @@
-# L2 consensus latency/throughput bench — CM5 BARE-METAL twin of
+# L2 consensus latency/throughput bench — PI5 BARE-METAL twin of
 # `consensus-bench.yaml` (`.context/rfc_performance_benchmarking.md` §6).
 # Full single-node consensus pipeline with a `consensus_bench` injector
 # feeding consensus.proposals directly. propose→commit latency and
@@ -6,13 +6,13 @@
 # commit_latency_ms, consensus commit_advances) over /metrics
 # (scrape :19090 over the wire) + log_net UDP:6666.
 #
-# Differs from the linux twin only in: target cm5, `platform.debug.to: net`
+# Differs from the linux twin only in: target pi5, `platform.debug.to: net`
 # (log_net observation), and `ip` (not `linux_net`) as the net module.
 #
-# ⚠ Bare-metal has no dev_fs provider yet — the WAL degrades to in-memory
-# (FS_OPEN_CREATE → ENODEV; see single-cm5-throughput.yaml). So this
-# measures the CONSENSUS + SCHEDULER path on real silicon, NOT a
-# disk-durable commit. Re-take when the fluxor cm5 NVMe provider lands.
+# DISK-DURABLE variant: nvme + fat32 provide the FS contract, so the WAL
+# writes real segment files (root_path=1, 8.3 names) to the NVMe FAT32
+# partition and fsyncs through the device NVMe Flush. This is the
+# disk-durable L2 commit path + the WAL's L1 metrics on real silicon.
 #
 # Validated 2026-06-16 on pi5-a (RFC §14): below the knee tracks offered
 # rate at p50≈4–6 ms; saturating plateau ≈1000–1060/s committed, inflight
@@ -27,8 +27,8 @@
 # batch ≤2. offered/s ≈ batch_per_step / inject_period × 1000.
 #
 # DEV/TEST ONLY — HTTP admin bypasses operations.
-target: cm5
-tick_us: 1000
+target: pi5
+tick_us: 6000
 
 scheduler:
   accept_cycles: true
@@ -39,17 +39,41 @@ platform:
   net: {}
 
 modules:
+  # ── disk stack: nvme block device + fat32 filesystem ──
+  - name: nvme
+    bind: m2_primary
+    namespace: 1
+    queue_depth: 32
+  - name: fat32
+    path: /
+    clean_root: 1           # truncate the bloated root dir to one warm cluster on
+                            # first create: dozens of prior runs left orphaned
+                            # root entries, and scanning a cold root-dir cluster
+                            # costs ~30 ms on this NVMe (first-touch read) — which
+                            # blows the WAL/raft step guard (~52-entry fault).
+    init_free_hint: 20000   # seed free-scan past the bench partition orphan region
+    clear_free_region: 2000 # zero an 8 MiB FAT span at the hint on first create:
+                            # this partition's FAT holds stale non-zero entries
+                            # (never cleanly formatted) that the free-scan would
+                            # otherwise walk for ~227 ms and blow the step guard.
+
   # L2 load injector — drives proposals into consensus.proposals.
   - name: consensus_bench
     params:
       total: 4000
       body_size: 64
       batch_per_step: 1
-      # Default 1 proposal every 4 ms ≈ 250/s — well below the ~1000/s
-      # bare-metal knee, so it completes cleanly (4000 committed, p50≈6 ms)
-      # as an "it works" smoke. To sweep the knee, drop inject_period
-      # toward 1 (1000/s) and beyond into the plateau (see header).
-      inject_period: 4
+      # inject_period=1 offers at the full injector step rate (~166/s on the
+      # 6 ms-tick disk graph). The proposals edge is a bounded FIFO; when raft
+      # is pinned at the uncommitted-inflight cap (disk commit is slower than
+      # the offer), the FIFO fills and channel_write returns CHAN_EAGAIN.
+      # consensus_bench now honours that (counts `blocked`, retries the same
+      # proposal next step), so it self-throttles to the disk commit rate
+      # LOSSLESSLY at any inject_period — no proposals dropped. (Before the
+      # wire_channels write_framed EAGAIN-sign fix, a full FIFO was mis-reported
+      # as a successful write and the proposal was silently dropped: inject_period=1
+      # ⇒ only 268/4000 reached raft. That bug is fixed.)
+      inject_period: 6
       warmup_ms: 2000
   - name: peer_router
     params:
@@ -71,6 +95,9 @@ modules:
       fsync_mode: 1
       group_window_ms: 5
       group_max_pending: 4
+      root_path: 1            # 8.3 root segment names for FAT32 (no mkdir)
+      segment_bytes: 65536    # 64 KiB segments → rotation within the run
+      skip_replay: 1          # L1/L2 throughput bench: start fresh each run so
       self_id: 0
       voter_count: 1
       partition_id: 0
@@ -81,6 +108,12 @@ modules:
       emit_interval_ms: 250
       listen_port: 19090
 wiring:
+  # ── nvme block device ↔ fat32 filesystem ──
+  - from: nvme.blocks
+    to: fat32.blocks
+  - from: fat32.block_writes
+    to: nvme.requests
+
   - from: ip.net_out
     to: peer_router.net_in
   - from: peer_router.net_out
@@ -132,14 +165,11 @@ wiring:
   - from: durability.quorum_durable
     to: consensus.durable
 
-  # Gap refetch: consensus pulls a durable entry's body back from
-  # the WAL by index when it's missing one (post-restart recovery, or
-  # a fan-out gap). Without this a restart advances commit_horizon via
-  # `commit_advanced` but consensus can never actually apply past
-  # it — it never received the entry bodies to apply.
+  # Apply-side gap recovery (Item 2): when the best-effort log_observe
+  # fan-out drops an entry body under overdrive, consensus refetches the
+  # missing index from the durable WAL instead of stalling.
   - from: consensus.entry_request
     to: durability.entry_request
-    rate: transaction
   - from: durability.entry_reply
     to: consensus.entry_reply
   - from: gateway.reads

@@ -41,7 +41,7 @@ mod abi;
 use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/params.rs");
+include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[path = "../../common/wire.rs"]
 mod wire;
@@ -96,12 +96,12 @@ const PATH_ROOT: &[u8] = b"nvbench.bin";
 const PATH_WAL: &[u8] = b"wal/nvbench.bin";
 
 /// Default steps to wait for FS_OPEN_CREATE to stop returning E_AGAIN.
-/// On a cm5 cold boot the FS provider (fat32) is not ready until nvme
+/// On a pi5 cold boot the FS provider (fat32) is not ready until nvme
 /// enumerates the namespace and fat32 reads block0/GPT/boot/root/FAT —
 /// all async, and it can take tens of seconds. E_AGAIN means "present
 /// but not ready, retry"; the bench waits this many steps (~1 step/ms,
 /// so ~60 s) before giving up on a stuck provider. The linux platform
-/// provider is ready on step 1, so this only matters on cm5.
+/// provider is ready on step 1, so this only matters on pi5.
 /// Overridable via the `open_retry_max` param.
 const OPEN_RETRY_MAX_DEFAULT: u32 = 60_000;
 
@@ -135,7 +135,7 @@ define_params! {
     5, step_batch, u16, 64
         => |s, d, len| { s.step_batch = p_u16(d, len, 0, 64); };
     // 1 = write to a root-directory file "nvbench.bin"; 0 = "wal/nvbench.bin"
-    // (the parent dir must already exist for 0). cm5/FAT32 has no mkdir, so
+    // (the parent dir must already exist for 0). pi5/FAT32 has no mkdir, so
     // the bare-metal bench uses root. Default 0 preserves the linux path.
     6, root_path, u16, 0
         => |s, d, len| { s.root_path = p_u16(d, len, 0, 0); };
@@ -149,10 +149,10 @@ define_params! {
     8, open_retry_max, u32, OPEN_RETRY_MAX_DEFAULT
         => |s, d, len| { s.open_retry_max = p_u32(d, len, 0, OPEN_RETRY_MAX_DEFAULT); };
     // Defer the first FS_OPEN_CREATE until kernel uptime ≥ this many ms.
-    // On cm5 the log_net consumer seeds its TAIL ~30 s post-boot, dropping
+    // On pi5 the log_net consumer seeds its TAIL ~30 s post-boot, dropping
     // earlier one-shot lines; delaying the create+write+verify past that
     // window makes the per-step bracket logs (open/seq/fsync) observable so
-    // a fault can be localised. 0 = no delay (linux reference). cm5 ~20000.
+    // a fault can be localised. 0 = no delay (linux reference). pi5 ~20000.
     9, start_delay_ms, u32, 0
         => |s, d, len| { s.start_delay_ms = p_u32(d, len, 0, 0); };
     // 1 = durability mode: skip create/write, FS_OPEN the existing file
@@ -367,7 +367,7 @@ fn kbps(bytes: u64, elapsed_us: u64) -> u32 {
 /// Self-driven module: the bench has no input port to wake it, so it must
 /// be stepped every tick regardless of channel activity. The bare-metal
 /// scheduler only steps an input-less module when it advertises deferred
-/// readiness (mirrors fluxor's `nvme_perf_probe`); without this, the cm5
+/// readiness (mirrors fluxor's `nvme_perf_probe`); without this, the pi5
 /// scheduler never calls `module_step` and the bench sits in PH_OPEN.
 /// (On linux every module is stepped, so this is a no-op there.)
 #[no_mangle]
@@ -396,7 +396,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // — it is "ready" the instant it is stepped — so we advertise Ready on
         // the first step, mirroring `foundation/ip` signalling Ready once
         // `ip_configured`. Without this, a downstream aggregator whose ONLY
-        // forward upstream is this bench (operations in nvme-bench-cm5)
+        // forward upstream is this bench (operations in nvme-bench-pi5)
         // would stay ready-gated forever — its `/metrics` export never fills.
         // The bit is sticky (the scheduler clears it only on module restart),
         // so this fires exactly once; we still emit metrics this tick — only

@@ -1,4 +1,4 @@
-# L2 consensus latency/throughput bench — CM5 BARE-METAL twin of
+# L2 consensus latency/throughput bench — PI5 BARE-METAL twin of
 # `consensus-bench.yaml` (`.context/rfc_performance_benchmarking.md` §6).
 # Full single-node consensus pipeline with a `consensus_bench` injector
 # feeding consensus.proposals directly. propose→commit latency and
@@ -6,7 +6,7 @@
 # commit_latency_ms, consensus commit_advances) over /metrics
 # (scrape :19090 over the wire) + log_net UDP:6666.
 #
-# Differs from the linux twin only in: target cm5, `platform.debug.to: net`
+# Differs from the linux twin only in: target pi5, `platform.debug.to: net`
 # (log_net observation), and `ip` (not `linux_net`) as the net module.
 #
 # DISK-DURABLE variant: nvme + fat32 provide the FS contract, so the WAL
@@ -27,7 +27,7 @@
 # batch ≤2. offered/s ≈ batch_per_step / inject_period × 1000.
 #
 # DEV/TEST ONLY — HTTP admin bypasses operations.
-target: cm5
+target: pi5
 tick_us: 6000
 
 scheduler:
@@ -46,21 +46,18 @@ modules:
     queue_depth: 32
   - name: fat32
     path: /
-    # NO clean_root for recovery: clean_root truncates the ROOT DIRECTORY on
+    clean_root: 1           # ESTABLISH: wipe the root (old segments + stale
+                            # RAFT0000.MET) for a clean fresh baseline.
+    # (recovery variant has NO clean_root: clean_root truncates the ROOT DIRECTORY on
     # the first file-create, which would DELETE the very WAL segment files we
     # need to replay (it fired when raft persisted RAFT0000.MET / the WAL
     # rotated, aborting replay mid-stream). The cold root-dir scan that
     # clean_root was avoiding is now absorbed by the WAL replay Burst path,
     # so recovery preserves the on-disk segments instead of wiping them.
     init_free_hint: 20000   # seed free-scan past the bench partition orphan region
-    clear_free_region: 2000 # fluxor gates this on clean_root (fresh-format only),
-                            # so on this recovery mount (no clean_root) it is a
-                            # no-op: the established WAL segment + RAFT0000.MET
-                            # FAT chains are preserved. (Before the fluxor gate it
-                            # blindly zeroed FAT[20000..22000], severing the
-                            # multi-cluster segment chain past cluster 1 — replay
-                            # then reconstructed only ~1 cluster. Kept for symmetry
-                            # with -establish.)
+    clear_free_region: 2000 # zero an 8 MiB FAT span in the FREE region only
+                            # (past the data) so segment/meta alloc is fast;
+                            # does not touch existing segment FAT chains.
 
   # L2 load injector — drives proposals into consensus.proposals.
   - name: consensus_bench
@@ -105,6 +102,7 @@ modules:
       group_max_pending: 4
       root_path: 1            # 8.3 root segment names for FAT32 (no mkdir)
       segment_bytes: 65536    # 64 KiB segments → rotation within the run
+      skip_replay: 1          # ESTABLISH: fresh start, write a clean small WAL.
       self_id: 0
       voter_count: 1
       partition_id: 0

@@ -1,4 +1,4 @@
-# L0/L1 WAL-PATH NVMe floor — CM5 BARE-METAL
+# L0/L1 WAL-PATH NVMe floor — PI5 BARE-METAL
 # (`.context/rfc_performance_benchmarking.md` §6/§15).
 #
 # Unlike `nvme-bench.yaml` (target linux, dev_fs over the Linux VFS),
@@ -20,7 +20,7 @@
 # Observation: log_net UDP:6666 ([nvbench] / [fat32] / [nvme] lines) +
 # GET :19090/metrics (fsync-latency histogram, module 0x16).
 
-target: cm5
+target: pi5
 # 3 ms ticks + a 6 ms step deadline. With step_batch=8 the per-step work
 # (8 writes + up to 8 fsyncs ≈ 5 ms) EXCEEDS the tick, so the bench is
 # work-bound, not tick-throttled — seq throughput reflects real device rate
@@ -58,7 +58,6 @@ modules:
                             # so seq throughput is device-rate, not tick-bound
       root_path: 1          # write root "nvbench.bin" (no mkdir on FAT32)
       verify: 1             # reopen + read back, assert byte-exact
-      verify_only: 1        # DURABILITY: read back only, no write (post cold cycle)
       start_delay_ms: 20000 # defer create+write past log_net history-skip
                             # (~30 s TAIL seed) so bracket logs survive
 

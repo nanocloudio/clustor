@@ -208,6 +208,14 @@ path = "tests/wal_group_fsync.rs"
 name = "wal_replay"
 path = "tests/wal_replay.rs"
 
+# Host-side unit coverage for the WAL's below-ring-floor segment-scan
+# fallback. Pulls `modules/app/durability/wal.rs` in via `#[path]`
+# against a mock SyscallTable (in-memory FS + byte-FIFO channels);
+# no fluxor-linux / .fmod prereqs, always runs.
+[[test]]
+name = "wal_scan"
+path = "tests/wal_scan.rs"
+
 # Criterion benches. Each uses `harness = false` so criterion's own
 # main runs instead of the default libtest harness. Run with
 # `cargo bench` or `cargo bench --bench <name> -- --quick`. All

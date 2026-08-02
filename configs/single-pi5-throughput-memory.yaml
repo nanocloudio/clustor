@@ -1,4 +1,4 @@
-# Pi 5 / CM5 bare-metal twin of `single-throughput.yaml`. Runs on
+# Pi 5 bare-metal twin of `single-throughput.yaml`. Runs on
 # the rig (`fluxor rig test --rig pi5-a`).
 #
 # Observation rides `platform.debug.to: net` — every `dev_log(…)`
@@ -6,15 +6,15 @@
 # `[telemetry.monitor_udp]` captures it (see
 # `~/.config/fluxor/labs/default/rigs/pi5-a.toml`).
 #
-# Disk-durable external-load profile: nvme + fat32 provide the FS contract,
-# so the WAL writes and fsyncs real segment files on the CM5 NVMe. There is
+# Ephemeral external-load profile: no FS provider is wired, so the WAL retains
+# recent entries in memory and acknowledges them without a durability barrier. There is
 # deliberately no on-DUT injector; drive POST /propose on the HTTP diagnostic
 # listener (`:19090`) from the load host. Port 9090 is the peer/client protocol
 # listener and is not the benchmark HTTP endpoint.
 #
-# Driver: `tests/hardware/drive-cm5-rig.sh`.
+# Driver: `tests/hardware/drive-pi5-rig.sh`.
 
-target: cm5
+target: pi5
 tick_us: 3500
 
 # Same cyclic-graph allowance as `single.yaml` — Raft's
@@ -40,27 +40,15 @@ platform:
     # Destination comes from ~/.config/fluxor/host.toml
     # debug.collector_ip (192.168.1.10), shared with proven log_net routing.
     export_dst_port: 4318
-    # OTLP JSON/TCP currently shares the transaction domain: a second CM5
-    # execution domain fails the boot/readiness gate on this firmware. Batch
-    # direct export once per minute; the binary /metrics path below remains at
-    # 250 ms for high-resolution benchmark capture.
+    # Export in coarse batches: a 1 s cadence measurably contends with the
+    # request path on the single scheduler domain. Five seconds preserves
+    # useful operational telemetry without paying JSON/TCP work every second.
     export_flush_ms: 60000
     # OTLP requires a Unix-epoch boot anchor. Refresh this per deployment
     # until the rig injects wall time or the DUT gains an RTC/NTP authority.
     export_epoch_sec: 1783893839
 
 modules:
-  # Bare-metal block device and filesystem provider.
-  - name: nvme
-    bind: m2_primary
-    namespace: 1
-    queue_depth: 32
-  - name: fat32
-    path: /
-    clean_root: 1
-    init_free_hint: 20000
-    clear_free_region: 4096
-
   - name: peer_router
     params:
       self_id: 0
@@ -80,22 +68,15 @@ modules:
     params:
       fsync_mode: 1
       group_window_ms: 5
-      group_max_pending: 8
-      root_path: 1
-      fixed_segment: 1
-      preallocate_settle_ms: 10000
-      segment_bytes: 8388608
+      group_max_pending: 4
+      root_path: 0
+      segment_bytes: 67108864
       skip_replay: 1
       self_id: 0
       voter_count: 1
       partition_id: 0
   - name: control_plane
   - name: admission
-    params:
-      entry_credit_max: 64
-      entry_rate_per_sec: 950
-      byte_credit_max_kib: 64
-      sample_period_ms: 10
   - name: operations
     params:
       emit_interval_ms: 250
@@ -123,16 +104,7 @@ wiring:
     to: observe.telemetry
   - from: ip.telemetry
     to: otlp_http.telemetry
-  - from: fat32.telemetry
-    to: observe.telemetry
-  - from: fat32.telemetry
-    to: otlp_http.telemetry
 
-  # ── NVMe block device ↔ FAT32 filesystem provider ───────────
-  - from: nvme.blocks
-    to: fat32.blocks
-  - from: fat32.block_writes
-    to: nvme.requests
   # ── ip ↔ peer_router (cleartext; no TLS) ─────────────────
   - from: ip.net_out
     to: peer_router.net_in
@@ -187,15 +159,15 @@ wiring:
   # ── Persistence ───────────────────────────────────────────
   - from: consensus.log_append
     to: durability.entries
-    rate: transaction
-  - from: durability.flushed
-    to: consensus.wal_flushed
-    rate: transaction
   # Dedicated boot handoff: Raft must resume its index at the exact WAL
   # replay high-water before proposal intake opens. Never multiplex this onto
   # wal.flushed, which also fans out durability acknowledgements.
   - from: durability.replay_complete
     to: consensus.wal_replay_complete
+    rate: transaction
+    rate: transaction
+  - from: durability.flushed
+    to: consensus.wal_flushed
     rate: transaction
   - from: consensus.cross_durability_ack
     to: durability.ack
@@ -279,10 +251,7 @@ wiring:
 
   # ── HTTP diagnostic listener → operations bypass (DEV/TEST) ──
   # POSTs route around operations; same caveat as `configs/single.yaml`.
-  - from: operations.net_out
-    to: ip.net_in
   - from: ip.net_out
     to: operations.net_in
-  # The latest readiness byte is replaceable state, not an ordered event
-  # stream. Give it a zero-copy mailbox so the ingress can answer /readyz
-  # locally without a request/response round-trip through operations.
+  - from: operations.net_out
+    to: ip.net_in

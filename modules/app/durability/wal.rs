@@ -81,19 +81,29 @@ const ENTRY_RING_MASK: u64 = (ENTRY_RING_SIZE as u64) - 1;
 /// from `ENTRY_RING_SIZE`, which also sizes `memory_entries` — those
 /// carry full 2 KiB bodies, so the two cannot share a bound.
 ///
-/// This bounds how long a log can be and still RECOVER: on restart,
-/// apply restarts at index 0 and refetches every entry, and any index
-/// below `entry_ring_min_index` answers NOT_FOUND — a node whose log
-/// outgrows the map cannot rebuild its state machine from it.
-/// Locations are 32 B, so 8192 slots cost ~256 KiB and cover
-/// realistic recovery windows between snapshots.
+/// On restart, apply restarts at index 0 and refetches every entry;
+/// any index below `entry_ring_min_index` misses the map. Locations
+/// are 32 B, so 8192 slots cost ~256 KiB and cover realistic recovery
+/// windows between snapshots.
 ///
-/// The bound is a hard ceiling: past it, local recovery fails loudly
-/// (`[wal] entry req below ring floor`) and snapshot install is the
-/// only way back.
+/// The bound is NOT a hard recovery ceiling: a request below the ring
+/// floor falls back to a bounded forward scan of the on-disk segments
+/// (`step_entry_scan`), which locates the record by walking frames
+/// from the oldest durable segment. Only indices whose segment was
+/// compacted away are truly unservable (`[wal] entry req unservable`)
+/// — for those, snapshot install is the only way back.
 const ENTRY_LOC_RING_SIZE: usize = 8192;
 const ENTRY_LOC_RING_MASK: u64 = (ENTRY_LOC_RING_SIZE as u64) - 1;
 const MEMORY_ENTRY_BODY_CAP: usize = 2048;
+
+/// Per-step record budget for the below-floor segment scan. Each
+/// record costs one `FS_SEEK` + two small `FS_READ`s (frame header +
+/// term/index prefix), so 16 records ≈ 48 provider calls — bounded,
+/// auditable step work in the same spirit as `MAX_ENTRY_PUMP_RECORDS`.
+/// The scan cursor persists across steps (and across served requests,
+/// so sequential recovery refetches resume in O(1) instead of
+/// rescanning from the segment start).
+const SCAN_RECORDS_PER_STEP: usize = 16;
 
 /// WCET/fairness backstop for the transaction-budgeted input pump. The byte
 /// grant is the pacing authority; this cap only bounds the number of provider
@@ -168,7 +178,7 @@ const FS_CAPS: u32 = 0x09FF;
 const FS_CAP_UNLINK: u32 = 1 << 5;
 
 /// FS E_AGAIN: the FS provider is present but still initialising (e.g. fat32
-/// reading the BPB/GPT/root on a cm5 cold boot). Distinct from a hard error
+/// reading the BPB/GPT/root on a pi5 cold boot). Distinct from a hard error
 /// (ENODEV/ENOSYS = no provider). On E_AGAIN the WAL WAITS — it holds new
 /// entries (raft backpressures) and retries the segment open every step —
 /// rather than degrading to in-memory, which would drop durability once the
@@ -406,14 +416,58 @@ pub struct Wal {
     /// Diagnostic: entry requests served (hit) vs not-found.
     entryreq_served: u32,
     entryreq_notfound: u32,
+    /// Diagnostic: entry requests served via the below-floor segment scan.
+    entryreq_scan_served: u32,
+
+    // ── Below-floor segment-scan fallback ─────────────────────
+    // A request for an index that has aged out of `entry_ring` is served
+    // by walking the on-disk segment frames forward from the oldest
+    // durable segment (mirroring `step_replay`'s framing walk), bounded
+    // to `SCAN_RECORDS_PER_STEP` records per step. One request at a
+    // time; concurrent below-floor requests for a different index get
+    // no reply and lean on the requester's re-issue throttle (apply's
+    // ENTRY_REFETCH_RETRY_MS / the replicator's NACK retry).
+    /// A scan target is pending (`scan_target` valid).
+    scan_active: bool,
+    /// Target located (`scan_loc` valid); the reply is pending delivery.
+    scan_found: bool,
+    /// Request id to echo in the scan-served reply.
+    scan_request_id: u32,
+    /// Index being scanned for (0 = none).
+    scan_target: u64,
+    /// Segment currently being walked.
+    scan_seg: u32,
+    /// Read-only fd on `scan_seg` (-1 = none). Kept open across steps
+    /// and across served requests as a warm cursor. Never `s.fd`.
+    scan_fd: i32,
+    scan_pos: u32,
+    scan_file_size: u32,
+    /// Consecutive missing-segment opens (gap tolerance, as replay).
+    scan_misses: u8,
+    /// Index/term of the last record the cursor walked past — the warm-
+    /// cursor key (a new target > `scan_last_index` resumes here) and
+    /// the `prev_term` source for sequential serves.
+    scan_last_index: u64,
+    scan_last_term: u64,
+    /// Term of the record at `scan_target - 1`, captured while walking.
+    scan_prev_term: u64,
+    /// Location of the found target (valid while `scan_found`).
+    scan_loc: EntryLoc,
+    /// Indices below this were compacted away (`MSG_WAL_COMPACT_BEFORE`)
+    /// — legitimately unservable; requests fail loudly instead of
+    /// scanning. Distinct from `entry_ring_min_index`, which also rises
+    /// as the ring wraps (still servable from disk).
+    compact_floor: u64,
+    /// One-shot latch for the loud unservable-(compacted)-index log.
+    entryreq_unservable_logged: bool,
 
     // ── In-module delivery latches (composite seams) ─────────
     /// Highest durable (term, index) this step, for the ledger
     /// component. Monotone latest-wins — the ledger's per-replica
     /// progress only ever advances, so collapsing multiple acks per
     /// step to the max is semantics-preserving.
-    /// One-shot latch for the below-ring-floor diagnostic (see the
-    /// NOT_FOUND path in the entry-request handler).
+    /// One-shot latch for the informative below-ring-floor diagnostic
+    /// (`entry req below floor: seg scan` — see `begin_entry_scan`).
     pub entryreq_floor_logged: bool,
     /// Durable high-water frozen at replay completion, and its term.
     /// Distinct from `current_index`, which advances on STAGED writes.
@@ -475,6 +529,22 @@ pub unsafe fn init(s: &mut Wal) {
     s.replay_first_size = 0;
     s.entryreq_served = 0;
     s.entryreq_notfound = 0;
+    s.entryreq_scan_served = 0;
+    s.scan_active = false;
+    s.scan_found = false;
+    s.scan_request_id = 0;
+    s.scan_target = 0;
+    s.scan_seg = 0;
+    s.scan_fd = -1;
+    s.scan_pos = 0;
+    s.scan_file_size = 0;
+    s.scan_misses = 0;
+    s.scan_last_index = 0;
+    s.scan_last_term = 0;
+    s.scan_prev_term = 0;
+    s.scan_loc = EntryLoc::zero();
+    s.compact_floor = 0;
+    s.entryreq_unservable_logged = false;
     s.continuity_fault = false;
     s.continuity_errors = 0;
     s.segment_seq = 1;
@@ -563,7 +633,7 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     // FS-readiness gate. While the segment isn't open and we haven't
     // decided the FS is genuinely absent, (re)try the open every step.
     // On E_AGAIN (provider still initialising — fat32 reading the BPB on
-    // a cm5 cold boot) HOLD: don't drain new entries, so raft backpressures
+    // a pi5 cold boot) HOLD: don't drain new entries, so raft backpressures
     // and nothing is acked that can't be persisted. Once the open succeeds
     // (disk) or hard-fails (in-memory), fall through to normal processing.
     if s.fd < 0 && !s.no_fs {
@@ -653,8 +723,10 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
         dev_report_step_effect(sys, effect);
     }
 
-    // 3. Service random-access read-back requests (replicator NACK retry).
+    // 3. Service random-access read-back requests (replicator NACK retry),
+    //    then advance the bounded below-floor segment scan (if pending).
     drain_entry_requests(s, sys);
+    step_entry_scan(s, sys);
 
     // 4. Emit metrics periodically
     emit_metrics(s, sys);
@@ -823,20 +895,33 @@ unsafe fn serve_entry_request(
     let loc = match lookup_entry_loc(s, wal_index) {
         Some(l) => l,
         None => {
+            // Below-floor miss: the index aged out of the location ring
+            // (see ENTRY_LOC_RING_SIZE) but its record is still in a
+            // durable segment unless compaction deleted it. Serve it via
+            // the bounded forward segment scan instead of NOT_FOUND —
+            // crash recovery refetches the WHOLE log through this path,
+            // and a NOT_FOUND there permanently wedges the rebuild
+            // (there is no snapshot to fall through to).
+            if wal_index > 0
+                && wal_index < s.entry_ring_min_index
+                && wal_index >= s.compact_floor
+                && !s.no_fs
+                && !VOLATILE
+            {
+                // No reply yet — the scan answers on a later step; the
+                // requester's re-issue throttle covers a dropped attach.
+                begin_entry_scan(s, sys, request_id, wal_index);
+                return;
+            }
             // NOT_FOUND — reply with header only, empty body. The leader
             // takes this as a signal to fall through to snapshot install.
             s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
-            // Below-floor miss: every index under `entry_ring_min_index`
-            // is unserveable (see ENTRY_LOC_RING_SIZE). For a FOLLOWER
-            // that is benign — the leader falls through to snapshot
-            // install. For LOCAL CRASH RECOVERY it is fatal: apply asks
-            // for an index below the floor, gets NOT_FOUND forever, and
-            // the state machine is never rebuilt — there is no snapshot
-            // to fall through to. Log it once so the failure names
-            // itself instead of presenting as an unexplained hang.
-            if wal_index < s.entry_ring_min_index && !s.entryreq_floor_logged {
-                s.entryreq_floor_logged = true;
-                dev_log(sys, 2, b"[wal] entry req below ring floor".as_ptr(), 32);
+            // Truly unservable below-floor index: compacted away (or the
+            // in-memory path, which retains nothing older than the body
+            // ring). Fail loudly — snapshot install is the only way back.
+            if wal_index < s.entry_ring_min_index && !s.entryreq_unservable_logged {
+                s.entryreq_unservable_logged = true;
+                dev_log(sys, 2, b"[wal] entry req unservable (compacted)".as_ptr(), 38);
             }
             let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
             wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
@@ -966,6 +1051,327 @@ unsafe fn serve_entry_request(
     s.entryreq_served = s.entryreq_served.saturating_add(1);
 }
 
+// ── Below-floor segment-scan fallback ───────────────────────
+//
+// Serves entry requests whose index has aged out of `entry_ring` by
+// walking the on-disk segment frames forward from the oldest durable
+// segment — the same `[len][crc][payload]` walk `step_replay` does,
+// but skipping payloads (seek) instead of reading them. Work is
+// bounded per step (`SCAN_RECORDS_PER_STEP` records, or one segment
+// open) and the cursor resumes across steps. After a serve, the
+// cursor stays warm so sequential refetches (crash recovery walks
+// index 1,2,3…) continue in O(1) per entry.
+
+/// Attach a below-floor request to the scan slot. One target at a
+/// time: a request for a different index while a scan is active is
+/// dropped without a reply — apply re-asks the same index after
+/// `ENTRY_REFETCH_RETRY_MS` and the replicator's NACK path re-issues
+/// likewise, so a dropped attach only costs one retry interval.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI in
+/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn begin_entry_scan(s: &mut Wal, sys: &SyscallTable, request_id: u32, wal_index: u64) {
+    // The located-but-undelivered reply matches: just refresh the id.
+    if s.scan_found {
+        if s.scan_loc.index == wal_index {
+            s.scan_request_id = request_id;
+        }
+        return;
+    }
+    if s.scan_active {
+        if s.scan_target == wal_index {
+            s.scan_request_id = request_id;
+        }
+        return; // busy with a different target — requester retries
+    }
+    // Warm-cursor continuation: the durable log is walked in ascending
+    // index order (appends are contiguous; truncation invalidates the
+    // cursor — see `truncate_after`), so a target past the last record
+    // the cursor walked resumes mid-segment instead of rescanning.
+    let warm = s.scan_fd >= 0 && s.scan_last_index > 0 && wal_index > s.scan_last_index;
+    if !warm {
+        reset_scan_cursor(s, sys);
+        s.scan_seg = s.oldest_segment_seq;
+    }
+    s.scan_prev_term = if warm && s.scan_last_index + 1 == wal_index {
+        s.scan_last_term
+    } else {
+        0
+    };
+    s.scan_target = wal_index;
+    s.scan_request_id = request_id;
+    s.scan_active = true;
+    // Informative one-shot: below-floor requests are being served via
+    // the segment scan (the old hard-failure signature at this site,
+    // `entry req below ring floor`, is retired; the loud path is now
+    // `entry req unservable`).
+    if !s.entryreq_floor_logged {
+        s.entryreq_floor_logged = true;
+        dev_log(sys, 3, b"[wal] entry req below floor: seg scan".as_ptr(), 37);
+    }
+}
+
+/// Drop any scan fd and forget the warm cursor. Does NOT touch the
+/// pending target/reply flags — callers decide those.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn reset_scan_cursor(s: &mut Wal, sys: &SyscallTable) {
+    if s.scan_fd >= 0 {
+        (sys.provider_call)(s.scan_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.scan_fd = -1;
+    }
+    s.scan_pos = 0;
+    s.scan_file_size = 0;
+    s.scan_misses = 0;
+    s.scan_last_index = 0;
+    s.scan_last_term = 0;
+}
+
+/// Terminate the active scan as unservable: the walk proved the index
+/// is not in any durable segment (compacted away, or a gap). Replies
+/// NOT_FOUND (header-only) so the requester falls through to its
+/// snapshot path, and logs the hard failure once.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn fail_entry_scan(s: &mut Wal, sys: &SyscallTable) {
+    let request_id = s.scan_request_id;
+    let wal_index = s.scan_target;
+    s.scan_active = false;
+    s.scan_found = false;
+    s.scan_target = 0;
+    s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
+    if !s.entryreq_unservable_logged {
+        s.entryreq_unservable_logged = true;
+        dev_log(sys, 2, b"[wal] entry req unservable (compacted)".as_ptr(), 38);
+    }
+    let poll_out = (sys.channel_poll)(s.out_entry_reply, POLL_OUT);
+    if poll_out > 0 && (poll_out as u32 & POLL_OUT) != 0 {
+        let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
+        wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
+        wire_channels::channel_write_msg(sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr);
+    }
+    // Channel full: the NOT_FOUND is dropped; the requester's retry
+    // re-attaches and fails again (idempotent, still loud-once).
+}
+
+/// Advance the below-floor scan by one bounded step: either one
+/// segment open (mirroring replay's one-open-per-step pacing) or up
+/// to `SCAN_RECORDS_PER_STEP` frame skips. Serves the reply the
+/// moment the target record is located.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI in
+/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
+    if s.scan_found {
+        deliver_scan_reply(s, sys);
+        return;
+    }
+    if !s.scan_active { return; }
+
+    // Open the segment under the cursor. One provider open per step —
+    // a cold open can pay the directory-scan penalty (see step_replay).
+    if s.scan_fd < 0 {
+        if s.scan_seg > s.segment_seq {
+            // Walked past the live segment without finding the index.
+            fail_entry_scan(s, sys);
+            return;
+        }
+        let mut path = [0u8; WAL_PATH_MAX];
+        let plen = encode_segment_path(s.partition_id, s.scan_seg, s.root_path != 0, &mut path);
+        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+        if fd == FS_E_AGAIN { return; } // provider initialising — retry
+        if fd < 0 {
+            // Missing segment: tolerate gaps exactly like replay.
+            s.scan_misses = s.scan_misses.saturating_add(1);
+            if s.scan_misses >= REPLAY_GAP_TOLERANCE {
+                fail_entry_scan(s, sys);
+                return;
+            }
+            s.scan_seg = s.scan_seg.saturating_add(1);
+            return;
+        }
+        let mut stat_buf = [0u8; 8];
+        let stat_rc = (sys.provider_call)(fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
+        let size = if stat_rc < 0 { 0 } else {
+            u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
+        };
+        if size == 0 {
+            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.scan_seg = s.scan_seg.saturating_add(1);
+            return;
+        }
+        s.scan_misses = 0;
+        s.scan_fd = fd;
+        s.scan_file_size = size;
+        s.scan_pos = 0;
+        return; // bounded: the open was this step's work
+    }
+
+    // Walk frames: [entry_len:u32][crc32c:u32][payload], where payload
+    // begins [term:u64][index:u64]. Read the 24-byte prefix, then seek
+    // past the payload — never read bodies we are only skipping.
+    const FRAME_HDR: u32 = 8;
+    let mut records = 0usize;
+    while records < SCAN_RECORDS_PER_STEP {
+        let remaining = s.scan_file_size.saturating_sub(s.scan_pos);
+        if remaining < FRAME_HDR {
+            // Segment exhausted — move to the next one.
+            (sys.provider_call)(s.scan_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.scan_fd = -1;
+            s.scan_seg = s.scan_seg.saturating_add(1);
+            return;
+        }
+        let seek_arg = (s.scan_pos as i32).to_le_bytes();
+        if (sys.provider_call)(s.scan_fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, 4) < 0 {
+            fail_entry_scan(s, sys);
+            reset_scan_cursor(s, sys);
+            return;
+        }
+        let mut hdr = [0u8; FRAME_HDR as usize];
+        let n = (sys.provider_call)(s.scan_fd, FS_READ, hdr.as_mut_ptr(), FRAME_HDR as usize);
+        if n < FRAME_HDR as i32 {
+            (sys.provider_call)(s.scan_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.scan_fd = -1;
+            s.scan_seg = s.scan_seg.saturating_add(1);
+            return;
+        }
+        let entry_len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
+        if entry_len == 0
+            || entry_len > 2048
+            || entry_len > s.scan_file_size.saturating_sub(s.scan_pos + FRAME_HDR)
+        {
+            // Terminator or torn frame — end of this segment's live data
+            // (same stop rule as replay).
+            (sys.provider_call)(s.scan_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.scan_fd = -1;
+            s.scan_seg = s.scan_seg.saturating_add(1);
+            return;
+        }
+        let payload_offset = s.scan_pos + FRAME_HDR;
+        if entry_len >= 16 {
+            let mut ti = [0u8; 16];
+            let n2 = (sys.provider_call)(s.scan_fd, FS_READ, ti.as_mut_ptr(), 16);
+            if n2 < 16 {
+                fail_entry_scan(s, sys);
+                reset_scan_cursor(s, sys);
+                return;
+            }
+            let (term, index) = wire::decode_term_index(&ti);
+            if index == s.scan_target {
+                s.scan_loc = EntryLoc {
+                    index,
+                    term,
+                    seg_seq: s.scan_seg,
+                    payload_offset,
+                    payload_len: entry_len,
+                };
+                s.scan_found = true;
+                s.scan_active = false;
+                deliver_scan_reply(s, sys);
+                return;
+            }
+            if index > s.scan_target {
+                // Passed the slot without finding it: the record is not
+                // in the durable log (leading segments compacted away).
+                // The cursor stays warm for later, higher targets.
+                fail_entry_scan(s, sys);
+                return;
+            }
+            if index + 1 == s.scan_target {
+                s.scan_prev_term = term;
+            }
+            if index > 0 {
+                s.scan_last_index = index;
+                s.scan_last_term = term;
+            }
+        }
+        s.scan_pos = payload_offset + entry_len;
+        records += 1;
+    }
+}
+
+/// Emit the reply for a scan-located record: read the payload from the
+/// scan fd and send it in the same wire shape as the ring-served path.
+/// Retries next step if the reply channel is full. On success the
+/// cursor advances past the record so a follow-up sequential request
+/// resumes without rescanning.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI in
+/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
+    if !s.scan_found { return; }
+    if s.out_entry_reply < 0 {
+        s.scan_found = false;
+        s.scan_target = 0;
+        return;
+    }
+    let poll_out = (sys.channel_poll)(s.out_entry_reply, POLL_OUT);
+    if poll_out <= 0 || (poll_out as u32 & POLL_OUT) == 0 { return; } // retry next step
+
+    let loc = s.scan_loc;
+    let payload_len = loc.payload_len as usize;
+    let mut body = [0u8; 4096];
+    let mut ok = s.scan_fd >= 0 && payload_len > 0 && payload_len <= body.len();
+    if ok {
+        let seek_arg = (loc.payload_offset as i32).to_le_bytes();
+        ok = (sys.provider_call)(s.scan_fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, 4) >= 0;
+    }
+    if ok {
+        let n = (sys.provider_call)(s.scan_fd, FS_READ, body.as_mut_ptr(), payload_len);
+        ok = (n as usize) >= payload_len;
+    }
+    if !ok {
+        // The segment vanished (or shrank) under the cursor — most
+        // plausibly compaction. Fail loudly like any unservable index.
+        s.scan_target = loc.index;
+        s.scan_found = false;
+        s.scan_active = true; // fail_entry_scan clears these
+        fail_entry_scan(s, sys);
+        reset_scan_cursor(s, sys);
+        return;
+    }
+
+    // Reply wire shape matches the ring-served path: strip the 16-byte
+    // [term][index] payload prefix; prev_term was captured while the
+    // scan walked the preceding record.
+    let rest = if payload_len > 16 { &body[16..payload_len] } else { &[][..] };
+    let total = wire::WAL_ENTRY_REPLY_HDR + rest.len();
+    let mut reply = [0u8; 4096];
+    let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
+    wire::encode_wal_entry_reply_hdr(
+        &mut hdr, s.scan_request_id, loc.term, loc.index, s.scan_prev_term,
+    );
+    reply[..wire::WAL_ENTRY_REPLY_HDR].copy_from_slice(&hdr);
+    reply[wire::WAL_ENTRY_REPLY_HDR..total].copy_from_slice(rest);
+    wire_channels::channel_write_msg(
+        sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &reply[..total],
+    );
+    s.entryreq_served = s.entryreq_served.saturating_add(1);
+    s.entryreq_scan_served = s.entryreq_scan_served.saturating_add(1);
+    s.scan_found = false;
+    s.scan_target = 0;
+    // Warm the cursor past the served record for sequential refetches.
+    s.scan_last_index = loc.index;
+    s.scan_last_term = loc.term;
+    s.scan_prev_term = 0;
+    s.scan_pos = loc.payload_offset + loc.payload_len;
+}
+
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Wal` (or shared
@@ -1061,6 +1467,22 @@ unsafe fn truncate_after(s: &mut Wal, sys: &SyscallTable, keep_through_index: u6
     s.current_term = new_term;
     s.truncations = s.truncations.saturating_add(1);
 
+    // Truncation rewrites the tail under the scan's ascending-order
+    // assumption. Drop the warm cursor; an in-flight scan for a target
+    // above the keep point is for a discarded entry (drop it without a
+    // reply — the requester's next attempt resolves against the new
+    // ring state), one at-or-below restarts from the oldest segment.
+    s.scan_found = false;
+    reset_scan_cursor(s, sys);
+    if s.scan_active {
+        if s.scan_target > keep_through_index {
+            s.scan_active = false;
+            s.scan_target = 0;
+        } else {
+            s.scan_seg = s.oldest_segment_seq;
+        }
+    }
+
     // Persist the new tail: seek to the cursor, write a zero-length frame
     // terminator (4 bytes of 0 = entry_len 0, which replay treats as
     // end-of-segment), and fsync so the truncation survives a crash.
@@ -1092,6 +1514,16 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
     if before_index > s.entry_ring_min_index {
         s.entry_ring_min_index = before_index;
     }
+    // Record the compaction floor so below-floor requests for indices
+    // this trim covers fail fast (loudly) instead of scanning segments
+    // that are about to be (or already were) deleted.
+    if before_index > s.compact_floor {
+        s.compact_floor = before_index;
+    }
+    // An active scan for a now-compacted target is unservable.
+    if s.scan_active && s.scan_target < before_index {
+        fail_entry_scan(s, sys);
+    }
     // Drop segments whose max-index is strictly below the requested
     // floor. The current write segment is exempt — we never delete it
     // while we're still appending to it.
@@ -1109,6 +1541,12 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
         }
     }
     if max_safe_seq_to_drop == 0 { return; }
+    // Segments are about to be deleted: the scan cursor (and any
+    // located-but-undelivered reply) may reference one of them. Drop
+    // the cursor and re-point it at the post-trim oldest segment; an
+    // in-flight scan for a surviving target restarts from there.
+    s.scan_found = false;
+    reset_scan_cursor(s, sys);
     // Delete segments [oldest_segment_seq .. max_safe_seq_to_drop] from
     // disk via FS_UNLINK where the provider supports it (probed once via
     // FS_CAPS — linux and fat32 both advertise `caps::UNLINK`; fat32's
@@ -1136,6 +1574,8 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
         }
         s.oldest_segment_seq += 1;
     }
+    // Restart any surviving in-flight scan at the new oldest segment.
+    s.scan_seg = s.oldest_segment_seq;
 }
 
 /// Lazily probe the FS provider's capability bitmap for `UNLINK` support.
@@ -1204,7 +1644,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         build_segment_path(s, s.replay_seg);
         let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), s.path_len as usize);
         if fd == FS_E_AGAIN {
-            // FS provider still initialising (fat32 reading the BPB on a cm5
+            // FS provider still initialising (fat32 reading the BPB on a pi5
             // cold boot). Do NOT count this as a missing segment — that would
             // skip real segments and lose committed state on recovery. Wait
             // and retry the same seq next step.

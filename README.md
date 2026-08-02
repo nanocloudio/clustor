@@ -146,7 +146,7 @@ behaviour.
 
 The seven substrate modules (`example_consumer` is wired only into
 the minimal smoke graph) sit in four execution domains on a
-Pi 5 / CM5:
+Pi 5:
 
 | Domain     | Tick   | Modules | Components |
 |------------|--------|---------|------------|

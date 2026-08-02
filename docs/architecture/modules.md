@@ -5,7 +5,7 @@ plus `example_consumer` as a minimal downstream demo wired into the
 smoke graph. The modules implement Raft consensus, durability, and
 a small control plane. They ship as position-independent `no_std`
 ELFs, communicate over mailbox channels, and run on the fluxor
-runtime — Pi 5 / CM5 hardware or a host-linux harness. The graph
+runtime — Pi 5 hardware or a `linux` host harness. The graph
 is the implementation; there is no separate "library" layer
 underneath.
 
@@ -27,7 +27,7 @@ with bounded step time — each component declares its own per-step
 bound and the dispatch table cites them, because the ~2 ms step
 guard budgets the *sum*. Modules with shared deadlines and tight
 data dependencies sit on the same core; cross-core hops use
-SEV/WFE-woken mailbox channels (~200ns latency on CM5's coherent
+SEV/WFE-woken mailbox channels (~200ns latency on the Pi 5's coherent
 L3). The consensus hot path is interior: `raft → replicator →
 commit → apply` runs as one fused dispatch inside `consensus`
 with no scheduler dispatch and no tick boundary between the
@@ -386,7 +386,7 @@ consensus hot path never waits for a tick boundary.
 ### Cross-domain edges
 
 Edges between domains use CrossCore mailbox channels with SEV/WFE
-hardware wake signalling (~200ns latency on CM5's coherent L3
+hardware wake signalling (~200ns latency on the Pi 5's coherent L3
 cache). The write commit path crosses two domain boundaries:
 
 ```

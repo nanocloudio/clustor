@@ -306,6 +306,23 @@ unsafe fn drain_net_events(
                 // we already log on init.
             }
             NMSG_ACCEPT => {
+                // Per-port filter: ACCEPT carries the parent listener's
+                // local_port after the conn_id. On a shared net_out
+                // broadcast (multi-anchor graphs) claiming every accept
+                // makes this h1 server answer 404s on OTHER protocols'
+                // connections — observed polluting an h2/gRPC anchor's
+                // port. Only claim conns accepted on OUR listen port;
+                // tolerate short frames from older net providers that
+                // don't carry the port (single-listener graphs).
+                if payload_len >= 3 {
+                    let port = u16::from_le_bytes([
+                        g.net_buf[NET_FRAME_HDR + 1],
+                        g.net_buf[NET_FRAME_HDR + 2],
+                    ]);
+                    if port != g.listen_port {
+                        continue;
+                    }
+                }
                 if alloc_conn(g, conn_id).is_some() {
                     let mut buf = [0u8; 48];
                     let n = format_accepted(&mut buf, conn_id);

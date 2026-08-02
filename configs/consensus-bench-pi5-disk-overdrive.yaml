@@ -1,11 +1,11 @@
-# OVERDRIVE variant of consensus-bench-cm5-disk.yaml for Item 2 validation
+# OVERDRIVE variant of consensus-bench-pi5-disk.yaml for Item 2 validation
 # (RFC §14 item 3b apply-side gap recovery). inject_period=1 drives the
 # injector at its full step rate (~166/s) so commit (durable) outruns apply
 # and the best-effort log_observe fan-out drops entry bodies. With the
 # apply-side WAL refetch, consensus reads the dropped indices back from
 # the durable WAL and stays lossless: appended==committed==applied==4000.
 # Watch apply APPLY_REFETCHED (metric 0x06/0x0004) climb > 0.
-# L2 consensus latency/throughput bench — CM5 BARE-METAL twin of
+# L2 consensus latency/throughput bench — PI5 BARE-METAL twin of
 # `consensus-bench.yaml` (`.context/rfc_performance_benchmarking.md` §6).
 # Full single-node consensus pipeline with a `consensus_bench` injector
 # feeding consensus.proposals directly. propose→commit latency and
@@ -13,7 +13,7 @@
 # commit_latency_ms, consensus commit_advances) over /metrics
 # (scrape :19090 over the wire) + log_net UDP:6666.
 #
-# Differs from the linux twin only in: target cm5, `platform.debug.to: net`
+# Differs from the linux twin only in: target pi5, `platform.debug.to: net`
 # (log_net observation), and `ip` (not `linux_net`) as the net module.
 #
 # DISK-DURABLE variant: nvme + fat32 provide the FS contract, so the WAL
@@ -34,7 +34,7 @@
 # batch ≤2. offered/s ≈ batch_per_step / inject_period × 1000.
 #
 # DEV/TEST ONLY — HTTP admin bypasses operations.
-target: cm5
+target: pi5
 tick_us: 6000
 
 scheduler:

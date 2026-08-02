@@ -19,7 +19,9 @@ fluxor = "0.0.1"
 [ci]
 # Module targets to build in CI phase 3. Clustor is host-only today;
 # the cluster harness consumes `bcm2712` `.fmod` artefacts as PIC on
-# linux/aarch64. Add `rp2350` / `cm5` here when those backends land.
+# linux/aarch64. This list is silicon and host tokens only — never a
+# board (`pi5` is a board; its modules are the `bcm2712` artefacts
+# already listed). Add `rp2350` here when that backend lands.
 targets = ["bcm2712"]
 
 [ci.test]

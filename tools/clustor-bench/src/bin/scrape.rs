@@ -9,7 +9,7 @@
 //!
 //! Usage:
 //!   clustor-scrape --host 192.168.1.9:19090 --window 12 \
-//!       --config configs/consensus-bench-cm5.yaml --target cm5 \
+//!       --config configs/consensus-bench-pi5.yaml --target pi5 \
 //!       --label l2-consensus --workload "offered=2000,batch=2" \
 //!       --out tests/hardware/baselines/l2-consensus-$(date +%Y%m%d).json
 //!

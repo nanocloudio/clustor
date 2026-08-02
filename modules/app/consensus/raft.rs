@@ -58,7 +58,7 @@ const PROBE_TIMEOUT_MS: u64 = 1500;
 /// upstream then backpressure (their channel to raft fills), turning the
 /// cliff into a plateau at commit throughput.
 /// Little's Law sizing: sustained write throughput ≈ in-flight window /
-/// commit latency. 48 is the knee for the CM5 NVMe path — deep enough to
+/// commit latency. 48 is the knee for the Pi 5 NVMe path — deep enough to
 /// hide fsync latency behind the WAL's pipelined durability fences (see wal
 /// `fence_depth`), while past it the device's serial fsync-barrier rate
 /// (~1000/s) dominates and a wider window only adds latency. Must stay ≤
@@ -133,7 +133,7 @@ const FS_OPEN: u32 = 0x0900;
 /// FAT32, which has no mkdir for the default `raft/meta` parent.
 const FS_OPEN_CREATE: u32 = 0x0909;
 /// FS E_AGAIN: provider present but still initialising (fat32 reading the BPB
-/// on a cm5 cold boot). `load_metadata` must retry rather than treat this as
+/// on a pi5 cold boot). `load_metadata` must retry rather than treat this as
 /// "no metadata" — otherwise a recovering node restarts fresh.
 const FS_E_AGAIN: i32 = -11;
 const FS_READ: u32 = 0x0901;

@@ -1,4 +1,4 @@
-# L2 consensus latency/throughput bench — CM5 BARE-METAL twin of
+# L2 consensus latency/throughput bench — PI5 BARE-METAL twin of
 # `consensus-bench.yaml` (`.context/rfc_performance_benchmarking.md` §6).
 # Full single-node consensus pipeline with a `consensus_bench` injector
 # feeding consensus.proposals directly. propose→commit latency and
@@ -6,7 +6,7 @@
 # commit_latency_ms, consensus commit_advances) over /metrics
 # (scrape :19090 over the wire) + log_net UDP:6666.
 #
-# Differs from the linux twin only in: target cm5, `platform.debug.to: net`
+# Differs from the linux twin only in: target pi5, `platform.debug.to: net`
 # (log_net observation), and `ip` (not `linux_net`) as the net module.
 #
 # DISK-DURABLE variant: nvme + fat32 provide the FS contract, so the WAL
@@ -27,7 +27,7 @@
 # batch ≤2. offered/s ≈ batch_per_step / inject_period × 1000.
 #
 # DEV/TEST ONLY — HTTP admin bypasses operations.
-target: cm5
+target: pi5
 tick_us: 6000
 
 scheduler:
@@ -46,35 +46,42 @@ modules:
     queue_depth: 32
   - name: fat32
     path: /
-    clean_root: 1           # truncate the bloated root dir to one warm cluster on
-                            # first create: dozens of prior runs left orphaned
-                            # root entries, and scanning a cold root-dir cluster
-                            # costs ~30 ms on this NVMe (first-touch read) — which
-                            # blows the WAL/raft step guard (~52-entry fault).
+    # NO clean_root for recovery: clean_root truncates the ROOT DIRECTORY on
+    # the first file-create, which would DELETE the very WAL segment files we
+    # need to replay (it fired when raft persisted RAFT0000.MET / the WAL
+    # rotated, aborting replay mid-stream). The cold root-dir scan that
+    # clean_root was avoiding is now absorbed by the WAL replay Burst path,
+    # so recovery preserves the on-disk segments instead of wiping them.
     init_free_hint: 20000   # seed free-scan past the bench partition orphan region
-    clear_free_region: 2000 # zero an 8 MiB FAT span at the hint on first create:
-                            # this partition's FAT holds stale non-zero entries
-                            # (never cleanly formatted) that the free-scan would
-                            # otherwise walk for ~227 ms and blow the step guard.
+    clear_free_region: 2000 # fluxor gates this on clean_root (fresh-format only),
+                            # so on this recovery mount (no clean_root) it is a
+                            # no-op: the established WAL segment + RAFT0000.MET
+                            # FAT chains are preserved. (Before the fluxor gate it
+                            # blindly zeroed FAT[20000..22000], severing the
+                            # multi-cluster segment chain past cluster 1 — replay
+                            # then reconstructed only ~1 cluster. Kept for symmetry
+                            # with -establish.)
 
   # L2 load injector — drives proposals into consensus.proposals.
   - name: consensus_bench
     params:
-      total: 4000
+      # L4 crash-recovery: inject a bounded batch, let it fully commit + fsync
+      # to the NVMe FAT32 segments, then hard power-cut and reboot. The reboot
+      # replays the segments (skip_replay OFF below) and raft loads RAFT0000.MET
+      # — committed state must survive the power loss.
+      total: 200
       body_size: 64
       batch_per_step: 1
-      # inject_period=1 offers at the full injector step rate (~166/s on the
-      # 6 ms-tick disk graph). The proposals edge is a bounded FIFO; when raft
-      # is pinned at the uncommitted-inflight cap (disk commit is slower than
-      # the offer), the FIFO fills and channel_write returns CHAN_EAGAIN.
-      # consensus_bench now honours that (counts `blocked`, retries the same
-      # proposal next step), so it self-throttles to the disk commit rate
-      # LOSSLESSLY at any inject_period — no proposals dropped. (Before the
-      # wire_channels write_framed EAGAIN-sign fix, a full FIFO was mis-reported
-      # as a successful write and the proposal was silently dropped: inject_period=1
-      # ⇒ only 268/4000 reached raft. That bug is fixed.)
-      inject_period: 6
-      warmup_ms: 2000
+      # inject_period is counted in MODULE STEPS, not ms. On the disk graph
+      # (tick_us=6000) the injector steps ~166/s, so inject_period=8 offers
+      # ~20/s. raft.proposals is a MAILBOX (latest-wins) edge with no
+      # backpressure (see header), and raft only reads it when NOT pinned at
+      # the uncommitted-inflight cap — i.e. at the disk commit rate. Offering
+      # faster than the disk commit throughput silently overwrites unread
+      # proposals (inject_period=1 ⇒ only 268/4000 reached raft). ~20/s sits
+      # safely below the disk commit ceiling so every proposal lands losslessly.
+      inject_period: 8
+      warmup_ms: 8000
   - name: peer_router
     params:
       self_id: 0
@@ -88,6 +95,7 @@ modules:
     params:
       self_id: 0
       voter_count: 1
+      root_path: 1            # L4 recovery: persist term/vote/durable-index to a
       heartbeat_interval_ms: 150
       peer_count: 1
   - name: durability
@@ -97,7 +105,6 @@ modules:
       group_max_pending: 4
       root_path: 1            # 8.3 root segment names for FAT32 (no mkdir)
       segment_bytes: 65536    # 64 KiB segments → rotation within the run
-      skip_replay: 1          # L1/L2 throughput bench: start fresh each run so
       self_id: 0
       voter_count: 1
       partition_id: 0
@@ -152,22 +159,18 @@ wiring:
 
   - from: consensus.log_append
     to: durability.entries
-  # Dedicated boot handoff: Raft must resume its index at the exact WAL
-  # replay high-water before proposal intake opens. Never multiplex this onto
-  # wal.flushed, which also fans out durability acknowledgements.
-  - from: durability.replay_complete
-    to: consensus.wal_replay_complete
-    rate: transaction
   - from: durability.flushed
     to: consensus.wal_flushed
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
   - from: consensus.cross_durability_ack
     to: durability.ack
   - from: durability.quorum_durable
     to: consensus.durable
 
-  # Apply-side gap recovery (Item 2): when the best-effort log_observe
-  # fan-out drops an entry body under overdrive, consensus refetches the
-  # missing index from the durable WAL instead of stalling.
+  # Apply-side gap recovery (Item 2): the recovery-release burst can overflow
+  # the best-effort log_observe fan-out; consensus refetches any dropped
+  # index from the durable WAL so apply stays lossless post-recovery too.
   - from: consensus.entry_request
     to: durability.entry_request
   - from: durability.entry_reply

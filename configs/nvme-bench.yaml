@@ -7,9 +7,9 @@
 #   - typed metrics at `GET /metrics` (operations + http surface),
 #     including the fsync-latency histogram (same buckets as the WAL).
 #
-# TARGET = linux on purpose. The bare-metal cm5 build has no filesystem
+# TARGET = linux on purpose. The bare-metal pi5 build has no filesystem
 # provider yet (wal's FS_OPEN_CREATE returns ENODEV — see
-# single-cm5-throughput.yaml), so the bare-metal poll-mode NVMe floor is
+# single-pi5-throughput.yaml), so the bare-metal poll-mode NVMe floor is
 # blocked on a fluxor dev_fs/nvme provider. Until that lands, run this on
 # the DUT's SD-card Linux (or the driver host) with `wal/` symlinked to a
 # mount on the NVMe under test:
