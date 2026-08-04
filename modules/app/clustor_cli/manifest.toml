@@ -1,0 +1,44 @@
+version          = "0.1.0"
+type             = "Cli"
+entry            = "mod.rs"
+hardware_targets = ["bcm2712"]
+timer_class      = "agnostic"
+
+# The clustor operator CLI as a fluxor cli-applet (rfc_cli_execution.md):
+# ONE PIC module dispatches clustor subcommands over the cli host surface.
+# Run: `fluxor exec clustor -- <cmd>`.
+#
+#   clustor crc <hex>                  crc32c of the decoded bytes
+#   clustor wal-frame <payload_hex>    frame an entry as [len][crc32c][payload]
+#   clustor wal-scan <segment_hex>     walk a WAL segment image, replay-exact
+#   clustor help
+#
+# wal-frame/wal-scan run the SAME Crc32c core and frame validation the
+# durability module runs at replay (modules/common/collections.rs +
+# durability/wal.rs framing), so a green `wal-scan` here is exactly the
+# durable prefix a replica would recover.
+
+# argv after `--`, NUL-separated (from cli_in.args_out): [subcommand, args...].
+[[ports]]
+name         = "args"
+direction    = "input"
+content_type = "OctetStream"
+buffer_size  = 8192
+
+# stdout → cli_out.bytes_in.
+[[ports]]
+name         = "stdout"
+direction    = "output"
+content_type = "TextPlain"
+buffer_size  = 8192
+
+# exit code [i32 LE] → cli_out.exit_in.
+[[ports]]
+name         = "exit"
+index        = 1
+direction    = "output"
+content_type = "OctetStream"
+buffer_size  = 16
+
+[observability]
+exempt = "run-to-completion CLI applet; no steady-state throughput to observe"

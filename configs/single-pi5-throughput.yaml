@@ -111,22 +111,11 @@ wiring:
     to: log_net.net_in
   - from: log_net.net_out
     to: ip.net_in
-  - from: ip.net_out
-    to: otlp_http.net_in
-  - from: otlp_http.net_out
-    to: ip.net_in
 
-  # OpenTelemetry-native module signals. Clustor's richer typed Raft/WAL/apply
-  # table remains on /metrics; these Telemetry ports feed both the local
-  # observer and the direct OTLP/HTTP exporter.
-  - from: ip.telemetry
-    to: observe.telemetry
-  - from: ip.telemetry
-    to: otlp_http.telemetry
-  - from: fat32.telemetry
-    to: observe.telemetry
-  - from: fat32.telemetry
-    to: otlp_http.telemetry
+  # OpenTelemetry-native module signals need no wiring: emission is
+  # ring-based (observe and the `export_telemetry: otlp` overlay drain
+  # the kernel telemetry ring directly). Clustor's richer typed
+  # Raft/WAL/apply table remains on /metrics.
 
   # ── NVMe block device ↔ FAT32 filesystem provider ───────────
   - from: nvme.blocks

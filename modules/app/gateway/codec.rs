@@ -422,9 +422,13 @@ unsafe fn forward_applied(c: &mut Codec, su: &mut surface::Surface, sys: &Syscal
                 }
             }
             wire::MSG_CLIENT_READ_RESPONSE if pl >= 8 => {
-                // `[correlation_id:u64]` from consensus. Reads are
-                // correlated through the same ring as writes — the
-                // codec stamps the correlation_id at submission time.
+                // `[correlation_id:u64][required_commit:u64]` from
+                // consensus. Only the correlation id matters here —
+                // reads correlate through the same ring as writes; the
+                // codec stamps the id at submission time. The commit
+                // index is for consumers wired directly to `applied`
+                // that fence their own state machine; the wire client
+                // keeps the empty-body contract below.
                 let corr_id = u64::from_le_bytes([
                     c.msg_buf[0], c.msg_buf[1], c.msg_buf[2], c.msg_buf[3],
                     c.msg_buf[4], c.msg_buf[5], c.msg_buf[6], c.msg_buf[7],

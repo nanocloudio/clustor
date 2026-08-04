@@ -1,0 +1,21 @@
+# The clustor CLI as a fluxor cli-applet (rfc_cli_execution.md): one PIC
+# module (clustor_cli) dispatches subcommands (crc, wal-frame, wal-scan, help)
+# over the cli host surface. Install + run:
+#   fluxor install packaging/cli/workload.toml
+#   fluxor exec clustor -- wal-scan <segment_hex>
+target: linux
+tick_us: 100
+
+platform:
+  cli: {}
+
+modules:
+  - name: clustor_cli
+
+wiring:
+  - from: cli_in.args_out
+    to: clustor_cli.args
+  - from: clustor_cli.stdout
+    to: cli_out.bytes_in
+  - from: clustor_cli.exit
+    to: cli_out.exit_in

@@ -955,7 +955,7 @@ unsafe fn drain_pending_reads(s: &mut Apply, sys: &SyscallTable, now: u64) {
 
         // Ready: linearization point reached AND CP fresh.
         if permit_fresh && s.apply_index >= slot.required_commit {
-            if emit_read_response(s, sys, slot.correlation_id) {
+            if emit_read_response(s, sys, slot.correlation_id, slot.required_commit) {
                 s.pending_reads[i] = PendingRead::empty();
                 s.reads_completed += 1;
             }
@@ -979,11 +979,31 @@ unsafe fn drain_pending_reads(s: &mut Apply, sys: &SyscallTable, now: u64) {
 /// `&Apply` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn emit_read_response(s: &mut Apply, sys: &SyscallTable, correlation_id: u64) -> bool {
+unsafe fn emit_read_response(
+    s: &mut Apply,
+    sys: &SyscallTable,
+    correlation_id: u64,
+    required_commit: u64,
+) -> bool {
     let poll = (sys.channel_poll)(s.out_applied, 0x02);
     if poll <= 0 || (poll as u32 & 0x02) == 0 { return false; }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&correlation_id.to_le_bytes());
+    // `[correlation_id:u64][required_commit:u64]`.
+    //
+    // The index is what makes this a fence a caller can actually
+    // enforce. Consensus releasing the read means CONSENSUS has applied
+    // through `required_commit` — it says nothing about the application
+    // state machine downstream, which receives committed entries over a
+    // channel and applies them on its own schedule. A reader that treats
+    // the release alone as permission can therefore query a state
+    // machine that has not yet seen the write it is supposed to observe,
+    // and read a false absence. Naming the index lets the application
+    // hold the read until its own applied position has caught up.
+    //
+    // The correlation id leads, so a consumer that only routes (the
+    // gateway codec) parses the 8-byte prefix and ignores the index.
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&correlation_id.to_le_bytes());
+    buf[8..].copy_from_slice(&required_commit.to_le_bytes());
     wire_channels::channel_write_msg(sys, s.out_applied, wire::MSG_CLIENT_READ_RESPONSE, &buf);
     true
 }

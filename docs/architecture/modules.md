@@ -307,6 +307,7 @@ and the example consumer are driver-side.
 | `consensus_bench` | Load injector and scrape driver for the consensus path; used by `configs/consensus-bench*.yaml`. |
 | `nvme_bench` | Device-floor and WAL-path storage driver; used by `configs/nvme-bench*.yaml`. |
 | `example_consumer` | Minimal downstream consumer module that `#[path]`-includes `modules/common/replica_facade.rs` and wires to `consensus.committed_entries`. Built alongside every clustor module on every `make ci` run — the gate that catches `no_std` regressions in the facade or in the per-entry emitter. See [consumer_facade.md](consumer_facade.md). |
+| `clustor_cli` | The operator CLI as a fluxor cli-applet (rfc_cli_execution.md): one PIC module behind `fluxor exec clustor -- <cmd>` (graph + workload manifest in `packaging/cli/`). `crc`, `wal-frame`, and `wal-scan` run the same Crc32c core and frame validation the `durability` module runs at replay, so a `wal-scan` reports exactly the durable prefix a replica would recover. Gated by `scripts/cli-e2e.sh`. |
 
 ---
 
