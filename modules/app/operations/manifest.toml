@@ -213,8 +213,9 @@ rate_class_max = "transaction"
 # Replies to requests that arrived on `request`. See that port.
 
 [observability]
-# Admission + workflow + synchronous proposal-correlation health, plus
+# The /propose bridge's request + proposal-correlation health, plus
 # the aggregator's own drop/eviction accounting (self-metrics under the
-# telemetry component id inside the export it serves).
-metrics = ["evaluations", "denials", "break_glass_grants", "requests", "duplicates", "unsupported", "requests_404", "correlations_inflight", "indices_inflight", "inflight_high_water", "proposal_timeouts", "commit_timeouts", "assignments_unmatched", "assignments_no_slot", "applies_unmatched", "rejections", "queue_unavailable", "committed", "bytes_in", "bytes_out"]
-spans = ["http.server.request"]
+# telemetry component id inside the export it serves). Every name here
+# has an emit site in http.rs / telemetry.rs — the list claims exactly
+# what the module ships.
+metrics = ["requests", "requests_404", "correlations_inflight", "indices_inflight", "inflight_high_water", "proposal_timeouts", "commit_timeouts", "assignments_unmatched", "assignments_no_slot", "applies_unmatched", "rejections", "queue_unavailable", "committed"]

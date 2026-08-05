@@ -6,8 +6,12 @@
 # `[telemetry.monitor_udp]` captures it (see
 # `~/.config/fluxor/labs/default/rigs/pi5-a.toml`).
 #
-# Ephemeral external-load profile: no FS provider is wired, so the WAL retains
-# recent entries in memory and acknowledges them without a durability barrier. There is
+# Ephemeral external-load profile: durability runs its `volatile` variant —
+# in-memory retention selected at build time, ledger compiled out, `ack` /
+# `quorum_durable` structurally absent — and consensus runs
+# `durability_mode: relaxed` so commit advances on quorum match alone.
+# Fail-closed by construction: this composition cannot emit a durability
+# proof, rather than a disk build whose FS grant happens to fail. There is
 # deliberately no on-DUT injector; drive POST /propose on the HTTP diagnostic
 # listener (`:19090`) from the load host. Port 9090 is the peer/client protocol
 # listener and is not the benchmark HTTP endpoint.
@@ -41,8 +45,8 @@ platform:
     # debug.collector_ip (192.168.1.10), shared with proven log_net routing.
     export_dst_port: 4318
     # Export in coarse batches: a 1 s cadence measurably contends with the
-    # request path on the single scheduler domain. Five seconds preserves
-    # useful operational telemetry without paying JSON/TCP work every second.
+    # request path on the single scheduler domain. Once per minute keeps the
+    # bench window clean of JSON/TCP export work.
     export_flush_ms: 60000
     # OTLP requires a Unix-epoch boot anchor. Refresh this per deployment
     # until the rig injects wall time or the DUT gains an RTC/NTP authority.
@@ -64,14 +68,12 @@ modules:
       voter_count: 1
       heartbeat_interval_ms: 150
       peer_count: 1
+      # relaxed: commit on quorum match; the volatile durability
+      # composition below has no quorum_durable to wait for.
+      durability_mode: 2
   - name: durability
+    variant: volatile
     params:
-      fsync_mode: 1
-      group_window_ms: 5
-      group_max_pending: 4
-      root_path: 0
-      segment_bytes: 67108864
-      skip_replay: 1
       self_id: 0
       voter_count: 1
       partition_id: 0
@@ -137,8 +139,6 @@ wiring:
   # ── Flow control ──────────────────────────────────────────
   - from: admission.credits
     to: gateway.credit_supply
-  - from: admission.envelope
-    to: gateway.throttle_status
 
   # ── Raft replication ──────────────────────────────────────
   # Genuine single voter: no remote AppendEntries fan-out is required.
@@ -158,15 +158,11 @@ wiring:
   - from: durability.replay_complete
     to: consensus.wal_replay_complete
     rate: transaction
-    rate: transaction
   - from: durability.flushed
     to: consensus.wal_flushed
     rate: transaction
-  - from: consensus.cross_durability_ack
-    to: durability.ack
-  - from: durability.quorum_durable
-    to: consensus.durable
-    rate: transaction
+  # No `durability.ack` / `durability.quorum_durable` edges: the
+  # volatile variant omits those ports entirely (see manifest).
 
   # ── Commit → apply ────────────────────────────────────────
   - from: consensus.entry_request

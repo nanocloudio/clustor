@@ -305,6 +305,11 @@ pub const CLIENT_REJECT_NOT_LEADER: u8       = 0x02;
 pub const CLIENT_REJECT_STALE_EPOCH: u8      = 0x03;
 pub const CLIENT_REJECT_FALLBACK: u8         = 0x04;
 pub const CLIENT_REJECT_READ_UNSUPPORTED: u8 = 0x05;
+/// The record's payload exceeds the largest proposal the log can
+/// carry. Rejected at the gateway surface, before any bytes are
+/// consumed downstream — truncating and proposing a prefix would
+/// commit a corrupted entry while acking the client's full write.
+pub const CLIENT_REJECT_TOO_LARGE: u8        = 0x06;
 
 /// Inner reject body, independent of envelope variant: 10 bytes
 /// `[status:u8][reserved:u8=0][retry_after_ms:u16 LE][entry_credits:i16 LE][byte_credits:i32 LE]`.
@@ -767,11 +772,11 @@ pub const MSG_HTTP_REQUEST: u8        = 0x74;
 /// text/plain with a short error string. The HTTP server module
 /// frames the wire-level HTTP response itself.
 pub const MSG_HTTP_RESPONSE: u8       = 0x75;
-/// Replaceable readiness snapshot from the http component to the ingress component.
-/// Payload: the latest `MSG_READYZ` body (currently one byte). This travels
-/// through a mailbox edge: only the newest state matters, unlike ordered HTTP
-/// requests and TCP events which remain FIFO.
-pub const MSG_HTTP_READY_SNAPSHOT: u8 = 0x79;
+// 0x79 (was MSG_HTTP_READY_SNAPSHOT) retired: the http → ingress
+// readiness hand-off is an interior seam (`ingress::deliver_ready`),
+// not a wire edge — seams carry no opcode and no stability promise
+// (standards fluxor-modules.md §8). Do not reuse 0x79 until the
+// sibling repos confirm no reader remains.
 
 /// Multiplexed client record on the cleartext path. Payload is
 /// `[conn_id:u8][raw client bytes]`. peer_router wraps every cleartext

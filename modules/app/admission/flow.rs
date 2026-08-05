@@ -21,7 +21,6 @@ fn fp_mul(a: i32, b: i32) -> i32 {
 pub struct Flow {
     pub in_lag: i32,       // in: LagSignal from replicator
     pub out_credits: i32,  // out: ThrottleCredits / ThrottleRefill
-    pub out_envelope: i32, // out: ThrottleEnvelope
     pub out_metrics: i32,  // out: MetricsPayload
 
     // PID gains (Q16.16)
@@ -56,7 +55,6 @@ pub struct Flow {
 pub unsafe fn init(f: &mut Flow) {
     f.in_lag = -1;
     f.out_credits = -1;
-    f.out_envelope = -1;
     f.out_metrics = -1;
     // Defaults: Throughput profile gains
     f.kp = (0.60f32 * FP_ONE as f32) as i32; // ~39321

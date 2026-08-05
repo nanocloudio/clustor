@@ -114,4 +114,16 @@ impl HorizonLatch {
             self.dirty = true;
         }
     }
+
+    /// Drain the latch: `Some((term, index))`, clearing `dirty`, when
+    /// a raise is pending. The dispatch table's accessor — callers
+    /// never touch the fields directly.
+    pub fn take(&mut self) -> Option<(u64, u64)> {
+        if self.dirty {
+            self.dirty = false;
+            Some((self.term, self.index))
+        } else {
+            None
+        }
+    }
 }

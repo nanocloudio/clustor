@@ -227,7 +227,7 @@ Each repo packs only what it owns:
 
 | Repo | `fluxor modules build --target bcm2712` packs |
 |------|-------------------------------------|
-| `clustor` | The seven substrate modules (with the `durability` and `operations` variant fmods), the standalone `session_directory` and `partition_router`, the two bench drivers, and `example_consumer` — full map in [architecture/modules.md](architecture/modules.md) and the canonical edge set in [`../configs/single.yaml`](../configs/single.yaml). |
+| `clustor` | The seven substrate modules (with the `durability` and `operations` variant fmods), the standalone `session_directory` and `partition_router`, the two bench drivers, `example_consumer`, and the `clustor_cli` applet — full map in [architecture/modules.md](architecture/modules.md) and the canonical edge set in [`../configs/single.yaml`](../configs/single.yaml). |
 | `quantum` | The quantum-specific app modules (codecs, session processing, topic/dedup engines, retained store, audit, DR, metrics, consumer groups, transactions, tenancy). |
 
 Both clustor and quantum publish `.fmod` files into the local

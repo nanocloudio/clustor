@@ -8,7 +8,7 @@
 //! the `rejected` port for external observers.
 
 use super::abi::SyscallTable;
-use super::{codec, surface, wire, wire_channels};
+use super::{wire, wire_channels};
 use super::dev_millis;
 
 const METRICS_INTERVAL_MS: u64 = 1000;
@@ -43,22 +43,16 @@ pub unsafe fn init(t: &mut Throttle) {
     t.last_metrics_ms = 0;
 }
 
-/// Per-step bound: ≤16 credit frames drained; ≤16 external proposals
-/// admitted off the `proposals` port; two counters on the metrics
-/// tick. Codec-path admission is additionally driven by the surface
-/// request loop (≤8/step) through [`on_proposal`].
+/// Drain credit updates (keep latest / accumulate refills).
+/// Per-step bound: ≤16 credit frames. The external-proposals loop is
+/// driven by the dispatch table through [`next_external`] /
+/// [`on_proposal`]; the metrics tick by [`step_metrics`].
 ///
 /// # Safety
 ///
-/// Caller must hold exclusive component borrows and a valid
+/// Caller must hold an exclusive `&mut Throttle` and a valid
 /// `&SyscallTable` per the module ABI.
-pub unsafe fn step(
-    t: &mut Throttle,
-    co: &mut codec::Codec,
-    su: &mut surface::Surface,
-    sys: &SyscallTable,
-) {
-    // Drain credit updates (keep latest / accumulate refills)
+pub unsafe fn drain_credits(t: &mut Throttle, sys: &SyscallTable) {
     if t.in_credits >= 0 {
         for _ in 0..16 {
             let poll = (sys.channel_poll)(t.in_credits, 0x01);
@@ -90,76 +84,100 @@ pub unsafe fn step(
             }
         }
     }
+}
 
-    // Drain external tagged proposals (bench injectors, the
-    // operations module's /propose and admin-PROPOSE bridges).
-    // Drain at least one full wall-clock refill quantum: the flow
-    // controller publishes an absolute grant; stopping short could
-    // leave valid tokens unused, and the next update would overwrite
-    // them, turning this loop bound into an accidental throughput
-    // ceiling. Every consumed proposal must have a terminal route:
-    // require the rejection tee (when wired) to be writable before
-    // reading, and — when we hold credits we intend to spend — the
-    // admitted channel too, so raft/WAL backpressure keeps frames
-    // queued upstream rather than being read here and dropped.
-    if t.in_proposals >= 0 {
-        for _ in 0..16 {
-            if t.out_rejected >= 0 {
-                let poll_rejected = (sys.channel_poll)(t.out_rejected, 0x02);
-                if poll_rejected <= 0 || (poll_rejected as u32 & 0x02) == 0 {
-                    break;
-                }
-            }
-            if t.entry_credits > 0 && t.out_admitted >= 0 {
-                let poll_out = (sys.channel_poll)(t.out_admitted, 0x02);
-                if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
-                    break;
-                }
-            }
-            let poll = (sys.channel_poll)(t.in_proposals, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 {
-                break;
-            }
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, t.in_proposals, &mut t.msg_buf);
-            if msg_type != wire::MSG_CLIENT_PROPOSAL || plen == 0 {
-                continue;
-            }
-            let pl = plen as usize;
-            let mut local = [0u8; 2048];
-            local[..pl].copy_from_slice(&t.msg_buf[..pl]);
-            on_proposal(t, co, su, sys, &local[..pl]);
+/// Read ONE external tagged proposal off the `proposals` port (bench
+/// injectors, the operations module's /propose and admin-PROPOSE
+/// bridges) into `out`. Returns `None` when the port is empty or a
+/// terminal route cannot be guaranteed. The dispatch table drives the
+/// ≤16/step loop — sized to drain at least one full wall-clock refill
+/// quantum: the flow controller publishes an absolute grant; stopping
+/// short could leave valid tokens unused, and the next update would
+/// overwrite them, turning the loop bound into an accidental
+/// throughput ceiling.
+///
+/// Every consumed proposal must have a terminal route: require the
+/// rejection tee (when wired) to be writable before reading, and —
+/// when we hold credits we intend to spend — the admitted channel
+/// too, so raft/WAL backpressure keeps frames queued upstream rather
+/// than being read here and dropped. `Some(0)` marks a consumed
+/// non-proposal frame the caller counts and skips.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Throttle` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn next_external(
+    t: &mut Throttle,
+    sys: &SyscallTable,
+    out: &mut [u8; 2048],
+) -> Option<usize> {
+    if t.in_proposals < 0 {
+        return None;
+    }
+    if t.out_rejected >= 0 {
+        let poll_rejected = (sys.channel_poll)(t.out_rejected, 0x02);
+        if poll_rejected <= 0 || (poll_rejected as u32 & 0x02) == 0 {
+            return None;
         }
     }
+    if t.entry_credits > 0 && t.out_admitted >= 0 {
+        let poll_out = (sys.channel_poll)(t.out_admitted, 0x02);
+        if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
+            return None;
+        }
+    }
+    let poll = (sys.channel_poll)(t.in_proposals, 0x01);
+    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        return None;
+    }
+    let (msg_type, plen) = wire_channels::channel_read_msg(sys, t.in_proposals, &mut t.msg_buf);
+    if msg_type != wire::MSG_CLIENT_PROPOSAL || plen == 0 {
+        return Some(0);
+    }
+    let pl = plen as usize;
+    out[..pl].copy_from_slice(&t.msg_buf[..pl]);
+    Some(pl)
+}
 
+/// Metrics tick — runs at the end of the throttle's dispatch slot,
+/// after the external-proposals loop, so the counters it exports
+/// include this step's admissions.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Throttle` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn step_metrics(t: &mut Throttle, sys: &SyscallTable) {
     emit_metrics(t, sys);
 }
 
 /// Admit or reject one tagged proposal `[correlation_id:u64 LE][body]`.
 /// Every delivered proposal gets a terminal route: an atomic write to
-/// `proposals_tagged`, or a rejection returned through the codec (and
-/// teed on `rejected`). A `<= 0` admitted write means raft's channel
-/// filled and NOTHING was written — the proposal falls through to a
-/// throttled reject rather than being dropped silently, so the client
-/// retries (RFC §13/§14).
+/// `proposals_tagged`, or a rejection — teed on `rejected` here and
+/// returned as the internal envelope for the dispatch table to hand
+/// to the codec (which resolves conn_id and frames the wire-facing
+/// reject). A `<= 0` admitted write means raft's channel filled and
+/// NOTHING was written — the proposal falls through to a throttled
+/// reject rather than being dropped silently, so the client retries
+/// (RFC §13/§14).
 ///
 /// # Safety
 ///
-/// Caller must hold exclusive component borrows and a valid
+/// Caller must hold an exclusive `&mut Throttle` and a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn on_proposal(
     t: &mut Throttle,
-    co: &mut codec::Codec,
-    su: &mut surface::Surface,
     sys: &SyscallTable,
     frame: &[u8],
-) {
+) -> Option<[u8; wire::CLIENT_REJECT_INTERNAL_LEN]> {
     let payload_len = frame.len();
     // Tagged-proposal convention (RFC §5.8): the codec stamps every
     // proposal with `[correlation_id:u64 LE][body]`. We need the
     // correlation_id so rejections map back to a conn_id; drop frames
     // that are too short to be tagged.
     if payload_len < wire::TAGGED_PROPOSAL_HDR {
-        return;
+        return None;
     }
     let correlation_id = u64::from_le_bytes([
         frame[0], frame[1], frame[2], frame[3], frame[4], frame[5], frame[6], frame[7],
@@ -190,8 +208,9 @@ pub unsafe fn on_proposal(
     }
     if !admitted {
         // Reject with the internal envelope: `[correlation_id][...]`.
-        // The codec looks up correlation_id → conn_id and emits the
-        // wire-facing MSG_CLIENT_REJECT through the surface.
+        // Returned to the dispatch table, which hands it to the codec
+        // (correlation_id → conn_id) and then the surface for the
+        // wire-facing MSG_CLIENT_REJECT.
         let mut env = [0u8; wire::CLIENT_REJECT_INTERNAL_LEN];
         let retry_ms: u16 = if t.entry_credits > 0 { 5 } else { 50 };
         let entry_clamped = t.entry_credits.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
@@ -203,7 +222,6 @@ pub unsafe fn on_proposal(
             entry_clamped,
             t.byte_credits,
         );
-        codec::on_reject_internal(co, su, sys, &env);
         // External tee for observers (e.g. the operations module's
         // proposal-rejection feedback). Best-effort.
         if t.out_rejected >= 0 {
@@ -218,7 +236,9 @@ pub unsafe fn on_proposal(
             }
         }
         t.rejected_count += 1;
+        return Some(env);
     }
+    None
 }
 
 pub fn work_count(t: &Throttle) -> u32 {

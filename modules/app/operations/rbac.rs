@@ -42,7 +42,7 @@
 //! own request loop). All work is table scans over 32 slots.
 
 use super::abi::SyscallTable;
-use super::{admin, telemetry, wire, wire_channels};
+use super::{wire, wire_channels};
 
 // Role bits
 pub const ROLE_OPERATOR: u8 = 0x01;
@@ -146,71 +146,77 @@ pub unsafe fn init(r: &mut Rbac) {
     r.denied_count = 0;
 }
 
-/// Per-step bound: 8 identity envelopes + 4 wire commands (see the
-/// module dispatch table).
+/// One pull off the wire admin-command port.
+pub enum Pulled {
+    Empty,
+    Skipped,
+    Command(usize),
+}
+
+/// Drain identity bindings. The dispatch table calls this BEFORE the
+/// wire-command loop so the role table is up-to-date for any commands
+/// arriving in the same tick. Per-step bound: 8 identity envelopes.
 ///
 /// # Safety
 ///
-/// Caller must hold exclusive component borrows and a valid
+/// Caller must hold an exclusive `&mut Rbac` and a valid
 /// `&SyscallTable` per the module ABI.
-pub unsafe fn step(
-    r: &mut Rbac,
-    admin: &mut admin::Admin,
-    tele: &mut telemetry::Telemetry,
-    sys: &SyscallTable,
-    now: u64,
-) {
-    // 1. Drain identity bindings BEFORE processing requests so the
-    //    role table is up-to-date for any commands arriving in the
-    //    same tick.
+pub unsafe fn step(r: &mut Rbac, sys: &SyscallTable) {
     drain_identity(r, sys);
+}
 
-    // 2. Authorize wire-origin admin commands against the per-conn
-    //    role (or `default_role` when no binding exists).
+/// Read ONE wire-origin admin command into `out`. The dispatch table
+/// drives the ≤4/step loop and routes each command through
+/// [`evaluate`] → `admin::on_command`. `Skipped` marks a consumed
+/// non-command frame so the loop bound counts it.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Rbac` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn next_wire_command(
+    r: &mut Rbac,
+    sys: &SyscallTable,
+    out: &mut [u8; 1024],
+) -> Pulled {
     if r.in_requests < 0 {
-        return;
+        return Pulled::Empty;
     }
-    for _ in 0..4 {
-        let poll = (sys.channel_poll)(r.in_requests, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
-            break;
-        }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, r.in_requests, &mut r.msg_buf);
-        if msg_type != wire::MSG_ADMIN_COMMAND || plen == 0 {
-            continue;
-        }
-        let pl = plen as usize;
-        if pl < 1 {
-            continue;
-        }
-        let mut local = [0u8; 1024];
-        local[..pl].copy_from_slice(&r.msg_buf[..pl]);
-        evaluate(r, admin, tele, sys, now, Origin::Wire, &local[..pl]);
+    let poll = (sys.channel_poll)(r.in_requests, 0x01);
+    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        return Pulled::Empty;
     }
+    let (msg_type, plen) = wire_channels::channel_read_msg(sys, r.in_requests, &mut r.msg_buf);
+    if msg_type != wire::MSG_ADMIN_COMMAND || plen == 0 {
+        return Pulled::Skipped;
+    }
+    let pl = plen as usize;
+    out[..pl].copy_from_slice(&r.msg_buf[..pl]);
+    Pulled::Command(pl)
 }
 
 /// Evaluate one admin command envelope `[conn_id:u8][op_code:u8][body]`.
-/// Authorized commands are delivered to the admin component; denials
-/// answer on the `denied` port. Returns whether the command was
-/// authorized.
+/// Returns whether the command is authorized; the dispatch table
+/// delivers authorized envelopes to `admin::on_command` and pings
+/// `telemetry::on_legacy_envelope` — this component only judges.
+/// Denials answer on the `denied` port here.
 ///
 /// When the optional `authorized` port is wired, the authorized
 /// envelope is also teed there verbatim — best-effort, dropped on
-/// backpressure, and never in the path of the delivery to `admin`.
+/// backpressure, and never gating the delivery the dispatch table
+/// performs.
 ///
 /// This is the single admission point for admin commands regardless
-/// of origin — the `http` component calls it for `POST /admin/<op>`.
+/// of origin — the dispatch table routes `POST /admin/<op>` envelopes
+/// from the `http` component through it too.
 ///
 /// # Safety
 ///
-/// Caller must hold exclusive component borrows and a valid
+/// Caller must hold an exclusive `&mut Rbac` and a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn evaluate(
     r: &mut Rbac,
-    admin: &mut admin::Admin,
-    tele: &mut telemetry::Telemetry,
     sys: &SyscallTable,
-    now: u64,
     origin: Origin,
     payload: &[u8],
 ) -> bool {
@@ -227,12 +233,10 @@ pub unsafe fn evaluate(
     let authorized = (role & (ROLE_OPERATOR | ROLE_BREAKGLASS)) != 0;
 
     if authorized {
-        admin::on_command(admin, sys, now, payload);
         r.authorized_count += 1;
-        // Tee the authorized envelope to any external observer. This
-        // runs strictly AFTER the delivery above and never gates it:
-        // an unwired or full port costs one poll and the command has
-        // already been handed to `admin`.
+        // Tee the authorized envelope to any external observer.
+        // Best-effort: an unwired or full port costs one poll and
+        // never gates the dispatch table's delivery to `admin`.
         if r.out_authorized >= 0 {
             let poll_out = (sys.channel_poll)(r.out_authorized, 0x02);
             if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
@@ -265,7 +269,6 @@ pub unsafe fn evaluate(
             wire_channels::channel_write_msg(sys, r.out_audit, wire::MSG_METRICS, &audit);
         }
     }
-    telemetry::on_legacy_envelope(tele);
 
     authorized
 }

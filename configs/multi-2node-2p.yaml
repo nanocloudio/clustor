@@ -129,8 +129,9 @@ wiring:
   - from: gateway.responses
     to: peer_router.client_resp
 
-  # Route client proposals through the canonical facade path:
-  # gateway → gateway → gateway → partition_router.
+  # Route client proposals through the canonical facade path: the
+  # gateway's interior surface → codec → throttle seams, then out to
+  # partition_router.
   - from: gateway.proposals_tagged
     to: partition_router.proposals_tagged
   - from: partition_router.proposals_tagged_p0

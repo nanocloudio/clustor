@@ -69,6 +69,8 @@ mod wire;
 mod wire_channels;
 #[path = "../../common/collections.rs"]
 mod collections;
+#[path = "../../common/wal_frame.rs"]
+mod wal_frame;
 
 mod keys;
 #[cfg(not(feature = "volatile"))]

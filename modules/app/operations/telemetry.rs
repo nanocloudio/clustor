@@ -146,6 +146,19 @@ pub unsafe fn init(t: &mut Telemetry, sys: &SyscallTable) {
     t.step_buckets = [0u32; STEP_HIST_BUCKETS];
 }
 
+/// True on exactly the steps the export tick emitted — the dispatch
+/// table refreshes the http/ingress caches on these steps.
+pub fn emitted(t: &Telemetry) -> bool {
+    t.emitted
+}
+
+/// Snapshot of the current readiness verdict and export payload for
+/// cache refresh. Sibling components consume these values through the
+/// dispatch table — never the telemetry struct itself.
+pub fn snapshot(t: &Telemetry) -> (bool, &[u8]) {
+    (t.ready, &t.export_buf[..t.export_len as usize])
+}
+
 /// Count a legacy opaque `MSG_METRICS` envelope from a sibling
 /// component — the same accounting the `ingest` port gives external
 /// producers.

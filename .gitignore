@@ -16,8 +16,12 @@
 # Build/test
 Cargo.lock
 /target/
+
+# Shadow-tracked (see standards/test-tracking.md) — versioned in
+# .git-shadow/, never pushed to this repo's remote.
 /tests/
 /benches/
+/.git-shadow/
 
 # Runtime WAL state (mutated by local runs, not source)
 /wal/

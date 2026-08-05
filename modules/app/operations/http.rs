@@ -32,7 +32,7 @@
 //! feedback drains below never consume an event they cannot answer.
 
 use super::abi::SyscallTable;
-use super::{admin, http_admin, ingress, rbac, telemetry, wire, wire_channels};
+use super::{http_admin, wire, wire_channels};
 use super::{dev_log, dev_millis, dev_report_step_effect, step_effect};
 
 /// Bound on the small cached envelopes — `/readyz` and `/why` carry a
@@ -62,6 +62,51 @@ const MAX_EXT_BODY: usize = 1024;
 const MAX_EXT_REQUEST: usize = 3 + MAX_EXT_PATH + MAX_EXT_BODY;
 const HTTP_PROPOSAL_TIMEOUT_MS: u64 = 10_000;
 const METRICS_INTERVAL_MS: u64 = 250;
+
+/// One response resolved for the ingress listener's response ring.
+/// The body is staged in `resp_frame[RESP_BODY..RESP_BODY+len]` —
+/// the dispatch table reads it via [`staged_body`] and hands it to
+/// `ingress::queue_response`. Replies to `request`-port traffic never
+/// appear here: they egress on this component's own `response` port
+/// inside the producing call. Consume each record before the next
+/// http call — `resp_frame` is a single staging slot.
+#[derive(Clone, Copy)]
+pub struct Queued {
+    pub conn_id: u8,
+    pub status: u16,
+    pub len: u16,
+}
+
+/// One pull off a proposal-feedback channel: nothing readable,
+/// consumed-and-finished (ext egress / unmatched / malformed — burns
+/// the loop slot), or a listener response to queue.
+pub enum Feedback {
+    Empty,
+    Handled,
+    Respond(Queued),
+}
+
+/// Terminal route for one HTTP request, resolved by [`on_request`].
+pub enum ReqOut {
+    /// Fully handled (proposal emitted, ext reply sent, dropped).
+    Done,
+    /// A listener response to queue on the ingress ring.
+    Queue(Queued),
+    /// A `POST /admin/<op>` envelope staged in the admin buffer
+    /// ([`admin_env`]); the dispatch table routes it through
+    /// rbac → admin and completes the reply via [`finish_admin`].
+    Admin { op_code: u8, len: u16 },
+}
+
+/// The staged response body for a [`Queued`] record.
+pub fn staged_body(h: &Http, len: u16) -> &[u8] {
+    &h.resp_frame[RESP_BODY..RESP_BODY + len as usize]
+}
+
+/// The staged admin envelope for a [`ReqOut::Admin`] record.
+pub fn admin_env(h: &Http, len: u16) -> &[u8] {
+    &h.admin_env[..len as usize]
+}
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -159,6 +204,9 @@ pub struct Http {
     /// Scratch for draining the proposal-feedback channels (small
     /// fixed-size frames).
     msg_buf: [u8; 256],
+    /// Staging for one `POST /admin/<op>` envelope handed to the
+    /// dispatch table as [`ReqOut::Admin`].
+    admin_env: [u8; 1024],
 }
 
 pub unsafe fn init(h: &mut Http) {
@@ -188,6 +236,7 @@ pub unsafe fn init(h: &mut Http) {
     h.committed = 0;
     h.last_metrics_ms = 0;
     h.admin_dropped = 0;
+    h.admin_env = [0u8; 1024];
 }
 
 fn mark_ext(h: &mut Http, conn_id: u8) {
@@ -235,131 +284,137 @@ unsafe fn emit_staged(
     true
 }
 
-/// Answer one request on whichever source it arrived from. `body` must
-/// not borrow from `h`; diagnostic payloads that do are staged into
-/// `resp_frame` at their call site instead.
-unsafe fn respond(
+/// Answer one request on whichever source it arrived from. `body`
+/// must not borrow from `h` (diagnostic payloads stage themselves
+/// into `resp_frame` at their call site instead). Ext-sourced
+/// replies egress here on the component's own `response` port and
+/// return `None`; listener replies are staged and returned as a
+/// [`Queued`] record for the dispatch table to hand to the ingress
+/// response ring.
+unsafe fn finish(
     h: &mut Http,
-    ing: &mut ingress::Ingress,
     sys: &SyscallTable,
     conn_id: u8,
     status: u16,
     body: &[u8],
-) -> bool {
+) -> Option<Queued> {
+    let n = body.len().min(METRICS_CACHE);
+    h.resp_frame[RESP_BODY..RESP_BODY + n].copy_from_slice(&body[..n]);
     if take_ext(h, conn_id) {
-        let n = body.len().min(METRICS_CACHE);
-        h.resp_frame[RESP_BODY..RESP_BODY + n].copy_from_slice(&body[..n]);
-        emit_staged(h, sys, conn_id, status, n)
+        emit_staged(h, sys, conn_id, status, n);
+        None
     } else {
-        ingress::queue_response(ing, sys, conn_id, status, body)
+        Some(Queued { conn_id, status, len: n as u16 })
     }
 }
 
-/// Drain the module's `request` port — `MSG_HTTP_REQUEST`
+/// One externally-parsed request pulled off the `request` port,
+/// handed to the dispatch table for [`on_request`] routing.
+#[repr(C)]
+pub struct ExtReq {
+    pub conn_id: u8,
+    pub method: u8,
+    pub path_len: u8,
+    pub body_len: u16,
+    pub path: [u8; MAX_EXT_PATH],
+    pub body: [u8; MAX_EXT_BODY],
+}
+
+impl ExtReq {
+    pub const fn new() -> Self {
+        Self { conn_id: 0, method: 0, path_len: 0, body_len: 0, path: [0; MAX_EXT_PATH], body: [0; MAX_EXT_BODY] }
+    }
+}
+
+/// One pull off the `request` port.
+pub enum ExtPulled {
+    Empty,
+    Skipped,
+    Request,
+}
+
+/// Read ONE frame off the module's `request` port — `MSG_HTTP_REQUEST`
 /// `[conn_id][method][path_len][path][body]` parsed by a consumer that
 /// serves HTTP over its own shared client port. Frames enter the same
-/// [`on_request`] handling the dedicated listener uses; the source is
-/// recorded so the reply egresses on `response`.
-///
-/// Per-step bound: ≤8 requests, matching the ingress event loop's
-/// per-request budget.
+/// [`on_request`] handling the dedicated listener uses (the dispatch
+/// table drives the ≤8/step loop, matching the ingress event loop's
+/// per-request budget); the source is recorded so the reply egresses
+/// on `response`. `Skipped` marks a consumed malformed frame so the
+/// loop bound counts it.
 ///
 /// # Safety
 ///
-/// Caller must hold exclusive component borrows and a valid
+/// Caller must hold an exclusive `&mut Http` and a valid
 /// `&SyscallTable` per the module ABI.
-pub unsafe fn drain_external_requests(
+pub unsafe fn next_external_request(
     h: &mut Http,
-    ing: &mut ingress::Ingress,
-    rb: &mut rbac::Rbac,
-    ad: &mut admin::Admin,
-    tele: &mut telemetry::Telemetry,
     sys: &SyscallTable,
-    now: u64,
-) {
+    req: &mut ExtReq,
+) -> ExtPulled {
     if h.in_request < 0 {
-        return;
+        return ExtPulled::Empty;
     }
-    for _ in 0..8 {
-        let poll = (sys.channel_poll)(h.in_request, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
-            break;
-        }
-        let mut buf = [0u8; MAX_EXT_REQUEST];
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, h.in_request, &mut buf);
-        if msg_type != wire::MSG_HTTP_REQUEST {
-            continue;
-        }
-        let pl = plen as usize;
-        if pl < 3 {
-            continue; // conn_id + method + path_len
-        }
-        let conn_id = buf[0];
-        let method_byte = buf[1];
-        let path_len = (buf[2] as usize).min(MAX_EXT_PATH);
-        if 3 + path_len > pl {
-            continue; // truncated path — a producer framing error
-        }
-        let body_off = 3 + path_len;
-        let body_len = (pl - body_off).min(MAX_EXT_BODY);
-        mark_ext(h, conn_id);
-        // `buf` is a local, so the borrows below are independent of
-        // `h` and can be handed straight to the shared handler.
-        let (head, tail) = buf.split_at(body_off);
-        on_request(
-            h,
-            ing,
-            rb,
-            ad,
-            tele,
-            sys,
-            now,
-            conn_id,
-            method_byte,
-            &head[3..3 + path_len],
-            &tail[..body_len],
-        );
+    let poll = (sys.channel_poll)(h.in_request, 0x01);
+    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        return ExtPulled::Empty;
     }
+    let mut buf = [0u8; MAX_EXT_REQUEST];
+    let (msg_type, plen) = wire_channels::channel_read_msg(sys, h.in_request, &mut buf);
+    if msg_type != wire::MSG_HTTP_REQUEST {
+        return ExtPulled::Skipped;
+    }
+    let pl = plen as usize;
+    if pl < 3 {
+        return ExtPulled::Skipped; // conn_id + method + path_len
+    }
+    let conn_id = buf[0];
+    let method_byte = buf[1];
+    let path_len = (buf[2] as usize).min(MAX_EXT_PATH);
+    if 3 + path_len > pl {
+        return ExtPulled::Skipped; // truncated path — a producer framing error
+    }
+    let body_off = 3 + path_len;
+    let body_len = (pl - body_off).min(MAX_EXT_BODY);
+    mark_ext(h, conn_id);
+    req.conn_id = conn_id;
+    req.method = method_byte;
+    req.path_len = path_len as u8;
+    req.body_len = body_len as u16;
+    req.path[..path_len].copy_from_slice(&buf[3..3 + path_len]);
+    req.body[..body_len].copy_from_slice(&buf[body_off..body_off + body_len]);
+    ExtPulled::Request
 }
 
-/// Refresh the diagnostic caches from the telemetry component. Called
-/// by the dispatch table on exactly the steps telemetry emitted, so
-/// cache freshness matches the export cadence.
-pub fn cache_from(h: &mut Http, t: &telemetry::Telemetry) {
-    h.readyz_buf[0] = t.ready as u8;
+/// Refresh the diagnostic caches from the telemetry component's
+/// snapshot values. Called by the dispatch table on exactly the steps
+/// telemetry emitted, so cache freshness matches the export cadence —
+/// the http component never sees the telemetry struct itself.
+pub fn cache_export(h: &mut Http, ready: bool, export: &[u8]) {
+    h.readyz_buf[0] = ready as u8;
     h.readyz_len = 1;
     h.why_buf[0] = 0;
     h.why_len = 1;
-    let len = (t.export_len as usize).min(METRICS_CACHE);
+    let len = export.len().min(METRICS_CACHE);
     if len > 0 {
-        h.metrics_buf[..len].copy_from_slice(&t.export_buf[..len]);
+        h.metrics_buf[..len].copy_from_slice(&export[..len]);
         h.metrics_len = len as u16;
     }
 }
 
-/// Per-step bound: 16 assignments + 8 rejections + 16 applies + one
-/// expiry scan over two 64-slot tables, plus the 250 ms self-metrics
-/// tick. Responses go through the ingress ring; every drain below is
-/// gated on ring space exactly as it was gated on the response
-/// channel, so feedback is never consumed without somewhere to
-/// answer.
+/// Own-state drains only: ≤16 proposal assignments. The response-
+/// producing feedback loops (≤8 rejections, ≤16 applies, one expiry)
+/// are driven by the dispatch table through [`next_rejection`] /
+/// [`next_applied`] / [`expire_step`], each pull gated there on
+/// `ingress::response_writable` exactly as the old in-component loops
+/// were — feedback is never consumed without somewhere to answer.
+/// The 250 ms self-metrics tick rides [`take_metrics`].
 ///
 /// # Safety
 ///
-/// Caller must hold exclusive component borrows and a valid
+/// Caller must hold an exclusive `&mut Http` and a valid
 /// `&SyscallTable` per the module ABI.
-pub unsafe fn step(
-    h: &mut Http,
-    ing: &mut ingress::Ingress,
-    tele: &mut telemetry::Telemetry,
-    sys: &SyscallTable,
-    now: u64,
-) {
+pub unsafe fn step(h: &mut Http, sys: &SyscallTable) {
     drain_proposal_assignments(h, sys);
-    drain_proposal_rejections(h, ing, sys);
-    drain_applied(h, ing, sys);
-    expire_proposals(h, ing, sys, now);
-    emit_metrics(h, tele, now);
 }
 
 unsafe fn drain_proposal_assignments(h: &mut Http, sys: &SyscallTable) {
@@ -406,59 +461,70 @@ unsafe fn drain_proposal_assignments(h: &mut Http, sys: &SyscallTable) {
     }
 }
 
-unsafe fn drain_proposal_rejections(h: &mut Http, ing: &mut ingress::Ingress, sys: &SyscallTable) {
+/// Pull ONE throttle rejection off the `proposal_rejected` port. The
+/// dispatch table drives the ≤8/step loop and gates each pull on
+/// `ingress::response_writable` — do not consume a rejection unless
+/// the response has somewhere to go.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Http` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn next_rejection(h: &mut Http, sys: &SyscallTable) -> Feedback {
     if h.in_proposal_rejected < 0 {
-        return;
+        return Feedback::Empty;
     }
-    for _ in 0..8 {
-        // Do not consume a rejection unless the response has somewhere
-        // to go.
-        if !ingress::response_writable(ing) {
-            break;
-        }
-        let poll = (sys.channel_poll)(h.in_proposal_rejected, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
-            break;
-        }
-        let (msg_type, plen) =
-            wire_channels::channel_read_msg(sys, h.in_proposal_rejected, &mut h.msg_buf);
-        if msg_type != wire::MSG_CLIENT_REJECT_INTERNAL {
-            continue;
-        }
-        let (correlation_id, _status, _retry, _entries, _bytes) =
-            match wire::decode_client_reject_internal(&h.msg_buf[..plen as usize]) {
-                Some(v) => v,
-                None => continue,
-            };
-        if let Some(pos) = h
-            .correlations
-            .iter()
-            .position(|slot| slot.correlation_id == correlation_id && correlation_id != 0)
-        {
-            let conn_id = h.correlations[pos].conn_id;
-            h.correlations[pos] = CorrSlot::empty();
-            h.proposal_rejections = h.proposal_rejections.saturating_add(1);
-            respond(h, ing, sys, conn_id, 503, b"proposal rejected");
-        }
+    let poll = (sys.channel_poll)(h.in_proposal_rejected, 0x01);
+    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        return Feedback::Empty;
     }
+    let (msg_type, plen) =
+        wire_channels::channel_read_msg(sys, h.in_proposal_rejected, &mut h.msg_buf);
+    if msg_type != wire::MSG_CLIENT_REJECT_INTERNAL {
+        return Feedback::Handled;
+    }
+    let (correlation_id, _status, _retry, _entries, _bytes) =
+        match wire::decode_client_reject_internal(&h.msg_buf[..plen as usize]) {
+            Some(v) => v,
+            None => return Feedback::Handled,
+        };
+    if let Some(pos) = h
+        .correlations
+        .iter()
+        .position(|slot| slot.correlation_id == correlation_id && correlation_id != 0)
+    {
+        let conn_id = h.correlations[pos].conn_id;
+        h.correlations[pos] = CorrSlot::empty();
+        h.proposal_rejections = h.proposal_rejections.saturating_add(1);
+        return match finish(h, sys, conn_id, 503, b"proposal rejected") {
+            Some(q) => Feedback::Respond(q),
+            None => Feedback::Handled,
+        };
+    }
+    Feedback::Handled
 }
 
-unsafe fn drain_applied(h: &mut Http, ing: &mut ingress::Ingress, sys: &SyscallTable) {
+/// Pull ONE apply acknowledgement off the `applied` port. The
+/// dispatch table drives the ≤16/step loop, gating each pull on
+/// `ingress::response_writable`.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Http` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn next_applied(h: &mut Http, sys: &SyscallTable) -> Feedback {
     if h.in_applied < 0 {
-        return;
+        return Feedback::Empty;
     }
-    for _ in 0..16 {
-        if !ingress::response_writable(ing) {
-            break;
-        }
+    {
         let poll = (sys.channel_poll)(h.in_applied, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 {
-            break;
+            return Feedback::Empty;
         }
         let (msg_type, plen) = wire_channels::channel_read_msg(sys, h.in_applied, &mut h.msg_buf);
         let pl = plen as usize;
         if msg_type != wire::MSG_CLIENT_RESPONSE || pl < 18 {
-            continue;
+            return Feedback::Handled;
         }
         // `[partition:u16][term:u64][index:u64]` — index at offset 10.
         let index_off = 10;
@@ -472,25 +538,36 @@ unsafe fn drain_applied(h: &mut Http, ing: &mut ingress::Ingress, sys: &SyscallT
             let conn_id = h.indices[pos].conn_id;
             h.indices[pos] = IndexSlot::empty();
             h.committed = h.committed.saturating_add(1);
-            respond(h, ing, sys, conn_id, 200, b"committed");
+            match finish(h, sys, conn_id, 200, b"committed") {
+                Some(q) => Feedback::Respond(q),
+                None => Feedback::Handled,
+            }
         } else {
             h.applies_unmatched = h.applies_unmatched.saturating_add(1);
+            Feedback::Handled
         }
     }
 }
 
-unsafe fn expire_proposals(h: &mut Http, ing: &mut ingress::Ingress, sys: &SyscallTable, now: u64) {
-    if !ingress::response_writable(ing) {
-        return;
-    }
+/// One expiry check per step (a corr timeout, else an index timeout —
+/// the old scan's exact behaviour). The dispatch table gates the call
+/// on `ingress::response_writable`.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Http` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn expire_step(h: &mut Http, sys: &SyscallTable, now: u64) -> Feedback {
     if let Some(pos) = h.correlations.iter().position(|slot| {
         slot.correlation_id != 0 && now.wrapping_sub(slot.started_ms) >= HTTP_PROPOSAL_TIMEOUT_MS
     }) {
         let conn_id = h.correlations[pos].conn_id;
         h.correlations[pos] = CorrSlot::empty();
         h.proposal_timeouts = h.proposal_timeouts.saturating_add(1);
-        respond(h, ing, sys, conn_id, 503, b"proposal timeout");
-        return;
+        return match finish(h, sys, conn_id, 503, b"proposal timeout") {
+            Some(q) => Feedback::Respond(q),
+            None => Feedback::Handled,
+        };
     }
     if let Some(pos) = h
         .indices
@@ -500,8 +577,12 @@ unsafe fn expire_proposals(h: &mut Http, ing: &mut ingress::Ingress, sys: &Sysca
         let conn_id = h.indices[pos].conn_id;
         h.indices[pos] = IndexSlot::empty();
         h.commit_timeouts = h.commit_timeouts.saturating_add(1);
-        respond(h, ing, sys, conn_id, 503, b"commit timeout");
+        return match finish(h, sys, conn_id, 503, b"commit timeout") {
+            Some(q) => Feedback::Respond(q),
+            None => Feedback::Handled,
+        };
     }
+    Feedback::Empty
 }
 
 unsafe fn emit_http_proposal(h: &mut Http, sys: &SyscallTable, conn_id: u8, body: &[u8]) -> bool {
@@ -543,91 +624,75 @@ unsafe fn emit_http_proposal(h: &mut Http, sys: &SyscallTable, conn_id: u8, body
     true
 }
 
-/// Handle one parsed HTTP request, delivered by the ingress
-/// component. `method_byte` is the first byte of the verb (G/P/…);
-/// `path`/`body` are the parsed request parts. Responses are queued
-/// on the ingress response ring.
+/// Handle one parsed HTTP request, delivered by the dispatch table
+/// (from the ingress listener or the `request` port). `method_byte`
+/// is the first byte of the verb (G/P/…); `path`/`body` are the
+/// parsed request parts. Listener responses come back as
+/// [`ReqOut::Queue`] for the dispatch table to hand to the ingress
+/// response ring; admin commands come back as [`ReqOut::Admin`] for
+/// the rbac → admin route, completed by [`finish_admin`].
 ///
 /// # Safety
 ///
-/// Caller must hold exclusive component borrows and a valid
+/// Caller must hold an exclusive `&mut Http` and a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn on_request(
     h: &mut Http,
-    ing: &mut ingress::Ingress,
-    rb: &mut rbac::Rbac,
-    ad: &mut admin::Admin,
-    tele: &mut telemetry::Telemetry,
     sys: &SyscallTable,
-    now: u64,
     conn_id: u8,
     method_byte: u8,
     path: &[u8],
     body: &[u8],
-) {
+) -> ReqOut {
     // POST /propose — synchronous write bridge. The response is
     // deferred until apply acknowledges the assigned WAL index.
     if method_byte == b'P' && path == b"/propose" {
+        let mut out = ReqOut::Done;
         if !emit_http_proposal(h, sys, conn_id, body) {
             h.queue_unavailable = h.queue_unavailable.saturating_add(1);
-            respond(h, ing, sys, conn_id, 503, b"propose queue unavailable");
+            if let Some(q) = finish(h, sys, conn_id, 503, b"propose queue unavailable") {
+                out = ReqOut::Queue(q);
+            }
         }
         h.requests_handled = h.requests_handled.saturating_add(1);
         dev_report_step_effect(sys, step_effect::WORK_DONE);
-        return;
+        return out;
     }
 
-    // POST /admin/<op> — admitted through rbac like every admin
-    // command. 202 means the command reached the admin component;
-    // its real status still answers on the module's `responses`
-    // port (returning it over HTTP is a follow-up slice).
+    // POST /admin/<op> — staged for admission through rbac like every
+    // admin command; the dispatch table routes the envelope and calls
+    // [`finish_admin`] with the verdict. 202 means the command reached
+    // the admin component; its real status still answers on the
+    // module's `responses` port (returning it over HTTP is a
+    // follow-up slice).
     if method_byte == b'P' && path.starts_with(b"/admin/") {
         let op_name = &path[b"/admin/".len()..];
-        match http_admin::admin_op_code(op_name) {
+        let out = match http_admin::admin_op_code(op_name) {
             Some(op_code) => {
                 if !http_admin::admin_body_fits(body.len()) {
                     h.admin_dropped = h.admin_dropped.saturating_add(1);
-                    respond(h, ing, sys, conn_id, 503, b"admin body too large");
-                } else {
-                    let mut env = [0u8; 1024];
-                    env[0] = conn_id;
-                    env[1] = op_code;
-                    env[2..2 + body.len()].copy_from_slice(body);
-                    let authorized = rbac::evaluate(
-                        rb,
-                        ad,
-                        tele,
-                        sys,
-                        now,
-                        rbac::Origin::Http,
-                        &env[..2 + body.len()],
-                    );
-                    if authorized {
-                        // Routing-decision signal, paired with
-                        // `[admin] op=N conn_id=M` on the admin side:
-                        // the only external proof the POST actually
-                        // reached the admin path, since the 202 below
-                        // fires immediately and unlike the
-                        // client-proposal path (see `CorrSlot`) admin
-                        // ops have no async reply to observe instead.
-                        let mut log = [0u8; 48];
-                        let n = format_admin_route_log(&mut log, op_code, conn_id);
-                        dev_log(sys, 3, log.as_ptr(), n);
-                        respond(h, ing, sys, conn_id, 202, b"accepted");
-                    } else {
-                        h.admin_dropped = h.admin_dropped.saturating_add(1);
-                        respond(h, ing, sys, conn_id, 403, b"forbidden");
+                    match finish(h, sys, conn_id, 503, b"admin body too large") {
+                        Some(q) => ReqOut::Queue(q),
+                        None => ReqOut::Done,
                     }
+                } else {
+                    h.admin_env[0] = conn_id;
+                    h.admin_env[1] = op_code;
+                    h.admin_env[2..2 + body.len()].copy_from_slice(body);
+                    ReqOut::Admin { op_code, len: (2 + body.len()) as u16 }
                 }
             }
             None => {
                 h.requests_404 = h.requests_404.saturating_add(1);
-                respond(h, ing, sys, conn_id, 400, b"unknown admin op");
+                match finish(h, sys, conn_id, 400, b"unknown admin op") {
+                    Some(q) => ReqOut::Queue(q),
+                    None => ReqOut::Done,
+                }
             }
-        }
+        };
         h.requests_handled = h.requests_handled.saturating_add(1);
         dev_report_step_effect(sys, step_effect::WORK_DONE);
-        return;
+        return out;
     }
 
     // Diagnostic payloads live in `h`'s caches, so they are staged
@@ -654,20 +719,57 @@ pub unsafe fn on_request(
         h.resp_frame[RESP_BODY..RESP_BODY + nf.len()].copy_from_slice(nf);
         (404, nf.len())
     };
-    if take_ext(h, conn_id) {
+    let out = if take_ext(h, conn_id) {
         emit_staged(h, sys, conn_id, status, len);
+        ReqOut::Done
     } else {
-        ingress::queue_response(ing, sys, conn_id, status, &h.resp_frame[RESP_BODY..RESP_BODY + len]);
-    }
+        ReqOut::Queue(Queued { conn_id, status, len: len as u16 })
+    };
     h.requests_handled = h.requests_handled.saturating_add(1);
     dev_report_step_effect(sys, step_effect::WORK_DONE);
+    out
 }
 
-/// Deliver self-telemetry to the telemetry component. Absolute
-/// counters and current bounded-table occupancy, every 250 ms.
-fn emit_metrics(h: &mut Http, tele: &mut telemetry::Telemetry, now: u64) {
+/// Complete a `POST /admin/<op>` request after the dispatch table has
+/// run the rbac → admin route: 202 when the envelope was authorized
+/// and delivered, 403 otherwise. Returns the listener response to
+/// queue, or `None` for `request`-port traffic (sent here).
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Http` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn finish_admin(
+    h: &mut Http,
+    sys: &SyscallTable,
+    conn_id: u8,
+    op_code: u8,
+    authorized: bool,
+) -> Option<Queued> {
+    if authorized {
+        // Routing-decision signal, paired with `[admin] op=N
+        // conn_id=M` on the admin side: the only external proof the
+        // POST actually reached the admin path, since the 202 below
+        // fires immediately and unlike the client-proposal path (see
+        // `CorrSlot`) admin ops have no async reply to observe
+        // instead.
+        let mut log = [0u8; 48];
+        let n = format_admin_route_log(&mut log, op_code, conn_id);
+        dev_log(sys, 3, log.as_ptr(), n);
+        finish(h, sys, conn_id, 202, b"accepted")
+    } else {
+        h.admin_dropped = h.admin_dropped.saturating_add(1);
+        finish(h, sys, conn_id, 403, b"forbidden")
+    }
+}
+
+/// Self-telemetry samples for the telemetry component — absolute
+/// counters and current bounded-table occupancy, every 250 ms. The
+/// dispatch table feeds the returned samples to
+/// `telemetry::on_typed_sample`; `None` off-tick.
+pub fn take_metrics(h: &mut Http, now: u64) -> Option<[(u16, u8, i64); 13]> {
     if now.wrapping_sub(h.last_metrics_ms) < METRICS_INTERVAL_MS {
-        return;
+        return None;
     }
     h.last_metrics_ms = now;
 
@@ -690,17 +792,7 @@ fn emit_metrics(h: &mut Http, tele: &mut telemetry::Telemetry, now: u64) {
         (wire::metric_ids::HTTP_REQUESTS, kc, i64::from(h.requests_handled)),
         (wire::metric_ids::HTTP_REQUESTS_404, kc, i64::from(h.requests_404)),
     ];
-    for &(metric_id, kind, value) in samples.iter() {
-        telemetry::on_typed_sample(
-            tele,
-            wire::SOURCE_ID_HTTP,
-            0,
-            metric_id,
-            kind,
-            value,
-            now,
-        );
-    }
+    Some(samples)
 }
 
 /// `[http] admin op=N conn_id=M` — see the call site's

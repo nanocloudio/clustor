@@ -42,7 +42,6 @@
 //!   `[ingress] closed conn_id=N`              — connection torn down
 
 use super::abi::SyscallTable;
-use super::{admin, http, rbac, telemetry};
 use super::{
     dev_log, dev_report_step_effect, net_read_frame, net_write_frame, step_effect, NET_FRAME_HDR,
     POLL_IN, POLL_OUT,
@@ -192,7 +191,10 @@ pub fn queue_response(
     status: u16,
     body: &[u8],
 ) -> bool {
-    let body_len = body.len().min(http::METRICS_CACHE);
+    // Largest queued body: the /metrics export (http::METRICS_CACHE
+    // mirrors this bound — a change must touch both).
+    const RESP_BODY_MAX: usize = 7600;
+    let body_len = body.len().min(RESP_BODY_MAX);
     let total = RESP_HDR + body_len;
     if (RESP_RING - g.ring_used as usize) < total {
         return false;
@@ -233,21 +235,60 @@ fn ring_read(g: &mut Ingress, n: usize, dst: &mut [u8]) {
 ///
 /// Caller must hold exclusive component borrows and a valid
 /// `&SyscallTable` per the module ABI.
-pub unsafe fn step(
-    g: &mut Ingress,
-    h: &mut http::Http,
-    rb: &mut rbac::Rbac,
-    ad: &mut admin::Admin,
-    tele: &mut telemetry::Telemetry,
-    sys: &SyscallTable,
-    now: u64,
-) {
+/// One parsed HTTP request handed to the dispatch table for
+/// `http::on_request` routing.
+#[repr(C)]
+pub struct ParsedReq {
+    pub conn_id: u8,
+    pub method: u8,
+    pub path_len: u8,
+    pub body_len: u16,
+    pub path: [u8; MAX_PATH],
+    pub body: [u8; MAX_BODY],
+}
+
+impl ParsedReq {
+    pub const fn new() -> Self {
+        Self { conn_id: 0, method: 0, path_len: 0, body_len: 0, path: [0; MAX_PATH], body: [0; MAX_BODY] }
+    }
+}
+
+/// One pull off the net-event channel.
+pub enum Pull {
+    Empty,
+    Handled,
+    Request,
+}
+
+/// Open the ingress dispatch slot: reset the step-work marker and
+/// retry the listen-socket bind. The dispatch table then drives the
+/// ≤16/step [`next_event`] loop and closes with [`finish_step`].
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Ingress` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn begin_step(g: &mut Ingress, sys: &SyscallTable) {
     g.step_work = false;
     if !g.bound {
         try_bind(g, sys);
     }
-    drain_net_events(g, h, rb, ad, tele, sys, now);
+}
+
+/// Close the ingress dispatch slot: response ring → wire.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Ingress` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn finish_step(g: &mut Ingress, sys: &SyscallTable) {
     drain_responses(g, sys);
+}
+
+/// Whether this step's event loop did real request work — the
+/// dispatch table's burst-classification input.
+pub fn took_work(g: &Ingress) -> bool {
+    g.step_work
 }
 
 // ── Bind the listen socket ───────────────────────────────────
@@ -275,35 +316,43 @@ unsafe fn try_bind(g: &mut Ingress, sys: &SyscallTable) {
 
 // ── Inbound: linux_net events and HTTP request parsing ──────
 
-unsafe fn drain_net_events(
+/// Pull ONE linux_net event. Accept/close/bound and data-buffering
+/// are handled here on the ingress's own state; a fully-received,
+/// parsed HTTP request is returned as [`Pull::Request`] in `req` for
+/// the dispatch table to route through `http::on_request`. The
+/// dispatch table drives the ≤16/step loop, so every consumed event
+/// counts against the same bound the old in-component loop had.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Ingress` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn next_event(
     g: &mut Ingress,
-    h: &mut http::Http,
-    rb: &mut rbac::Rbac,
-    ad: &mut admin::Admin,
-    tele: &mut telemetry::Telemetry,
     sys: &SyscallTable,
-    now: u64,
-) {
+    req: &mut ParsedReq,
+) -> Pull {
     if g.in_net < 0 {
-        return;
+        return Pull::Empty;
     }
-    for _ in 0..16 {
+    {
         let poll = (sys.channel_poll)(g.in_net, POLL_IN);
         if poll <= 0 || (poll as u32 & POLL_IN) == 0 {
-            break;
+            return Pull::Empty;
         }
         let (event, payload_len) = net_read_frame(sys, g.in_net, g.net_buf.as_mut_ptr(), TX_BUF);
         if event == 0 {
-            break;
+            return Pull::Empty;
         }
         if payload_len < 1 {
-            continue;
+            return Pull::Handled;
         }
         let conn_id = g.net_buf[NET_FRAME_HDR];
         match event {
             NMSG_BOUND => {
                 // linux_net acknowledged the bind. Nothing to do —
                 // we already log on init.
+                Pull::Handled
             }
             NMSG_ACCEPT => {
                 // Per-port filter: ACCEPT carries the parent listener's
@@ -320,7 +369,7 @@ unsafe fn drain_net_events(
                         g.net_buf[NET_FRAME_HDR + 2],
                     ]);
                     if port != g.listen_port {
-                        continue;
+                        return Pull::Handled;
                     }
                 }
                 if alloc_conn(g, conn_id).is_some() {
@@ -328,46 +377,44 @@ unsafe fn drain_net_events(
                     let n = format_accepted(&mut buf, conn_id);
                     dev_log(sys, 3, buf.as_ptr(), n);
                 }
+                Pull::Handled
             }
             NMSG_DATA => {
                 if payload_len < 2 {
-                    continue;
+                    return Pull::Handled;
                 }
                 let data_start = NET_FRAME_HDR + 1;
                 let data_len = payload_len - 1;
-                ingest_data(g, h, rb, ad, tele, sys, now, conn_id, data_start, data_len);
+                ingest_data(g, sys, conn_id, data_start, data_len, req)
             }
             NMSG_CLOSED => {
                 free_conn(g, conn_id);
                 let mut buf = [0u8; 48];
                 let n = format_closed(&mut buf, conn_id);
                 dev_log(sys, 3, buf.as_ptr(), n);
+                Pull::Handled
             }
-            _ => {}
+            _ => Pull::Handled,
         }
     }
 }
 
 unsafe fn ingest_data(
     g: &mut Ingress,
-    h: &mut http::Http,
-    rb: &mut rbac::Rbac,
-    ad: &mut admin::Admin,
-    tele: &mut telemetry::Telemetry,
     sys: &SyscallTable,
-    now: u64,
     conn_id: u8,
     data_start: usize,
     data_len: usize,
-) {
+    req: &mut ParsedReq,
+) -> Pull {
     let take = data_len.min(RX_BUF);
     let slot = match find_conn(g, conn_id) {
         Some(i) => i,
-        None => return,
+        None => return Pull::Handled,
     };
     if g.conns[slot].sent_request {
         // Awaiting the response — extra inbound bytes are dropped.
-        return;
+        return Pull::Handled;
     }
     {
         let rx_len = g.conns[slot].rx_len as usize;
@@ -386,27 +433,28 @@ unsafe fn ingest_data(
         let content_length = parse_content_length(&g.conns[slot].rx[..headers_end]);
         let need = headers_end + content_length;
         if total >= need {
-            deliver_request(g, h, rb, ad, tele, sys, now, slot, headers_end, content_length);
+            return deliver_request(g, sys, slot, headers_end, content_length, req);
         }
     }
+    Pull::Handled
 }
 
-/// Parse and deliver the request at `slot` to the http component.
+/// Parse the request at `slot` and hand it to the dispatch table.
 /// `headers_end` is the index of the byte AFTER the `\r\n\r\n`
 /// terminator; `body_len` is the byte count of the request body
-/// (typically the parsed `Content-Length`; 0 for GET).
+/// (typically the parsed `Content-Length`; 0 for GET). Malformed
+/// requests and the `/readyz` short-circuit answer here on the
+/// ingress's own state; everything else fills `req` for
+/// `http::on_request`, whose response comes back through the
+/// response ring.
 unsafe fn deliver_request(
     g: &mut Ingress,
-    h: &mut http::Http,
-    rb: &mut rbac::Rbac,
-    ad: &mut admin::Admin,
-    tele: &mut telemetry::Telemetry,
     sys: &SyscallTable,
-    now: u64,
     slot: usize,
     headers_end: usize,
     body_len: usize,
-) {
+    req: &mut ParsedReq,
+) -> Pull {
     g.conns[slot].close_after_response =
         requests_connection_close(&g.conns[slot].rx[..headers_end]);
     let (conn_id, method_byte, path, path_len) = {
@@ -416,7 +464,7 @@ unsafe fn deliver_request(
             None => {
                 // Malformed — send a 400 immediately and bail.
                 send_http_response(g, sys, slot, 400, b"bad request\n");
-                return;
+                return Pull::Handled;
             }
         }
     };
@@ -429,15 +477,18 @@ unsafe fn deliver_request(
         let body = [g.ready_byte];
         let status = if g.ready_seen && g.ready_byte != 0 { 200 } else { 503 };
         send_http_response(g, sys, slot, status, &body);
-        return;
+        return Pull::Handled;
     }
 
-    // Copy the body out of the connection buffer, then hand the parsed
-    // request to the http component. Responses come back through the
-    // response ring.
+    // Copy the request parts out of the connection buffer for the
+    // dispatch table.
     let body_capped = body_len.min(MAX_BODY);
-    let mut body_local = [0u8; MAX_BODY];
-    body_local[..body_capped]
+    req.conn_id = conn_id;
+    req.method = method_byte;
+    req.path_len = path_len as u8;
+    req.body_len = body_capped as u16;
+    req.path[..path_len].copy_from_slice(&path[..path_len]);
+    req.body[..body_capped]
         .copy_from_slice(&g.conns[slot].rx[headers_end..headers_end + body_capped]);
     g.conns[slot].sent_request = true;
     g.step_work = true;
@@ -449,19 +500,7 @@ unsafe fn deliver_request(
     let mut buf = [0u8; 128];
     let n = format_request_line(&mut buf, method_byte, &path[..path_len], body_capped, conn_id);
     dev_log(sys, 3, buf.as_ptr(), n);
-    http::on_request(
-        h,
-        g,
-        rb,
-        ad,
-        tele,
-        sys,
-        now,
-        conn_id,
-        method_byte,
-        &path[..path_len],
-        &body_local[..body_capped],
-    );
+    Pull::Request
 }
 
 // ── Outbound: response ring → wire ───────────────────────────

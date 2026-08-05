@@ -24,9 +24,11 @@
 target: linux
 tick_us: 1000
 
-# Accept structural cycles. The clustor graph has a metrics fanout
-# `consensus → operations → gateway → consensus.rpc`
-# which is a topological cycle but a semantic feedback edge — each
+# Accept structural cycles. The clustor graph has a metrics fan-in
+# (`consensus.metrics → operations.ingest`, `operations.export →
+# gateway.metrics_data`) whose loop closes via
+# `gateway.proposals_tagged → consensus.proposals_tagged` —
+# a topological cycle but a semantic feedback edge — each
 # step is single-pass and never re-enters the cycle within one tick.
 # Without this the scheduler rejects the graph; see fluxor's
 # `prepare_graph` and `scheduler.accept_cycles`.

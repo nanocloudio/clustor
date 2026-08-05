@@ -24,10 +24,16 @@
 use super::abi::SyscallTable;
 use super::collections::Crc32c;
 use super::types::{Index, Term};
+use super::wal_frame;
 use super::{
     dev_input_flow_budget, dev_log, dev_micros, dev_millis, dev_report_step_effect,
     fmt_u32_raw, step_effect, wire, wire_channels, POLL_IN, POLL_OUT,
 };
+
+/// Frame header size, as `u32` for the cursor/offset arithmetic in
+/// this file. The canonical constant (and the full frame contract
+/// shared with `clustor_cli`'s `wal-scan`) is `common/wal_frame.rs`.
+const FRAME_HDR: u32 = wal_frame::FRAME_HDR as u32;
 
 /// Compile-time variant selector: the `volatile` variant retains
 /// entries in memory by design (never as a fallback).
@@ -1222,7 +1228,6 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
     // Walk frames: [entry_len:u32][crc32c:u32][payload], where payload
     // begins [term:u64][index:u64]. Read the 24-byte prefix, then seek
     // past the payload — never read bodies we are only skipping.
-    const FRAME_HDR: u32 = 8;
     let mut records = 0usize;
     while records < SCAN_RECORDS_PER_STEP {
         let remaining = s.scan_file_size.saturating_sub(s.scan_pos);
@@ -1247,11 +1252,11 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
             s.scan_seg = s.scan_seg.saturating_add(1);
             return;
         }
-        let entry_len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-        if entry_len == 0
-            || entry_len > 2048
-            || entry_len > s.scan_file_size.saturating_sub(s.scan_pos + FRAME_HDR)
-        {
+        let (entry_len, _) = wal_frame::parse_header(&hdr);
+        if wal_frame::len_invalid(
+            entry_len,
+            u64::from(s.scan_file_size.saturating_sub(s.scan_pos + FRAME_HDR)),
+        ) {
             // Terminator or torn frame — end of this segment's live data
             // (same stop rule as replay).
             (sys.provider_call)(s.scan_fd, FS_CLOSE, core::ptr::null_mut(), 0);
@@ -1752,7 +1757,6 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
     }
 
     // Read one framed entry: [entry_len: u32 LE] [crc32c: u32 LE] [entry_data]
-    const FRAME_HDR: u32 = 8;
     let remaining = s.replay_file_size - s.replay_pos;
     if remaining < FRAME_HDR {
         // Not enough data for a frame header — segment done
@@ -1773,9 +1777,9 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
     }
     s.replay_pos += FRAME_HDR;
 
-    let entry_len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-    let stored_crc = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-    if entry_len == 0 || entry_len > 2048 || (entry_len as u32) > (s.replay_file_size - s.replay_pos) {
+    let (entry_len32, stored_crc) = wal_frame::parse_header(&hdr);
+    let entry_len = entry_len32 as usize;
+    if wal_frame::len_invalid(entry_len32, u64::from(s.replay_file_size - s.replay_pos)) {
         // Invalid / impossible length — a torn header. Stop replay for this
         // segment at the last good entry.
         (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
@@ -1985,7 +1989,6 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     // read it back. In group mode the FS_FSYNC is deferred to flush_batch —
     // emitting the ack before that fsync would signal durability that doesn't
     // yet hold on disk.
-    const FRAME_HDR: u32 = 8;
     let entry_payload_offset = s.cursor.saturating_add(FRAME_HDR);
     ensure_segment_open(s, sys);
     if s.fd < 0 {

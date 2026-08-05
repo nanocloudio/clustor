@@ -22,6 +22,17 @@ hardware_targets = ["bcm2712"]
 
 permissions = []
 
+# Service role (fluxor capability_surface.md §Replication): consensus
+# owns the apply-pipeline surface — committed-entry stream,
+# quorum-durability fusion, snapshot-coordinated apply reset — the
+# canonical `replication.state_machine` role downstream consumers
+# attach to. Typo-checked against fluxor's capability vocabulary;
+# graphs still wire the surface's ports explicitly (no generic
+# requires→provides resolver exists yet — the declaration is what a
+# future validator matches on). NOT `provides`: that field names
+# kernel provider contracts and the run layer rejects role names.
+capabilities = ["replication.state_machine"]
+
 # raft persists term + voted_for + durable-index metadata via the FS
 # contract (root-level RAFT<pppp>.MET when root_path = 1, raft/meta
 # otherwise). Without this declaration check_contract_grant returns

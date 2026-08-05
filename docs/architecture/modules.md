@@ -40,12 +40,13 @@ single channel hop.
 
 ### Network surface
 
-Three modules — `nic`, `ip`, `tls` — are fluxor foundation modules,
-shared with every fluxor application. The rest are clustor's own.
+The network stack comes from fluxor: a per-target NIC driver plus
+the foundation modules `ip` and `tls`, expanded into the graph by
+the `platform.net` stack. The rest are clustor's own.
 
 | Module | Description |
 |--------|-------------|
-| `nic` | Kernel-bypass NIC driver (DPDK / io_uring); exchanges raw frames with the IP stack at line rate. *(fluxor foundation)* |
+| NIC driver | The target's NIC driver, selected by the `platform.net` expansion — `rp1_gem` on Pi 5 / bcm2712 (`e810`, `virtio_net` on other targets); exchanges raw frames with the IP stack at line rate. *(fluxor driver)* |
 | `ip` | TCP/UDP socket service with connection tracking; provides the transport substrate for all HTTP and Raft RPC traffic. *(fluxor foundation)* |
 | `tls` | TLS 1.3 termination (ChaCha20-Poly1305, AES-GCM, P-256 ECDH) with SPIFFE identity and X.509 validation. *(fluxor foundation)* |
 
@@ -70,7 +71,11 @@ responses on `client_resp`. `tls_identity` carries TLS-verified
 ### `consensus`
 
 Raft leader election, log replication, quorum commit and ordered
-apply.
+apply. Declares `capabilities = ["replication.state_machine"]` — the
+replicated state-machine role from fluxor's `capability_surface.md`,
+typo-checked against the capability vocabulary. The declaration is
+vocabulary, not wiring: graphs attach to the surface's ports
+explicitly until a fluxor validator/resolver consumes the name.
 
 | Component | Responsibility |
 |---|---|
@@ -381,7 +386,7 @@ consensus hot path never waits for a tick boundary.
 |------|--------|------|---------|-----------|
 | 0 | ops | Tier 0, 1ms | `operations`, `control_plane` | Neither is latency-critical. A 1ms tick is fine for CP proof refresh (5s intervals), admin operations, telemetry aggregation, and the HTTP diagnostic surface. |
 | 1 | consensus | Tier 3, poll | `consensus`, `durability` | The persistence pipeline must never wait for a tick boundary. Poll-mode steps continuously: log append → WAL write → group fsync → durability ack → commit advance. Everything except the append hop is interior to one of the two modules. |
-| 2 | network | Tier 3, poll | `nic`, `ip`, `tls`, `peer_router` | Kernel-bypass NIC with zero-copy mailbox edges. `peer_router` sits with the network stack so an AppendEntries dispatch is a single channel write followed by immediate TLS framing and NIC TX. |
+| 2 | network | Tier 3, poll | NIC driver (`rp1_gem`), `ip`, `tls`, `peer_router` | Dedicated NIC driver with zero-copy mailbox edges. `peer_router` sits with the network stack so an AppendEntries dispatch is a single channel write followed by immediate TLS framing and NIC TX. |
 | 3 | apply | Tier 1, 250µs | `gateway`, `admission` | 250µs tick gives a 4 kHz client-admission rate. The flow controller and the throttle are one hop apart — the credit path is `admission.credits` → `gateway.credit_supply` — and the admitted proposal leaves on `proposals_tagged`. |
 
 ### Cross-domain edges
@@ -437,8 +442,8 @@ memcpy. For 4 MiB batches this avoids ~1ms of copy time.
 
 **Replication fan-out.** The `replicator` component writes to all peer channels
 in a single step (sequential memcpy to ring buffers, ~µs total for
-a 5-node cluster), and `peer_router` frames them onward. The `nic`
-module then transmits all queued frames in its next poll
+a 5-node cluster), and `peer_router` frames them onward. The NIC
+driver (`rp1_gem` on Pi 5) then transmits all queued frames in its next poll
 iteration. From the network's perspective every AppendEntries RPC
 is dispatched within microseconds of every other one.
 

@@ -109,8 +109,6 @@ wiring:
   # ── Flow control ──────────────────────────────────────────
   - from: admission.credits
     to: gateway.credit_supply
-  - from: admission.envelope
-    to: gateway.throttle_status
 
   # ── Raft replication ──────────────────────────────────────
   - from: consensus.net_out

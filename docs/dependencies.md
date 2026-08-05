@@ -39,6 +39,19 @@ the resolved lockfile entry. `[required] fluxor = { abi = N }` is
 also honoured as an optional explicit assertion for defense in
 depth.
 
+`fluxor.toml::[dependencies]` also pins `wave`, the sibling project
+that publishes the protocol-module palette (`http`, `ws_stream`,
+`rtp`) into the same local registry. Clustor consumes those fmods
+through the deployment graph exactly like fluxor's foundation
+modules; nothing links against wave at the cargo level.
+
+The `clustor-bench` host crate (`tools/clustor-bench/`) — the
+`clustor-scrape` / `clustor-loadgen` driver-host binaries — is
+std-only by design with zero external dependencies (raw `std::net`,
+hand-rolled JSON and histogram), so it builds on an offline Pi. It
+sits outside the runtime substrate and holds a structured lint
+exemption in `fluxor.toml`.
+
 PIC modules in `modules/app/*/mod.rs` `#[path]`-mount fluxor's SDK
 source from the synced location at
 `target/fluxor/fluxor-abi/sdk/<file>.rs`.

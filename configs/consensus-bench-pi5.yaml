@@ -107,8 +107,6 @@ wiring:
 
   - from: admission.credits
     to: gateway.credit_supply
-  - from: admission.envelope
-    to: gateway.throttle_status
 
   - from: consensus.net_out
     to: peer_router.peer_tx

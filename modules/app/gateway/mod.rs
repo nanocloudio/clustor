@@ -16,19 +16,28 @@
 //! ## Dispatch table
 //!
 //! Components step in a fixed order; intra-step delivery order is
-//! owned HERE and nowhere else:
+//! owned HERE and nowhere else. Components never call each other:
+//! each returns message-shaped records (verdicts, outbound frames)
+//! and the routing between them — codec → throttle admission,
+//! throttle-reject → codec → surface, applied → surface — happens in
+//! `module_step`'s loops (standards fluxor-modules.md §8):
 //!
-//!   1. `codec`    — placement/leader/assignment drains; apply
-//!      responses route back through the surface.
-//!   2. `throttle` — credit drains + admission telemetry.
-//!   3. `surface`  — inbound frame routing; client frames flow
-//!      surface → codec → throttle same-step, so every consumed frame
-//!      has a terminal route (admit, reject, or structured drop) —
-//!      the composite never holds a consumed-but-unrouted proposal.
-//!   4. `codec` `client_requests` drain — pre-demuxed client traffic
-//!      from producers that own their own connection namespace,
-//!      entering the correlation hub on the same terms as step 3's
-//!      wire frames.
+//!   1. `codec`    — placement/leader/assignment drains; then the
+//!      applied-response loop (≤8) resolves conn_ids and sends
+//!      through the surface.
+//!   2. `throttle` — credit drains; the external-proposals loop
+//!      (≤16) admits or walks each reject back through
+//!      codec → surface; admission telemetry.
+//!   3. `surface`  — inbound frame loop (≤8): raft/admin frames
+//!      route on the surface's own ports, client frames flow
+//!      codec → throttle same-step, so every consumed frame has a
+//!      terminal route (admit, reject, or structured drop) — the
+//!      composite never holds a consumed-but-unrouted proposal.
+//!      Then admin responses + diagnostic drains.
+//!   4. `codec` `client_requests` loop (≤8) — pre-demuxed client
+//!      traffic from producers that own their own connection
+//!      namespace, entering the correlation hub on the same terms as
+//!      step 3's wire frames.
 
 #![no_std]
 #![allow(
@@ -130,18 +139,17 @@ pub extern "C" fn module_new(
 
         // Port handles. Indices follow the manifest declaration order.
         s.surface.in_requests = in_chan; // in[0] requests
-        s.surface.in_throttle_status = dev_channel_port(sys, 0, 1);
-        s.surface.in_admin_resp = dev_channel_port(sys, 0, 2);
-        s.surface.in_readyz = dev_channel_port(sys, 0, 3);
-        s.surface.in_why = dev_channel_port(sys, 0, 4);
-        s.surface.in_metrics = dev_channel_port(sys, 0, 5);
-        s.codec.in_applied = dev_channel_port(sys, 0, 6);
-        s.codec.in_placement = dev_channel_port(sys, 0, 7);
-        s.codec.in_proposal_assigned = dev_channel_port(sys, 0, 8);
-        s.codec.in_leader_state = dev_channel_port(sys, 0, 9);
-        s.throttle.in_credits = dev_channel_port(sys, 0, 10);
-        s.throttle.in_proposals = dev_channel_port(sys, 0, 11);
-        s.codec.in_client_requests = dev_channel_port(sys, 0, 12);
+        s.surface.in_admin_resp = dev_channel_port(sys, 0, 1);
+        s.surface.in_readyz = dev_channel_port(sys, 0, 2);
+        s.surface.in_why = dev_channel_port(sys, 0, 3);
+        s.surface.in_metrics = dev_channel_port(sys, 0, 4);
+        s.codec.in_applied = dev_channel_port(sys, 0, 5);
+        s.codec.in_placement = dev_channel_port(sys, 0, 6);
+        s.codec.in_proposal_assigned = dev_channel_port(sys, 0, 7);
+        s.codec.in_leader_state = dev_channel_port(sys, 0, 8);
+        s.throttle.in_credits = dev_channel_port(sys, 0, 9);
+        s.throttle.in_proposals = dev_channel_port(sys, 0, 10);
+        s.codec.in_client_requests = dev_channel_port(sys, 0, 11);
         s.surface.out_raft_rpc = out_chan; // out[0] raft_rpc
         s.surface.out_responses = dev_channel_port(sys, 1, 1);
         s.surface.out_admin_req = dev_channel_port(sys, 1, 2);
@@ -179,11 +187,67 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             .wrapping_add(throttle::work_count(&s.throttle));
 
         // Dispatch table — see the module header for the ordering
-        // contract.
-        codec::step(&mut s.codec, &mut s.surface, sys);
-        throttle::step(&mut s.throttle, &mut s.codec, &mut s.surface, sys);
-        surface::step(&mut s.surface, &mut s.codec, &mut s.throttle, sys);
-        codec::drain_client_requests(&mut s.codec, &mut s.throttle, &mut s.surface, sys);
+        // contract. All cross-component routing lives in these loops.
+        let mut frame = [0u8; 2048];
+
+        // 1. codec drains, then the applied-response loop.
+        codec::step(&mut s.codec, sys);
+        for _ in 0..8 {
+            match codec::next_applied(&mut s.codec, sys) {
+                None => break,
+                Some(out) => {
+                    if surface::send_outbound(&mut s.surface, sys, &out) {
+                        codec::note_response_sent(&mut s.codec);
+                    }
+                }
+            }
+        }
+
+        // 2. throttle: credits, external proposals, metrics.
+        throttle::drain_credits(&mut s.throttle, sys);
+        for _ in 0..16 {
+            match throttle::next_external(&mut s.throttle, sys, &mut frame) {
+                None => break,
+                Some(0) => {}
+                Some(len) => {
+                    if let Some(env) =
+                        throttle::on_proposal(&mut s.throttle, sys, &frame[..len])
+                    {
+                        reject_chain(s, sys, &env);
+                    }
+                }
+            }
+        }
+        throttle::step_metrics(&mut s.throttle, sys);
+
+        // 3. surface inbound loop, then its own post-routing work.
+        for _ in 0..8 {
+            match surface::next_request(&mut s.surface, sys, &mut frame) {
+                surface::Inbound::Empty => break,
+                surface::Inbound::Handled => {}
+                surface::Inbound::Client { msg_type, len } => {
+                    route_client(s, sys, msg_type, len, &frame);
+                }
+                surface::Inbound::Oversize { conn_id } => {
+                    let out = codec::reject_too_large(conn_id);
+                    if surface::send_outbound(&mut s.surface, sys, &out) {
+                        codec::note_response_sent(&mut s.codec);
+                    }
+                }
+            }
+        }
+        surface::finish_step(&mut s.surface, sys);
+
+        // 4. pre-demuxed client_requests loop.
+        for _ in 0..8 {
+            match codec::next_client_request(&mut s.codec, sys, &mut frame) {
+                codec::Pulled::Empty => break,
+                codec::Pulled::Skipped => {}
+                codec::Pulled::Frame(msg_type, len) => {
+                    route_client(s, sys, msg_type, len, &frame);
+                }
+            }
+        }
 
         let work_after = surface::work_count(&s.surface)
             .wrapping_add(codec::work_count(&s.codec))
@@ -192,5 +256,52 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             dev_report_step_effect(sys, step_effect::WORK_DONE);
         }
         0
+    }
+}
+
+/// Route one client record `[conn_id:u8][body]` through the
+/// codec → throttle → codec → surface chain. Cross-component order
+/// lives here, in the composition layer, not in any component.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn route_client(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    msg_type: u8,
+    len: usize,
+    frame: &[u8; 2048],
+) {
+    let mut proposal = [0u8; 2048];
+    match codec::on_request(&mut s.codec, sys, msg_type, &frame[..len], &mut proposal) {
+        codec::Route::Done => {}
+        codec::Route::Respond(out) => {
+            if surface::send_outbound(&mut s.surface, sys, &out) {
+                codec::note_response_sent(&mut s.codec);
+            }
+        }
+        codec::Route::Propose(plen) => {
+            if let Some(env) = throttle::on_proposal(&mut s.throttle, sys, &proposal[..plen]) {
+                reject_chain(s, sys, &env);
+            }
+        }
+    }
+}
+
+/// Walk one throttle rejection back out: codec resolves the
+/// correlation id to a conn_id and frames the wire reject; the
+/// surface sends it.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn reject_chain(s: &mut ModuleState, sys: &SyscallTable, env: &[u8]) {
+    if let Some(out) = codec::on_reject_internal(&mut s.codec, env) {
+        if surface::send_outbound(&mut s.surface, sys, &out) {
+            codec::note_response_sent(&mut s.codec);
+        }
     }
 }

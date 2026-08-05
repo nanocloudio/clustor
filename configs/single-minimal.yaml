@@ -36,7 +36,8 @@ wiring:
   - from: consensus.leader_state
     to: gateway.leader_state
   # Throttled requests are surfaced as structured MSG_CLIENT_REJECT
-  # envelopes back through gateway → gateway → peer_router.
+  # envelopes built inside gateway (throttle → codec seams) and sent
+  # back out through peer_router.
 
   # ── Persistence ───────────────────────────────────────────
   - from: consensus.log_append

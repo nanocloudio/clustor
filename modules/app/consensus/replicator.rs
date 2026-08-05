@@ -22,6 +22,19 @@ use super::seam::SeamRing;
 use super::types::*;
 use super::{dev_log, dev_millis, wire, wire_channels};
 
+/// Drain the E2 match seam: copy the coalesced per-replica match
+/// indices into `out` and clear the dirty flag. Returns `false` (and
+/// leaves `out` untouched) when nothing is pending. The dispatch
+/// table's accessor — the composition layer never reads the fields.
+pub fn take_matches(s: &mut Repl, out: &mut [Index; MAX_NODES]) -> bool {
+    if !s.match_dirty {
+        return false;
+    }
+    s.match_dirty = false;
+    *out = s.match_out;
+    true
+}
+
 const METRICS_INTERVAL_MS: u64 = 1000;
 
 /// Outstanding WAL read-back request slot. Bounded so a slow WAL
@@ -136,12 +149,12 @@ pub struct Repl {
     pub out_cross_durability_ack: i32, // out: synthesized MSG_FSYNC_ACK to durability's ack (§10.4.1)
 
     // ── Seams ───────────────────────────────────────────────
-    /// E2 (was `match_indices` → commit): coalesced per-replica max of
-    /// follower match indices — exactly the coalescing the old
-    /// unbounded drain performed. The dispatch table delivers it to
-    /// `commit::on_match` when `match_dirty` is set.
-    pub match_out: [Index; MAX_NODES],
-    pub match_dirty: bool,
+    /// E2: coalesced per-replica max of follower match indices —
+    /// many acks per step collapse to one array. The dispatch table
+    /// drains it via [`take_matches`] and delivers to
+    /// `commit::on_match`.
+    match_out: [Index; MAX_NODES],
+    match_dirty: bool,
 
     /// E11 seam (the leader-state hint raft already publishes on
     /// `leader_state`, delivered in-module): AppendEntries is a

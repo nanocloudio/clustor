@@ -30,6 +30,7 @@ include = [
     "common/collections.rs",
     "common/http_admin.rs",
     "common/replica_facade.rs",
+    "common/session_registry.rs",
     "common/types.rs",
     "common/wire.rs",
 ]

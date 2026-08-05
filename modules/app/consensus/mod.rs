@@ -380,10 +380,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // 4. E2 coalesced match array → commit.
-        if s.repl.match_dirty {
-            s.repl.match_dirty = false;
-            for r in 0..MAX_NODES {
-                let index = s.repl.match_out[r];
+        let mut matches = [0 as types::Index; MAX_NODES];
+        if replicator::take_matches(&mut s.repl, &mut matches) {
+            for (r, &index) in matches.iter().enumerate() {
                 if index > 0 {
                     commit::on_match(&mut s.commit, r as u8, index);
                 }
@@ -398,24 +397,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //    feedback and inflight-gate timing). E3/E6 horizons + the
         //    E6 RESET are handed to apply's step, which orders them
         //    internally (reset first, bodies before horizons).
-        if s.commit.raft_commit_out.dirty {
-            s.commit.raft_commit_out.dirty = false;
-            s.raft
-                .commit_in
-                .raise(s.commit.raft_commit_out.term, s.commit.raft_commit_out.index);
+        if let Some((term, index)) = s.commit.raft_commit_out.take() {
+            s.raft.commit_in.raise(term, index);
         }
-        let raft_horizon = if s.raft.apply_horizon_out.dirty {
-            s.raft.apply_horizon_out.dirty = false;
-            Some((s.raft.apply_horizon_out.term, s.raft.apply_horizon_out.index))
-        } else {
-            None
-        };
-        let commit_horizon = if s.commit.horizon_out.dirty {
-            s.commit.horizon_out.dirty = false;
-            Some((s.commit.horizon_out.term, s.commit.horizon_out.index))
-        } else {
-            None
-        };
+        let raft_horizon = s.raft.apply_horizon_out.take();
+        let commit_horizon = s.commit.horizon_out.take();
         let reset = s.raft.apply_reset_out.take();
 
         // 7. apply — reset first, then raft's E5 body ring, then the

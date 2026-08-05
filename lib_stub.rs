@@ -2,7 +2,7 @@
 //!
 //! The Clustor implementation lives as a graph of fluxor-native PIC
 //! modules under [`modules/app/`](modules/app/) and is built with
-//! `make modules TARGET=<board>`.
+//! `fluxor modules build --all`.
 //!
 //! Host-side tests and benches pull module source files directly
 //! with `#[path = "../modules/..."]`, so this stub deliberately

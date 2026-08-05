@@ -42,6 +42,11 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 #[path = "../../common/collections.rs"]
 mod collections;
 use collections::Crc32c;
+// The WAL frame contract itself — the same file durability's replay
+// compiles, so wal-scan's verdict is replay's by construction.
+#[path = "../../common/wal_frame.rs"]
+mod wal_frame;
+use wal_frame::{FRAME_HDR, MAX_ENTRY_LEN};
 
 const PORT_INPUT: u8 = 0;
 const PORT_OUTPUT: u8 = 1;
@@ -50,10 +55,6 @@ const STEP_DONE: i32 = 1;
 const ARGV_BUF: usize = 8192;
 const BIN_BUF: usize = 4096;
 const OUT_BUF: usize = 8192;
-/// Replay's per-entry payload cap (durability/wal.rs) — wal-scan mirrors it.
-const MAX_ENTRY_LEN: usize = 2048;
-/// WAL frame header: [entry_len: u32 LE][crc32c: u32 LE].
-const FRAME_HDR: usize = 8;
 /// Steps to wait for the argv record before defaulting to `help` (cli_in emits
 /// it early; an empty argv — no `--` — never arrives, so we fall through).
 const ARGV_WAIT: u32 = 2000;
@@ -245,16 +246,11 @@ fn cmd_wal_scan(s: &mut State, seg_hex: &[u8]) -> (usize, i32) {
     let mut p = 0usize;
     while slen - pos >= FRAME_HDR {
         let hdr_at = pos;
-        let entry_len =
-            u32::from_le_bytes([s.bin[pos], s.bin[pos + 1], s.bin[pos + 2], s.bin[pos + 3]])
-                as usize;
-        let stored_crc = u32::from_le_bytes([
-            s.bin[pos + 4],
-            s.bin[pos + 5],
-            s.bin[pos + 6],
-            s.bin[pos + 7],
-        ]);
-        if entry_len == 0 || entry_len > MAX_ENTRY_LEN || entry_len > slen - pos - FRAME_HDR {
+        let mut hdr = [0u8; FRAME_HDR];
+        hdr.copy_from_slice(&s.bin[pos..pos + FRAME_HDR]);
+        let (entry_len32, stored_crc) = wal_frame::parse_header(&hdr);
+        let entry_len = entry_len32 as usize;
+        if wal_frame::len_invalid(entry_len32, (slen - pos - FRAME_HDR) as u64) {
             p = append(&mut s.out, p, b"torn header at offset ");
             p = append_u64(&mut s.out, p, hdr_at as u64);
             p = append(&mut s.out, p, b" after ");

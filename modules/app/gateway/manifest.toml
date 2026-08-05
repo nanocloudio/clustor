@@ -21,11 +21,6 @@ direction = "input"
 content_type = "OctetStream"
 
 [[ports]]
-name = "throttle_status"
-direction = "input"
-content_type = "OctetStream"
-
-[[ports]]
 name = "admin_responses"
 direction = "input"
 content_type = "OctetStream"

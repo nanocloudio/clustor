@@ -8,7 +8,7 @@
 //! in-module.
 
 use super::abi::SyscallTable;
-use super::{read_gate, types, wire, wire_channels};
+use super::{types, wire, wire_channels};
 
 #[repr(C)]
 pub struct ProofCache {
@@ -46,11 +46,15 @@ pub unsafe fn init(p: &mut ProofCache, sys: &SyscallTable) {
 /// Per-step bound: both proof ports drained latest-wins (≤8 frames
 /// each), one state-ladder evaluation, at most one transition emit.
 ///
+/// Returns the new cache state on a transition (`None` otherwise);
+/// the dispatch table delivers it to the read-gate component —
+/// cross-component routing is owned there, not here.
+///
 /// # Safety
 ///
 /// Caller must hold exclusive component borrows and a valid
 /// `&SyscallTable` per the module ABI.
-pub unsafe fn step(p: &mut ProofCache, gate: &mut read_gate::ReadGate, sys: &SyscallTable, now: u64) {
+pub unsafe fn step(p: &mut ProofCache, sys: &SyscallTable, now: u64) -> Option<u8> {
     // 1. Drain proofs (latest wins) from both attach points.
     drain_proofs(p, sys, now, 0);
     drain_proofs(p, sys, now, 1);
@@ -73,10 +77,6 @@ pub unsafe fn step(p: &mut ProofCache, gate: &mut read_gate::ReadGate, sys: &Sys
     if new_state != p.last_emitted_state {
         p.last_emitted_state = new_state;
 
-        // Deliver to the read gate in-module, then publish on both
-        // external attach points.
-        read_gate::on_cache_state(gate, new_state);
-
         let mut buf = [0u8; 1];
         wire::encode_cache_state(&mut buf, new_state);
         for chan in [p.out_cache_state, p.out_fresh_state] {
@@ -98,7 +98,9 @@ pub unsafe fn step(p: &mut ProofCache, gate: &mut read_gate::ReadGate, sys: &Sys
                 wire_channels::channel_write_msg(sys, p.out_fallback, wire::MSG_FALLBACK_SIGNAL, &buf[..1]);
             }
         }
+        return Some(new_state);
     }
+    None
 }
 
 unsafe fn drain_proofs(p: &mut ProofCache, sys: &SyscallTable, now: u64, which: u8) {

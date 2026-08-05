@@ -20,22 +20,29 @@
 //! ## Dispatch table
 //!
 //! Components step in a fixed order; intra-step delivery order is
-//! owned HERE and nowhere else:
+//! owned HERE and nowhere else. Components never call each other:
+//! each returns message-shaped records (requests, verdicts, staged
+//! responses) and the routing between them — request → http,
+//! admin envelope → rbac → admin, response → ingress ring — happens
+//! in `module_step`'s loops (standards fluxor-modules.md §8):
 //!
 //!   1. `telemetry` — drain ingest, recompute readiness, emit tick.
 //!      (Heaviest single step on the emit tick: one global + up to 32
 //!      per-module histogram scrapes, export ≤ 7400 B.)
 //!   2. on an emit tick: refresh the http caches and the ingress
-//!      readiness byte from telemetry's fresh payloads.
-//!   3. `rbac`  — identity bindings, then wire admin commands
-//!      (authorized commands deliver into `admin` same-step).
+//!      readiness byte from telemetry's snapshot values.
+//!   3. `rbac`  — identity bindings, then the wire admin-command
+//!      loop (≤4): each authorized envelope delivers into `admin`
+//!      same-step, here.
 //!   4. `admin` — apply acknowledgements, direct-inject commands.
-//!   5. `http`  — proposal feedback drains, expiry, self-telemetry.
-//!   6. `http` `request` drain — externally-parsed HTTP requests,
-//!      handled on the same terms as listener traffic; their replies
-//!      egress on `response`.
-//!   7. `ingress` — bind, net events (parsed requests deliver into
-//!      `http` same-step), response ring → wire.
+//!   5. `http`  — proposal feedback loops (assignments, ≤8
+//!      rejections, ≤16 applies, one expiry — each pull gated on
+//!      ingress ring space), self-telemetry into `telemetry`.
+//!   6. `http` `request` loop (≤8) — externally-parsed HTTP
+//!      requests, handled on the same terms as listener traffic;
+//!      their replies egress on `response`.
+//!   7. `ingress` — bind, net-event loop (≤16; parsed requests
+//!      route through `http` same-step), response ring → wire.
 //!
 //! Per-component step bounds are documented on each component's
 //! `step`; the sum stays well inside the runtime step guard.
@@ -242,45 +249,199 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let now = dev_millis(sys);
 
         // Dispatch table — see the module header for the ordering
-        // contract. Components interact only through the
-        // message-shaped calls their signatures name.
+        // contract. All cross-component routing lives in these loops.
         telemetry::step(&mut s.telemetry, sys, now);
 
         #[cfg(feature = "http")]
-        if s.telemetry.emitted {
-            http::cache_from(&mut s.http, &s.telemetry);
-            ingress::deliver_ready(&mut s.ingress, s.telemetry.ready as u8);
+        if telemetry::emitted(&s.telemetry) {
+            let (ready, export) = telemetry::snapshot(&s.telemetry);
+            http::cache_export(&mut s.http, ready, export);
+            ingress::deliver_ready(&mut s.ingress, ready as u8);
         }
 
-        rbac::step(&mut s.rbac, &mut s.admin, &mut s.telemetry, sys, now);
+        // rbac: identity bindings, then the wire admin-command loop.
+        rbac::step(&mut s.rbac, sys);
+        let mut env = [0u8; 1024];
+        for _ in 0..4 {
+            match rbac::next_wire_command(&mut s.rbac, sys, &mut env) {
+                rbac::Pulled::Empty => break,
+                rbac::Pulled::Skipped => {}
+                rbac::Pulled::Command(len) => {
+                    route_admin(s, sys, now, rbac::Origin::Wire, len, &env);
+                }
+            }
+        }
+
         admin::step(&mut s.admin, sys, now);
 
         #[cfg(feature = "http")]
         {
-            http::step(&mut s.http, &mut s.ingress, &mut s.telemetry, sys, now);
-            http::drain_external_requests(
-                &mut s.http,
-                &mut s.ingress,
-                &mut s.rbac,
-                &mut s.admin,
-                &mut s.telemetry,
-                sys,
-                now,
-            );
-            ingress::step(
-                &mut s.ingress,
-                &mut s.http,
-                &mut s.rbac,
-                &mut s.admin,
-                &mut s.telemetry,
-                sys,
-                now,
-            );
-            if s.ingress.step_work {
+            // http: own drains, then the response-producing feedback
+            // loops — each pull gated on ring space, so a response is
+            // staged only when the ingress ring can take it.
+            http::step(&mut s.http, sys);
+            for _ in 0..8 {
+                if !ingress::response_writable(&s.ingress) {
+                    break;
+                }
+                match http::next_rejection(&mut s.http, sys) {
+                    http::Feedback::Empty => break,
+                    http::Feedback::Handled => {}
+                    http::Feedback::Respond(q) => queue_http_response(s, sys, q),
+                }
+            }
+            for _ in 0..16 {
+                if !ingress::response_writable(&s.ingress) {
+                    break;
+                }
+                match http::next_applied(&mut s.http, sys) {
+                    http::Feedback::Empty => break,
+                    http::Feedback::Handled => {}
+                    http::Feedback::Respond(q) => queue_http_response(s, sys, q),
+                }
+            }
+            if ingress::response_writable(&s.ingress) {
+                if let http::Feedback::Respond(q) = http::expire_step(&mut s.http, sys, now) {
+                    queue_http_response(s, sys, q);
+                }
+            }
+            if let Some(samples) = http::take_metrics(&mut s.http, now) {
+                for &(metric_id, kind, value) in samples.iter() {
+                    telemetry::on_typed_sample(
+                        &mut s.telemetry,
+                        wire::SOURCE_ID_HTTP,
+                        0,
+                        metric_id,
+                        kind,
+                        value,
+                        now,
+                    );
+                }
+            }
+
+            // Externally-parsed requests off the `request` port.
+            let mut ext = http::ExtReq::new();
+            for _ in 0..8 {
+                match http::next_external_request(&mut s.http, sys, &mut ext) {
+                    http::ExtPulled::Empty => break,
+                    http::ExtPulled::Skipped => {}
+                    http::ExtPulled::Request => route_http_request(
+                        s,
+                        sys,
+                        now,
+                        ext.conn_id,
+                        ext.method,
+                        ext.path_len as usize,
+                        ext.body_len as usize,
+                        &ext.path,
+                        &ext.body,
+                    ),
+                }
+            }
+
+            // ingress: bind, net-event loop, response ring → wire.
+            ingress::begin_step(&mut s.ingress, sys);
+            let mut req = ingress::ParsedReq::new();
+            for _ in 0..16 {
+                match ingress::next_event(&mut s.ingress, sys, &mut req) {
+                    ingress::Pull::Empty => break,
+                    ingress::Pull::Handled => {}
+                    ingress::Pull::Request => route_http_request(
+                        s,
+                        sys,
+                        now,
+                        req.conn_id,
+                        req.method,
+                        req.path_len as usize,
+                        req.body_len as usize,
+                        &req.path,
+                        &req.body,
+                    ),
+                }
+            }
+            ingress::finish_step(&mut s.ingress, sys);
+            if ingress::took_work(&s.ingress) {
                 return STEP_BURST;
             }
         }
 
         0
+    }
+}
+
+/// Route one admin envelope through the single admission point:
+/// rbac judges, authorized envelopes deliver to `admin`, and the
+/// telemetry envelope counter ticks — cross-component order owned
+/// here, in the composition layer.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn route_admin(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    now: u64,
+    origin: rbac::Origin,
+    len: usize,
+    env: &[u8],
+) -> bool {
+    let authorized = rbac::evaluate(&mut s.rbac, sys, origin, &env[..len]);
+    if authorized {
+        admin::on_command(&mut s.admin, sys, now, &env[..len]);
+    }
+    telemetry::on_legacy_envelope(&mut s.telemetry);
+    authorized
+}
+
+/// Queue one http-staged response on the ingress response ring. The
+/// body lives in the http component's staging slot; the two borrows
+/// are disjoint fields of the module state.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and a valid
+/// `&SyscallTable` per the module ABI.
+#[cfg(feature = "http")]
+unsafe fn queue_http_response(s: &mut ModuleState, sys: &SyscallTable, q: http::Queued) {
+    let ModuleState { http, ingress, .. } = s;
+    ingress::queue_response(ingress, sys, q.conn_id, q.status, http::staged_body(http, q.len));
+}
+
+/// Route one parsed HTTP request (listener or `request`-port) through
+/// `http::on_request`, then walk its outcome: queue the listener
+/// response, or run the admin envelope through [`route_admin`] and
+/// complete the reply via `http::finish_admin`.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and a valid
+/// `&SyscallTable` per the module ABI.
+#[cfg(feature = "http")]
+#[allow(clippy::too_many_arguments, reason = "flat request parts avoid a borrowed struct")]
+unsafe fn route_http_request(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    now: u64,
+    conn_id: u8,
+    method: u8,
+    path_len: usize,
+    body_len: usize,
+    path: &[u8],
+    body: &[u8],
+) {
+    match http::on_request(&mut s.http, sys, conn_id, method, &path[..path_len], &body[..body_len])
+    {
+        http::ReqOut::Done => {}
+        http::ReqOut::Queue(q) => queue_http_response(s, sys, q),
+        http::ReqOut::Admin { op_code, len } => {
+            let mut env = [0u8; 1024];
+            let src = http::admin_env(&s.http, len);
+            env[..src.len()].copy_from_slice(src);
+            let authorized = route_admin(s, sys, now, rbac::Origin::Http, len as usize, &env);
+            if let Some(q) = http::finish_admin(&mut s.http, sys, conn_id, op_code, authorized) {
+                queue_http_response(s, sys, q);
+            }
+        }
     }
 }

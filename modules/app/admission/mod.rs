@@ -144,8 +144,7 @@ pub extern "C" fn module_new(
         s.proof_cache.out_fallback = dev_channel_port(sys, 1, 2);
         s.read_gate.out_permits = dev_channel_port(sys, 1, 3);
         s.flow.out_credits = dev_channel_port(sys, 1, 4);
-        s.flow.out_envelope = dev_channel_port(sys, 1, 5);
-        s.flow.out_metrics = dev_channel_port(sys, 1, 6);
+        s.flow.out_metrics = dev_channel_port(sys, 1, 5);
 
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
@@ -176,7 +175,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Dispatch table — see the module header for the ordering
         // contract.
-        proof_cache::step(&mut s.proof_cache, &mut s.read_gate, sys, now);
+        // Cross-component routing owned here: a proof-cache state
+        // transition is delivered to the read gate same-step, before
+        // the gate evaluates its standing permit.
+        if let Some(state) = proof_cache::step(&mut s.proof_cache, sys, now) {
+            read_gate::on_cache_state(&mut s.read_gate, state);
+        }
         read_gate::step(&mut s.read_gate, sys);
         flow::step(&mut s.flow, sys, now);
         0
