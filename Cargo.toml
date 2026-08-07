@@ -197,6 +197,14 @@ name = "session_registry"
 path = "tests/session_registry.rs"
 
 [[test]]
+name = "timing"
+path = "tests/timing.rs"
+
+[[test]]
+name = "timing_cluster_e2e"
+path = "tests/timing_cluster_e2e.rs"
+
+[[test]]
 name = "session_directory_e2e"
 path = "tests/session_directory_e2e.rs"
 

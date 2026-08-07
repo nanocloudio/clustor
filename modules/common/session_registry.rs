@@ -26,9 +26,12 @@
 //   rx high-water only moves forward.
 // - the **wrapped-key custodian** (§13.7.6, R1): session AEAD keys are
 //   stored only as opaque KEK-wrapped blobs this registry cannot read,
-//   with quorum wipe on teardown. TTL is carried as metadata; expiry
-//   is enforced by a replicated KEY_WIPE proposed from the module's
-//   timer (the wipe is what replicates — determinism is preserved).
+//   with quorum wipe on teardown. TTL expiry rides the deterministic
+//   replicated timing component (`modules/common/timing.rs`,
+//   rfc_deterministic_timing.md): KEY_PUT with a TTL registers a
+//   generation-fenced deadline in the embedded `TimingState`; the due
+//   handler wipes the key while applying the committed time entry.
+//   There is no second authoritative local timer queue (RFC §19.3).
 // - the **fence-ordering gate** (§13.7.2a/§13.7.4, R3): an anchor
 //   takeover (BIND that changes `anchor_id` on a fence-required
 //   session) is refused until an out-of-band emission fence has been
@@ -41,6 +44,8 @@
 //   every session's outstanding reservations and blocks further
 //   grants until that session's epoch bumps. This is the consumer-
 //   observable form of "unsafe recovery voids outstanding blocks".
+
+use crate::timing::{Deadline, TimingState, TM_BATCH_MAX, TM_MAX_OWNERS};
 
 // ── Capacity ────────────────────────────────────────────────────────
 
@@ -86,6 +91,23 @@ pub const SR_ST_FENCE_REQUIRED: u8 = 6;
 pub const SR_ST_FLOOR_REGRESSION: u8 = 7;
 /// RECOVERY_MARK with a non-advancing recovery epoch.
 pub const SR_ST_RECOVERY_STALE: u8 = 8;
+/// KEY_PUT with a TTL could not register its expiry deadline
+/// (timing-index capacity or generation overflow). The command fails
+/// without storing the key — capacity is checked as part of the same
+/// apply operation (rfc_deterministic_timing.md §6.2).
+pub const SR_ST_DEADLINE_CAPACITY: u8 = 9;
+
+// ── Deterministic timing (rfc_deterministic_timing.md) ──────────────
+
+/// Owner namespace for session-key TTL deadlines in the embedded
+/// timing index. Deadline id = session_id; generation = the slot's
+/// `key_gen` at KEY_PUT time.
+pub const SR_OWNER_KEY_TTL: u16 = 0;
+
+/// Per-owner deadline capacity partition for this state machine
+/// (identical on every replica by deployment discipline; validated on
+/// snapshot restore). Owner 0 = key TTLs, sized to the session table.
+pub const SR_TIMING_CAPS: [u16; TM_MAX_OWNERS] = [SR_MAX_SESSIONS as u16, 0, 0, 0];
 
 // ── BIND flags ──────────────────────────────────────────────────────
 
@@ -349,6 +371,11 @@ pub struct SessionSlot {
     /// KEK-wrapped key blob (opaque, R1) + declared TTL metadata.
     pub key_len: u16,
     pub key_ttl_ms: u32,
+    /// Generation of the key's expiry deadline: bumped by every
+    /// KEY_PUT that arms a TTL. A due callback wipes the key only
+    /// when its generation still matches (rfc_deterministic_timing.md
+    /// §9.3 — an old deadline is a deterministic no-op).
+    pub key_gen: u64,
     pub key: [u8; SR_MAX_WRAPPED_KEY],
 }
 
@@ -368,12 +395,14 @@ impl SessionSlot {
             high_water: [0; SR_NUM_COUNTERS],
             key_len: 0,
             key_ttl_ms: 0,
+            key_gen: 0,
             key: [0; SR_MAX_WRAPPED_KEY],
         }
     }
 
     /// Zeroize key custody (R1 wipe). Length, TTL, and every blob
     /// byte — the durable substrate must hold nothing after teardown.
+    /// `key_gen` survives: it fences deadlines, not custody.
     fn wipe_key(&mut self) {
         self.key_len = 0;
         self.key_ttl_ms = 0;
@@ -391,6 +420,17 @@ pub struct SessionRegistry {
     pub recovery_epoch: u32,
     /// Applied-command counter (diagnostics / metrics only).
     pub applied: u64,
+    /// Embedded deterministic timing state
+    /// (rfc_deterministic_timing.md §4: timing and consumer state
+    /// share one apply and snapshot boundary).
+    pub timing: TimingState,
+    /// Due callbacks that performed their domain transition (key
+    /// wiped). Replicated so divergence is byte-visible.
+    pub deadlines_fired: u32,
+    /// Due callbacks that were deterministic no-ops (object gone or
+    /// generation mismatch). Replicated so a systematic mismatch is
+    /// observable rather than silent (RFC §7).
+    pub deadline_noop: u32,
 }
 
 impl Default for SessionRegistry {
@@ -405,6 +445,9 @@ impl SessionRegistry {
             slots: [SessionSlot::empty(); SR_MAX_SESSIONS],
             recovery_epoch: 0,
             applied: 0,
+            timing: TimingState::new(SR_TIMING_CAPS),
+            deadlines_fired: 0,
+            deadline_noop: 0,
         }
     }
 
@@ -446,7 +489,7 @@ impl SessionRegistry {
             return SessionReply::fail(0, SR_ST_MALFORMED);
         }
         let op = body[0];
-        match op {
+        let reply = match op {
             SR_OP_BIND => self.apply_bind(body),
             SR_OP_EPOCH_BUMP => self.apply_epoch_bump(body),
             SR_OP_RESERVE => self.apply_reserve(body),
@@ -457,6 +500,82 @@ impl SessionRegistry {
             SR_OP_UNBIND => self.apply_unbind(body),
             SR_OP_RECOVERY_MARK => self.apply_recovery_mark(body),
             _ => SessionReply::fail(op, SR_ST_MALFORMED),
+        };
+        // Post-command due pass (rfc_deterministic_timing.md §7): a
+        // command that registered an already-due deadline gets the
+        // same bounded pass `TimeAdvance` runs — still a consequence
+        // of the committed entry, never of a local timer. Cheap when
+        // nothing is due (one sorted-front comparison).
+        self.run_due_pass();
+        reply
+    }
+
+    // ── Deterministic timing (rfc_deterministic_timing.md §7–§8) ────
+
+    /// Bounded due pass: pop at most [`TM_BATCH_MAX`] due deadlines in
+    /// canonical order and run each owner's due handler inline.
+    fn run_due_pass(&mut self) -> u16 {
+        let mut fired = 0u16;
+        while (fired as usize) < TM_BATCH_MAX {
+            let Some(d) = self.timing.pop_due() else {
+                break;
+            };
+            self.on_deadline_due(d);
+            fired += 1;
+        }
+        fired
+    }
+
+    /// Deterministic due handler (RFC §7): mutates replicated state
+    /// only. The authoritative object decides the meaning; an absent
+    /// object or generation mismatch is a recorded no-op.
+    fn on_deadline_due(&mut self, d: Deadline) {
+        match d.owner {
+            SR_OWNER_KEY_TTL => {
+                if let Some(i) = self.find(&d.id) {
+                    let slot = &mut self.slots[i];
+                    if slot.key_gen == d.generation && slot.key_len > 0 {
+                        slot.wipe_key();
+                        self.deadlines_fired = self.deadlines_fired.saturating_add(1);
+                        return;
+                    }
+                }
+                self.deadline_noop = self.deadline_noop.saturating_add(1);
+            }
+            _ => {
+                self.deadline_noop = self.deadline_noop.saturating_add(1);
+            }
+        }
+    }
+
+    /// Apply a committed `TimeAdvance` entry (RFC §8). Regressions
+    /// and duplicates retain the existing logical time — safe and
+    /// deterministic. Returns what happened so the module wrapper can
+    /// emit metrics and the leader can schedule `TimeDrain`.
+    pub fn apply_time_advance(&mut self, proposed_time_ms: u64) -> crate::timing::TimeApplied {
+        let _ = self.timing.advance(proposed_time_ms);
+        let fired = self.run_due_pass();
+        crate::timing::TimeApplied {
+            logical_now_ms: self.timing.logical_now_ms(),
+            fired,
+            due_remaining: self.timing.due_depth(),
+        }
+    }
+
+    /// Apply a committed `TimeDrain` entry (RFC §8). A drain never
+    /// advances time; `through_time_ms` must equal the applied
+    /// logical time or the drain is a deterministic no-op — a stale
+    /// drain request cannot invent a new time fence.
+    pub fn apply_time_drain(&mut self, through_time_ms: u64) -> crate::timing::TimeApplied {
+        let fired = if through_time_ms == self.timing.logical_now_ms() {
+            self.run_due_pass()
+        } else {
+            0
+        };
+        crate::timing::TimeApplied {
+            logical_now_ms: self.timing.logical_now_ms(),
+            fired,
+            due_remaining: self.timing.due_depth(),
         }
     }
 
@@ -644,10 +763,31 @@ impl SessionRegistry {
         let Some(i) = self.find(&sid) else {
             return Self::reply_err(SR_OP_KEY_PUT, &sid, 0, SR_ST_UNKNOWN_SESSION);
         };
-        let slot = &mut self.slots[i];
-        if epoch != slot.epoch {
-            return Self::reply_err(SR_OP_KEY_PUT, &sid, slot.epoch, SR_ST_STALE_EPOCH);
+        if epoch != self.slots[i].epoch {
+            let cur = self.slots[i].epoch;
+            return Self::reply_err(SR_OP_KEY_PUT, &sid, cur, SR_ST_STALE_EPOCH);
         }
+        // TTL expiry rides the replicated timing index. Registration
+        // happens BEFORE the key is stored: if the owner's deadline
+        // partition is full (or the generation would overflow), the
+        // command fails deterministically without creating its
+        // consumer object (rfc_deterministic_timing.md §6.2, §9.1).
+        if ttl_ms > 0 {
+            let gen = self.slots[i].key_gen.wrapping_add(1);
+            let due = self.timing.logical_now_ms().saturating_add(ttl_ms as u64);
+            match self.timing.register(SR_OWNER_KEY_TTL, sid, gen, due) {
+                Ok(_) => self.slots[i].key_gen = gen,
+                Err(_) => {
+                    let cur = self.slots[i].epoch;
+                    return Self::reply_err(SR_OP_KEY_PUT, &sid, cur, SR_ST_DEADLINE_CAPACITY);
+                }
+            }
+        } else {
+            // Non-expiring key replaces an expiring one: disarm.
+            let gen = self.slots[i].key_gen;
+            let _ = self.timing.cancel(SR_OWNER_KEY_TTL, &sid, gen);
+        }
+        let slot = &mut self.slots[i];
         // R1: the blob is opaque — stored and returned byte-for-byte,
         // never parsed. The KEK lives with the anchors / HSM; this
         // registry (and the WAL under it) cannot read the key.
@@ -673,6 +813,8 @@ impl SessionRegistry {
         };
         // Deliberately NOT epoch-gated: a wipe must never be refused
         // as stale — teardown and TTL expiry always win (R1).
+        let gen = self.slots[i].key_gen;
+        let _ = self.timing.cancel(SR_OWNER_KEY_TTL, &sid, gen);
         let slot = &mut self.slots[i];
         slot.wipe_key();
         Self::reply_ok(SR_OP_KEY_WIPE, &sid, slot.epoch, 0, 0)
@@ -714,10 +856,16 @@ impl SessionRegistry {
         let Some(i) = self.find(&sid) else {
             return Self::reply_err(SR_OP_UNBIND, &sid, 0, SR_ST_UNKNOWN_SESSION);
         };
-        let slot = &mut self.slots[i];
-        if epoch != slot.epoch {
-            return Self::reply_err(SR_OP_UNBIND, &sid, slot.epoch, SR_ST_STALE_EPOCH);
+        if epoch != self.slots[i].epoch {
+            let cur = self.slots[i].epoch;
+            return Self::reply_err(SR_OP_UNBIND, &sid, cur, SR_ST_STALE_EPOCH);
         }
+        // Teardown disarms any pending key-TTL deadline: the slot (the
+        // authoritative object) is going away, so the index entry must
+        // not linger as a guaranteed no-op.
+        let gen = self.slots[i].key_gen;
+        let _ = self.timing.cancel(SR_OWNER_KEY_TTL, &sid, gen);
+        let slot = &mut self.slots[i];
         // Teardown implies key wipe (R1) and frees the slot. The
         // session's counter high-waters die with it — a REUSED
         // session_id would restart counters at zero, so session_ids
@@ -761,12 +909,20 @@ impl SessionRegistry {
     // ── Snapshot (state-machine export/install) ─────────────────────
 
     /// Serialized snapshot size: fixed-layout dump of every slot plus
-    /// the registry header. Layout (all LE):
-    ///   [recovery_epoch:4][applied:8] then per slot:
+    /// the registry header and the embedded timing section — one
+    /// blob, one applied index (rfc_deterministic_timing.md §12: a
+    /// snapshot containing a consumer schedule without its deadline,
+    /// or a deadline without its consumer object, is invalid — made
+    /// impossible here by construction). Layout (all LE):
+    ///   [recovery_epoch:4][applied:8][deadlines_fired:4][deadline_noop:4]
+    ///   [timing section: TimingState::SNAPSHOT_LEN (versioned)]
+    ///   then per slot:
     ///   [used:1][voided:1][fence_state:1][flags:1][epoch:4]
     ///   [session_id:16][anchor:8][worker:8][fence_target:8]
-    ///   [rx_floor:8][high_water:8*3][key_len:2][key_ttl_ms:4][key:80]
-    pub const SNAPSHOT_LEN: usize = 4 + 8 + SR_MAX_SESSIONS * SLOT_SNAP_LEN;
+    ///   [rx_floor:8][high_water:8*3][key_gen:8][key_len:2]
+    ///   [key_ttl_ms:4][key:80]
+    pub const SNAPSHOT_LEN: usize =
+        4 + 8 + 4 + 4 + TimingState::SNAPSHOT_LEN + SR_MAX_SESSIONS * SLOT_SNAP_LEN;
 
     pub fn snapshot(&self, dst: &mut [u8]) -> i32 {
         if dst.len() < Self::SNAPSHOT_LEN {
@@ -774,7 +930,16 @@ impl SessionRegistry {
         }
         dst[0..4].copy_from_slice(&self.recovery_epoch.to_le_bytes());
         dst[4..12].copy_from_slice(&self.applied.to_le_bytes());
-        let mut o = 12;
+        dst[12..16].copy_from_slice(&self.deadlines_fired.to_le_bytes());
+        dst[16..20].copy_from_slice(&self.deadline_noop.to_le_bytes());
+        if self
+            .timing
+            .snapshot(&mut dst[20..20 + TimingState::SNAPSHOT_LEN])
+            < 0
+        {
+            return -1;
+        }
+        let mut o = 20 + TimingState::SNAPSHOT_LEN;
         let mut i = 0;
         while i < SR_MAX_SESSIONS {
             let s = &self.slots[i];
@@ -793,9 +958,10 @@ impl SessionRegistry {
                 dst[o + 56 + c * 8..o + 64 + c * 8].copy_from_slice(&s.high_water[c].to_le_bytes());
                 c += 1;
             }
-            dst[o + 80..o + 82].copy_from_slice(&s.key_len.to_le_bytes());
-            dst[o + 82..o + 86].copy_from_slice(&s.key_ttl_ms.to_le_bytes());
-            dst[o + 86..o + 86 + SR_MAX_WRAPPED_KEY].copy_from_slice(&s.key);
+            dst[o + 80..o + 88].copy_from_slice(&s.key_gen.to_le_bytes());
+            dst[o + 88..o + 90].copy_from_slice(&s.key_len.to_le_bytes());
+            dst[o + 90..o + 94].copy_from_slice(&s.key_ttl_ms.to_le_bytes());
+            dst[o + 94..o + 94 + SR_MAX_WRAPPED_KEY].copy_from_slice(&s.key);
             o += SLOT_SNAP_LEN;
             i += 1;
         }
@@ -806,11 +972,23 @@ impl SessionRegistry {
         if src.len() < Self::SNAPSHOT_LEN {
             return false;
         }
+        // Timing section first: it fails closed (unknown version,
+        // capacity mismatch, non-canonical order, time regression)
+        // without touching any state, so a rejected install leaves
+        // the registry coherent.
+        if !self
+            .timing
+            .restore(&src[20..20 + TimingState::SNAPSHOT_LEN])
+        {
+            return false;
+        }
         self.recovery_epoch = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
         self.applied = u64::from_le_bytes([
             src[4], src[5], src[6], src[7], src[8], src[9], src[10], src[11],
         ]);
-        let mut o = 12;
+        self.deadlines_fired = u32::from_le_bytes([src[12], src[13], src[14], src[15]]);
+        self.deadline_noop = u32::from_le_bytes([src[16], src[17], src[18], src[19]]);
+        let mut o = 20 + TimingState::SNAPSHOT_LEN;
         let mut i = 0;
         while i < SR_MAX_SESSIONS {
             let s = &mut self.slots[i];
@@ -847,10 +1025,20 @@ impl SessionRegistry {
                 ]);
                 c += 1;
             }
-            s.key_len = u16::from_le_bytes([src[o + 80], src[o + 81]]);
-            s.key_ttl_ms = u32::from_le_bytes([src[o + 82], src[o + 83], src[o + 84], src[o + 85]]);
+            s.key_gen = u64::from_le_bytes([
+                src[o + 80],
+                src[o + 81],
+                src[o + 82],
+                src[o + 83],
+                src[o + 84],
+                src[o + 85],
+                src[o + 86],
+                src[o + 87],
+            ]);
+            s.key_len = u16::from_le_bytes([src[o + 88], src[o + 89]]);
+            s.key_ttl_ms = u32::from_le_bytes([src[o + 90], src[o + 91], src[o + 92], src[o + 93]]);
             s.key
-                .copy_from_slice(&src[o + 86..o + 86 + SR_MAX_WRAPPED_KEY]);
+                .copy_from_slice(&src[o + 94..o + 94 + SR_MAX_WRAPPED_KEY]);
             o += SLOT_SNAP_LEN;
             i += 1;
         }
@@ -859,4 +1047,4 @@ impl SessionRegistry {
 }
 
 /// Per-slot snapshot record length (see `snapshot` layout comment).
-pub const SLOT_SNAP_LEN: usize = 86 + SR_MAX_WRAPPED_KEY;
+pub const SLOT_SNAP_LEN: usize = 94 + SR_MAX_WRAPPED_KEY;

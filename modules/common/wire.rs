@@ -269,6 +269,60 @@ pub fn decode_config_change(buf: &[u8]) -> Option<(u8, usize, usize)> {
     Some((op_code, 10, n))
 }
 
+/// Magic prefix of a deterministic-timing substrate entry
+/// (rfc_deterministic_timing.md §8, §18). Followed by
+/// `[op:u8 (1 = TimeAdvance, 2 = TimeDrain)][time_ms:u64 LE]`.
+/// TimeAdvance carries the proposed logical time; TimeDrain carries
+/// `through_time_ms`, which must equal the applied logical time or
+/// the drain is a deterministic no-op. These are internal entries:
+/// only the leader's time producer may propose them, and the gateway
+/// rejects client bodies carrying this prefix (RFC §17). See
+/// [`ADMIN_MAGIC`] for the 8-byte sizing rationale.
+pub const TIMING_MAGIC: [u8; 8] = [0x54, 0x4D, 0x45, 0x21, 0x9E, 0x1F, 0x5C, 0xA7];
+
+/// True when `buf` begins with [`TIMING_MAGIC`].
+#[inline]
+pub fn has_timing_magic(buf: &[u8]) -> bool {
+    buf.len() >= 8 && buf[..8] == TIMING_MAGIC
+}
+
+pub const TIMING_OP_ADVANCE: u8       = 0x01;
+pub const TIMING_OP_DRAIN: u8         = 0x02;
+
+/// Total encoded size of a timing entry body.
+pub const TIMING_ENTRY_LEN: usize     = 8 + 1 + 8;
+
+/// Encode a timing entry body (`TimeAdvance` / `TimeDrain`).
+/// Returns bytes written or 0 on buffer-too-small / bad op.
+#[inline]
+pub fn encode_time_entry(buf: &mut [u8], op: u8, time_ms: u64) -> usize {
+    if buf.len() < TIMING_ENTRY_LEN || (op != TIMING_OP_ADVANCE && op != TIMING_OP_DRAIN) {
+        return 0;
+    }
+    buf[..8].copy_from_slice(&TIMING_MAGIC);
+    buf[8] = op;
+    buf[9..17].copy_from_slice(&time_ms.to_le_bytes());
+    TIMING_ENTRY_LEN
+}
+
+/// Decode a timing entry body. Returns `(op, time_ms)` or `None` when
+/// the prefix, op or length is wrong (unknown timing entries fail
+/// closed at the consumer, RFC §18).
+#[inline]
+pub fn decode_time_entry(buf: &[u8]) -> Option<(u8, u64)> {
+    if !has_timing_magic(buf) || buf.len() < TIMING_ENTRY_LEN {
+        return None;
+    }
+    let op = buf[8];
+    if op != TIMING_OP_ADVANCE && op != TIMING_OP_DRAIN {
+        return None;
+    }
+    let time_ms = u64::from_le_bytes([
+        buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16],
+    ]);
+    Some((op, time_ms))
+}
+
 /// `consensus` → `consensus` / `durability` voter-set
 /// update. Sent every time the current or joint voter set changes so
 /// the downstream quorum tracker can adjust. Payload (3 bytes):
@@ -465,6 +519,38 @@ pub const MSG_WAL_REPLAY_COMPLETE: u8 = 0x2D;
 /// committed entries are immutable, so truncation can only ever touch the
 /// uncommitted tail. Shares the `wal.compact_before` control channel.
 pub const MSG_WAL_TRUNCATE_AFTER: u8  = 0x2E;
+
+/// `durability` → `consensus` continuity rejection. Emitted when the WAL is
+/// handed an entry whose index is not `wal_current_index + 1`, i.e. raft's log
+/// has diverged from what the WAL actually holds. Payload (8 bytes):
+/// `[expected_index:u64 LE]` — the index the WAL will accept next.
+///
+/// Why this exists: raft's durability backpressure used to treat a successful
+/// `channel_write_msg` as "the WAL took this entry". It is not — it only means
+/// the frame entered the WAL's input channel. A continuity rejection happens
+/// *inside* the WAL after that call returns, so raft would advance
+/// `last_log_index` for an entry the WAL never persisted, and the WAL's
+/// (deliberately sticky) fail-closed latch would then wedge the node forever
+/// with no signal anywhere. This message closes that loop: raft resyncs its
+/// tip down to `expected_index - 1` and replays from there, which the WAL
+/// accepts, clearing the latch.
+pub const MSG_WAL_REJECT: u8          = 0x2F;
+
+/// Encode / decode the 8-byte `MSG_WAL_REJECT` payload.
+#[inline]
+pub fn encode_wal_reject(buf: &mut [u8; 8], expected_index: u64) {
+    buf.copy_from_slice(&expected_index.to_le_bytes());
+}
+
+#[inline]
+pub fn decode_wal_reject(buf: &[u8]) -> Option<u64> {
+    if buf.len() < 8 {
+        return None;
+    }
+    Some(u64::from_le_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]))
+}
 
 /// `MSG_WAL_ENTRY_REQUEST` payload size (12 bytes).
 pub const WAL_ENTRY_REQUEST_LEN: usize = 12;
@@ -829,6 +915,7 @@ pub const SOURCE_ID_TELEMETRY: u8     = 0x15;
 pub const SOURCE_ID_NVME_BENCH: u8        = 0x16;
 pub const SOURCE_ID_CONSENSUS_BENCH: u8   = 0x17;
 pub const SOURCE_ID_HTTP: u8      = 0x18;
+pub const SOURCE_ID_TIMING: u8            = 0x19;
 
 /// Per-module metric ids. Each module owns a small private space
 /// (0x00..0xFF). Documented next to the module's metric emission.
@@ -877,6 +964,22 @@ pub mod metric_ids {
     /// leader). Consumed by operations to drive a real `/readyz` instead of
     /// a fixed boot timer. 0 until all three hold.
     pub const RAFT_READY: u16                  = 0x0012;
+    /// Counter: WAL continuity rejections repaired — times raft rolled its
+    /// tip back to the index the WAL actually holds (`MSG_WAL_REJECT`).
+    /// Steady state is 0. Non-zero means raft's log had claimed entries the
+    /// WAL never persisted; sustained growth means something upstream is
+    /// repeatedly desynchronising the two (see rfc/troubleshooting §5b).
+    pub const RAFT_WAL_RESYNCS: u16            = 0x0013;
+    /// Counter: appends held because the log was already `MAX_WAL_UNACKED`
+    /// ahead of the local durable index. Non-zero = the WAL is the
+    /// bottleneck and durability backpressure is engaging (healthy under
+    /// load); it is what keeps the log from diverging from the WAL.
+    pub const RAFT_WAL_UNACKED_HOLDS: u16      = 0x0014;
+    /// Counter: AppendEntries refused because the carried `entry_index` was
+    /// not `last_log_index + 1` even though `prev_log_*` matched — i.e. the
+    /// leader shipped a mis-sequenced entry. Refusing turns what would have
+    /// been an unrepairable WAL hole into ordinary Raft log repair.
+    pub const RAFT_AE_NONCONTIGUOUS: u16       = 0x0015;
 
     // wal (module_id = 0x02)
     pub const WAL_ENTRIES_WRITTEN: u16         = 0x0001;
@@ -922,6 +1025,20 @@ pub mod metric_ids {
     pub const WAL_PUMP_RECORDS: u16            = 0x0010;
     /// Counter: non-contiguous append indices observed at the WAL input.
     pub const WAL_CONTINUITY_ERRORS: u16       = 0x0011;
+    /// Counter: records consumed from the input channel that could not be
+    /// staged this step and were STASHED for re-drive rather than dropped.
+    /// Non-zero is healthy backpressure at the WAL; it is what keeps the
+    /// index sequence contiguous. (Dropping them was the cause of the
+    /// continuity faults this counter now prevents.)
+    pub const WAL_STASHED_HOLDS: u16           = 0x0012;
+    /// Gauge: the WAL's own `current_index` — the value continuity is
+    /// compared against. Distinct from `entries_written` (a count, which
+    /// diverges from the index across replay/ephemeral paths).
+    pub const WAL_CURRENT_INDEX: u16           = 0x0013;
+    /// Gauge: index the WAL expected / actually got at the first continuity
+    /// break. The pair IS the diagnosis.
+    pub const WAL_FAULT_EXPECTED: u16          = 0x0014;
+    pub const WAL_FAULT_GOT: u16               = 0x0015;
 
     // replicator (module_id = 0x03)
     pub const REPL_RPCS_SENT: u16              = 0x0001;
@@ -934,6 +1051,15 @@ pub mod metric_ids {
     /// as distinct from log-divergence NACKs. Retire an in-flight RPC without
     /// rolling next_index back.
     pub const REPL_BACKPRESSURE: u16           = 0x0006;
+    /// Gauge: consecutive leader steps that replicated nothing because the
+    /// WAL has not answered a tip probe (`last_emitted_index == 0`). 0 in
+    /// steady state INCLUDING an idle leader with nothing to ship; sustained
+    /// non-zero on a leader means it is silently not replicating at all.
+    pub const REPL_TIP_UNRESOLVED: u16         = 0x0007;
+    /// Counter: snapshot-install escalations dropped because the
+    /// `snapshot_request` port is unwired. Non-zero = a follower has fallen
+    /// past this WAL's read-back retention and this graph cannot recover it.
+    pub const REPL_SNAPSHOT_DROPPED: u16       = 0x0008;
 
     // consensus — commit component (source_id = 0x04)
     pub const COMMIT_INDEX: u16                = 0x0001;
@@ -1033,7 +1159,40 @@ pub mod metric_ids {
     pub const CBENCH_PHASE: u16                = 0x0001;
     pub const CBENCH_PROPOSALS_SENT: u16       = 0x0002;
     pub const CBENCH_BLOCKED: u16              = 0x0003;
+
+    // timing (source_id = 0x19) — deterministic replicated timing
+    // (rfc_deterministic_timing.md §16), emitted by the deadline-
+    // enabled consumer module (session_directory today).
+    /// Gauge: committed PRG logical time (ms since epoch).
+    pub const TIMING_LOGICAL_TIME_MS: u16      = 0x0001;
+    /// Gauge: disciplined wall time minus logical time on the leader
+    /// (staleness / lateness signal). 0 on followers.
+    pub const TIMING_LOGICAL_LAG_MS: u16       = 0x0002;
+    /// Counter: committed TimeAdvance entries applied.
+    pub const TIMING_ADVANCE_TOTAL: u16        = 0x0003;
+    /// Counter: committed TimeDrain entries applied.
+    pub const TIMING_DRAIN_TOTAL: u16          = 0x0004;
+    /// Gauge: live deadlines in the index.
+    pub const TIMING_DEADLINES_ACTIVE: u16     = 0x0005;
+    /// Gauge: due-but-undelivered backlog (drain depth).
+    pub const TIMING_DUE_DEPTH: u16            = 0x0006;
+    /// Counter: due handlers that performed their domain transition.
+    pub const TIMING_FIRED_TOTAL: u16          = 0x0007;
+    /// Counter: due handlers that were deterministic no-ops
+    /// (generation mismatch / object gone).
+    pub const TIMING_NOOP_TOTAL: u16           = 0x0008;
+    /// Gauge: why time production is paused on this node
+    /// (`TIMING_PAUSE_*`), 0 = producing / not applicable.
+    pub const TIMING_PAUSE_REASON: u16         = 0x0009;
 }
+
+/// `TIMING_PAUSE_REASON` gauge values (rfc_deterministic_timing.md
+/// §16 `/why` vocabulary, node-local view).
+pub const TIMING_PAUSE_NONE: u8           = 0;
+pub const TIMING_PAUSE_NOT_LEADER: u8     = 1;
+pub const TIMING_PAUSE_CLOCK_ALARM: u8    = 2;
+pub const TIMING_PAUSE_DRAIN_BACKLOG: u8  = 3;
+pub const TIMING_PAUSE_IDLE: u8           = 4;
 
 /// Fixed-bucket histograms (RFC §4.1, `docs/architecture/observability.md`).
 ///

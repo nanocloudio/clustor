@@ -19,22 +19,6 @@ source = "cargo/fluxor-sdk-0.0.1.crate"
 
 [[fmod]]
 project = "fluxor"
-name = "bank"
-target = "bcm2712"
-version = "2.0.0"
-hash = "sha256:7635efa99e3f4feba526a2f62ab6b7cca5f600a8082da7b57c392af2af19a947"
-source = "fmod/fluxor/bcm2712/bank/2.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "codec"
-target = "bcm2712"
-version = "1.0.0"
-hash = "sha256:75e42b485967e809af03394b50dfab877b6d0d349a4df60a2307645a5e5b289f"
-source = "fmod/fluxor/bcm2712/codec/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "conn_demux"
 target = "bcm2712"
 version = "1.0.0"
@@ -48,14 +32,6 @@ target = "bcm2712"
 version = "1.0.0"
 hash = "sha256:f06779d1c4555d29880a6a92f5c643f3892571be5d88c3291e12dff76d5a1000"
 source = "fmod/fluxor/bcm2712/conn_guard/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "content_controls"
-target = "bcm2712"
-version = "1.0.0"
-hash = "sha256:9336c15593162f5da4020a2291d331b63e5f7e723926055230b21cb834a546f9"
-source = "fmod/fluxor/bcm2712/content_controls/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
@@ -147,14 +123,6 @@ source = "fmod/fluxor/bcm2712/gesture/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "http_edge"
-target = "bcm2712"
-version = "2.0.0"
-hash = "sha256:967b620936d92e4848f2d422d2309514b6f4b021ff32231531afb9c442dc56f3"
-source = "fmod/fluxor/bcm2712/http_edge/2.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "ip"
 target = "bcm2712"
 version = "1.0.0"
@@ -219,14 +187,6 @@ source = "fmod/fluxor/bcm2712/monitor/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "mqtt"
-target = "bcm2712"
-version = "2.0.0"
-hash = "sha256:4c43ab251a874664bcd2ac7fe0f3cc5ab32e3501ececc4ecccc3e863addda7d6"
-source = "fmod/fluxor/bcm2712/mqtt/2.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "nvme"
 target = "bcm2712"
 version = "0.2.0"
@@ -264,22 +224,6 @@ target = "bcm2712"
 version = "1.0.0"
 hash = "sha256:26e6cb4236fa1f52ba814221c42703cc9ce19f25f42627af0d2f098951bec35c"
 source = "fmod/fluxor/bcm2712/observe/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "otel_udp_sample"
-target = "bcm2712"
-version = "1.0.0"
-hash = "sha256:16aa527716ec807e8828c9a2b590315381f54ee504f8d0eef03e560a32865bf9"
-source = "fmod/fluxor/bcm2712/otel_udp_sample/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "otlp_http"
-target = "bcm2712"
-version = "1.0.0"
-hash = "sha256:a06463e1ccc6ac3a5581e4ee32860c96b013faf6af7f7e76539b9cfbf69564d7"
-source = "fmod/fluxor/bcm2712/otlp_http/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
@@ -344,14 +288,6 @@ target = "bcm2712"
 version = "1.0.0"
 hash = "sha256:7f80c9a448fe6f9e7cf6308763f88d063063cc6fe877f0c7c5c8e36009f573f1"
 source = "fmod/fluxor/bcm2712/rp1_gem/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "sequencer"
-target = "bcm2712"
-version = "1.0.0"
-hash = "sha256:1d2092add3b3e5a7ccbd2be5d4130ca58f68a74c9155fd1bba98d2a8971ba335"
-source = "fmod/fluxor/bcm2712/sequencer/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
@@ -467,14 +403,6 @@ source = "fmod/fluxor/rp2040/ota_ingest/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "otel_udp_sample"
-target = "rp2040"
-version = "1.0.0"
-hash = "sha256:de4c0ff86047f7034987497557b4290dffe7ad98226d3f7517f82fca5c9a1536"
-source = "fmod/fluxor/rp2040/otel_udp_sample/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "pio_rp"
 target = "rp2040"
 version = "1.0.0"
@@ -515,22 +443,6 @@ source = "fmod/fluxor/rp2350/adc_rp/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "bank"
-target = "rp2350"
-version = "2.0.0"
-hash = "sha256:ec80c3a7579a884d279674e737a450dbeccafce116994d51ac2760091f6f3eb3"
-source = "fmod/fluxor/rp2350/bank/2.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "brightness"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:2fe704ea0dc64f8f1911779c52b117bd959eb00e9f71764d12d411f3a42e5c6d"
-source = "fmod/fluxor/rp2350/brightness/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "button"
 target = "rp2350"
 version = "1.0.0"
@@ -544,14 +456,6 @@ target = "rp2350"
 version = "1.0.0"
 hash = "sha256:c229f26bb6c7ab27f6d080e36dc7b61ae5690f3a51d89022ecad1ac2e9eb3327"
 source = "fmod/fluxor/rp2350/ch9120/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "codec"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:2bac2fb7014e2cefce95277188c956109420024d9ed67236887785ed4a315c85"
-source = "fmod/fluxor/rp2350/codec/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
@@ -603,14 +507,6 @@ source = "fmod/fluxor/rp2350/dns/2.1.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "drum"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:c1df2ba6b09082bcc6466d1876e89f4bc54bc148d52fb709b154df7d3d2cd7a0"
-source = "fmod/fluxor/rp2350/drum/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "echo_anchor"
 target = "rp2350"
 version = "1.0.0"
@@ -624,14 +520,6 @@ target = "rp2350"
 version = "1.0.0"
 hash = "sha256:f9bd6924e8905bf516fb7e03bdaca68acb49ace4fa5ee40abe78e187a8d7d66a"
 source = "fmod/fluxor/rp2350/echo_worker/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "effects"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:b70a072a4445c49b6ec8f682bd1a4e1c2195652d7230f29814fb63fcf291d1bb"
-source = "fmod/fluxor/rp2350/effects/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
@@ -763,14 +651,6 @@ source = "fmod/fluxor/rp2350/log_net/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "mesh"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:fc94c4d4856814e841a281cbda3ea0baf290b9c65304caf26ae335377dda4e30"
-source = "fmod/fluxor/rp2350/mesh/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "mic_pio"
 target = "rp2350"
 version = "1.0.0"
@@ -779,27 +659,11 @@ source = "fmod/fluxor/rp2350/mic_pio/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "mixer"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:0e342df89e649fc58d28c9dd9ebdf455016518e2cf4dc5d13542066b082fe623"
-source = "fmod/fluxor/rp2350/mixer/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "monitor"
 target = "rp2350"
 version = "1.0.0"
 hash = "sha256:dd4f55a8dac0dcc2ff56ca5f69e60c2af21e385687f102b3a2841354d5ac6680"
 source = "fmod/fluxor/rp2350/monitor/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "mqtt"
-target = "rp2350"
-version = "2.0.0"
-hash = "sha256:36654bbf82bf487437357e079eed723ac7d8c4fd49a181895edb8c2228ab37cc"
-source = "fmod/fluxor/rp2350/mqtt/2.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
@@ -824,22 +688,6 @@ target = "rp2350"
 version = "1.0.0"
 hash = "sha256:0d4a7a49c57076b7771b1b0358770c5126c518a8c5a60c22610ec0bea4dfe74e"
 source = "fmod/fluxor/rp2350/ota_ingest/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "otel_udp_sample"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:3d056a91a5e3a218e51b5d9019187524d34155954ef9e0fa1c7cdb3a7cb83ba4"
-source = "fmod/fluxor/rp2350/otel_udp_sample/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "otlp_http"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:0fe780ff821d084cee478ff55551cb925b18ed769e5496b5240fabab7c8363e9"
-source = "fmod/fluxor/rp2350/otlp_http/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
@@ -923,14 +771,6 @@ source = "fmod/fluxor/rp2350/sd/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "sequencer"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:ca55c2b2cdc978d261586cd68058b2091c6730ead4aecfe72b05be155174787f"
-source = "fmod/fluxor/rp2350/sequencer/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "spi_pl022"
 target = "rp2350"
 version = "1.0.0"
@@ -944,14 +784,6 @@ target = "rp2350"
 version = "1.0.0"
 hash = "sha256:cbf4b96153475f2c9d6071e92a445747e502a49609829cf01c8915f9a159e088"
 source = "fmod/fluxor/rp2350/st7701s/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "synth"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:2928675ec89f9ebc5dcfa9d9162a770140770dd50a59722b8789d4aae2b51761"
-source = "fmod/fluxor/rp2350/synth/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
@@ -1003,43 +835,11 @@ source = "fmod/fluxor/rp2350/usb_midi_host/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"
-name = "voip"
-target = "rp2350"
-version = "1.0.0"
-hash = "sha256:657a74748af1bc4e0e811a47065d05a57b3a95227aeaf271296b5565065bce31"
-source = "fmod/fluxor/rp2350/voip/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
 name = "wifi"
 target = "rp2350"
 version = "1.0.0"
 hash = "sha256:3941f85234aca58c702813246ad46f6baeac4d53169b1d66750c8cf337d2be5d"
 source = "fmod/fluxor/rp2350/wifi/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "bank"
-target = "wasm"
-version = "2.0.0"
-hash = "sha256:df8190335b84ae29d13d5a6e80a85d9a0d84e2df4ac4dc9bb53051f597382c8b"
-source = "fmod/fluxor/wasm/bank/2.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "codec"
-target = "wasm"
-version = "1.0.0"
-hash = "sha256:5ca4cec181e6f4ec03d2a68334c5d2c8d7e643bba3cc095687b02b56784ca8ef"
-source = "fmod/fluxor/wasm/codec/1.0.0.fmod"
-
-[[fmod]]
-project = "fluxor"
-name = "content_controls"
-target = "wasm"
-version = "1.0.0"
-hash = "sha256:e49acf9b1106d4bb0b9dfb6eb687a94f6b8532b66cee0dec47c6f9a3340fb5fe"
-source = "fmod/fluxor/wasm/content_controls/1.0.0.fmod"
 
 [[fmod]]
 project = "fluxor"

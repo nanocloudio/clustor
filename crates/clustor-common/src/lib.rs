@@ -52,5 +52,9 @@ pub mod replica_facade;
 pub mod http_admin;
 
 #[rustfmt::skip]
+#[path = "../common/timing.rs"]
+pub mod timing;
+
+#[rustfmt::skip]
 #[path = "../common/session_registry.rs"]
 pub mod session_registry;

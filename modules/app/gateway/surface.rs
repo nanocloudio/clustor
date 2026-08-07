@@ -175,6 +175,21 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
             // MSG_CLIENT_READ_REQUEST route to the codec;
             // unknown types are treated as proposals (the body
             // is opaque to the substrate).
+            //
+            // Substrate-entry forgery guard: bodies carrying a
+            // substrate magic (admin, config-change, timing) are
+            // internal entries proposed by their owning modules only;
+            // a client must not be able to inject a TimeAdvance or
+            // config change through the opaque-proposal path
+            // (rfc_deterministic_timing.md §17).
+            let body = &su.msg_buf[payload_start..payload_end];
+            if wire::has_admin_magic(body)
+                || wire::has_config_change_magic(body)
+                || wire::has_timing_magic(body)
+            {
+                su.requests_routed += 1;
+                return Inbound::Handled; // dropped; requester times out
+            }
             let routed_type = match msg_type {
                 wire::MSG_CLIENT_PROPOSAL | wire::MSG_CLIENT_READ_REQUEST => msg_type,
                 _ => wire::MSG_CLIENT_PROPOSAL,

@@ -67,6 +67,15 @@ const PROBE_TIMEOUT_MS: u64 = 1500;
 /// the window trades memory, not durability.
 const MAX_UNCOMMITTED_INFLIGHT: u64 = 48;
 
+/// How far `last_log_index` may run ahead of `local_durable_index` — i.e. how
+/// many appends may sit in the WAL's input channel unacknowledged — before we
+/// stop accepting more. Bounds the log-vs-WAL divergence that
+/// `channel_write_msg` success cannot detect (see the durability bound in
+/// `handle_append_entries`). Generous enough not to throttle healthy
+/// pipelining on a disk-backed WAL, small enough that a stalled WAL is caught
+/// long before the divergence covers committed entries.
+const MAX_WAL_UNACKED: u64 = 256;
+
 /// Recent (index → term) ring for follower-side log matching and Raft §5.3
 /// conflict repair. Only the *uncommitted* tail can ever diverge (committed
 /// entries are immutable and identical cluster-wide), and that tail is
@@ -272,6 +281,17 @@ pub struct Raft {
     /// Count of Raft §5.3 conflict-repair truncations this node has driven
     /// (divergent suffix discarded). Emitted as `raft.log_truncations`.
     log_truncations: u32,
+    /// WAL continuity rejections repaired (`MSG_WAL_REJECT` → tip rollback).
+    /// Emitted as `raft.wal_resyncs`; steady state 0.
+    wal_resyncs: u32,
+    /// Appends held because our log was already `MAX_WAL_UNACKED` ahead of
+    /// `local_durable_index`. Non-zero means the WAL is the bottleneck and
+    /// backpressure is doing its job — not an error.
+    wal_unacked_holds: u32,
+    /// AppendEntries refused because `entry_index != last_log_index + 1` while
+    /// `prev_log_*` matched — a leader shipping a mis-sequenced entry. Steady
+    /// state 0; non-zero means log repair ran instead of a WAL hole.
+    ae_noncontiguous: u32,
 
     /// Replica-local WAL-durable watermark (spec §10.4.1
     /// `local_wal_durable_index`). Tracked from MSG_FSYNC_ACK on the
@@ -491,6 +511,9 @@ pub fn init(s: &mut Raft) {
     s.commit_index = 0;
     s.tail_terms = [TailTerm { index: 0, term: 0 }; TAIL_TERM_RING];
     s.log_truncations = 0;
+    s.wal_resyncs = 0;
+    s.wal_unacked_holds = 0;
+    s.ae_noncontiguous = 0;
     s.local_durable_index = 0;
     s.meta_root_path = 0;
     s.meta_fd = -1;
@@ -1286,12 +1309,71 @@ unsafe fn drain_commit_in(s: &mut Raft, sys: &SyscallTable) {
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// Roll our log tip back to what the WAL actually holds after a continuity
+/// rejection (`MSG_WAL_REJECT`, payload = the index the WAL wants next).
+///
+/// This repairs the divergence rather than papering over it. The discarded
+/// tail is uncommitted BY CONSTRUCTION: the WAL never acked those indices, so
+/// they were never quorum-durable and no `commit_index` can cover them. A
+/// follower re-derives them from the leader's next AppendEntries; a leader
+/// re-proposes them. The `keep_through < commit_index` clamp below is the
+/// safety net — if it ever fires, the invariant is already broken upstream and
+/// refusing to truncate is the conservative choice.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` (or shared `&Raft` where the
+/// signature uses one) and supply a valid `&SyscallTable` whose function
+/// pointers reach live kernel routines per the module ABI.
+unsafe fn resync_to_wal(s: &mut Raft, sys: &SyscallTable, expected_index: Index) {
+    let keep_through = expected_index.saturating_sub(1);
+    if keep_through >= s.last_log_index {
+        // Nothing to roll back — the reject raced a truncation that already
+        // brought us to (or below) the WAL's tip.
+        s.flush_deferred = false;
+        return;
+    }
+    // DELIBERATELY NOT a log rollback.
+    //
+    // An earlier version of this rolled `last_log_index` back to the WAL's tip
+    // and evicted the tail-ring slots above it. That is wrong, and measurably
+    // so: the apply pipeline has ALREADY consumed those entries, so rewinding
+    // the tip re-delivers them (a deadline fired twice — 2 of 5 runs of
+    // `leader_failover_produces_one_logical_firing`) and the evicted ring slots
+    // make `log_term_matches` disown entries the leader still holds, producing
+    // `[raft] ae conflict` storms that stop the cluster forming at all. A
+    // repair that destabilises healthy nodes is worse than the fault it
+    // repairs.
+    //
+    // The divergence is now PREVENTED at its source — the boot-handshake gate
+    // in `handle_append_entries` and the `MAX_WAL_UNACKED` bound — so there is
+    // nothing legitimate left to repair here. If it somehow occurs anyway, the
+    // node stalls, but LOUDLY: counted and logged, which is the whole point of
+    // the reject signal. Clearing the stale deferral is safe and keeps intake
+    // from being wedged behind a flag whose batch is gone.
+    s.flush_deferred = false;
+    s.wal_resyncs = s.wal_resyncs.saturating_add(1);
+    dev_log(sys, 1, b"[raft] wal divergence".as_ptr(), 21);
+}
+
 unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
     if s.in_wal_flushed < 0 { return; }
     for _ in 0..8 {
         let poll = (sys.channel_poll)(s.in_wal_flushed, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
         let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_wal_flushed, &mut s.msg_buf);
+        if msg_type == wire::MSG_WAL_REJECT {
+            // The WAL refused our append as discontinuous: our log claims
+            // entries it never persisted. A successful `channel_write_msg`
+            // only proved the frame reached its input channel, never that it
+            // was accepted, so this is the ONLY authoritative signal that our
+            // tip is a fiction. Resync down to what the WAL actually holds and
+            // replay from there.
+            if let Some(expected) = wire::decode_wal_reject(&s.msg_buf[..plen.max(0) as usize]) {
+                resync_to_wal(s, sys, expected);
+            }
+            continue;
+        }
         if msg_type != wire::MSG_FSYNC_ACK || (plen as usize) < 17 { continue; }
         let (_term, index, _replica) = wire::decode_fsync_ack(&s.msg_buf);
         if index > s.local_durable_index {
@@ -1716,6 +1798,27 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
     s.leader_id = leader as i8;
     reset_election_deadline(s, now);
 
+    // Boot handshake gate — the follower half of the rule `step_leader`
+    // already enforces (`!s.awaiting_replay`). Until the WAL hands us its
+    // on-disk high-water we do not know where our log actually ends, so
+    // appending now and rewinding to `replay_hw` a moment later leaves raft
+    // and the WAL permanently disagreeing: the WAL keeps the entries it
+    // already accepted, raft restarts from the reported high-water, and the
+    // leader's resend arrives as an index the WAL has long passed.
+    //
+    // Rig-observed exactly this way, with `skip_replay = 1` reporting a
+    // high-water of 0: `wal fault_expected = 9, fault_got = 1` — a REWIND, not
+    // a gap. The WAL had taken 8 entries before the handshake landed, raft
+    // reset to 0, and index 1 came back around. The resulting continuity fault
+    // is unrepairable once commit passes it.
+    //
+    // `busy` (not a log mismatch): the leader retries this same entry once we
+    // are ready, rather than rolling next_index back into needless repair.
+    if s.awaiting_replay {
+        send_append_response(s, sys, false, true);
+        return;
+    }
+
     // ── Log matching + conflict repair (Raft §5.3) ──────────────
     // (1) Gap: we don't hold an entry as far as prev_log_index. NACK; the
     //     response carries our last_log_index so the leader (replicator)
@@ -1755,7 +1858,50 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
             return;
         }
 
-        // Clean append: entry_index == last_log_index + 1.
+        // Durability bound (the other half of RFC §13/§14's fail-closed
+        // contract). `channel_write_msg` succeeding below proves only that the
+        // frame entered the WAL's input channel — never that the WAL ACCEPTED
+        // it. So without a bound here our log can run arbitrarily far ahead of
+        // what is actually persisted, one accepted-but-unwritten entry per
+        // step, until something (a continuity rejection) wedges the pair.
+        // Rig-observed: last_log_index 450 entries past `wal entries_written`,
+        // with those 450 counted as COMMITTED locally — a node that would lose
+        // acknowledged entries on restart, and which no rollback can repair
+        // precisely because they are committed.
+        //
+        // Hold intake once we are too far ahead of our own durable index and
+        // answer `busy`, which is the existing, correct backpressure path: the
+        // leader retries this same entry rather than rolling next_index back
+        // into needless log repair.
+        if s.last_log_index.saturating_sub(s.local_durable_index) >= MAX_WAL_UNACKED {
+            s.wal_unacked_holds = s.wal_unacked_holds.saturating_add(1);
+            send_append_response(s, sys, false, true);
+            return;
+        }
+
+        // Clean append. The checks above validate `prev_log_*` only — nothing
+        // there constrains `entry_index`, so ENFORCE the contiguity this arm
+        // has always assumed. A leader whose per-peer `prev_log_index`
+        // bookkeeping disagrees with the entry it actually ships (the
+        // replicator derives it from two sources: WAL read-back and the
+        // per-batch tip) can present prev_log_index == our tip together with
+        // an entry_index that skips. Writing that punches a hole in BOTH our
+        // log and the WAL: the WAL rejects it as discontinuous and latches,
+        // and by the time anyone notices `commit_index` has advanced past the
+        // WAL's tip, so the divergence can no longer be repaired by rollback
+        // without discarding committed entries. Rig-observed at ~32.5k entries
+        // under sustained catch-up load.
+        //
+        // NACK instead. The response carries our real `last_log_index`, which
+        // is exactly what the leader needs to reset `next_index` and resend
+        // from the right place — ordinary Raft log repair, no hole.
+        if entry_index != s.last_log_index.saturating_add(1) {
+            s.ae_noncontiguous = s.ae_noncontiguous.saturating_add(1);
+            dev_log(sys, 3, b"[raft] ae noncontiguous".as_ptr(), 23);
+            send_append_response(s, sys, false, false);
+            return;
+        }
+
         let entry_payload_start = wire::AE_HDR_LEN;
         let entry_len = pl.saturating_sub(entry_payload_start);
 
@@ -2596,6 +2742,15 @@ unsafe fn become_follower(s: &mut Raft, sys: &SyscallTable, term: Term) {
     s.pre_vote_active = false;
     s.proposal_batch_len = 0;
     s.proposal_batch_count = 0;
+    // `flush_deferred` means "I am holding a batch the WAL refused". The
+    // batch was just discarded, so the flag is now a lie — and a fatal one:
+    // `step_leader` gates `drain_proposals` on `!flush_deferred`, while the
+    // only code that clears it lives past `flush_proposal_batch`'s
+    // `count == 0` early return. Left set with an empty batch it is
+    // unrecoverable: intake is suspended forever, the proposal channel fills,
+    // and the proposer blocks against a raft that is idle and not
+    // backpressured. Clear it with the batch it describes.
+    s.flush_deferred = false;
     // Drop any pending correlation ids — proposals from a prior term are
     // discarded, so the proposer will time out and retry.
     for i in 0..MAX_BATCH_PROPOSALS { s.correlation_ids[i] = 0; }
@@ -2617,6 +2772,11 @@ unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     s.last_heartbeat_ms = now;
     s.proposal_batch_len = 0;
     s.proposal_batch_count = 0;
+    // See `become_follower`: the discarded batch takes its deferral flag with
+    // it. A node that latched `flush_deferred` while its WAL was busy (boot
+    // preallocation, mid-fsync) and then won an election would otherwise take
+    // leadership with intake permanently suspended.
+    s.flush_deferred = false;
     for i in 0..MAX_BATCH_PROPOSALS { s.correlation_ids[i] = 0; }
 
     dev_log(sys, 3, b"[raft] leader".as_ptr(), 13);
@@ -2729,7 +2889,7 @@ unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
     let raft_ready = (!s.awaiting_replay
         && !s.meta_load_pending
         && (s.role == ROLE_LEADER || s.leader_id >= 0)) as i64;
-    let samples: [(u16, u8, i64); 18] = [
+    let samples: [(u16, u8, i64); 21] = [
         // RAFT_READY leads the array: the emit loop stops at a full
         // metrics channel, so readiness must be the last casualty under
         // backpressure, not the first.
@@ -2755,6 +2915,9 @@ unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
         (wire::metric_ids::RAFT_REPLAY_HW, kg, s.replay_hw_received as i64),
         (wire::metric_ids::RAFT_META_HINT, kg, s.meta_hint_loaded as i64),
         (wire::metric_ids::RAFT_LOG_TRUNCATIONS, kc, s.log_truncations as i64),
+        (wire::metric_ids::RAFT_WAL_RESYNCS, kc, s.wal_resyncs as i64),
+        (wire::metric_ids::RAFT_WAL_UNACKED_HOLDS, kc, s.wal_unacked_holds as i64),
+        (wire::metric_ids::RAFT_AE_NONCONTIGUOUS, kc, s.ae_noncontiguous as i64),
     ];
     for &(metric_id, kind, value) in samples.iter() {
         let poll = (sys.channel_poll)(s.out_metrics, 0x02);

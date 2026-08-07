@@ -301,6 +301,22 @@ pub struct Wal {
     /// missing WAL record.
     continuity_fault: bool,
     continuity_errors: u32,
+    /// A record consumed from `in_entries` that could not be staged this step
+    /// (write buffer undrainable, segment unopenable). `msg_buf` still holds
+    /// it; length in bytes, 0 = none. Re-driven at the top of the next
+    /// `process_entries` BEFORE any new channel read, so a transient staging
+    /// failure can never punch a hole in the index sequence.
+    stashed_len: u16,
+    /// Times a record was stashed rather than dropped. Non-zero is healthy
+    /// backpressure (the WAL is the bottleneck); it is what prevents the
+    /// discontinuity, not a symptom of one.
+    stashed_holds: u32,
+    /// The (expected, got) index pair at the FIRST continuity break. Exposed
+    /// as metrics because the pair is the whole diagnosis: a `got` far above
+    /// `expected` means records were lost upstream; `got` below means a
+    /// replay/rewind delivered an old index.
+    fault_expected: u64,
+    fault_got: u64,
     /// Replay-time CRC32C mismatches (torn / corrupt entries). A mismatch
     /// stops replay of that segment at the bad frame so we never replay
     /// garbage past a torn tail.
@@ -553,6 +569,10 @@ pub unsafe fn init(s: &mut Wal) {
     s.entryreq_unservable_logged = false;
     s.continuity_fault = false;
     s.continuity_errors = 0;
+    s.stashed_len = 0;
+    s.stashed_holds = 0;
+    s.fault_expected = 0;
+    s.fault_got = 0;
     s.segment_seq = 1;
     s.oldest_segment_seq = 1;
     s.crc = Crc32c::new();
@@ -1921,12 +1941,49 @@ fn encode_segment_path(partition_id: u16, seq: u32, root: bool, out: &mut [u8]) 
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// Tell raft which index this WAL will accept next, so it can resync its tip
+/// instead of diverging silently. Best-effort: a full output channel just
+/// means the next `recover_continuity` pass re-sends it.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid `&SyscallTable`
+/// per the module ABI.
+unsafe fn emit_wal_reject(s: &mut Wal, sys: &SyscallTable, expected: u64) {
+    if s.out_flushed < 0 {
+        return;
+    }
+    let poll = (sys.channel_poll)(s.out_flushed, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return;
+    }
+    let mut buf = [0u8; 8];
+    wire::encode_wal_reject(&mut buf, expected);
+    wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_WAL_REJECT, &buf);
+}
+
 unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
-    // Once continuity is lost, consuming later records cannot repair it: Raft
-    // no longer retains the missing proposal body. Leave the input full so
-    // backpressure propagates, and never acknowledge a high-water across the
-    // hole.
-    if s.continuity_fault { return; }
+    // Continuity is fail-closed but RECOVERABLE. `current_index` still never
+    // advances across a hole, so a high-water is never acknowledged across one
+    // — the durability invariant is unchanged. What changed: we no longer
+    // return here forever.
+    //
+    // The old behaviour ("leave the input full so backpressure propagates")
+    // assumed raft would notice the backpressure and stop. It cannot: raft's
+    // only signal is `channel_write_msg` failing once the channel fills, which
+    // it reads as a transient WAL-busy condition and latches `flush_deferred`
+    // — suspending intake forever with no error anywhere. Rig-observed as a
+    // leader with role=2, stable term, heartbeats flowing, and zero
+    // replication (`wal entries_written` frozen 95 behind `raft
+    // last_log_index`).
+    //
+    // So instead we tell raft (`MSG_WAL_REJECT` carrying the index we want
+    // next) and keep draining below, discarding records until raft resyncs and
+    // replays from `expected`. Those discarded records are uncommitted by
+    // construction — the WAL never acked them, so no quorum ever counted them
+    // durable, and raft re-derives them from the leader (follower) or
+    // re-proposes them (leader). The latch clears on the first record that
+    // lands exactly on `expected` (see the index check below).
 
     // An async durability fence is outstanding for the current batch. Do NOT
     // stage new records: they would advance `pending_max_index` past what the
@@ -1961,9 +2018,18 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 { return; }
     }
 
-    // Read entry
-    let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
-    if msg_type != wire::MSG_WAL_ENTRY || plen < 16 { return; }
+    // Read entry — unless `msg_buf` still holds one we consumed but could not
+    // stage last step (see the stash points below). Re-driving it here is what
+    // makes the consume-then-fail paths lossless.
+    let plen: u16 = if s.stashed_len > 0 {
+        let n = s.stashed_len;
+        s.stashed_len = 0;
+        n
+    } else {
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
+        if msg_type != wire::MSG_WAL_ENTRY || plen < 16 { return; }
+        plen
+    };
 
     let (term, index) = wire::decode_term_index(&s.msg_buf);
     let payload_len = plen as usize;
@@ -1971,14 +2037,30 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     let expected = s.current_index.saturating_add(1);
     if index != expected {
         // Commit only the valid contiguous prefix already staged, then latch
-        // closed. This record is deliberately not reflected in cursor/index.
+        // closed. This record is deliberately not reflected in cursor/index,
+        // so `current_index` never crosses the hole and no high-water is ever
+        // acked across it.
         if s.has_batch {
             flush_batch(s, sys);
         }
-        s.continuity_errors = s.continuity_errors.saturating_add(1);
-        s.continuity_fault = true;
-        dev_log(sys, 3, b"[wal] continuity FAIL".as_ptr(), 21);
+        if !s.continuity_fault {
+            // Count the BREAK, not every record discarded behind it — the
+            // counter stays "how many times continuity was lost".
+            s.continuity_errors = s.continuity_errors.saturating_add(1);
+            s.continuity_fault = true;
+            s.fault_expected = expected;
+            s.fault_got = index;
+            dev_log(sys, 1, b"[wal] continuity FAIL".as_ptr(), 21);
+        }
+        // Re-assert on every discard: a reject dropped by a momentarily full
+        // output channel must not strand raft waiting for a resync hint.
+        emit_wal_reject(s, sys, expected);
         return;
+    }
+    if s.continuity_fault {
+        // Raft resynced to our tip and replayed from the right index.
+        s.continuity_fault = false;
+        dev_log(sys, 3, b"[wal] continuity resync".as_ptr(), 23);
     }
 
     // Frame: [entry_len: u32 LE] [crc32c: u32 LE] [entry_data]. The CRC32C
@@ -2027,6 +2109,10 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         }
         // A configured filesystem exists but the segment could not be opened:
         // fail closed rather than acknowledging data that was not persisted.
+        // STASH it — this record is already out of the channel, and dropping
+        // it would leave a hole that surfaces later as a continuity fault on
+        // the NEXT record (which is then unrepairable once commit passes it).
+        s.stashed_len = plen as u16;
         s.write_errors = s.write_errors.saturating_add(1);
         dev_log(sys, 3, b"[wal] entry FAIL no-fd".as_ptr(), 22);
         return;
@@ -2040,10 +2126,29 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         c.finalize()
     };
     let frame_len = FRAME_HDR as usize + payload_len;
-    if frame_len > WRITE_BUF_SIZE { return; }
+    if frame_len > WRITE_BUF_SIZE {
+        // Unstageable at any time (record larger than the whole write buffer).
+        // Not a transient condition, so do NOT stash — that would spin. This
+        // is a hard mis-sizing; fail closed and let the continuity fault
+        // report it rather than silently losing the entry.
+        s.write_errors = s.write_errors.saturating_add(1);
+        return;
+    }
     if s.write_pos as usize + frame_len > WRITE_BUF_SIZE {
         flush_batch(s, sys);
-        if s.has_batch { return; }
+        if s.has_batch {
+            // The buffer could not be drained this step (fsync in flight, ack
+            // channel full, segment rolling). This record is already out of
+            // the channel — stash and re-drive it next step instead of
+            // dropping it. THIS was the source of the WAL discontinuity: the
+            // drop left `current_index` un-advanced, so the following record
+            // arrived as `current_index + 2` and latched the continuity fault
+            // ~one segment's worth of entries in (rig-observed at ~32.5k with
+            // an 8 MiB segment at ~258 B/entry).
+            s.stashed_len = plen as u16;
+            s.stashed_holds = s.stashed_holds.saturating_add(1);
+            return;
+        }
     }
     let pos = s.write_pos as usize;
     s.write_buf[pos..pos + 4].copy_from_slice(&(payload_len as u32).to_le_bytes());
@@ -2673,7 +2778,7 @@ unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
     let kc = wire::METRIC_KIND_COUNTER;
     let kg = wire::METRIC_KIND_GAUGE;
     let kh = wire::METRIC_KIND_HISTOGRAM;
-    let scalars: [(u16, u8, i64); 17] = [
+    let scalars: [(u16, u8, i64); 21] = [
         (wire::metric_ids::WAL_ENTRIES_WRITTEN, kc, i64::from(s.entries_written)),
         (wire::metric_ids::WAL_WRITE_ERRORS, kc, i64::from(s.write_errors)),
         (wire::metric_ids::WAL_CHECKSUM_FAILURES, kc, i64::from(s.checksum_failures)),
@@ -2693,6 +2798,10 @@ unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
         (wire::metric_ids::WAL_INPUT_BUDGET_BYTES, kg, i64::from(s.input_budget_bytes)),
         (wire::metric_ids::WAL_PUMP_RECORDS, kg, i64::from(s.pump_records)),
         (wire::metric_ids::WAL_CONTINUITY_ERRORS, kc, i64::from(s.continuity_errors)),
+        (wire::metric_ids::WAL_STASHED_HOLDS, kc, i64::from(s.stashed_holds)),
+        (wire::metric_ids::WAL_CURRENT_INDEX, kg, s.current_index as i64),
+        (wire::metric_ids::WAL_FAULT_EXPECTED, kg, s.fault_expected as i64),
+        (wire::metric_ids::WAL_FAULT_GOT, kg, s.fault_got as i64),
     ];
     for &(metric_id, kind, value) in scalars.iter() {
         emit_sample(s, sys, mid, pid, metric_id, kind, value);

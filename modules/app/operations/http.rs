@@ -389,11 +389,14 @@ pub unsafe fn next_external_request(
 /// snapshot values. Called by the dispatch table on exactly the steps
 /// telemetry emitted, so cache freshness matches the export cadence —
 /// the http component never sees the telemetry struct itself.
-pub fn cache_export(h: &mut Http, ready: bool, export: &[u8]) {
+pub fn cache_export(h: &mut Http, ready: bool, timing_pause: u8, export: &[u8]) {
     h.readyz_buf[0] = ready as u8;
     h.readyz_len = 1;
-    h.why_buf[0] = 0;
-    h.why_len = 1;
+    // `/why` payload: [version:1][timing_pause_reason] — mirrors the
+    // MSG_WHY wire form (see telemetry.rs).
+    h.why_buf[0] = 1;
+    h.why_buf[1] = timing_pause;
+    h.why_len = 2;
     let len = export.len().min(METRICS_CACHE);
     if len > 0 {
         h.metrics_buf[..len].copy_from_slice(&export[..len]);

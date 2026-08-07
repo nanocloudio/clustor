@@ -41,12 +41,29 @@
 //! is the reference implementation). FENCE_CONFIRM must be proposed
 //! only by the agent that actually observed the cutoff.
 //!
+//! - **Deterministic timing** (rfc_deterministic_timing.md): this
+//!   module hosts the leader-fenced time producer for its state
+//!   machine. When (and only when) this node is the PRG leader per
+//!   `MSG_LEADER_HINT`, its clock guard is healthy, and the timing
+//!   index has work (live deadlines / due backlog / a pending
+//!   duration admission), it proposes `TimeAdvance` / `TimeDrain`
+//!   entries through the ordinary tagged-proposal path. An idle PRG
+//!   proposes no time entries (idle coalescing, RFC §5.2). Committed
+//!   timing entries come back on `committed_entries` like every other
+//!   entry and are applied to the registry's embedded `TimingState` —
+//!   deadlines fire ONLY during committed apply, never from a local
+//!   timer.
+//!
 //! # Parameters (TLV v2)
 //!
 //! | Tag | Name       | Type | Default | Description                              |
 //! |-----|------------|------|---------|------------------------------------------|
-//! | 1   | replica_id | u8   | 0       | Stamped into correlation ids (uniqueness across proposers). |
-//! | 2   | smoke      | u8   | 0       | 1 = propose a BIND + two RESERVEs at boot; the committed grants prove the quorum path end-to-end (e2e assertion hook). |
+//! | 1   | replica_id | u8   | 0       | Stamped into correlation ids (uniqueness across proposers). Must equal the node's raft id — the leader fence compares it against MSG_LEADER_HINT. |
+//! | 2   | smoke      | u8   | 0       | 1 = propose a BIND + two RESERVEs at boot; the committed grants prove the quorum path end-to-end (e2e assertion hook). 2 = additionally propose a KEY_PUT with a 1500 ms TTL after the grants — its committed expiry proves the deterministic-timing path end-to-end. |
+//! | 3   | time_advance_period_ms | u32 | 1000 | Target committed-time cadence while deadlines are pending (RFC §6.2). |
+//! | 4   | logical_max_step_ms    | u32 | 60000 | Max forward movement of logical time per proposed entry (forward-jump clamp). |
+//! | 5   | clock_slew_tolerance_ms | u32 | 100 | Wall-vs-monotonic disagreement tolerated before the backward-jump alarm. |
+//! | 6   | logical_staleness_ms   | u32 | 5000 | Duration-admission freshness bound: a TTL command observed while logical time lags wall time by more than this triggers a time-freshness barrier (admission-time only, RFC §5.2). |
 
 #![no_std]
 #![allow(
@@ -76,11 +93,14 @@ mod wire;
 mod wire_channels;
 #[path = "../../common/replica_facade.rs"]
 mod replica_facade;
+#[path = "../../common/timing.rs"]
+mod timing;
 #[path = "../../common/session_registry.rs"]
 mod session_registry;
 
 use replica_facade::{CommitOrderError, CommittedSubscriber, TAGGED_PROPOSAL_HDR};
 use session_registry::*;
+use timing::{ClockGuard, ClockHealth};
 
 /// Two-byte prefix on every replicated registry command so registry
 /// entries are unambiguous in the shared raft log (admin ops, client
@@ -107,8 +127,14 @@ const SMOKE_IDLE: u8 = 0;
 const SMOKE_BIND_SENT: u8 = 1;
 const SMOKE_RESERVE1_SENT: u8 = 2;
 const SMOKE_RESERVE2_SENT: u8 = 3;
-const SMOKE_DONE: u8 = 4;
+const SMOKE_KEY_ARM: u8 = 4;
+const SMOKE_KEY_SENT: u8 = 5;
+const SMOKE_DONE: u8 = 6;
 const SMOKE_OFF: u8 = 0xFF;
+
+/// TTL for the smoke KEY_PUT (smoke = 2): long enough to commit the
+/// put before expiry, short enough for an e2e to observe the fire.
+const SMOKE_KEY_TTL_MS: u32 = 1500;
 
 /// Smoke-session identity (only used with `smoke = 1`).
 const SMOKE_SID: [u8; SR_SESSION_ID] = *b"SMOKE-SESSION-01";
@@ -124,6 +150,7 @@ struct ModuleState {
     in_snapshot_chunk: i32,   // in[2]: MSG_APP_SNAPSHOT_CHUNK / RESET (install)
     in_snapshot_request: i32, // in[3]: MSG_APP_SNAPSHOT_REQUEST
     in_proposal_assigned: i32, // in[4]: MSG_PROPOSAL_ASSIGNED from consensus
+    in_leader_state: i32,     // in[5]: MSG_LEADER_HINT from consensus
     out_proposals: i32,       // out[0]: MSG_CLIENT_PROPOSAL to consensus.proposals_tagged
     out_replies: i32,         // out[1]: MSG_SR_REPLY to requester
     out_metrics: i32,         // out[2]: MSG_METRICS to operations
@@ -165,6 +192,28 @@ struct ModuleState {
     applied_rejected: u32,
     stream_gaps: u32,
 
+    // ── Deterministic timing (rfc_deterministic_timing.md) ──────────
+    /// Current PRG leader per MSG_LEADER_HINT (0xFF = unknown).
+    leader_id: u8,
+    /// Node-local pause reason (wire::TIMING_PAUSE_*), metrics/why.
+    pause_reason: u8,
+    _pad3: [u8; 2],
+    // Params (tags 3–6).
+    time_advance_period_ms: u32,
+    logical_max_step_ms: u32,
+    clock_slew_tolerance_ms: u32,
+    logical_staleness_ms: u32,
+    /// Leader-side wall-clock discipline. Never consulted in apply.
+    clock_guard: ClockGuard,
+    /// Monotonic throttle stamps for time proposals.
+    last_advance_propose_ms: u64,
+    last_drain_propose_ms: u64,
+    /// Last sampled wall clock (leader only; lag metric).
+    last_unix_ms: u64,
+    /// Committed timing entries applied (metrics).
+    time_advance_applied: u32,
+    time_drain_applied: u32,
+
     /// Cached scheduler index for MON_SESSION emission.
     self_idx: u8,
     _pad1: [u8; 7],
@@ -183,8 +232,9 @@ struct ModuleState {
 }
 
 mod params_def {
-    use super::ModuleState;
+    use super::p_u32;
     use super::p_u8;
+    use super::ModuleState;
     use super::SCHEMA_MAX;
 
     define_params! {
@@ -195,6 +245,18 @@ mod params_def {
 
         2, smoke, u8, 0
             => |s, d, len| { s.smoke = p_u8(d, len, 0, 0); };
+
+        3, time_advance_period_ms, u32, 1000
+            => |s, d, len| { s.time_advance_period_ms = p_u32(d, len, 0, 1000); };
+
+        4, logical_max_step_ms, u32, 60000
+            => |s, d, len| { s.logical_max_step_ms = p_u32(d, len, 0, 60000); };
+
+        5, clock_slew_tolerance_ms, u32, 100
+            => |s, d, len| { s.clock_slew_tolerance_ms = p_u32(d, len, 0, 100); };
+
+        6, logical_staleness_ms, u32, 5000
+            => |s, d, len| { s.logical_staleness_ms = p_u32(d, len, 0, 5000); };
     }
 }
 
@@ -242,6 +304,98 @@ unsafe fn propose(s: &mut ModuleState, request_id: u64, body: &[u8]) -> bool {
     s.pending_used[slot] = true;
     s.proposals_out = s.proposals_out.saturating_add(1);
     true
+}
+
+/// Propose an untracked internal entry (timing). No pending-table
+/// registration: time entries need no reply routing — the committed
+/// entry itself is the effect. Returns false when the proposal ring
+/// has no space (retry next step).
+unsafe fn propose_raw(s: &mut ModuleState, body: &[u8]) -> bool {
+    let sys = &*s.syscalls;
+    let poll = (sys.channel_poll)(s.out_proposals, 0x02);
+    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        return false;
+    }
+    let corr = next_correlation(s);
+    let mut prop = [0u8; TAGGED_PROPOSAL_HDR + wire::TIMING_ENTRY_LEN];
+    let n = match replica_facade::build_tagged_proposal(&mut prop, corr, body) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let wrote =
+        wire_channels::channel_write_msg(sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL, &prop[..n]);
+    if wrote > 0 {
+        s.proposals_out = s.proposals_out.saturating_add(1);
+        true
+    } else {
+        false
+    }
+}
+
+/// True when this node is the current PRG leader per MSG_LEADER_HINT.
+fn is_leader(s: &ModuleState) -> bool {
+    s.leader_id != 0xFF && s.leader_id == s.replica_id
+}
+
+/// Duration-admission freshness barrier (rfc_deterministic_timing.md
+/// §5.2). ADMISSION-TIME ONLY: the check compares the local wall
+/// clock against replicated logical time before PROPOSING a duration
+/// command; it is never re-evaluated during apply. Returns true when
+/// the command may be proposed now (time fresh, or this node is not
+/// the leader so the proposal cannot commit anyway); on a stale clock
+/// it proposes a TimeAdvance barrier entry first and reports whether
+/// the command may follow it in the same submission order.
+unsafe fn ensure_time_fresh(s: &mut ModuleState) -> bool {
+    let sys = &*s.syscalls;
+    if !is_leader(s) {
+        return true;
+    }
+    let logical = s.registry.timing.logical_now_ms();
+    let unix = dev_unix_millis(sys);
+    if unix == 0 {
+        // No trusted wall clock: refuse duration admission (fail
+        // closed — a 0 source is never a valid epoch instant).
+        return false;
+    }
+    if unix.saturating_sub(logical) <= s.logical_staleness_ms as u64 {
+        return true;
+    }
+    let mono = dev_millis(sys);
+    if s.clock_guard.sample(mono, unix) != ClockHealth::Healthy {
+        return false;
+    }
+    let Some(t) = s.clock_guard.propose_time(logical, unix) else {
+        return false;
+    };
+    let mut body = [0u8; wire::TIMING_ENTRY_LEN];
+    let n = wire::encode_time_entry(&mut body, wire::TIMING_OP_ADVANCE, t);
+    if n == 0 || !propose_raw(s, &body[..n]) {
+        return false;
+    }
+    // The barrier is in the log ahead of the command; whether it made
+    // time FULLY fresh depends on the step clamp — admit only when it
+    // did, otherwise the requester retries while catch-up continues.
+    unix.saturating_sub(t) <= s.logical_staleness_ms as u64
+}
+
+/// Apply one committed timing entry to the embedded state machine.
+unsafe fn apply_timing_entry(s: &mut ModuleState, body: &[u8]) {
+    let sys = &*s.syscalls;
+    let Some((op, time_ms)) = wire::decode_time_entry(body) else {
+        // Unknown timing entry versions fail closed (RFC §18).
+        dev_log(sys, 2, b"[sess_dir] bad time entry".as_ptr(), 25);
+        return;
+    };
+    let r = if op == wire::TIMING_OP_ADVANCE {
+        s.time_advance_applied = s.time_advance_applied.saturating_add(1);
+        s.registry.apply_time_advance(time_ms)
+    } else {
+        s.time_drain_applied = s.time_drain_applied.saturating_add(1);
+        s.registry.apply_time_drain(time_ms)
+    };
+    if r.fired > 0 {
+        dev_log(sys, 3, b"[sess_dir] deadline fired".as_ptr(), 25);
+    }
 }
 
 // ── Telemetry ───────────────────────────────────────────────────────
@@ -341,6 +495,7 @@ pub extern "C" fn module_new(
         s.in_snapshot_chunk = dev_channel_port(sys, 0, 2);
         s.in_snapshot_request = dev_channel_port(sys, 0, 3);
         s.in_proposal_assigned = dev_channel_port(sys, 0, 4);
+        s.in_leader_state = dev_channel_port(sys, 0, 5);
         s.out_proposals = out_chan;
         s.out_replies = dev_channel_port(sys, 1, 1);
         s.out_metrics = dev_channel_port(sys, 1, 2);
@@ -363,6 +518,14 @@ pub extern "C" fn module_new(
         s.applied_ok = 0;
         s.applied_rejected = 0;
         s.stream_gaps = 0;
+        s.leader_id = 0xFF;
+        s.pause_reason = wire::TIMING_PAUSE_NOT_LEADER;
+        s._pad3 = [0; 2];
+        s.last_advance_propose_ms = 0;
+        s.last_drain_propose_ms = 0;
+        s.last_unix_ms = 0;
+        s.time_advance_applied = 0;
+        s.time_drain_applied = 0;
         s.self_idx = 0xFF;
         s._pad1 = [0; 7];
         s.last_metrics_ms = 0;
@@ -379,6 +542,10 @@ pub extern "C" fn module_new(
         if s.smoke == 0 {
             s.smoke_phase = SMOKE_OFF;
         }
+        s.clock_guard = ClockGuard::new(
+            s.logical_max_step_ms as u64,
+            s.clock_slew_tolerance_ms as u64,
+        );
 
         dev_log(sys, 3, b"[sess_dir] init".as_ptr(), 15);
         0
@@ -392,6 +559,13 @@ pub extern "C" fn module_new(
 /// replica; the reply is relayed only by the replica whose pending
 /// proposal was assigned exactly this wal index.
 unsafe fn apply_committed(s: &mut ModuleState, index: u64, command: &[u8]) {
+    // Substrate timing entries (TimeAdvance / TimeDrain) apply to the
+    // registry's embedded TimingState on every replica — the ONLY
+    // path on which a deadline can fire (rfc_deterministic_timing.md).
+    if wire::has_timing_magic(command) {
+        apply_timing_entry(s, command);
+        return;
+    }
     if command.len() <= 2 || command[..2] != SR_CMD_MAGIC {
         return;
     }
@@ -451,6 +625,17 @@ unsafe fn smoke_advance(s: &mut ModuleState, reply: &SessionReply) {
             }
         }
         (SMOKE_RESERVE2_SENT, SR_OP_RESERVE, SR_ST_OK) => {
+            if s.smoke >= 2 {
+                // Timing smoke: arm a TTL'd key. The proposal happens
+                // from the step loop (SMOKE_KEY_ARM) so the freshness
+                // barrier can retry until duration admission passes.
+                s.smoke_phase = SMOKE_KEY_ARM;
+            } else {
+                s.smoke_phase = SMOKE_DONE;
+                dev_log(sys, 3, b"[sess_dir] smoke complete".as_ptr(), 25);
+            }
+        }
+        (SMOKE_KEY_SENT, SR_OP_KEY_PUT, SR_ST_OK) => {
             s.smoke_phase = SMOKE_DONE;
             dev_log(sys, 3, b"[sess_dir] smoke complete".as_ptr(), 25);
         }
@@ -597,6 +782,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // 3.5) Timing smoke: arm the TTL'd key once duration admission
+        //      passes the freshness barrier (retries every step).
+        if s.smoke_phase == SMOKE_KEY_ARM && ensure_time_fresh(s) {
+            let mut cmd = [0u8; SR_MAX_CMD];
+            let n = build_key_put(&mut cmd, &SMOKE_SID, 1, SMOKE_KEY_TTL_MS, b"smoke-key");
+            if n > 0 && propose(s, 0, &cmd[..n]) {
+                s.smoke_phase = SMOKE_KEY_SENT;
+                dev_log(sys, 3, b"[sess_dir] smoke key sent".as_ptr(), 25);
+            }
+        }
+
         // 4) Snapshot install (catch-up path).
         if s.in_snapshot_chunk >= 0 {
             for _ in 0..4 {
@@ -691,6 +887,70 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // 5.5) Leader hints — the fence for the time producer.
+        if s.in_leader_state >= 0 {
+            for _ in 0..8 {
+                let poll = (sys.channel_poll)(s.in_leader_state, 0x01);
+                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                    break;
+                }
+                let (msg_type, plen) =
+                    wire_channels::channel_read_msg(sys, s.in_leader_state, &mut s.msg_buf);
+                if msg_type == wire::MSG_LEADER_HINT && plen >= 1 {
+                    s.leader_id = s.msg_buf[0];
+                }
+            }
+        }
+
+        // 5.6) Deterministic time production (leader-fenced,
+        //      rfc_deterministic_timing.md §5, §10). Only the current
+        //      leader samples wall time and proposes TimeAdvance /
+        //      TimeDrain; an idle index proposes nothing (idle
+        //      coalescing); an unhealthy clock makes deadlines late
+        //      rather than firing from an untrusted source.
+        if !is_leader(s) {
+            s.pause_reason = wire::TIMING_PAUSE_NOT_LEADER;
+            s.last_unix_ms = 0;
+        } else {
+            let mono = dev_millis(sys);
+            let unix = dev_unix_millis(sys);
+            s.last_unix_ms = unix;
+            let health = s.clock_guard.sample(mono, unix);
+            let logical = s.registry.timing.logical_now_ms();
+            if health != ClockHealth::Healthy {
+                s.pause_reason = wire::TIMING_PAUSE_CLOCK_ALARM;
+            } else if s.registry.timing.due_depth() > 0 {
+                // Committed due backlog: continue with drain entries
+                // through the already-committed time fence. Advancing
+                // pauses so due work stays within apply budgets.
+                s.pause_reason = wire::TIMING_PAUSE_DRAIN_BACKLOG;
+                if mono.wrapping_sub(s.last_drain_propose_ms) >= 50 {
+                    let mut body = [0u8; wire::TIMING_ENTRY_LEN];
+                    let n = wire::encode_time_entry(&mut body, wire::TIMING_OP_DRAIN, logical);
+                    if n > 0 && propose_raw(s, &body[..n]) {
+                        s.last_drain_propose_ms = mono;
+                    }
+                }
+            } else if s.registry.timing.live > 0 {
+                s.pause_reason = wire::TIMING_PAUSE_NONE;
+                if mono.wrapping_sub(s.last_advance_propose_ms)
+                    >= s.time_advance_period_ms as u64
+                {
+                    if let Some(t) = s.clock_guard.propose_time(logical, unix) {
+                        let mut body = [0u8; wire::TIMING_ENTRY_LEN];
+                        let n =
+                            wire::encode_time_entry(&mut body, wire::TIMING_OP_ADVANCE, t);
+                        if n > 0 && propose_raw(s, &body[..n]) {
+                            s.last_advance_propose_ms = mono;
+                        }
+                    }
+                }
+            } else {
+                // No live deadlines: idle tick coalescing (§5.2).
+                s.pause_reason = wire::TIMING_PAUSE_IDLE;
+            }
+        }
+
         // 6) Heartbeat metrics.
         let now = dev_millis(sys);
         if now.wrapping_sub(s.last_metrics_ms) >= 1000 && s.out_metrics >= 0 {
@@ -706,6 +966,78 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let poll = (sys.channel_poll)(s.out_metrics, 0x02);
             if poll > 0 && (poll as u32 & 0x02) != 0 {
                 wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf);
+            }
+
+            // Typed timing series for /metrics export
+            // (rfc_deterministic_timing.md §16).
+            let logical = s.registry.timing.logical_now_ms();
+            let lag = if is_leader(s) && s.last_unix_ms > 0 {
+                s.last_unix_ms.saturating_sub(logical)
+            } else {
+                0
+            };
+            let samples: [(u16, u8, i64); 9] = [
+                (
+                    wire::metric_ids::TIMING_LOGICAL_TIME_MS,
+                    wire::METRIC_KIND_GAUGE,
+                    logical as i64,
+                ),
+                (
+                    wire::metric_ids::TIMING_LOGICAL_LAG_MS,
+                    wire::METRIC_KIND_GAUGE,
+                    lag as i64,
+                ),
+                (
+                    wire::metric_ids::TIMING_ADVANCE_TOTAL,
+                    wire::METRIC_KIND_COUNTER,
+                    s.time_advance_applied as i64,
+                ),
+                (
+                    wire::metric_ids::TIMING_DRAIN_TOTAL,
+                    wire::METRIC_KIND_COUNTER,
+                    s.time_drain_applied as i64,
+                ),
+                (
+                    wire::metric_ids::TIMING_DEADLINES_ACTIVE,
+                    wire::METRIC_KIND_GAUGE,
+                    s.registry.timing.live as i64,
+                ),
+                (
+                    wire::metric_ids::TIMING_DUE_DEPTH,
+                    wire::METRIC_KIND_GAUGE,
+                    s.registry.timing.due_depth() as i64,
+                ),
+                (
+                    wire::metric_ids::TIMING_FIRED_TOTAL,
+                    wire::METRIC_KIND_COUNTER,
+                    s.registry.deadlines_fired as i64,
+                ),
+                (
+                    wire::metric_ids::TIMING_NOOP_TOTAL,
+                    wire::METRIC_KIND_COUNTER,
+                    s.registry.deadline_noop as i64,
+                ),
+                (
+                    wire::metric_ids::TIMING_PAUSE_REASON,
+                    wire::METRIC_KIND_GAUGE,
+                    s.pause_reason as i64,
+                ),
+            ];
+            for (metric_id, kind, value) in samples {
+                let poll = (sys.channel_poll)(s.out_metrics, 0x02);
+                if poll <= 0 || (poll as u32 & 0x02) == 0 {
+                    break;
+                }
+                let mut mb = [0u8; wire::METRIC_SAMPLE_LEN];
+                wire::encode_metric_sample(
+                    &mut mb,
+                    wire::SOURCE_ID_TIMING,
+                    0,
+                    metric_id,
+                    kind,
+                    value,
+                );
+                wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &mb);
             }
         }
 

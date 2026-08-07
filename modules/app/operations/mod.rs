@@ -255,7 +255,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         #[cfg(feature = "http")]
         if telemetry::emitted(&s.telemetry) {
             let (ready, export) = telemetry::snapshot(&s.telemetry);
-            http::cache_export(&mut s.http, ready, export);
+            let timing_pause = telemetry::timing_pause_reason(&s.telemetry);
+            http::cache_export(&mut s.http, ready, timing_pause, export);
             ingress::deliver_ready(&mut s.ingress, ready as u8);
         }
 

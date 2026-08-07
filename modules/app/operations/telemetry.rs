@@ -216,6 +216,21 @@ fn compute_ready(t: &Telemetry) -> bool {
     saw_raft && raft_ok && (!saw_apply || apply_ok)
 }
 
+/// Latest reported deterministic-timing pause reason
+/// (`wire::TIMING_PAUSE_*`, from the deadline-enabled consumer's
+/// `TIMING_PAUSE_REASON` gauge). 0 when no timing source reports —
+/// a graph without deterministic timing has nothing to explain.
+pub fn timing_pause_reason(t: &Telemetry) -> u8 {
+    for slot in t.metrics.iter() {
+        if slot.module_id == wire::SOURCE_ID_TIMING
+            && slot.metric_id == wire::metric_ids::TIMING_PAUSE_REASON
+        {
+            return slot.value as u8;
+        }
+    }
+    0
+}
+
 fn upsert(
     t: &mut Telemetry,
     module_id: u8,
@@ -499,11 +514,15 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
             }
         }
 
-        // Why: empty payload for now (no blocking reasons)
+        // Why: `[version:u8 = 1][timing_pause_reason:u8]`. The reason
+        // vocabulary is `wire::TIMING_PAUSE_*`
+        // (rfc_deterministic_timing.md §16); 0 = nothing paused / not
+        // applicable. Extend with further blocking reasons as they
+        // gain reporters.
         if t.out_why >= 0 {
             let poll = (sys.channel_poll)(t.out_why, 0x02);
             if poll > 0 && (poll as u32 & 0x02) != 0 {
-                let buf = [0u8; 1];
+                let buf = [1u8, timing_pause_reason(t)];
                 wire_channels::channel_write_msg(sys, t.out_why, wire::MSG_WHY, &buf);
             }
         }

@@ -36,7 +36,7 @@ platform:
   debug:
     to: net
     observe: true
-    export_telemetry: otlp
+    export_telemetry: udp
     # Destination comes from ~/.config/fluxor/host.toml
     # debug.collector_ip (192.168.1.10), shared with proven log_net routing.
     export_dst_port: 4318
@@ -113,7 +113,7 @@ wiring:
     to: ip.net_in
 
   # OpenTelemetry-native module signals need no wiring: emission is
-  # ring-based (observe and the `export_telemetry: otlp` overlay drain
+  # ring-based (observe and the `export_telemetry: udp` overlay drain
   # the kernel telemetry ring directly). Clustor's richer typed
   # Raft/WAL/apply table remains on /metrics.
 

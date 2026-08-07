@@ -115,6 +115,7 @@ e2e: $(FLUXOR_SDK)
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test partition -- --test-threads=$(E2E_THREADS)
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test chaos -- --test-threads=$(E2E_THREADS)
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test cluster -- --test-threads=$(E2E_THREADS)
+	CLUSTOR_REQUIRE_E2E=1 cargo test --test session_directory_e2e --test timing_cluster_e2e -- --test-threads=1
 
 publish:
 	fluxor publish

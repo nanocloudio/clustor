@@ -212,6 +212,14 @@ pub struct Repl {
     /// WAL. A periodic read-back for tip+1 against the local WAL
     /// advances the tip from the durable source instead.
     tip_probe_cooldown: u16,
+    /// Consecutive leader steps that bailed out because `last_emitted_index`
+    /// is still 0 — i.e. the WAL has never answered a tip probe, so this
+    /// leader is replicating nothing. Reset the moment a tip resolves.
+    tip_unresolved: u32,
+    /// Snapshot-install escalations that could not be emitted because
+    /// `snapshot_request` is unwired. Non-zero means some follower is beyond
+    /// this WAL's read-back retention and CANNOT be recovered by this graph.
+    snapshot_escalations_dropped: u32,
     /// Failure responses due to follower WAL backpressure (busy), counted
     /// separately from divergence NACKs so the in-flight gauge stays exact
     /// and a backpressure storm doesn't masquerade as log divergence.
@@ -259,6 +267,8 @@ pub fn init(s: &mut Repl) {
     s.acks_received = 0;
     s.nacks_received = 0;
     s.tip_probe_cooldown = 0;
+    s.tip_unresolved = 0;
+    s.snapshot_escalations_dropped = 0;
     s.backpressure_responses = 0;
     s.catchup_sent = 0;
     s.last_metrics_ms = 0;
@@ -629,8 +639,19 @@ unsafe fn drive_catchup(s: &mut Repl, sys: &SyscallTable) {
     }
     let tip = s.last_emitted_index;
     if tip == 0 {
+        // A leader that cannot learn its own tip replicates NOTHING — and
+        // until now did so completely silently: role=2, stable term,
+        // heartbeats flowing, peers connected, zero AppendEntries, followers
+        // pinned forever. Nothing distinguished "no catch-up work" from "the
+        // WAL never answered my probe". Count the stall so it is visible, and
+        // say so once it is clearly not a cold start.
+        s.tip_unresolved = s.tip_unresolved.saturating_add(1);
+        if s.tip_unresolved == TIP_UNRESOLVED_ALARM {
+            dev_log(sys, 1, b"[repl] tip unresolved - not replicating".as_ptr(), 38);
+        }
         return;
     }
+    s.tip_unresolved = 0;
     for i in 0..MAX_NODES {
         if i == s.self_id as usize {
             continue;
@@ -657,6 +678,11 @@ unsafe fn drive_catchup(s: &mut Repl, sys: &SyscallTable) {
 
 /// Pseudo peer id for tip probes (never a real replica slot).
 const PROBE_PEER: u8 = 0xFE;
+
+/// Consecutive tip-unresolved leader steps before we log. Probes are issued
+/// every ~500 steps, so this is several probe intervals — well past any cold
+/// start, and only reached when the WAL genuinely never replies.
+const TIP_UNRESOLVED_ALARM: u32 = 2000;
 
 unsafe fn issue_wal_request(
     s: &mut Repl,
@@ -816,8 +842,20 @@ unsafe fn maybe_promote(s: &mut Repl, sys: &SyscallTable, peer: u8) {
 /// `&Repl` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn request_snapshot_install(s: &Repl, sys: &SyscallTable, target: u8) {
-    if s.out_snapshot_request < 0 { return; }
+unsafe fn request_snapshot_install(s: &mut Repl, sys: &SyscallTable, target: u8) {
+    if s.out_snapshot_request < 0 {
+        // The ONLY recovery for a follower that has fallen past what our WAL
+        // can still serve — and with the port unwired it is a silent no-op, so
+        // the follower stalls forever while we spin on NOT_FOUND. Every config
+        // in the repo shipped without this edge, which is precisely why that
+        // went unnoticed. Count it and say so once: an unrecoverable follower
+        // must not be invisible.
+        s.snapshot_escalations_dropped = s.snapshot_escalations_dropped.saturating_add(1);
+        if s.snapshot_escalations_dropped == 1 {
+            dev_log(sys, 1, b"[repl] snapshot_request unwired".as_ptr(), 31);
+        }
+        return;
+    }
     let poll = (sys.channel_poll)(s.out_snapshot_request, 0x02);
     if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
     let buf = [target; 1];
@@ -995,13 +1033,15 @@ unsafe fn emit_metrics(s: &mut Repl, sys: &SyscallTable) {
         .saturating_sub(s.acks_received)
         .saturating_sub(s.nacks_received)
         .saturating_sub(s.backpressure_responses);
-    let samples: [(u16, u8, i64); 6] = [
+    let samples: [(u16, u8, i64); 8] = [
         (wire::metric_ids::REPL_RPCS_SENT, kc, i64::from(s.rpcs_sent)),
         (wire::metric_ids::REPL_ACKS_RECEIVED, kc, i64::from(s.acks_received)),
         (wire::metric_ids::REPL_NACKS_RECEIVED, kc, i64::from(s.nacks_received)),
         (wire::metric_ids::REPL_CATCHUP_SENT, kc, i64::from(s.catchup_sent)),
         (wire::metric_ids::REPL_INFLIGHT_DEPTH, kg, i64::from(inflight)),
         (wire::metric_ids::REPL_BACKPRESSURE, kc, i64::from(s.backpressure_responses)),
+        (wire::metric_ids::REPL_TIP_UNRESOLVED, kg, i64::from(s.tip_unresolved)),
+        (wire::metric_ids::REPL_SNAPSHOT_DROPPED, kc, i64::from(s.snapshot_escalations_dropped)),
     ];
     for &(metric_id, kind, value) in samples.iter() {
         let poll = (sys.channel_poll)(s.out_metrics, 0x02);

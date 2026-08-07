@@ -1,22 +1,7 @@
-# Clustor: single-node graph + session_directory — the session-
-# directory / reservation-authority consumer (fluxor rfc_protocols.md
-# §8.3 / §13.7; docs/architecture/session_directory.md).
-#
-# Same graph as single.yaml plus `session_directory` wired as a
-# replicated consumer:
-#   - consensus.committed_entries → session_directory (strict
-#     per-entry apply of the session-registry state machine)
-#   - session_directory.proposals → consensus.proposals_tagged
-#     (fan-in beside gateway.proposals_tagged — both emit frame-atomic
-#     MSG_CLIENT_PROPOSAL envelopes and the single-domain graph steps
-#     modules cooperatively, so writes never interleave mid-frame)
-#
-# `smoke: 1` makes the directory propose BIND → RESERVE → RESERVE for
-# a synthetic session at boot; the two committed grants (start=0 then
-# start=4096, visible as MON_SESSION reservation_granted lines and the
-# final "[sess_dir] smoke complete") prove the quorum-committed grant
-# path end-to-end. tests/session_directory_e2e.rs asserts exactly
-# that.
+# Clustor — 3-node deterministic-timing validation, driver-host nodes.
+# Linux twin of session-directory-pi5-3node.yaml for nodes 1 and 2 on the
+# driver (192.168.1.10): node 0 is the bare-metal DUT at 192.168.1.9,
+# reached via peer0_host. Render with SELF_ID=1/2, LISTEN_PORT=9091/9092.
 #
 target: linux
 tick_us: 1000
@@ -34,21 +19,43 @@ platform:
   net: {}
 
 modules:
+  # L2 load injector — offered load = batch_per_step / inject_period x 1000/s.
+  # Modest by default; the driver host runs two of these plus the DUT's peer
+  # traffic on 4 shared cores (RFC 2.4 HARNESS_BOUND caveat).
+  - name: consensus_bench
+    params:
+      total: 1000000
+      body_size: 64
+      batch_per_step: 1
+      # 20 => ~50/s offered. The bare-metal DUT does disk-durable fsync per
+      # batch on real NVMe while these drivers write to a loopback-fast local
+      # WAL; 250/s outruns the DUT and it falls permanently behind. Size the
+      # offered load to the SLOWEST voter, not the fastest.
+      inject_period: 20
+      # 60 s: the bare-metal DUT takes ~55 s to boot and join. Injecting
+      # before it has joined races the cluster thousands of entries ahead of
+      # a node sitting at index 0, and it can never backfill that gap —
+      # observed as an endless `[raft] ae gap` storm (1767 in 12 s) while the
+      # drivers commit happily without it (quorum is 2 of 3).
+      warmup_ms: 60000
   - name: peer_router
     params:
       self_id: __SELF_ID__
-      peer_count: 1
+      peer_count: 3
       listen_port: __LISTEN_PORT__
-      peer0_port: __LISTEN_PORT__
+      peer0_port: __PEER0_PORT__
+      peer0_host: "192.168.1.9"
+      peer1_port: __PEER1_PORT__
+      peer2_port: __PEER2_PORT__
   - name: gateway
     params:
       self_id: __SELF_ID__
   - name: consensus
     params:
       self_id: __SELF_ID__
-      voter_count: 1
+      voter_count: 3
       heartbeat_interval_ms: 150
-      peer_count: 1
+      peer_count: 3
   - name: session_directory
     params:
       replica_id: __SELF_ID__
@@ -59,7 +66,7 @@ modules:
   - name: durability
     params:
       self_id: __SELF_ID__
-      voter_count: 1
+      voter_count: 3
       partition_id: 0
   - name: control_plane
   - name: admission
@@ -106,6 +113,25 @@ wiring:
   # partitioned-tagged port.
   - from: consensus.proposal_assigned
     to: session_directory.proposal_assigned
+  # `POST /propose` client-write bridge (wire::ADMIN_OP_PROPOSE): operations
+  # emits the opaque body as a raw client proposal and gateway tags it into
+  # consensus. Without this edge the bridge answers 503 "propose queue
+  # unavailable" — the load generator's path into this graph.
+  - from: operations.proposal
+    to: gateway.proposals
+    rate: transaction
+  # L2 load injector (consensus-bench-3node.yaml §injector): feeds
+  # consensus.proposals directly. Only the leader's raft drains them, so
+  # whichever driver node is elected generates the quorum-replicated load
+  # that the bare-metal DUT follows — the DUT's WAL + apply work under
+  # that load is what exercises its otel export path.
+  - from: consensus_bench.proposals
+    to: consensus.proposals
+  - from: consensus_bench.metrics
+    to: operations.ingest
+  - from: gateway.rejected
+    to: operations.proposal_rejected
+    rate: transaction
   - from: consensus.leader_state
     to: gateway.leader_state
   # Leader fence for the deterministic-timing producer (rides the
@@ -171,6 +197,17 @@ wiring:
   # ── Snapshots ─────────────────────────────────────────────
   - from: durability.export_chunks
     to: consensus.snapshot_rx
+  # Snapshot-install escalation (consensus/manifest.toml:250): the leader
+  # emits this when a WAL read-back returns NOT_FOUND for the index a lagging
+  # follower needs — i.e. the follower has fallen past what this WAL can still
+  # serve. WITHOUT this edge `request_snapshot_install` hits
+  # `out_snapshot_request < 0` and returns silently, so the follower can never
+  # be recovered: the leader spins on NotFound forever (rig-observed at ~640
+  # misses/s while the follower sat frozen). An ephemeral WAL only retains
+  # ENTRY_RING_SIZE (256) entries for read-back, so this is reachable in
+  # seconds under load, not an exotic corner.
+  - from: consensus.snapshot_request
+    to: durability.install_request
   - from: consensus.snapshot_import
     to: durability.import_chunks
   - from: durability.manifest_auth
