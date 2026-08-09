@@ -11,8 +11,9 @@ hardware_targets = ["bcm2712"]
 # manifests) and placement (placement epochs + kpg-keyed epoch
 # events). Both are pure sources; the module has no inputs.
 #
-# tenant_records / capabilities / epoch_events are optional ports —
-# graphs without tenancy or session fencing leave them unwired.
+# tenant_records / capabilities / epoch_events / metrics are optional
+# ports — graphs without tenancy, session fencing, or telemetry
+# aggregation leave them unwired.
 
 [[ports]]
 name = "proof"
@@ -39,5 +40,12 @@ name = "epoch_events"
 direction = "output"
 content_type = "OctetStream"
 
+# Per-component step-time histograms (fluxor-modules.md §8 rule 8) to
+# operations.telemetry; the module's only telemetry output.
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
 [observability]
-exempt = "pure source components — CP proofs, tenant records, capability manifests, placement epochs; originates no data-plane telemetry"
+exempt = "pure source components — CP proofs, tenant records, capability manifests, placement epochs; originates no data-plane telemetry (the metrics port carries only §8 per-component step accounting)"

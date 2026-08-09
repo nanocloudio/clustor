@@ -305,14 +305,14 @@ pub unsafe fn arm(s: &mut Repl, sys: &SyscallTable) {
 
 /// Deliver raft's current leadership state (E11). Message-shaped
 /// per Discipline §2: the dispatch table calls this after `raft::step`
-/// and before `replicator::step`, exactly where the old
-/// `leader_state` channel hint would have landed a tick later.
+/// and before `replicator::step`, so the replicator acts on the
+/// leadership state raft holds THIS step.
 pub fn on_leader_state(s: &mut Repl, is_leader: bool) {
     s.is_leader = is_leader;
 }
 
 /// One replicator step. `ae` is raft's AppendEntries outbox ring (E1),
-/// drained here at the original ≤4/step bound. Voter-set updates are
+/// drained here at the declared ≤4/step bound. Voter-set updates are
 /// delivered by the dispatch table via [`on_voter_set`] BEFORE this
 /// step runs, so peer activation state is current before the AE
 /// responses below are processed.
@@ -483,8 +483,7 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         // joint consensus catch up in non-voting state
                         // first; their match_index doesn't enter the
                         // quorum median until they're promoted.
-                        // E2 seam: coalesced per-replica max + dirty flag
-                        // (was a MSG_APPEND_ENTRIES_RESP channel write).
+                        // E2 seam: coalesced per-replica max + dirty flag.
                         if was_voting && index > prev_match {
                             let r = replica as usize;
                             if index > s.match_out[r] {
@@ -743,8 +742,7 @@ unsafe fn issue_wal_request(
     wire_channels::channel_write_msg(sys, s.out_wal_request, wire::MSG_WAL_ENTRY_REQUEST, &req);
 }
 
-/// Deliver a voter-set update from raft (E10; was the `voter_set`
-/// channel). Activates new peers in
+/// Deliver a voter-set update from raft (seam E10). Activates new peers in
 /// non-voting state and drops removed peers cleanly.
 ///
 /// # Safety

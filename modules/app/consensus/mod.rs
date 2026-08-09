@@ -33,7 +33,7 @@
 //!   3. voter latch  — E10 delivered to commit + replicator in the
 //!      same step raft applies a config change.
 //!   4. `replicator` — drains raft's AE outbox ring (E1) at its
-//!      original ≤4/step bound, gated on `net_out`.
+//!      declared ≤4/step bound, gated on `net_out`.
 //!   5. reply demux  — the `entry_reply` fan-in serves both WAL
 //!      read-back consumers, split on request-id bit 31: set →
 //!      `apply::on_entry_reply` (gap refetch), clear →
@@ -47,10 +47,15 @@
 //!      ring (E5, ≤16/step), then the horizons, then the read path
 //!      (probe replies E8 from raft's queue).
 //!
-//! Step effects are reported per component at their original sites;
+//! Step effects are reported per component at their emitting sites;
 //! the module step itself always returns 0.
+//!
+//! The dispatch table brackets every `component::step` call with
+//! `dev_micros` reads and publishes a per-component step-time
+//! histogram each second under the component's source id
+//! (`step_accounting`, §8 rule 8).
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     unused_imports,
     dead_code,
@@ -77,6 +82,8 @@ mod types;
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
+#[path = "../../common/step_accounting.rs"]
+mod step_accounting;
 
 mod apply;
 mod commit;
@@ -162,21 +169,26 @@ struct ModuleState {
     commit: commit::Commit,
     apply: apply::Apply,
 
+    /// Per-component step-time histograms (§8 rule 8), owned by the
+    /// dispatch table: [raft, replicator, commit, apply].
+    comp_step: [step_accounting::CompStepHist; 4],
+    comp_step_last_ms: u64,
+
     /// Demux scratch: one inbound frame at a time.
     msg_buf: [u8; 4096],
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -261,6 +273,9 @@ pub extern "C" fn module_new(
         // bit-31 request-id namespace keeps their ids disjoint.
         s.repl.out_wal_request = s.apply.out_entry_request;
 
+        s.comp_step = [step_accounting::CompStepHist::new(); 4];
+        s.comp_step_last_ms = 0;
+
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
@@ -285,7 +300,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
@@ -330,6 +345,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //    (filled during LAST step's apply dispatch → next-step
         //    timing preserved) and the E4 commit-horizon latch raised
         //    last step.
+        let t0 = dev_micros(sys);
         raft::step(
             &mut s.raft,
             sys,
@@ -338,6 +354,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             &mut s.apply.probe_out,
             &mut s.apply.probe_out_count,
         );
+        s.comp_step[0].record(dev_micros(sys).wrapping_sub(t0));
 
         // 1b. E11 leader-state hint → replicator. AppendEntries is a
         //     leader-only RPC; the replicator's catch-up fan-out must
@@ -352,7 +369,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // 3. replicator — drains raft's E1 AE outbox.
+        let t0 = dev_micros(sys);
         replicator::step(&mut s.repl, &mut s.raft.outbox_ae, sys);
+        s.comp_step[1].record(dev_micros(sys).wrapping_sub(t0));
 
         // 3b. entry_reply fan-in demux (inputs merge A): one WAL
         //     read-back reply input serves both consumers, split on
@@ -390,7 +409,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // 5. commit — quorum recompute; raises the E3/E4 horizon latches.
+        let t0 = dev_micros(sys);
         commit::step(&mut s.commit, sys);
+        s.comp_step[2].record(dev_micros(sys).wrapping_sub(t0));
 
         // 6. Latch drains. E4 → raft's commit_in (raft consumes it NEXT
         //    step because it dispatches first — the one-tick
@@ -406,6 +427,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 7. apply — reset first, then raft's E5 body ring, then the
         //    horizons, then the read path (E8 probe replies).
+        let t0 = dev_micros(sys);
         apply::step(
             &mut s.apply,
             sys,
@@ -417,6 +439,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             &mut s.raft.probe_reply_out,
             &mut s.raft.probe_reply_count,
         );
+        s.comp_step[3].record(dev_micros(sys).wrapping_sub(t0));
+
+        // 8. Per-component step accounting (§8 rule 8): publish each
+        //    component's step-time histogram every second under its
+        //    own source id.
+        if now.wrapping_sub(s.comp_step_last_ms) >= 1000 {
+            s.comp_step_last_ms = now;
+            const COMP_IDS: [u8; 4] = [
+                wire::SOURCE_ID_RAFT,
+                wire::SOURCE_ID_REPLICATOR,
+                wire::SOURCE_ID_COMMIT,
+                wire::SOURCE_ID_APPLY,
+            ];
+            for (h, &id) in s.comp_step.iter().zip(COMP_IDS.iter()) {
+                h.emit(sys, s.raft.out_metrics, id, s.partition_id);
+            }
+        }
 
         // A step that persisted raft metadata (vote/term change) did a
         // synchronous FS write+fsync. Classify it as Burst so the

@@ -230,12 +230,12 @@ Each repo packs only what it owns:
 | `clustor` | The seven substrate modules (with the `durability` and `operations` variant fmods), the standalone `session_directory` and `partition_router`, the two bench drivers, `example_consumer`, and the `clustor_cli` applet — full map in [architecture/modules.md](architecture/modules.md) and the canonical edge set in [`../configs/single.yaml`](../configs/single.yaml). |
 | `quantum` | The quantum-specific app modules (codecs, session processing, topic/dedup engines, retained store, audit, DR, metrics, consumer groups, transactions, tenancy). |
 
-Both clustor and quantum publish `.fmod` files into the local
-fluxor registry (`make publish` per project; see
+Both clustor and quantum publish `.fmod` module artefacts into the
+local OCI store (`make publish` per project; see
 [`../../standards/dependencies.md`](../../standards/dependencies.md)
 for the contract). A consumer project that depends on both via
 `fluxor.toml::[dependencies]` runs `fluxor sync` to materialise the
-resolved palette into its own `target/<silicon>/modules/<name>.fmod`
+digest-pinned palette into its own `target/<silicon>/modules/<name>.fmod`
 layout. At runtime fluxor's host tool composes the graph using the
 manifests it discovers via search paths and resolves each module's
 `.fmod` against that synced output directory.
@@ -272,7 +272,7 @@ works; both have to run at least once on a clean tree.
   Distinct from clustor's `common/wire.rs`.
 - `<consuming-project>/target/<silicon>/modules/<name>.fmod` —
   packed artifacts read at runtime. `fluxor sync` lands the
-  registry-resolved fmods here; `fluxor modules build` lands the ones the
+  store-resolved fmods here; `fluxor modules build` lands the ones the
   consumer owns.
 
 ## PIC module pitfalls

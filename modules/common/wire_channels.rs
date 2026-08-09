@@ -15,14 +15,14 @@
 //! ```
 //!
 //! Function bodies reference envelope constants and codecs from
-//! `crate::wire::*`, which resolves because every consumer mounts
-//! `wire.rs` at the crate root as `mod wire`.
+//! `super::wire::*`, which resolves in any consumer that mounts
+//! `wire.rs` as a sibling `mod wire` in the same parent module.
 //!
 //! These wrappers are fluxor-adjacent — they only touch
 //! `SyscallTable` and the envelope formats fluxor channels carry —
 //! and a future RFC may move them upstream into `fluxor-sdk`.
 
-use crate::wire::{
+use super::wire::{
     decode_header, decode_partitioned_header, encode_header, encode_partitioned_header,
     ENVELOPE_HDR, MAX_PAYLOAD, PARTITIONED_HDR, ROUTED_HDR, ROUTED_PARTITIONED_HDR,
 };
@@ -54,7 +54,7 @@ use crate::wire::{
 /// `sys` must point to a valid SyscallTable. `chan` must be a valid handle.
 #[inline]
 unsafe fn write_framed(
-    sys: &crate::abi::SyscallTable,
+    sys: &super::abi::SyscallTable,
     chan: i32,
     hdr: &[u8],
     payload: &[u8],
@@ -62,10 +62,10 @@ unsafe fn write_framed(
     let total = hdr.len() + payload.len();
     // The channel ring caps at CHANNEL_BUFFER_SIZE; a larger frame can
     // never be delivered. Reject up front rather than half-write.
-    if total > crate::abi::CHANNEL_BUFFER_SIZE {
+    if total > super::abi::CHANNEL_BUFFER_SIZE {
         return -1;
     }
-    let mut buf = [0u8; crate::abi::CHANNEL_BUFFER_SIZE];
+    let mut buf = [0u8; super::abi::CHANNEL_BUFFER_SIZE];
     buf[..hdr.len()].copy_from_slice(hdr);
     buf[hdr.len()..total].copy_from_slice(payload);
     let w = (sys.channel_write)(chan, buf.as_ptr(), total);
@@ -93,7 +93,7 @@ unsafe fn write_framed(
 /// `sys` must point to a valid SyscallTable. `chan` must be a valid channel handle.
 #[inline]
 pub unsafe fn channel_write_msg(
-    sys: &crate::abi::SyscallTable,
+    sys: &super::abi::SyscallTable,
     chan: i32,
     msg_type: u8,
     payload: &[u8],
@@ -114,7 +114,7 @@ pub unsafe fn channel_write_msg(
 /// `sys` must point to a valid SyscallTable. `chan` must be a valid channel handle.
 #[inline]
 pub unsafe fn channel_read_msg(
-    sys: &crate::abi::SyscallTable,
+    sys: &super::abi::SyscallTable,
     chan: i32,
     buf: &mut [u8],
 ) -> (u8, u16) {
@@ -155,7 +155,7 @@ pub unsafe fn channel_read_msg(
 /// `sys` must point to a valid SyscallTable. `chan` must be a valid handle.
 #[inline]
 pub unsafe fn channel_write_partitioned(
-    sys: &crate::abi::SyscallTable,
+    sys: &super::abi::SyscallTable,
     chan: i32,
     partition_id: u16,
     msg_type: u8,
@@ -178,7 +178,7 @@ pub unsafe fn channel_write_partitioned(
 /// `sys` must point to a valid SyscallTable. `chan` must be a valid handle.
 #[inline]
 pub unsafe fn channel_read_partitioned(
-    sys: &crate::abi::SyscallTable,
+    sys: &super::abi::SyscallTable,
     chan: i32,
     buf: &mut [u8],
 ) -> (u16, u8, u16) {
@@ -217,7 +217,7 @@ pub unsafe fn channel_read_partitioned(
 /// `sys` must point to a valid SyscallTable.
 #[inline]
 pub unsafe fn channel_write_routed(
-    sys: &crate::abi::SyscallTable,
+    sys: &super::abi::SyscallTable,
     chan: i32,
     target: u8,
     msg_type: u8,
@@ -241,7 +241,7 @@ pub unsafe fn channel_write_routed(
 /// `sys` must point to a valid SyscallTable.
 #[inline]
 pub unsafe fn channel_read_routed(
-    sys: &crate::abi::SyscallTable,
+    sys: &super::abi::SyscallTable,
     chan: i32,
     buf: &mut [u8],
 ) -> (u8, u8, u16) {
@@ -283,7 +283,7 @@ pub unsafe fn channel_read_routed(
 /// `sys` must point to a valid SyscallTable.
 #[inline]
 pub unsafe fn channel_write_routed_partitioned(
-    sys: &crate::abi::SyscallTable,
+    sys: &super::abi::SyscallTable,
     chan: i32,
     target: u8,
     partition_id: u16,
@@ -311,7 +311,7 @@ pub unsafe fn channel_write_routed_partitioned(
 /// `sys` must point to a valid SyscallTable.
 #[inline]
 pub unsafe fn channel_read_routed_partitioned(
-    sys: &crate::abi::SyscallTable,
+    sys: &super::abi::SyscallTable,
     chan: i32,
     buf: &mut [u8],
 ) -> (u8, u16, u8, u16) {

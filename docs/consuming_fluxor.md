@@ -15,13 +15,16 @@ Prescriptive contract:
 ## TL;DR
 
 ```sh
-fluxor update && fluxor sync && fluxor modules build --all
+fluxor sync && fluxor modules build --all
 ```
 
-In clustor's checkout. `update` re-resolves `fluxor.lock` against
-the local registry. `sync` materialises fluxor's published crates,
-fmods, and `fluxor-linux` into clustor's `target/` tree. `make
+In clustor's checkout. `sync` resolves `fluxor.lock` against the
+local OCI store and materialises fluxor's published source trees,
+fmods, and `fluxor-linux` into clustor's `target/` tree (writing
+resolved digests through the lockfile for workspace members). `make
 modules` builds clustor's PIC modules against the synced fluxor SDK.
+`fluxor update` is the deliberate verb for advancing pinned
+(non-workspace) entries to the latest published digests.
 
 ## What clustor consumes from fluxor
 
@@ -33,13 +36,14 @@ modules` builds clustor's PIC modules against the synced fluxor SDK.
 | `fluxor-linux` runtime | `target/aarch64-unknown-linux-gnu/release/fluxor-linux` | `tests/support/cluster.rs` spawns it |
 | `module.ld` linker script | `target/fluxor/fluxor-abi/sdk/module.ld` | `fluxor modules build` picks it up automatically |
 
-Every consumed artefact flows through the local registry at
-`~/.fluxor/registry/`.
+Every consumed artefact flows through the local OCI store —
+`$FLUXOR_STORE`, else `$XDG_DATA_HOME/fluxor/store`, else
+`~/.local/share/fluxor/store` — pinned by digest in `fluxor.lock`.
 
 ## First-time setup (per developer machine)
 
 You need both fluxor and clustor checked out, and a published fluxor
-in the local registry.
+in the local store.
 
 ```sh
 # 1. Clone fluxor as a sibling of clustor (any layout works; sibling is
@@ -47,22 +51,20 @@ in the local registry.
 cd ~/Development/nanocloudio
 git clone git@github.com:nanocloudio/fluxor.git
 
-# 2. Install the fluxor CLI and bootstrap the registry
+# 2. Bootstrap the fluxor CLI (first build on an empty-store machine;
+#    thereafter the installed launcher resolves the CLI from the store)
 cd fluxor
-make -C ../fluxor install           # one-time CLI install
-fluxor registry init                # bootstrap ~/.fluxor/registry/
-fluxor registry setup-cargo         # adds [registries.fluxor] to ~/.cargo/config.toml
+make install
 
-# 3. First canonical publish (or workspace setup — see "Two modes" below)
-make publish                         # publishes abi + sdk + fmods + runtime
+# 3. First publish (see "Two modes" below for workspace setup)
+make publish                         # publishes SDK source + fmods + runtime into the store
 ```
 
 Then in clustor:
 
 ```sh
 cd ../clustor
-fluxor update                        # resolves fluxor.lock against the registry
-fluxor sync                            # materialises everything into target/
+fluxor sync                          # resolves fluxor.lock, materialises everything into target/
 ```
 
 After that, the normal clustor workflow works:
@@ -75,24 +77,25 @@ make ci                              # full gate
 
 ## Two modes — when to use which
 
-### Mode A — canonical, registry-pinned (default)
+### Mode A — pinned (default, no workspace membership)
 
-`fluxor.lock` records exact `(name, version, sha256)` for every
-fluxor artefact clustor consumes. Reproducible across machines.
+`fluxor.lock` records a `[[artifact]]` digest pin for every fluxor
+artefact clustor consumes. Sync materialises exactly what the
+lockfile says; tag movement upstream is invisible until you ask
+for it. Reproducible across machines.
 
 **Workflow:**
 
 ```sh
 # upstream maintainer publishes
 cd ../fluxor
-[bump fluxor.toml's [project].version]
 make publish
 
 # downstream picks it up
 cd ../clustor
-fluxor update                        # rewrites fluxor.lock with new version
-fluxor sync                            # copies new artefacts into target/
-git add fluxor.lock                  # commit the new pin
+fluxor update                        # advances fluxor.lock to the latest published digests
+fluxor sync                          # materialises the new artefacts into target/
+git add fluxor.lock                  # commit the new pins
 ```
 
 This is the right mode for CI, release branches, and any tree state
@@ -100,8 +103,9 @@ you want reproducible.
 
 ### Mode B — live workspace iteration
 
-When iterating fluxor + clustor simultaneously and you don't want
-to bump versions on every change. Set up once:
+When iterating fluxor + clustor simultaneously. Live mode is a
+resolution policy, not a file format: workspace membership is the
+only thing that distinguishes it. Set up once:
 
 ```sh
 # ~/.fluxor/workspace.toml — user-local, NOT committed
@@ -117,28 +121,29 @@ mode is active.
 
 **In live mode:**
 
-- `fluxor sync` prefers fluxor's locally-built `target/` artefacts as
-  an override; anything not built locally resolves from the registry
-  copy recorded in `fluxor.lock` (hash-verified). Iteration is
-  opt-in per artefact — build only what you change, take the rest
-  from the registry. A summary advisory at the end of sync names
-  every workspace member that fell back, so it's clear at a glance
-  whether local edits are flowing through.
-- Source crates resolve via the registry-extracted location and
-  refresh whenever you re-run `fluxor sync` after a fluxor publish.
-- `fluxor.lock` hashes are bypassed only for artefacts that
-  resolved live; fallbacks stay hash-verified.
-- `[dependencies] fluxor = "..."` in `fluxor.toml` is advisory
-  inside the workspace — version pinning takes effect only when
-  the CLI is invoked from outside any workspace member.
+- `fluxor sync` resolves each workspace member's artefacts to
+  `:latest` — the most recently published digest — and **writes the
+  resolved digest through `fluxor.lock`**. The lockfile is never
+  bypassed; what changed is visible as an ordinary `git diff
+  fluxor.lock`, reviewed with normal commit discipline.
+- Publish is always explicit. Sync never builds or publishes on
+  fluxor's behalf: edits in a member checkout reach clustor only
+  after `fluxor publish` in that member (`fluxor workspace publish`
+  batches every stale member in dependency order).
+- Sync warns per artefact whose inputs changed since its last
+  publish — e.g. `warning: module 'tls' inputs changed since
+  publish (fluxor)` — and proceeds. `fluxor workspace status`
+  shows the same data. `fluxor ci` is the one place that staleness
+  is a hard failure.
+- Everything materialised stays digest-verified, live or pinned.
 
-This is the right mode for active development. **Hand off to Mode A
-before pushing branches** — leaving live-mode artefacts in
-`fluxor.lock` would make CI non-reproducible.
+This is the right mode for active development. Because sync writes
+the lockfile through, the branch you push already carries real
+digest pins — review the `fluxor.lock` diff like any other change.
 
 Switch between modes by toggling `~/.fluxor/workspace.toml`: removing
-the file (or removing fluxor from `members`) reverts to canonical
-mode.
+the file (or removing fluxor from `members`) reverts to pinned
+resolution.
 
 ## Daily-iteration checklist
 
@@ -148,61 +153,60 @@ While iterating between fluxor and clustor in Mode B:
 # edited fluxor
 cd ../fluxor
 [edit anything]
-fluxor modules build --all   # rebuild the .fmod artefacts you changed
-                          # (skip if no module source changed)
-make linux-bin            # rebuild fluxor-linux if you changed it
-                          # (skip otherwise)
+fluxor publish            # publish the changed artefacts; repoints :latest
+                          # (or `fluxor workspace publish` to batch every
+                          # stale member in dependency order)
 
 # pick up in clustor
 cd ../clustor
-fluxor sync               # live builds override; everything else from the registry
+fluxor sync               # members resolve :latest; digests written through fluxor.lock
 fluxor modules build --all   # rebuild clustor modules against the synced fluxor SDK
 make test                 # cluster harness picks up the synced fluxor-linux
 ```
 
-Rebuild only what you changed. `fluxor sync` takes whatever fluxor's
-`target/` holds as the override and resolves everything else from
-the lockfile's registry copy. Sync's tail advisory names every
-workspace member that fell back to the registry, so it's clear at a
-glance which paths are live.
+Publish only what changed — `fluxor publish`'s work is scoped by
+input digests, and `workspace publish`'s work-list IS the
+input-digest comparison. Sync's per-artifact advisory names every
+member artefact whose inputs changed since its last publish, so
+it's clear at a glance when a publish is owed.
 
 ## Updating the fluxor pin (Mode A)
 
 ```sh
-# upstream cuts a release
+# upstream publishes
 cd ../fluxor
-[bump fluxor.toml's [project].version, e.g. 0.1.0 → 0.1.1]
-make publish                         # publishes everything at the new version
+make publish                         # repoints :latest to the new digests
 
 # downstream adopts
 cd ../clustor
-fluxor update                          # fluxor.lock now has version = "0.1.1"
-fluxor sync                            # crates re-extracted, fmods re-copied
-git diff fluxor.lock                 # review the new pin
+fluxor update                        # fluxor.lock pins advance to the new digests
+fluxor sync                          # source trees re-materialised, fmods re-copied
+git diff fluxor.lock                 # review the new pins
 git add fluxor.lock
-git commit -m "Bump fluxor to 0.1.1"
+git commit -m "Advance fluxor pins"
 ```
 
-`fluxor.toml::[dependencies] fluxor = "0.1"` in clustor doesn't
-need to change — the caret semver range continues to match every
-`0.1.x`. Only edit it when fluxor cuts a new major (e.g. ABI bump
-to `0.2`).
+`fluxor.toml::[dependencies] fluxor = "..."` in clustor doesn't
+need to change — the version string is a readability label;
+resolution is by lockfile digest and `:latest`, never by version
+ordering.
 
 ## Things to know
 
 ### The lockfile is committed.
 
-`fluxor.lock` records SHA-256 hashes of every resolved artefact.
-Committing it means anyone with the same registry state can
-reproduce your build. CI verifies consistency via `fluxor ci`'s
-`lockfile-consistency` phase.
+`fluxor.lock` records the `sha256:` digest of every resolved
+artefact. Committing it means anyone with the same store state can
+reproduce your build; rollback and history are git's (`git log
+fluxor.lock`, revert + `fluxor sync`). CI verifies consistency via
+`fluxor ci`'s lockfile phase.
 
 ### `make ci` validates the lockfile.
 
-The `lockfile-consistency` phase rejects drift — if your local
-registry has a different fluxor version than what `fluxor.lock`
-pins, CI fails with a precise diff. Run `fluxor update` to bring the
-lockfile up to date.
+Lockfile-vs-tree inconsistency is a hard `fluxor ci` failure, as is
+a live workspace member whose inputs changed since its last publish
+— a green gate against a known-stale upstream would be a clean
+build wearing a misleading name.
 
 ### PIC module paths are stable across fluxor versions.
 
@@ -235,21 +239,22 @@ cascades to every publishable crate; the publish CLI enforces that
 the resolved version matches `fluxor.toml::[project].version`.
 
 Downstream projects of clustor (loam, lattice, future siblings)
-consume `clustor-common` through the same registry mechanism that
+consume `clustor-common` through the same store mechanism that
 clustor uses for fluxor.
 
 ### Workspace mode is per-developer.
 
 `~/.fluxor/workspace.toml` is user-local and gitignored. Each
 developer maintains their own. CI runners shouldn't have one — they
-operate in canonical mode against the registry.
+resolve fully pinned against the store.
 
 ## Things that can go wrong
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `fluxor update` says "no matching canonical artefacts" | fluxor hasn't been published yet | Run `make publish` in fluxor's checkout |
-| `fluxor sync` reports `hash mismatch` | Registry tampered or out of sync with lockfile | Re-run `make publish` upstream, then `fluxor update && fluxor sync` here |
+| `fluxor sync` says a dependency has no published artefacts | fluxor hasn't been published yet | Run `make publish` in fluxor's checkout |
+| `fluxor sync` says a pinned digest is `no longer in store — run 'fluxor update'` | The pinned blob was garbage-collected (this checkout isn't a workspace member, so its pins aren't GC roots) | `fluxor update && fluxor sync` |
+| `fluxor sync` reports a digest mismatch | Store blob out of sync with lockfile | Re-run `make publish` upstream, then `fluxor update && fluxor sync` here |
 | `fluxor modules build` says "no manifest found for module 'ip'" | Search paths don't include fluxor's modules | Set `$FLUXOR_PROJECT_ROOT` to fluxor's checkout, OR ensure `target/fluxor/fluxor-abi/sdk/` is populated via `fluxor sync` |
 | `cargo check` says "rustc 1.92.0 not supported by fixed@1.31" | Transitive dep of fluxor-sdk wants newer rustc | `cargo update fixed --precise 1.29.0` (or whatever's compatible) |
 | Tests fail to find `fluxor-linux` | Either upstream didn't publish runtime, or sync didn't run | `cd ../fluxor && make publish` then back to clustor `fluxor sync` |

@@ -50,7 +50,7 @@ edition = "2021"
 
 # Clustor ships as a set of fluxor-native PIC modules (see
 # `modules/app/`, built by `fluxor modules build`). The cargo package itself
-# has no library target beyond `lib_stub.rs`; it exists so the
+# has no library target beyond the empty `src/lib.rs` stub; it exists so the
 # host-side test and bench targets that pull
 # `modules/common/replica_facade.rs` via `#[path = ...]` can be
 # compiled and exercised on the host toolchain. On-target module
@@ -63,7 +63,7 @@ autotests = false
 # Per-package lint set. Cargo doesn't allow mixing
 # `lints.workspace = true` with per-lint overrides in the same
 # `[lints]` block, and this package is effectively all test/bench
-# code around an empty `lib_stub.rs` — the strict lib-grade lints in
+# code around an empty `src/lib.rs` stub — the strict lib-grade lints in
 # `[workspace.lints]` (unwrap_used = "deny", etc.) don't fit. The
 # package is exempted from the workspace-lint opt-in audit via
 # `[[ci.lints.exemption]]` in `fluxor.toml`; the block below mirrors
@@ -109,10 +109,10 @@ missing_const_for_fn    = "allow"
 too_many_lines          = "allow"
 
 [lib]
-# No library target. Tests under `tests/` are integration crates and
-# do not need a `clustor` library to link against — they pull module
-# source files directly with `#[path = "../modules/.../..."]`.
-path = "lib_stub.rs"
+# `src/lib.rs` is an empty stub, not a real library. Tests under
+# `tests/` are integration crates and do not need a `clustor` library
+# to link against — they pull module source files directly with
+# `#[path = "../modules/.../..."]`.
 # The stub has no benches; without this, `cargo bench` runs the lib's
 # default libtest harness (which rejects criterion's `--quick`).
 bench = false
@@ -141,7 +141,7 @@ strip = "symbols"
 #   facade           — facade contract unit/integration coverage
 #   facade_stress    — facade structures under thread stress
 #   config_validate  — renders every configs/*.yaml with fluxor.toml
-#                      defaults and runs `fluxor validate` against
+#                      defaults and runs `fluxor build --check` against
 #                      `target: linux`. Always runs (no E2E deps).
 #   cluster          — multi-node fluxor-linux harness smoke tests.
 #                      Runtime-skips when fluxor-linux or the .fmod

@@ -362,7 +362,7 @@ fn format_recv_log(dst: &mut [u8], op_code: u8, conn_id: u8) -> usize {
     pos
 }
 
-pub(crate) fn push_usize(dst: &mut [u8], mut n: usize) -> usize {
+fn push_usize(dst: &mut [u8], mut n: usize) -> usize {
     if n == 0 && !dst.is_empty() {
         dst[0] = b'0';
         return 1;

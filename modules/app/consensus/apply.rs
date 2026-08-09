@@ -371,8 +371,7 @@ pub unsafe fn step(
     }
 }
 
-/// Deliver one commit-horizon advance (E3/E6; the body the old
-/// MSG_COMMITTED_BATCH arm of `drain_committed_batches` ran): per-shard
+/// Deliver one commit-horizon advance (seams E3/E6): per-shard
 /// dedup, horizon raise, then the in-order apply pass.
 ///
 /// # Safety
@@ -835,8 +834,7 @@ unsafe fn drain_read_submissions(s: &mut Apply, sys: &SyscallTable, now: u64) {
     }
 }
 
-/// Queue a strict-ReadIndex probe request for raft (E7; was the
-/// `read_probe_request` channel).
+/// Queue a strict-ReadIndex probe request for raft (seam E7).
 ///
 /// # Safety
 ///
@@ -849,8 +847,7 @@ unsafe fn issue_read_probe(s: &mut Apply, _sys: &SyscallTable, correlation_id: u
 }
 
 /// Consume strict-ReadIndex probe replies from raft's reply queue
-/// (E8; was the `read_probe_reply` channel). ≤8 per step — the queue
-/// is one step deep, the same bound.
+/// (seam E8). ≤8 per step — the queue is one step deep.
 ///
 /// # Safety
 ///

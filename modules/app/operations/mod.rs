@@ -46,8 +46,14 @@
 //!
 //! Per-component step bounds are documented on each component's
 //! `step`; the sum stays well inside the runtime step guard.
+//!
+//! The dispatch table brackets each section with `dev_micros` reads
+//! and hands a per-component step-time histogram to the in-module
+//! telemetry component each second under the component's source id
+//! (`step_accounting`, §8 rule 8); a section's routing chains bill
+//! the section's driving component.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     unused_imports,
     dead_code,
@@ -74,6 +80,8 @@ mod wire;
 mod wire_channels;
 #[path = "../../common/http_admin.rs"]
 mod http_admin;
+#[path = "../../common/step_accounting.rs"]
+mod step_accounting;
 
 mod admin;
 mod rbac;
@@ -131,19 +139,28 @@ struct ModuleState {
     http: http::Http,
     #[cfg(feature = "http")]
     ingress: ingress::Ingress,
+
+    /// Per-component step-time histograms (§8 rule 8), owned by the
+    /// dispatch table: [telemetry, rbac, admin, http, ingress]. The
+    /// headless variant leaves the http/ingress entries idle. Each
+    /// dispatch section is charged to its driving component; routing
+    /// chains bill the section owner. Delivered message-shaped to the
+    /// in-module telemetry component on a 1 s tick.
+    comp_step: [step_accounting::CompStepHist; 5],
+    comp_step_last_ms: u64,
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -211,6 +228,9 @@ pub extern "C" fn module_new(
             s.http.out_response = dev_channel_port(sys, 1, 11);
         }
 
+        s.comp_step = [step_accounting::CompStepHist::new(); 5];
+        s.comp_step_last_ms = 0;
+
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
@@ -234,7 +254,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
@@ -250,6 +270,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Dispatch table — see the module header for the ordering
         // contract. All cross-component routing lives in these loops.
+        let mut t0 = dev_micros(sys);
         telemetry::step(&mut s.telemetry, sys, now);
 
         #[cfg(feature = "http")]
@@ -259,6 +280,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             http::cache_export(&mut s.http, ready, timing_pause, export);
             ingress::deliver_ready(&mut s.ingress, ready as u8);
         }
+
+        let t1 = dev_micros(sys);
+        s.comp_step[0].record(t1.wrapping_sub(t0));
+        t0 = t1;
 
         // rbac: identity bindings, then the wire admin-command loop.
         rbac::step(&mut s.rbac, sys);
@@ -273,13 +298,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        let t1 = dev_micros(sys);
+        s.comp_step[1].record(t1.wrapping_sub(t0));
+        t0 = t1;
+
         admin::step(&mut s.admin, sys, now);
+        s.comp_step[2].record(dev_micros(sys).wrapping_sub(t0));
 
         #[cfg(feature = "http")]
         {
             // http: own drains, then the response-producing feedback
             // loops — each pull gated on ring space, so a response is
             // staged only when the ingress ring can take it.
+            let mut t0 = dev_micros(sys);
             http::step(&mut s.http, sys);
             for _ in 0..8 {
                 if !ingress::response_writable(&s.ingress) {
@@ -340,6 +371,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
 
+            let t1 = dev_micros(sys);
+            s.comp_step[3].record(t1.wrapping_sub(t0));
+            t0 = t1;
+
             // ingress: bind, net-event loop, response ring → wire.
             ingress::begin_step(&mut s.ingress, sys);
             let mut req = ingress::ParsedReq::new();
@@ -361,9 +396,41 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
             ingress::finish_step(&mut s.ingress, sys);
-            if ingress::took_work(&s.ingress) {
-                return STEP_BURST;
+            s.comp_step[4].record(dev_micros(sys).wrapping_sub(t0));
+        }
+
+        // Per-component step accounting (§8 rule 8): hand each
+        // component's cumulative step-time buckets straight to the
+        // in-module telemetry component every second.
+        if now.wrapping_sub(s.comp_step_last_ms) >= 1000 {
+            s.comp_step_last_ms = now;
+            const COMP_IDS: [u8; 5] = [
+                wire::SOURCE_ID_TELEMETRY,
+                wire::SOURCE_ID_RBAC,
+                wire::SOURCE_ID_ADMIN,
+                wire::SOURCE_ID_HTTP,
+                wire::SOURCE_ID_INGRESS,
+            ];
+            let present: usize = if cfg!(feature = "http") { 5 } else { 3 };
+            for c in 0..present {
+                let cum = s.comp_step[c].cumulative();
+                for (i, &v) in cum.iter().enumerate() {
+                    telemetry::on_typed_sample(
+                        &mut s.telemetry,
+                        COMP_IDS[c],
+                        0,
+                        wire::hist::COMP_STEP_BASE + i as u16,
+                        wire::METRIC_KIND_HISTOGRAM,
+                        v,
+                        now,
+                    );
+                }
             }
+        }
+
+        #[cfg(feature = "http")]
+        if ingress::took_work(&s.ingress) {
+            return STEP_BURST;
         }
 
         0

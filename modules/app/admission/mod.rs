@@ -17,14 +17,24 @@
 //!
 //!   1. `proof_cache` — drain proofs, evaluate the ladder; a
 //!      transition delivers the new state into `read_gate` same-step.
+//!      Bound (`proof_cache::step`): ≤8 frames per proof port
+//!      latest-wins, one ladder evaluation, ≤1 transition emit.
 //!   2. `read_gate`   — standing permit from the freshest state.
-//!   3. `flow`        — lag drain, PID tick, credit emit.
+//!      Bound (`read_gate::step`): ≤1 permit emit.
+//!   3. `flow`        — lag drain, PID tick, credit emit. Bound
+//!      (`flow::step`): ≤8 lag frames latest-wins; PID + ≤1 credit
+//!      emit on the sample tick; two gauges on the metrics tick.
+//!
+//! The dispatch table brackets every component step with `dev_micros`
+//! reads and publishes a per-component step-time histogram each
+//! second under the component's source id (`step_accounting`,
+//! §8 rule 8).
 //!
 //! `proof` and `input` are the same contract on two attach points, as
 //! are `cache_state` and `fresh_state` — deployments differ in which
 //! name they wire, and both are part of the published surface.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     unused_imports,
     dead_code,
@@ -51,6 +61,8 @@ mod types;
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
+#[path = "../../common/step_accounting.rs"]
+mod step_accounting;
 
 mod flow;
 mod proof_cache;
@@ -90,19 +102,24 @@ struct ModuleState {
     proof_cache: proof_cache::ProofCache,
     read_gate: read_gate::ReadGate,
     flow: flow::Flow,
+
+    /// Per-component step-time histograms (§8 rule 8), owned by the
+    /// dispatch table: [proof_cache, read_gate, flow].
+    comp_step: [step_accounting::CompStepHist; 3],
+    comp_step_last_ms: u64,
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -146,6 +163,9 @@ pub extern "C" fn module_new(
         s.flow.out_credits = dev_channel_port(sys, 1, 4);
         s.flow.out_metrics = dev_channel_port(sys, 1, 5);
 
+        s.comp_step = [step_accounting::CompStepHist::new(); 3];
+        s.comp_step_last_ms = 0;
+
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
@@ -159,7 +179,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
@@ -178,11 +198,34 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Cross-component routing owned here: a proof-cache state
         // transition is delivered to the read gate same-step, before
         // the gate evaluates its standing permit.
+        let mut t0 = dev_micros(sys);
         if let Some(state) = proof_cache::step(&mut s.proof_cache, sys, now) {
             read_gate::on_cache_state(&mut s.read_gate, state);
         }
+        let t1 = dev_micros(sys);
+        s.comp_step[0].record(t1.wrapping_sub(t0));
+        t0 = t1;
         read_gate::step(&mut s.read_gate, sys);
+        let t1 = dev_micros(sys);
+        s.comp_step[1].record(t1.wrapping_sub(t0));
+        t0 = t1;
         flow::step(&mut s.flow, sys, now);
+        s.comp_step[2].record(dev_micros(sys).wrapping_sub(t0));
+
+        // Per-component step accounting (§8 rule 8): publish each
+        // component's step-time histogram every second under its own
+        // source id.
+        if now.wrapping_sub(s.comp_step_last_ms) >= 1000 {
+            s.comp_step_last_ms = now;
+            const COMP_IDS: [u8; 3] = [
+                wire::SOURCE_ID_PROOF_CACHE,
+                wire::SOURCE_ID_READ_GATE,
+                wire::SOURCE_ID_FLOW,
+            ];
+            for (h, &id) in s.comp_step.iter().zip(COMP_IDS.iter()) {
+                h.emit(sys, s.flow.out_metrics, id, 0);
+            }
+        }
         0
     }
 }

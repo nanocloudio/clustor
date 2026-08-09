@@ -246,8 +246,7 @@ unsafe fn drain_proposal_assigned(c: &mut Codec, sys: &SyscallTable) {
 /// `responses`.
 ///
 /// Consumes at most ONE frame per call so the dispatch table's loop
-/// bound counts every read, malformed frames included (the old
-/// in-component loop's bound). Unknown types are treated as
+/// bound counts every read, malformed frames included. Unknown types are treated as
 /// proposals — the body is opaque to the substrate, exactly as the
 /// surface's default arm does. The dispatch table drives the ≤8/step
 /// loop and routes each frame through [`on_request`].

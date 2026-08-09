@@ -38,8 +38,13 @@
 //!      traffic from producers that own their own connection
 //!      namespace, entering the correlation hub on the same terms as
 //!      step 3's wire frames.
+//!
+//! The dispatch table brackets each section with `dev_micros` reads
+//! and publishes a per-component step-time histogram each second
+//! under the component's source id (`step_accounting`, §8 rule 8);
+//! a section's routing chains bill the section's driving component.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     unused_imports,
     dead_code,
@@ -66,6 +71,8 @@ mod types;
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
+#[path = "../../common/step_accounting.rs"]
+mod step_accounting;
 
 mod codec;
 mod surface;
@@ -92,19 +99,26 @@ struct ModuleState {
     surface: surface::Surface,
     codec: codec::Codec,
     throttle: throttle::Throttle,
+
+    /// Per-component step-time histograms (§8 rule 8), owned by the
+    /// dispatch table: [surface, codec, throttle]. Each dispatch
+    /// section is charged to its driving component; a routing chain
+    /// crossing components mid-section bills the section owner.
+    comp_step: [step_accounting::CompStepHist; 3],
+    comp_step_last_ms: u64,
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -158,6 +172,9 @@ pub extern "C" fn module_new(
         s.codec.out_reads = dev_channel_port(sys, 1, 5);
         s.throttle.out_metrics = dev_channel_port(sys, 1, 6);
 
+        s.comp_step = [step_accounting::CompStepHist::new(); 3];
+        s.comp_step_last_ms = 0;
+
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
@@ -170,7 +187,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
@@ -191,6 +208,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let mut frame = [0u8; 2048];
 
         // 1. codec drains, then the applied-response loop.
+        let mut t0 = dev_micros(sys);
         codec::step(&mut s.codec, sys);
         for _ in 0..8 {
             match codec::next_applied(&mut s.codec, sys) {
@@ -202,6 +220,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         }
+
+        let t1 = dev_micros(sys);
+        s.comp_step[1].record(t1.wrapping_sub(t0));
+        t0 = t1;
 
         // 2. throttle: credits, external proposals, metrics.
         throttle::drain_credits(&mut s.throttle, sys);
@@ -219,6 +241,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         throttle::step_metrics(&mut s.throttle, sys);
+        let t1 = dev_micros(sys);
+        s.comp_step[2].record(t1.wrapping_sub(t0));
+        t0 = t1;
 
         // 3. surface inbound loop, then its own post-routing work.
         for _ in 0..8 {
@@ -237,8 +262,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         surface::finish_step(&mut s.surface, sys);
+        let t1 = dev_micros(sys);
+        s.comp_step[0].record(t1.wrapping_sub(t0));
+        t0 = t1;
 
-        // 4. pre-demuxed client_requests loop.
+        // 4. pre-demuxed client_requests loop (codec-driven).
         for _ in 0..8 {
             match codec::next_client_request(&mut s.codec, sys, &mut frame) {
                 codec::Pulled::Empty => break,
@@ -246,6 +274,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 codec::Pulled::Frame(msg_type, len) => {
                     route_client(s, sys, msg_type, len, &frame);
                 }
+            }
+        }
+
+        s.comp_step[1].record(dev_micros(sys).wrapping_sub(t0));
+
+        // Per-component step accounting (§8 rule 8): publish each
+        // component's step-time histogram every second under its own
+        // source id.
+        let now = dev_millis(sys);
+        if now.wrapping_sub(s.comp_step_last_ms) >= 1000 {
+            s.comp_step_last_ms = now;
+            const COMP_IDS: [u8; 3] = [
+                wire::SOURCE_ID_SURFACE,
+                wire::SOURCE_ID_CODEC,
+                wire::SOURCE_ID_THROTTLE,
+            ];
+            for (h, &id) in s.comp_step.iter().zip(COMP_IDS.iter()) {
+                h.emit(sys, s.throttle.out_metrics, id, 0);
             }
         }
 

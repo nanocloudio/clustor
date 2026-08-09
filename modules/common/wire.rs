@@ -327,7 +327,7 @@ pub fn decode_time_entry(buf: &[u8]) -> Option<(u8, u64)> {
 /// update. Sent every time the current or joint voter set changes so
 /// the downstream quorum tracker can adjust. Payload (3 bytes):
 ///   `[current_set:u8][joint_set:u8][joint_active:u8]`
-/// Each `u8` is a [`crate::types::NodeSet`] bitmask. `joint_active = 0`
+/// Each `u8` is a [`super::types::NodeSet`] bitmask. `joint_active = 0`
 /// means single-config; otherwise both sets must be considered for
 /// quorum.
 pub const MSG_VOTER_SET_UPDATE: u8    = 0x76;
@@ -916,6 +916,7 @@ pub const SOURCE_ID_NVME_BENCH: u8        = 0x16;
 pub const SOURCE_ID_CONSENSUS_BENCH: u8   = 0x17;
 pub const SOURCE_ID_HTTP: u8      = 0x18;
 pub const SOURCE_ID_TIMING: u8            = 0x19;
+pub const SOURCE_ID_INGRESS: u8           = 0x1A;
 
 /// Per-module metric ids. Each module owns a small private space
 /// (0x00..0xFF). Documented next to the module's metric emission.
@@ -1235,6 +1236,20 @@ pub mod hist {
     pub const SNAPSHOT_MS: [u64; 9] = [
         1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000,
     ];
+
+    /// Per-component step-time histogram (fluxor-modules.md §8 rule 8)
+    /// — inclusive upper bounds, microseconds. Mirrors the kernel
+    /// scheduler's per-module step bucket edges (`<2, <4, <8, <16,
+    /// <32, <64, <256 µs, +Inf` expressed as inclusive integer-µs
+    /// bounds) so component and module histograms compare directly.
+    pub const COMP_STEP_US: [u64; 7] = [1, 3, 7, 15, 31, 63, 255];
+
+    /// First `metric_id` of the per-component step histogram range.
+    /// Bucket i is emitted at `COMP_STEP_BASE + i` under
+    /// `module_id = SOURCE_ID_<component>` — distinct from HIST_BASE
+    /// (module-scalar histograms) and STEP_PERMOD_BASE (kernel
+    /// per-slot step histograms) so the three never collide.
+    pub const COMP_STEP_BASE: u16 = 0x1200;
 
     /// Classify `v` (same unit as `bounds`) into a bucket index in
     /// `0..=bounds.len()`. The returned index is the first bound `v`

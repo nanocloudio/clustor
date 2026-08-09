@@ -26,7 +26,8 @@ execution-domain rationale is at
 
 ## Setup
 
-Clustor consumes fluxor through a local-first registry. The
+Clustor consumes fluxor through the local OCI store
+(`$FLUXOR_STORE`, default `~/.local/share/fluxor/store`). The
 contract lives at
 [`../standards/dependencies.md`](../standards/dependencies.md);
 the day-to-day guide is
@@ -36,21 +37,20 @@ the day-to-day guide is
 # one-time, per developer machine
 git clone git@github.com:nanocloudio/fluxor.git ../fluxor
 cd ../fluxor
-make install               # install the fluxor CLI onto PATH
-fluxor registry init       # bootstrap ~/.fluxor/registry/
-fluxor registry setup-cargo  # add [registries.fluxor] to ~/.cargo/config.toml
-make publish               # publish abi + sdk crates, fmod palette, runtime
+make install               # bootstrap the fluxor CLI launcher onto PATH
+make publish               # publish SDK source, fmod palette, runtime into the store
 
 # in clustor's checkout
 cd ../clustor
-fluxor update              # resolve fluxor.lock against the local registry
-fluxor modules build --all # build; pre-flight materialises registry artefacts
+fluxor sync                # resolve fluxor.lock, materialise store artefacts
+fluxor modules build --all # build; pre-flight replays the lockfile
 ```
 
-Subsequent fluxor changes flow through with `make publish` (in
-fluxor) followed by `fluxor update` in clustor; the next build
-re-materialises resolved artefacts automatically, and `fluxor sync`
-forces it explicitly. The lockfile records what
+Subsequent fluxor changes flow through with `fluxor publish` (in
+fluxor) followed by `fluxor sync` in clustor — as a workspace
+member fluxor resolves `:latest` and sync writes the new digest
+through `fluxor.lock`; outside a workspace, `fluxor update`
+advances the pins first. The lockfile records digest pins for what
 fluxor publishes; the deployment YAML decides which subset is wired
 into the runtime (RFC §5).
 
@@ -67,20 +67,21 @@ members = [
 ]
 ```
 
-`fluxor sync` then prefers fluxor's locally-built `target/`
-artefacts as an override; anything unbuilt locally resolves from
-the registry copy recorded in `fluxor.lock`. Source crates resolve
-through the registry either way — re-publish on demand when you
-change fluxor's SDK source.
+`fluxor sync` then resolves each member's artefacts to the most
+recently published digest (`:latest`) and writes it through
+`fluxor.lock`. Publishing stays explicit — `fluxor publish` in the
+changed member (or `fluxor workspace publish` to batch every stale
+member); sync prints a per-artifact advisory when a member's
+inputs have changed since its last publish.
 
 ### Bumping fluxor
 
 ```sh
 # in ../fluxor
-make publish               # canonical (bump [project].version first)
+make publish               # publish into the store
 
 # in clustor
-fluxor update              # regenerate fluxor.lock against the registry
+fluxor update              # advance fluxor.lock to the latest published digests
 fluxor sync                # materialise resolved artefacts into target/
 git commit fluxor.lock     # commit the pin
 ```
@@ -88,18 +89,20 @@ git commit fluxor.lock     # commit the pin
 ### Publishing clustor downstream
 
 Projects that depend on clustor (Lattice, Loam, Quantum, …) pin it
-through the same registry mechanism by declaring `clustor = "X.Y"`
+through the same store mechanism by declaring `clustor = "X.Y"`
 in their `fluxor.toml::[dependencies]`. From clustor's checkout:
 
 ```sh
 make publish               # publish clustor-common + the substrate fmod palette
 ```
 
-This populates `~/.fluxor/registry/cargo/clustor-common-X.Y.Z.crate`
-and `~/.fluxor/registry/fmod/clustor/<silicon>/<name>/X.Y.Z.fmod`
-for every module under `modules/app/`. Downstream consumers then
-run `fluxor update && fluxor sync` in their own checkouts to resolve
-and materialise the published palette. Bump
+This publishes the `clustor-common` source tree
+(`clustor/src/clustor-common`) and a module artifact
+(`<silicon>/<name>:<ver>`) for every module under `modules/app/`
+into the store, each digest-addressed and epoch-annotated.
+Downstream consumers then run `fluxor update && fluxor sync` in
+their own checkouts to resolve and materialise the published
+palette. Bump
 `[workspace.package].version` (Cargo.toml), the matching
 `[package].version` in `crates/clustor-common/Cargo.toml`, and
 `[project].version` in `fluxor.toml` together before publishing a
@@ -109,7 +112,7 @@ new release; `fluxor publish` rejects mismatches at publish time.
 
 ```sh
 fluxor modules build --all   # build .fmod for bcm2712 (default target)
-fluxor up configs/single.yaml
+fluxor run configs/single.yaml
 make test                    # host-side test suite (~20 s)
 make e2e                     # strict cluster/chaos/partition/wal e2e
 make ci                      # full pipeline (fmt + test + clippy + modules)
@@ -139,7 +142,7 @@ workload manifest: [`packaging/cli/`](packaging/cli/); CI gate:
 The cluster harness needs `fluxor` on PATH (defaults to
 `/usr/bin/fluxor`) and `fluxor-linux` at
 `target/aarch64-unknown-linux-gnu/release/fluxor-linux` (materialised
-by `fluxor sync` from the local registry). Missing
+by `fluxor sync` from the local store). Missing
 prereqs cause `cluster.rs` / `chaos.rs` / `partition.rs` to
 **runtime-skip** with a one-line note rather than fail — so a green
 `cargo test` from a workstation without those prereqs proves only

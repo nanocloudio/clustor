@@ -132,8 +132,7 @@ pub fn on_match(s: &mut Commit, replica: u8, index: Index) {
     }
 }
 
-/// Deliver a voter-set update from raft (E10; body from the old
-/// `drain_voter_set`). Anything that changes the active quorum forces
+/// Deliver a voter-set update from raft (seam E10). Anything that changes the active quorum forces
 /// a commit-advance recheck.
 pub fn on_voter_set(s: &mut Commit, current: u8, joint: u8, joint_active: bool) {
     s.current_voters = NodeSet(current);
@@ -270,7 +269,7 @@ unsafe fn emit_metrics(s: &mut Commit, sys: &SyscallTable) {
 unsafe fn drain_durability(s: &mut Commit, sys: &SyscallTable) -> bool {
     if s.in_durable < 0 { return false; }
     let mut changed = false;
-    // Cap 32 per step (ledger-precedent bound; the drain was unbounded).
+    // Cap 32 per step (matches the durability ledger's ack-drain bound).
     for _ in 0..32 {
         let poll = (sys.channel_poll)(s.in_durable, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }

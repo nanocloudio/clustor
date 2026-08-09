@@ -22,7 +22,7 @@
 //! blocks per `module_step` so it never overruns the cooperative step
 //! budget. It runs once on startup, then idles in DONE.
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     unused_imports,
     dead_code,
@@ -212,15 +212,15 @@ struct ModuleState {
     log_buf: [u8; 128],
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 { core::mem::size_of::<ModuleState>() as u32 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32, out_chan: i32, _ctrl_chan: i32,
@@ -370,11 +370,11 @@ fn kbps(bytes: u64, elapsed_us: u64) -> u32 {
 /// readiness (mirrors fluxor's `nvme_perf_probe`); without this, the pi5
 /// scheduler never calls `module_step` and the bench sits in PH_OPEN.
 /// (On linux every module is stepped, so this is a no-op there.)
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_deferred_ready"]
 pub extern "C" fn module_deferred_ready() -> u32 { 1 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: see module_new — the kernel hands us a live state + syscalls.

@@ -28,19 +28,32 @@
 //! owned HERE and nowhere else:
 //!
 //!   1. `keys`     — rotation check; the epoch is handed to wal and
-//!      snapshot (idempotent latest-wins).
+//!      snapshot (idempotent latest-wins). Bound (`keys::step`): one
+//!      rotation check, ≤1 cert-refresh emit.
 //!   2. `wal`      — replay or the write path. Durable high-water and
-//!      rotation triggers land in monotone latches.
+//!      rotation triggers land in monotone latches. Bound
+//!      (`wal::step`): replay is one FS open OR one frame; normal
+//!      mode ≤8 input records + ≤4 control frames + ≤8 gap-refetch
+//!      serves.
 //!   3. latch drain — the ledger receives the local durable advance;
-//!      the snapshot component receives the rotation trigger.
+//!      the snapshot component receives the rotation trigger. O(1)
+//!      composition-layer code.
 //!   4. `ledger`   — cross-node ack drain + quorum recompute (disk
-//!      variant only).
+//!      variant only). Bound (`ledger::step`): ≤32 acks + ≤1 quorum
+//!      recompute and proof emit.
 //!   5. `snapshot` — floors, external triggers, install transfer.
+//!      Bound (`snapshot::step`): ≤4 frames per input family + ≤1
+//!      app-body chunk.
 //!
 //! The wal's Burst classifications and the snapshot component's
 //! cold-FS steps propagate as the module's step return.
+//!
+//! The dispatch table brackets every component step with `dev_micros`
+//! reads and publishes a per-component step-time histogram each
+//! second under the component's source id (`step_accounting`,
+//! §8 rule 8).
 
-#![no_std]
+#![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
     unused_imports,
     dead_code,
@@ -71,6 +84,8 @@ mod wire_channels;
 mod collections;
 #[path = "../../common/wal_frame.rs"]
 mod wal_frame;
+#[path = "../../common/step_accounting.rs"]
+mod step_accounting;
 
 mod keys;
 #[cfg(not(feature = "volatile"))]
@@ -151,19 +166,25 @@ struct ModuleState {
     ledger: ledger::Ledger,
     snapshot: snapshot::Snapshot,
     keys: keys::Keys,
+
+    /// Per-component step-time histograms (§8 rule 8), owned by the
+    /// dispatch table: [keys, wal, ledger, snapshot]. The volatile
+    /// variant leaves the ledger entry idle.
+    comp_step: [step_accounting::CompStepHist; 4],
+    comp_step_last_ms: u64,
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
 pub extern "C" fn module_state_size() -> u32 {
     core::mem::size_of::<ModuleState>() as u32
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
     in_chan: i32,
@@ -235,6 +256,9 @@ pub extern "C" fn module_new(
         // The snapshot component shares the module's metrics port.
         s.snapshot.out_metrics = s.wal.out_metrics;
 
+        s.comp_step = [step_accounting::CompStepHist::new(); 4];
+        s.comp_step_last_ms = 0;
+
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
@@ -263,7 +287,7 @@ pub extern "C" fn module_new(
     }
 }
 
-#[no_mangle]
+#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
     // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
@@ -279,15 +303,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Dispatch table — see the module header for the ordering
         // contract.
+        let t0 = dev_micros(sys);
         let epoch = keys::step(&mut s.keys, sys, now);
+        s.comp_step[0].record(dev_micros(sys).wrapping_sub(t0));
         s.wal.dek_epoch = epoch;
         s.snapshot.dek_epoch = epoch;
 
+        let t0 = dev_micros(sys);
         let wal_rc = wal::step(&mut s.wal, sys);
+        s.comp_step[1].record(dev_micros(sys).wrapping_sub(t0));
 
         // Drain the wal's seam latches (monotone latest-wins).
         #[cfg(not(feature = "volatile"))]
         {
+            let t0 = dev_micros(sys);
             let local_advanced = if s.wal.ledger_dirty {
                 s.wal.ledger_dirty = false;
                 let (term, index) = s.wal.ledger_ack;
@@ -296,6 +325,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 false
             };
             ledger::step(&mut s.ledger, sys, local_advanced);
+            s.comp_step[2].record(dev_micros(sys).wrapping_sub(t0));
         }
         let mut cold_fs = false;
         if s.wal.snap_trigger_dirty {
@@ -309,8 +339,23 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 cold_fs = true;
             }
         }
+        let t0 = dev_micros(sys);
         if snapshot::step(&mut s.snapshot, sys) {
             cold_fs = true;
+        }
+        s.comp_step[3].record(dev_micros(sys).wrapping_sub(t0));
+
+        // Per-component step accounting (§8 rule 8): publish each
+        // component's step-time histogram every second under its own
+        // source id (the volatile variant's ledger entry stays zero
+        // and is skipped).
+        if now.wrapping_sub(s.comp_step_last_ms) >= 1000 {
+            s.comp_step_last_ms = now;
+            s.comp_step[0].emit(sys, s.wal.out_metrics, wire::SOURCE_ID_KEYS, s.partition_id);
+            s.comp_step[1].emit(sys, s.wal.out_metrics, wire::SOURCE_ID_WAL, s.partition_id);
+            #[cfg(not(feature = "volatile"))]
+            s.comp_step[2].emit(sys, s.wal.out_metrics, wire::SOURCE_ID_LEDGER, s.partition_id);
+            s.comp_step[3].emit(sys, s.wal.out_metrics, wire::SOURCE_ID_SNAPSHOT, s.partition_id);
         }
 
         if wal_rc == STEP_BURST || cold_fs {

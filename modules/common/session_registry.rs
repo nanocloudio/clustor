@@ -45,7 +45,7 @@
 //   grants until that session's epoch bumps. This is the consumer-
 //   observable form of "unsafe recovery voids outstanding blocks".
 
-use crate::timing::{Deadline, TimingState, TM_BATCH_MAX, TM_MAX_OWNERS};
+use super::timing::{Deadline, TimingState, TM_BATCH_MAX, TM_MAX_OWNERS};
 
 // ── Capacity ────────────────────────────────────────────────────────
 
@@ -552,10 +552,10 @@ impl SessionRegistry {
     /// and duplicates retain the existing logical time — safe and
     /// deterministic. Returns what happened so the module wrapper can
     /// emit metrics and the leader can schedule `TimeDrain`.
-    pub fn apply_time_advance(&mut self, proposed_time_ms: u64) -> crate::timing::TimeApplied {
+    pub fn apply_time_advance(&mut self, proposed_time_ms: u64) -> super::timing::TimeApplied {
         let _ = self.timing.advance(proposed_time_ms);
         let fired = self.run_due_pass();
-        crate::timing::TimeApplied {
+        super::timing::TimeApplied {
             logical_now_ms: self.timing.logical_now_ms(),
             fired,
             due_remaining: self.timing.due_depth(),
@@ -566,13 +566,13 @@ impl SessionRegistry {
     /// advances time; `through_time_ms` must equal the applied
     /// logical time or the drain is a deterministic no-op — a stale
     /// drain request cannot invent a new time fence.
-    pub fn apply_time_drain(&mut self, through_time_ms: u64) -> crate::timing::TimeApplied {
+    pub fn apply_time_drain(&mut self, through_time_ms: u64) -> super::timing::TimeApplied {
         let fired = if through_time_ms == self.timing.logical_now_ms() {
             self.run_due_pass()
         } else {
             0
         };
-        crate::timing::TimeApplied {
+        super::timing::TimeApplied {
             logical_now_ms: self.timing.logical_now_ms(),
             fired,
             due_remaining: self.timing.due_depth(),

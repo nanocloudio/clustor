@@ -37,7 +37,7 @@ scripts = ["tools/ci-e2e.sh", "scripts/cli-e2e.sh"]
 # `[lints] workspace = true` opt-in audit because cargo doesn't
 # allow mixing `lints.workspace = true` with per-lint overrides in
 # the same `[lints]` table, and the package's reality (tests +
-# benches around an empty `lib_stub.rs`) needs `unwrap_used` /
+# benches around an empty `src/lib.rs` stub) needs `unwrap_used` /
 # `panic` / `print_stdout` relaxed. The package inlines a slightly
 # relaxed mirror of `[workspace.lints]` in its own `[lints]` block.
 [[ci.lints.exemption]]
@@ -50,8 +50,8 @@ reason = "driver-host bench CLI (clustor-scrape/clustor-loadgen); prints JSON to
 
 [ci.hygiene]
 # Tiers where inline tests are banned. `modules/**` is no_std PIC and
-# can't host a std test harness; `src/**` would be too if clustor had
-# one (it currently has only `lib_stub.rs`).
+# can't host a std test harness; `src/**` holds only the empty
+# `src/lib.rs` stub.
 forbid_inline_tests = ["modules", "src"]
 mode = "strict"
 max_inline_lines = 80

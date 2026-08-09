@@ -35,21 +35,25 @@ help:
 	@echo "clustor lifecycle:"
 	@echo "  make build     cargo build --workspace --all-targets"
 	@echo "  make test      cargo test --workspace (TEST_THREADS=$(TEST_THREADS))"
-	@echo "  make lint      rustfmt --check + clippy -D warnings + palette lint"
+	@echo "  make lint      rustfmt --check + clippy -D warnings"
 	@echo "  make ci        fluxor ci — the full gate (lints, hygiene,"
 	@echo "                 tests, strict module build, lockfile checks)"
 	@echo "  make publish   fluxor publish — canonical registry publish"
 	@echo "  make clean     cargo clean + module artefacts (the staged"
-	@echo "                 fluxor tree restages itself on next build)"
+	@echo "                 tree restages itself on next build)"
 	@echo "clustor-specific:"
 	@echo "  make bench     host L0/L1 micro-benches (criterion, --quick)"
 	@echo "  make e2e       strict cluster/chaos/partition/wal e2e"
 	@echo "                 (sequential, thread-bounded; hard-fails on skip)"
 	@echo ""
-	@echo "Not make targets (use the CLI directly):"
+	@echo "Not make targets (use the CLI / scripts directly):"
 	@echo "  fluxor modules build [--target …]   PIC modules"
 	@echo "  fluxor run / up                     bring-up"
 	@echo "  fluxor update / sync                registry consumption"
+	@echo "  tools/palette-lint.sh               palette text lint — enforced inside"
+	@echo "                                      'fluxor ci' via tools/ci-e2e.sh"
+	@echo "  tools/attach-surface.sh             published attach-surface report (TSV)"
+	@echo "  scripts/cli-e2e.sh                  CLI applet e2e (ci phase 3.5)"
 	@echo "One-time setup: make -C ../fluxor install"
 
 build: $(FLUXOR_SDK)
@@ -74,7 +78,6 @@ bench: $(FLUXOR_SDK)
 lint: $(FLUXOR_SDK)
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --all-features -- -D warnings
-	tools/palette-lint.sh
 
 ci: $(FLUXOR_SDK)
 	fluxor ci

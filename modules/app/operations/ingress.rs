@@ -321,7 +321,7 @@ unsafe fn try_bind(g: &mut Ingress, sys: &SyscallTable) {
 /// parsed HTTP request is returned as [`Pull::Request`] in `req` for
 /// the dispatch table to route through `http::on_request`. The
 /// dispatch table drives the ≤16/step loop, so every consumed event
-/// counts against the same bound the old in-component loop had.
+/// counts against that one bound.
 ///
 /// # Safety
 ///

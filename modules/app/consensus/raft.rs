@@ -904,8 +904,7 @@ unsafe fn handle_read_index_probe_resp(s: &mut Raft, sys: &SyscallTable, plen: u
 }
 
 /// Drain strict-ReadIndex probe requests from apply's probe queue
-/// (E7; was the `read_probe_request` channel). ≤4 per step, matching
-/// the same bound.
+/// (seam E7), ≤4 per step.
 ///
 /// # Safety
 ///
@@ -1037,9 +1036,8 @@ unsafe fn expire_probes(s: &mut Raft, sys: &SyscallTable, now: u64) {
     }
 }
 
-/// Queue a probe reply for apply (E8; was the `read_probe_reply`
-/// channel). A full queue drops the reply — the same silent drop the
-/// full channel produced.
+/// Queue a probe reply for apply (seam E8).
+/// A full queue silently drops the reply.
 ///
 /// # Safety
 ///
@@ -1259,9 +1257,8 @@ unsafe fn truncate_log_after(s: &mut Raft, sys: &SyscallTable, keep_through: Ind
 }
 
 /// Consume the quorum-commit horizon latch from the commit component
-/// (E3; was the `commit` channel). commit dispatches after raft, so
-/// this consumes the previous step's raise — the same one-tick
-/// feedback the channel had.
+/// (seam E3). commit dispatches after raft, so this consumes the
+/// previous step's raise — one tick of feedback spacing.
 ///
 /// # Safety
 ///
@@ -1559,10 +1556,9 @@ unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
     dev_log(sys, 3, b"[raft] config applied".as_ptr(), 21);
 }
 
-/// E10 seam (was the `voter_set` channel): latch the voter-set update
-/// for same-step delivery to commit + replicator by the dispatch
-/// table — strictly better than the per-consumer tick skew of the
-/// channel fan-out.
+/// E10 seam: latch the voter-set update for same-step delivery to
+/// commit + replicator by the dispatch table — every consumer sees
+/// the update on the same tick.
 ///
 /// # Safety
 ///

@@ -5,7 +5,7 @@
 //! record framing with the same all-or-nothing write contract (a record
 //! that does not fit the free space is dropped whole — atomic single
 //! frames, never a torn two-part write). The consumer drains it at its
-//! original per-step bound.
+//! declared per-step bound.
 //!
 //! [`HorizonLatch`] stands in for a retried commit-horizon channel: a
 //! monotone latest-wins latch the dispatch table drains every step, so
@@ -17,8 +17,8 @@
 const HDR: usize = 3;
 
 /// Slots in the fixed strict-ReadIndex probe queues (E7 request /
-/// E8 reply). A probe issued at step N is seen at step N+1 — the same
-/// one-tick spacing the channel edges had.
+/// E8 reply). A probe issued at step N is seen at step N+1 — one tick of
+/// delivery spacing.
 pub const PROBE_QUEUE_SLOTS: usize = 8;
 
 /// Producer-owned wrapping byte ring with channel-record framing.

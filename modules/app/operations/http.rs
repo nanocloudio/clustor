@@ -408,8 +408,7 @@ pub fn cache_export(h: &mut Http, ready: bool, timing_pause: u8, export: &[u8]) 
 /// producing feedback loops (≤8 rejections, ≤16 applies, one expiry)
 /// are driven by the dispatch table through [`next_rejection`] /
 /// [`next_applied`] / [`expire_step`], each pull gated there on
-/// `ingress::response_writable` exactly as the old in-component loops
-/// were — feedback is never consumed without somewhere to answer.
+/// `ingress::response_writable` — feedback is never consumed without somewhere to answer.
 /// The 250 ms self-metrics tick rides [`take_metrics`].
 ///
 /// # Safety
@@ -552,8 +551,8 @@ pub unsafe fn next_applied(h: &mut Http, sys: &SyscallTable) -> Feedback {
     }
 }
 
-/// One expiry check per step (a corr timeout, else an index timeout —
-/// the old scan's exact behaviour). The dispatch table gates the call
+/// One expiry check per step (a corr timeout, else an index timeout).
+/// The dispatch table gates the call
 /// on `ingress::response_writable`.
 ///
 /// # Safety
@@ -806,11 +805,28 @@ fn format_admin_route_log(dst: &mut [u8], op_code: u8, conn_id: u8) -> usize {
     let n = head.len().min(dst.len() - pos);
     dst[pos..pos + n].copy_from_slice(&head[..n]);
     pos += n;
-    pos += super::admin::push_usize(&mut dst[pos..], op_code as usize);
+    pos += push_usize(&mut dst[pos..], op_code as usize);
     let mid = b" conn_id=";
     let n = mid.len().min(dst.len() - pos);
     dst[pos..pos + n].copy_from_slice(&mid[..n]);
     pos += n;
-    pos += super::admin::push_usize(&mut dst[pos..], conn_id as usize);
+    pos += push_usize(&mut dst[pos..], conn_id as usize);
     pos
+}
+
+fn push_usize(dst: &mut [u8], mut n: usize) -> usize {
+    if n == 0 && !dst.is_empty() {
+        dst[0] = b'0';
+        return 1;
+    }
+    let mut tmp = [0u8; 20];
+    let mut i = tmp.len();
+    while n > 0 {
+        i -= 1;
+        tmp[i] = b'0' + ((n % 10) as u8);
+        n /= 10;
+    }
+    let take = (tmp.len() - i).min(dst.len());
+    dst[..take].copy_from_slice(&tmp[i..i + take]);
+    take
 }

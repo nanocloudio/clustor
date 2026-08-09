@@ -376,6 +376,10 @@ unsafe fn build_export(t: &mut Telemetry, sys: &SyscallTable) -> usize {
     // 4. Per-module step histograms (RFC §4.3). Scrape each scheduler module
     //    slot; export only NON-ZERO (active) modules, byte-budgeted. Tagged by
     //    partition_id = scheduler module_idx, metric_id = STEP_PERMOD_BASE + i.
+    //    Composites additionally publish per-COMPONENT step histograms as
+    //    typed samples (metric_id = COMP_STEP_BASE + i under the component's
+    //    source id — fluxor-modules.md §8 rule 8); those ride the ordinary
+    //    slot table exported in section 1.
     for m in 0..STEP_MODULES {
         let mut sb = [0u32; STEP_HIST_BUCKETS];
         let rc = (sys.provider_call)(
@@ -473,7 +477,7 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
         }
     }
 
-    // Real readiness (replaces the old fixed 5 s boot timer): the node is
+    // Real readiness: the node is
     // ready once every raft instance reports RAFT_READY=1 (boot replay
     // done, metadata loaded, consensus established) AND — if an
     // an apply instance is present in this graph — every apply instance
