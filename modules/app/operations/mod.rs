@@ -382,6 +382,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 match ingress::next_event(&mut s.ingress, sys, &mut req) {
                     ingress::Pull::Empty => break,
                     ingress::Pull::Handled => {}
+                    // Connection lifecycle edge: deferred per-conn
+                    // reply state must not survive into a reused id.
+                    ingress::Pull::ConnBoundary(cid) => http::purge_conn(&mut s.http, cid),
                     ingress::Pull::Request => route_http_request(
                         s,
                         sys,

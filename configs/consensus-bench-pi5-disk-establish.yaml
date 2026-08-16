@@ -159,6 +159,7 @@ wiring:
     to: consensus.wal_flushed
   - from: durability.replay_complete
     to: consensus.wal_replay_complete
+    rate: transaction
   - from: consensus.cross_durability_ack
     to: durability.ack
   - from: durability.quorum_durable

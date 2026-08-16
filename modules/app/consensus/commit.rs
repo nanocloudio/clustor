@@ -67,6 +67,17 @@ pub struct Commit {
     committed_index: Index,
     committed_term: Term,
 
+    /// §5.4.2 current-term fence from raft (E12): (leader term, first
+    /// index of that term — the election no-op). While set, the quorum
+    /// tally may not advance the commit index below the fence: prior-term
+    /// entries commit only transitively, once the fence entry itself has
+    /// quorum. Index 0 = no fence (follower, or before this node's first
+    /// election).
+    term_fence_index: Index,
+    /// Term the fence belongs to. Fences are monotone in term; a lower
+    /// one is a stale delivery and is ignored.
+    term_fence_term: Term,
+
     // CP state
     cp_cache_state: u8,
     strict_fallback: bool,
@@ -99,6 +110,8 @@ pub fn init(s: &mut Commit) {
     s.durable_index = 0;
     s.committed_index = 0;
     s.committed_term = 0;
+    s.term_fence_index = 0;
+    s.term_fence_term = 0;
     s.cp_cache_state = 0;
     s.strict_fallback = false;
     s.msg_buf = [0u8; 32];
@@ -130,6 +143,42 @@ pub fn on_match(s: &mut Commit, replica: u8, index: Index) {
         s.match_indices[replica as usize] = index;
         s.match_changed = true;
     }
+}
+
+/// Deliver the (term, first-index-of-term) fence from a freshly-elected
+/// leader (seam E12), and reset the per-replica match tallies with it.
+/// Match indices are monotone only within a leadership: across a term
+/// change a stale one can name a log position conflict repair has since
+/// rewritten. Peers re-report under the new term within a round-trip —
+/// the fence entry's own AE forces it.
+/// Arrives twice per leadership: `index == 0` when raft takes office
+/// (the fence is ARMED but its index is not yet known — no commit may
+/// advance by counting until it is, or the window between election and
+/// the no-op landing would commit prior-term entries under either a
+/// zero fence or this node's previous reign's), then again with the
+/// real index once the no-op is in the WAL.
+pub fn on_term_fence(s: &mut Commit, term: Term, index: Index) {
+    if term < s.term_fence_term { return; }
+    if term > s.term_fence_term {
+        // New leadership. Match indices are monotone only WITHIN a
+        // leadership: across a term change a stale one can name a log
+        // position conflict repair has since rewritten. Peers re-report
+        // within a round-trip; this node's own slot is local truth, so
+        // re-seed it from `durable_index` rather than zeroing it
+        // (`drain_durability` only refreshes the slot on a proof
+        // STRICTLY above `durable_index`, which a quiescent leader may
+        // not see for some time). Only on a term CHANGE — the armed and
+        // resolved fences of one term must not reset it twice and drop
+        // peer tallies already gathered under it.
+        s.match_indices = [0; MAX_NODES];
+        if (s.self_id as usize) < MAX_NODES {
+            s.match_indices[s.self_id as usize] = s.durable_index;
+        }
+        s.term_fence_term = term;
+    }
+    // `Index::MAX` blocks every counting-based advance while armed.
+    s.term_fence_index = if index == 0 { Index::MAX } else { index };
+    s.match_changed = true;
 }
 
 /// Deliver a voter-set update from raft (seam E10). Anything that changes the active quorum forces
@@ -188,13 +237,12 @@ pub unsafe fn step(s: &mut Commit, sys: &SyscallTable) {
 /// MSG_COMPACTION_FLOOR so the snapshot side defers snapshot triggers —
 /// and therefore WAL compaction — past what the slowest LIVE voter has
 /// replicated. Without this floor a leader-local snapshot can compact
-/// entries a lagging follower still needs; with manifest-only snapshots
-/// (no state body yet) that follower can then NEVER catch up: its
-/// replicator NACK-refetches a compacted index forever, the permanent
-/// lag signal makes the flow controller strangle proposal credits, and the
-/// whole write path wedges. A DEAD follower
-/// pins the floor — the safe default until state-body snapshots make
-/// install-based catch-up lossless; operators drop dead voters via
+/// entries a lagging follower still needs, and with manifest-only
+/// snapshots (no state body) that follower can never catch up: it
+/// NACK-refetches a compacted index forever and its permanent lag signal
+/// makes the flow controller strangle proposal credits. A DEAD follower
+/// therefore pins the floor — the safe default until state-body snapshots
+/// make install-based catch-up lossless; operators drop dead voters via
 /// membership change.
 ///
 /// Emitted only on change; dropped under backpressure (the next change
@@ -348,6 +396,19 @@ unsafe fn advance_commit(s: &mut Commit) {
         DUR_RELAXED => quorum_match,
         _ => quorum_match,
     };
+
+    // §5.4.2 current-term gate: while the quorum sits below the current
+    // term's first entry, the commit index may not advance by counting.
+    // A prior-term entry with quorum can still be legally overwritten by
+    // a higher-term leader (Raft Fig. 8); it commits transitively, when
+    // the fence entry itself commits.
+    if s.term_fence_index > 0
+        && new_commit > s.committed_index
+        && new_commit < s.term_fence_index
+    {
+        emit_committed(s);
+        return;
+    }
 
     if new_commit > s.committed_index {
         // Count committed ENTRIES, not advance events: a single advance can

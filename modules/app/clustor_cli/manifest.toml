@@ -19,11 +19,14 @@ timer_class      = "agnostic"
 # durable prefix a replica would recover.
 
 # argv after `--`, NUL-separated (from cli_in.args_out): [subcommand, args...].
+# Sized ≥ the module's ARGV_BUF (2×16 KiB hex + slack): a channel write is an
+# atomic single frame, so a smaller ring caps wal-scan input below the
+# module's own 16 KiB image buffer.
 [[ports]]
 name         = "args"
 direction    = "input"
 content_type = "OctetStream"
-buffer_size  = 8192
+buffer_size  = 33024
 
 # stdout → cli_out.bytes_in.
 [[ports]]

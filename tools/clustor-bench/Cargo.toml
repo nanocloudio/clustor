@@ -6,9 +6,13 @@ publish = false
 description = "Off-DUT benchmark harness for clustor: /metrics scrape + parser (clustor-scrape) and open-loop load generator (clustor-loadgen). Std-only, no external deps (RFC §5)."
 
 # std-only by design: this is the driver-host tool (RFC §1, 192.168.1.10), it
-# never runs on fluxor, and keeping it dependency-free means it builds on an
+# never runs on fluxor, and taking no third-party deps means it builds on an
 # offline Pi. Networking is raw std::net; JSON + the latency histogram are
-# hand-rolled in lib.rs.
+# hand-rolled in lib.rs. The only dependency is the in-workspace
+# `clustor-common` path dep, so shared contracts — the FNV-1a partition hash —
+# have one implementation on both sides of the wire.
+[dependencies]
+clustor-common = { path = "../../crates/clustor-common" }
 
 # Tool-shaped package (driver-host CLI): it prints JSON to stdout and uses
 # unwrap on arg parsing, so the strict lib-grade workspace lints don't fit.

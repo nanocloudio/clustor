@@ -10,13 +10,25 @@ default-members = [".", "crates/clustor-common", "tools/clustor-bench"]
 # Mirrors `fluxor.toml::[project].version`; publish enforces equality.
 version = "0.0.1"
 
-# Workspace lint policy, per standards/lints.md §1. Every member
-# (only `clustor` today) opts in via `[lints] workspace = true`
-# below. The `priority = -1` on group enables makes the
-# per-lint overrides apply after the group, not be silently overridden
-# by it.
+# MSRV, per standards/lints.md: `reason = "..."` on lint attributes
+# and `#[expect(...)]` both stabilised in 1.81. Members inherit via
+# `rust-version.workspace = true`.
+rust-version = "1.81"
+
+# Workspace lint policy, per standards/lints.md §1 — the canonical
+# baseline every member's `[lints]` block mirrors. No member
+# currently inherits it verbatim: all three packages (`clustor`,
+# `clustor-common`, `clustor-bench`) inline a relaxed mirror because
+# cargo doesn't allow `lints.workspace = true` alongside per-lint
+# overrides (each is exempted via `[[ci.lints.exemption]]` in
+# `fluxor.toml`). Keep this table as the reference the mirrors are
+# diffed against. The `priority = -1` on group enables makes the
+# per-lint overrides apply after the group, not be silently
+# overridden by it. `unsafe_code` stays at `deny` — lints.md §5
+# rejects workspace-level `forbid`; no-unsafe crates escalate to
+# `forbid` locally.
 [workspace.lints.rust]
-unsafe_code               = "forbid"
+unsafe_code               = "deny"
 unused_must_use           = "deny"
 elided_lifetimes_in_paths = "warn"
 
@@ -47,6 +59,7 @@ too_many_lines          = "allow"
 name = "clustor"
 version = "0.0.1"
 edition = "2021"
+rust-version.workspace = true
 
 # Clustor ships as a set of fluxor-native PIC modules (see
 # `modules/app/`, built by `fluxor modules build`). The cargo package itself
@@ -159,6 +172,10 @@ strip = "symbols"
 [[test]]
 name = "facade"
 path = "tests/facade.rs"
+
+[[test]]
+name = "limit_register"
+path = "tests/limit_register.rs"
 
 [[test]]
 name = "facade_stress"

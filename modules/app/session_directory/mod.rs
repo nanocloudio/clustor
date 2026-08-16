@@ -62,7 +62,7 @@
 //! | 2   | smoke      | u8   | 0       | 1 = propose a BIND + two RESERVEs at boot; the committed grants prove the quorum path end-to-end (e2e assertion hook). 2 = additionally propose a KEY_PUT with a 1500 ms TTL after the grants — its committed expiry proves the deterministic-timing path end-to-end. |
 //! | 3   | time_advance_period_ms | u32 | 1000 | Target committed-time cadence while deadlines are pending (RFC §6.2). |
 //! | 4   | logical_max_step_ms    | u32 | 60000 | Max forward movement of logical time per proposed entry (forward-jump clamp). |
-//! | 5   | clock_slew_tolerance_ms | u32 | 100 | Wall-vs-monotonic disagreement tolerated before the backward-jump alarm. |
+//! | 5   | clock_slew_tolerance_ms | u32 | 2000 | Wall-vs-monotonic disagreement tolerated before the backward-jump alarm. Default sized for the pi5's ~1 s-granular UNIX_MILLIS (apparent slews ≥1100 ms on healthy rigs); a tighter value false-alarms and pauses deterministic time production. |
 //! | 6   | logical_staleness_ms   | u32 | 5000 | Duration-admission freshness bound: a TTL command observed while logical time lags wall time by more than this triggers a time-freshness barrier (admission-time only, RFC §5.2). |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
@@ -97,6 +97,8 @@ mod replica_facade;
 mod timing;
 #[path = "../../common/session_registry.rs"]
 mod session_registry;
+#[path = "../../common/wal_frame.rs"]
+mod wal_frame;
 
 use replica_facade::{CommitOrderError, CommittedSubscriber, TAGGED_PROPOSAL_HDR};
 use session_registry::*;
@@ -113,6 +115,17 @@ const SR_CMD_MAGIC: [u8; 2] = *b"SR";
 /// new requests rather than dropping replies.
 const MAX_PENDING: usize = 16;
 
+/// Reclaim TTL for pending-proposal slots. A slot whose
+/// `MSG_PROPOSAL_ASSIGNED` (or committed entry) is lost would
+/// otherwise leak forever — and after `MAX_PENDING` leaks the module
+/// stops consuming requests until restart. An order of magnitude
+/// above the raft propose→commit window (the per-second cadences used
+/// elsewhere in this module), so a live proposal is never reclaimed.
+/// There is no substrate timeout reply shape (`SR_ST_*` has none), so
+/// the requester's reply-timeout retry is the client-visible signal —
+/// the same policy as the consumed-but-unproposable drop in step 2.
+const PENDING_TTL_MS: u64 = 10_000;
+
 /// Snapshot chunk body size. The registry snapshot is
 /// `SessionRegistry::SNAPSHOT_LEN` bytes (~10.4 KiB), so exports run
 /// to a dozen chunks.
@@ -120,8 +133,10 @@ const SNAP_CHUNK: usize = 1024;
 
 /// Scratch buffer: committed entries carry the command body
 /// (SR_CMD_MAGIC + SR_MAX_CMD) under a 16-byte entry header; snapshot
-/// chunks are APP_SNAPSHOT_HDR + SNAP_CHUNK.
-const MSG_BUF: usize = 2048;
+/// chunks are APP_SNAPSHOT_HDR + SNAP_CHUNK. Sized to the shared WAL
+/// entry-body cap (modules/common/wal_frame.rs) — the one value every
+/// proposal-carrying buffer in the graph must agree on.
+const MSG_BUF: usize = wal_frame::MAX_ENTRY_BODY;
 
 const SMOKE_IDLE: u8 = 0;
 const SMOKE_BIND_SENT: u8 = 1;
@@ -182,11 +197,15 @@ struct ModuleState {
     pending_corr: [u64; MAX_PENDING],
     pending_req: [u64; MAX_PENDING],
     pending_idx: [u64; MAX_PENDING],
+    /// dev_millis stamp at propose time, for the TTL reclaim.
+    pending_born_ms: [u64; MAX_PENDING],
     pending_used: [bool; MAX_PENDING],
 
     // Counters (metrics)
     requests_in: u32,
     proposals_out: u32,
+    /// Pending slots reclaimed by the TTL (lost assignment/commit).
+    proposals_expired: u32,
     replies_out: u32,
     applied_ok: u32,
     applied_rejected: u32,
@@ -252,8 +271,14 @@ mod params_def {
         4, logical_max_step_ms, u32, 60000
             => |s, d, len| { s.logical_max_step_ms = p_u32(d, len, 0, 60000); };
 
-        5, clock_slew_tolerance_ms, u32, 100
-            => |s, d, len| { s.clock_slew_tolerance_ms = p_u32(d, len, 0, 100); };
+        // Must clear the pi5's coarse UNIX_MILLIS: the wall clock
+        // there advances in ~1 s steps, so a healthy rig shows
+        // apparent slews ≥1100 ms. A tolerance under that raises
+        // spurious backward-jump alarms, which pause deterministic
+        // time production. 2000 clears 1.1 s with margin while still
+        // catching real clock breakage.
+        5, clock_slew_tolerance_ms, u32, 2000
+            => |s, d, len| { s.clock_slew_tolerance_ms = p_u32(d, len, 0, 2000); };
 
         6, logical_staleness_ms, u32, 5000
             => |s, d, len| { s.logical_staleness_ms = p_u32(d, len, 0, 5000); };
@@ -301,6 +326,7 @@ unsafe fn propose(s: &mut ModuleState, request_id: u64, body: &[u8]) -> bool {
     s.pending_corr[slot] = corr;
     s.pending_req[slot] = request_id;
     s.pending_idx[slot] = 0;
+    s.pending_born_ms[slot] = dev_millis(sys);
     s.pending_used[slot] = true;
     s.proposals_out = s.proposals_out.saturating_add(1);
     true
@@ -511,9 +537,11 @@ pub extern "C" fn module_new(
         s.pending_corr = [0; MAX_PENDING];
         s.pending_req = [0; MAX_PENDING];
         s.pending_idx = [0; MAX_PENDING];
+        s.pending_born_ms = [0; MAX_PENDING];
         s.pending_used = [false; MAX_PENDING];
         s.requests_in = 0;
         s.proposals_out = 0;
+        s.proposals_expired = 0;
         s.replies_out = 0;
         s.applied_ok = 0;
         s.applied_rejected = 0;
@@ -687,6 +715,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.pending_idx[i] = wal_index;
                         break;
                     }
+                }
+            }
+        }
+
+        // 0.5) Pending-slot TTL reclaim. Nothing else frees a slot
+        //      whose MSG_PROPOSAL_ASSIGNED (or committed entry) is
+        //      lost, and MAX_PENDING such leaks wedge the request path
+        //      until restart. The requester sees the same signal as any
+        //      other lost proposal: a reply timeout → retry.
+        {
+            let now = dev_millis(sys);
+            for i in 0..MAX_PENDING {
+                if s.pending_used[i]
+                    && now.wrapping_sub(s.pending_born_ms[i]) > PENDING_TTL_MS
+                {
+                    s.pending_used[i] = false;
+                    s.proposals_expired = s.proposals_expired.saturating_add(1);
+                    dev_log(sys, 2, b"[sess_dir] pending expired".as_ptr(), 26);
                 }
             }
         }

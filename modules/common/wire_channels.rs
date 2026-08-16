@@ -98,7 +98,9 @@ pub unsafe fn channel_write_msg(
     msg_type: u8,
     payload: &[u8],
 ) -> i32 {
-    if ENVELOPE_HDR + payload.len() > MAX_PAYLOAD + ENVELOPE_HDR { return -1; }
+    if ENVELOPE_HDR + payload.len() > MAX_PAYLOAD + ENVELOPE_HDR {
+        return -1;
+    }
 
     let mut hdr = [0u8; ENVELOPE_HDR];
     encode_header(&mut hdr, msg_type, payload.len() as u16);
@@ -120,7 +122,9 @@ pub unsafe fn channel_read_msg(
 ) -> (u8, u16) {
     let mut hdr = [0u8; ENVELOPE_HDR];
     let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), ENVELOPE_HDR);
-    if n < ENVELOPE_HDR as i32 { return (0, 0); }
+    if n < ENVELOPE_HDR as i32 {
+        return (0, 0);
+    }
 
     let (msg_type, payload_len) = decode_header(&hdr);
     let plen = payload_len as usize;
@@ -136,14 +140,18 @@ pub unsafe fn channel_read_msg(
         while remaining > 0 {
             let chunk = remaining.min(256);
             let r = (sys.channel_read)(chan, discard.as_mut_ptr(), chunk);
-            if r <= 0 { break; }
+            if r <= 0 {
+                break;
+            }
             remaining -= r as usize;
         }
         return (0, 0);
     }
 
     let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), plen);
-    if (n2 as usize) < plen { return (0, 0); }
+    if (n2 as usize) < plen {
+        return (0, 0);
+    }
 
     (msg_type, payload_len)
 }
@@ -161,7 +169,9 @@ pub unsafe fn channel_write_partitioned(
     msg_type: u8,
     payload: &[u8],
 ) -> i32 {
-    if PARTITIONED_HDR + payload.len() > MAX_PAYLOAD + PARTITIONED_HDR { return -1; }
+    if PARTITIONED_HDR + payload.len() > MAX_PAYLOAD + PARTITIONED_HDR {
+        return -1;
+    }
 
     let mut hdr = [0u8; PARTITIONED_HDR];
     encode_partitioned_header(&mut hdr, partition_id, msg_type, payload.len() as u16);
@@ -184,7 +194,9 @@ pub unsafe fn channel_read_partitioned(
 ) -> (u16, u8, u16) {
     let mut hdr = [0u8; PARTITIONED_HDR];
     let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), PARTITIONED_HDR);
-    if n < PARTITIONED_HDR as i32 { return (0, 0, 0); }
+    if n < PARTITIONED_HDR as i32 {
+        return (0, 0, 0);
+    }
 
     let (partition_id, msg_type, payload_len) = decode_partitioned_header(&hdr);
     let plen = payload_len as usize;
@@ -199,14 +211,18 @@ pub unsafe fn channel_read_partitioned(
         while remaining > 0 {
             let chunk = remaining.min(256);
             let r = (sys.channel_read)(chan, discard.as_mut_ptr(), chunk);
-            if r <= 0 { break; }
+            if r <= 0 {
+                break;
+            }
             remaining -= r as usize;
         }
         return (0, 0, 0);
     }
 
     let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), plen);
-    if (n2 as usize) < plen { return (0, 0, 0); }
+    if (n2 as usize) < plen {
+        return (0, 0, 0);
+    }
 
     (partition_id, msg_type, payload_len)
 }
@@ -223,7 +239,9 @@ pub unsafe fn channel_write_routed(
     msg_type: u8,
     payload: &[u8],
 ) -> i32 {
-    if ROUTED_HDR + payload.len() > MAX_PAYLOAD + ROUTED_HDR { return -1; }
+    if ROUTED_HDR + payload.len() > MAX_PAYLOAD + ROUTED_HDR {
+        return -1;
+    }
 
     let mut hdr = [0u8; ROUTED_HDR];
     hdr[0] = target;
@@ -247,7 +265,9 @@ pub unsafe fn channel_read_routed(
 ) -> (u8, u8, u16) {
     let mut hdr = [0u8; ROUTED_HDR];
     let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), ROUTED_HDR);
-    if n < ROUTED_HDR as i32 { return (0, 0, 0); }
+    if n < ROUTED_HDR as i32 {
+        return (0, 0, 0);
+    }
 
     let target = hdr[0];
     let msg_type = hdr[1];
@@ -265,14 +285,18 @@ pub unsafe fn channel_read_routed(
         while remaining > 0 {
             let chunk = remaining.min(256);
             let r = (sys.channel_read)(chan, discard.as_mut_ptr(), chunk);
-            if r <= 0 { break; }
+            if r <= 0 {
+                break;
+            }
             remaining -= r as usize;
         }
         return (0, 0, 0);
     }
 
     let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), plen);
-    if (n2 as usize) < plen { return (0, 0, 0); }
+    if (n2 as usize) < plen {
+        return (0, 0, 0);
+    }
 
     (target, msg_type, payload_len)
 }
@@ -290,7 +314,9 @@ pub unsafe fn channel_write_routed_partitioned(
     msg_type: u8,
     payload: &[u8],
 ) -> i32 {
-    if ROUTED_PARTITIONED_HDR + payload.len() > MAX_PAYLOAD + ROUTED_PARTITIONED_HDR { return -1; }
+    if ROUTED_PARTITIONED_HDR + payload.len() > MAX_PAYLOAD + ROUTED_PARTITIONED_HDR {
+        return -1;
+    }
 
     let mut hdr = [0u8; ROUTED_PARTITIONED_HDR];
     hdr[0] = target;
@@ -317,7 +343,9 @@ pub unsafe fn channel_read_routed_partitioned(
 ) -> (u8, u16, u8, u16) {
     let mut hdr = [0u8; ROUTED_PARTITIONED_HDR];
     let n = (sys.channel_read)(chan, hdr.as_mut_ptr(), ROUTED_PARTITIONED_HDR);
-    if n < ROUTED_PARTITIONED_HDR as i32 { return (0, 0, 0, 0); }
+    if n < ROUTED_PARTITIONED_HDR as i32 {
+        return (0, 0, 0, 0);
+    }
 
     let target = hdr[0];
     let partition_id = u16::from_le_bytes([hdr[1], hdr[2]]);
@@ -335,14 +363,18 @@ pub unsafe fn channel_read_routed_partitioned(
         while remaining > 0 {
             let chunk = remaining.min(256);
             let r = (sys.channel_read)(chan, discard.as_mut_ptr(), chunk);
-            if r <= 0 { break; }
+            if r <= 0 {
+                break;
+            }
             remaining -= r as usize;
         }
         return (0, 0, 0, 0);
     }
 
     let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), plen);
-    if (n2 as usize) < plen { return (0, 0, 0, 0); }
+    if (n2 as usize) < plen {
+        return (0, 0, 0, 0);
+    }
 
     (target, partition_id, msg_type, payload_len)
 }

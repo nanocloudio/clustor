@@ -12,7 +12,7 @@
 //!
 //! `wal-frame` and `wal-scan` run the IDENTICAL include!'d Crc32c core the
 //! durability module runs, and `wal-scan` applies the same frame validation
-//! as WAL replay (durability/wal.rs): a length of 0, > 2048, or past the end
+//! as WAL replay (durability/wal.rs): a length of 0, > 2064, or past the end
 //! of the image is a torn header; a CRC mismatch is a corrupt payload; either
 //! way the scan stops and everything before it is the durable prefix — exactly
 //! the log a replica would recover from that segment. A truncated scan exits
@@ -52,9 +52,19 @@ const PORT_INPUT: u8 = 0;
 const PORT_OUTPUT: u8 = 1;
 const STEP_DONE: i32 = 1;
 
-const ARGV_BUF: usize = 8192;
-const BIN_BUF: usize = 4096;
+/// Binary staging cap for decoded `crc`/`wal-scan`/`wal-frame` input. Input
+/// past this is reported as oversize, never as invalid hex.
+const BIN_BUF: usize = 16 * 1024;
+/// Holds the hex encoding of a full `BIN_BUF` image plus subcommand and NUL
+/// separators. The `args` port buffer (manifest.toml) must be at least this
+/// large: argv arrives as one atomic frame.
+const ARGV_BUF: usize = 2 * BIN_BUF + 64;
+/// One full framed entry: `[len][crc]` header + a `MAX_ENTRY_LEN` payload.
+const FRAMED_BUF: usize = FRAME_HDR + MAX_ENTRY_LEN;
 const OUT_BUF: usize = 8192;
+/// Tail of `OUT_BUF` kept free for `wal-scan`'s verdict line, so a long
+/// entry listing can never crowd out the summary that carries the result.
+const SCAN_SUMMARY_RESERVE: usize = 192;
 /// Steps to wait for the argv record before defaulting to `help` (cli_in emits
 /// it early; an empty argv — no `--` — never arrives, so we fall through).
 const ARGV_WAIT: u32 = 2000;
@@ -70,11 +80,11 @@ struct State {
     exit_chan: i32,
     waited: u32,
     done: u8,
-    // Large work buffers live in module state; `module_step` copies
-    // argv to a stack scratch only to avoid aliasing `&mut State`.
+    // Large work buffers live in module state; commands split-borrow the
+    // disjoint fields so no argv-sized copy lands on the module stack.
     arec: [u8; ARGV_BUF],
     bin: [u8; BIN_BUF],
-    framed: [u8; BIN_BUF],
+    framed: [u8; FRAMED_BUF],
     out: [u8; OUT_BUF],
 }
 
@@ -130,16 +140,26 @@ fn hex_nibble(c: u8) -> Option<u8> {
     }
 }
 
-fn hex_decode(hex: &[u8], out: &mut [u8]) -> Option<usize> {
-    if hex.len() % 2 != 0 || out.len() < hex.len() / 2 {
-        return None;
+/// Decode failure split: oversize input must not be reported as bad hex —
+/// the operator's fix differs (shrink the image vs. re-enter the string).
+enum HexErr {
+    NotHex,
+    TooBig,
+}
+
+fn hex_decode(hex: &[u8], out: &mut [u8]) -> Result<usize, HexErr> {
+    if hex.len() % 2 != 0 {
+        return Err(HexErr::NotHex);
+    }
+    if out.len() < hex.len() / 2 {
+        return Err(HexErr::TooBig);
     }
     for i in 0..hex.len() / 2 {
-        let hi = hex_nibble(hex[i * 2])?;
-        let lo = hex_nibble(hex[i * 2 + 1])?;
+        let hi = hex_nibble(hex[i * 2]).ok_or(HexErr::NotHex)?;
+        let lo = hex_nibble(hex[i * 2 + 1]).ok_or(HexErr::NotHex)?;
         out[i] = (hi << 4) | lo;
     }
-    Some(hex.len() / 2)
+    Ok(hex.len() / 2)
 }
 
 fn crc32c(bytes: &[u8]) -> u32 {
@@ -182,50 +202,64 @@ fn cmd_help(out: &mut [u8]) -> usize {
 }
 
 /// `crc <hex>`: CRC32C of the decoded bytes — the same Castagnoli core the
-/// WAL uses for frame integrity.
-fn cmd_crc(s: &mut State, hex: &[u8]) -> (usize, i32) {
-    let Some(blen) = hex_decode(hex, &mut s.bin) else {
-        return (append(&mut s.out, 0, b"error: not valid hex\n"), 1);
+/// WAL uses for frame integrity. `(a, b)` spans the hex arg in `s.arec`.
+fn cmd_crc(s: &mut State, a: usize, b: usize) -> (usize, i32) {
+    let State { arec, bin, out, .. } = s;
+    let blen = match hex_decode(&arec[a..b], bin) {
+        Ok(n) => n,
+        Err(HexErr::NotHex) => return (append(out, 0, b"error: not valid hex\n"), 1),
+        Err(HexErr::TooBig) => {
+            let mut p = append(out, 0, b"error: input exceeds the ");
+            p = append_u64(out, p, BIN_BUF as u64);
+            p = append(out, p, b"-byte buffer\n");
+            return (p, 1);
+        }
     };
-    let crc = crc32c(&s.bin[..blen]);
+    let crc = crc32c(&bin[..blen]);
     let mut hexed = [0u8; 8];
     let Some(hl) = hex_encode(&crc.to_be_bytes(), &mut hexed) else {
-        return (append(&mut s.out, 0, b"error: encode\n"), 1);
+        return (append(out, 0, b"error: encode\n"), 1);
     };
-    let mut p = append(&mut s.out, 0, &hexed[..hl]);
-    p = append(&mut s.out, p, b"\n");
+    let mut p = append(out, 0, &hexed[..hl]);
+    p = append(out, p, b"\n");
     (p, 0)
 }
 
 /// `wal-frame <payload_hex>`: emit the framed entry
 /// `[entry_len: u32 LE][crc32c: u32 LE][payload]` — byte-identical to what the
 /// WAL appends to a segment, so the output feeds straight into `wal-scan`.
-fn cmd_wal_frame(s: &mut State, payload_hex: &[u8]) -> (usize, i32) {
-    let Some(plen) = hex_decode(payload_hex, &mut s.bin) else {
-        return (
-            append(&mut s.out, 0, b"error: payload is not valid hex\n"),
-            1,
-        );
+fn cmd_wal_frame(s: &mut State, a: usize, b: usize) -> (usize, i32) {
+    let State {
+        arec,
+        bin,
+        framed,
+        out,
+        ..
+    } = s;
+    let plen = match hex_decode(&arec[a..b], bin) {
+        Ok(n) => n,
+        Err(HexErr::NotHex) => {
+            return (append(out, 0, b"error: payload is not valid hex\n"), 1);
+        }
+        // Past the staging buffer is a fortiori past the entry cap below.
+        Err(HexErr::TooBig) => MAX_ENTRY_LEN + 1,
     };
     if plen == 0 || plen > MAX_ENTRY_LEN {
-        return (
-            append(&mut s.out, 0, b"error: payload must be 1..2048 bytes\n"),
-            1,
-        );
+        let mut p = append(out, 0, b"error: payload must be 1..");
+        p = append_u64(out, p, MAX_ENTRY_LEN as u64);
+        p = append(out, p, b" bytes\n");
+        return (p, 1);
     }
-    let crc = crc32c(&s.bin[..plen]);
-    s.framed[0..4].copy_from_slice(&(plen as u32).to_le_bytes());
-    s.framed[4..8].copy_from_slice(&crc.to_le_bytes());
-    s.framed[FRAME_HDR..FRAME_HDR + plen].copy_from_slice(&s.bin[..plen]);
-    let mut hexed = [0u8; 2 * BIN_BUF];
-    let Some(hl) = hex_encode(&s.framed[..FRAME_HDR + plen], &mut hexed) else {
-        return (
-            append(&mut s.out, 0, b"error: frame too large to print\n"),
-            1,
-        );
+    let crc = crc32c(&bin[..plen]);
+    framed[0..4].copy_from_slice(&(plen as u32).to_le_bytes());
+    framed[4..8].copy_from_slice(&crc.to_le_bytes());
+    framed[FRAME_HDR..FRAME_HDR + plen].copy_from_slice(&bin[..plen]);
+    let mut hexed = [0u8; 2 * FRAMED_BUF];
+    let Some(hl) = hex_encode(&framed[..FRAME_HDR + plen], &mut hexed) else {
+        return (append(out, 0, b"error: frame too large to print\n"), 1);
     };
-    let mut p = append(&mut s.out, 0, &hexed[..hl]);
-    p = append(&mut s.out, p, b"\n");
+    let mut p = append(out, 0, &hexed[..hl]);
+    p = append(out, p, b"\n");
     (p, 0)
 }
 
@@ -234,42 +268,63 @@ fn cmd_wal_frame(s: &mut State, payload_hex: &[u8]) -> (usize, i32) {
 /// >= 16 bytes carry term(8 LE) + index(8 LE) first, wire::decode_term_index's
 /// layout), then either the clean-segment summary (exit 0) or the truncation
 /// point (exit 1 — the durable prefix ends there).
-fn cmd_wal_scan(s: &mut State, seg_hex: &[u8]) -> (usize, i32) {
-    let Some(slen) = hex_decode(seg_hex, &mut s.bin) else {
-        return (
-            append(&mut s.out, 0, b"error: segment is not valid hex\n"),
-            1,
-        );
+fn cmd_wal_scan(s: &mut State, a: usize, b: usize) -> (usize, i32) {
+    let State { arec, bin, out, .. } = s;
+    let slen = match hex_decode(&arec[a..b], bin) {
+        Ok(n) => n,
+        Err(HexErr::NotHex) => {
+            return (append(out, 0, b"error: segment is not valid hex\n"), 1);
+        }
+        Err(HexErr::TooBig) => {
+            let mut p = append(out, 0, b"error: segment exceeds the ");
+            p = append_u64(out, p, BIN_BUF as u64);
+            p = append(out, p, b"-byte scan buffer\n");
+            return (p, 1);
+        }
     };
     let mut pos = 0usize;
     let mut entries = 0u64;
     let mut p = 0usize;
+    let mut listing_truncated = false;
     while slen - pos >= FRAME_HDR {
         let hdr_at = pos;
         let mut hdr = [0u8; FRAME_HDR];
-        hdr.copy_from_slice(&s.bin[pos..pos + FRAME_HDR]);
+        hdr.copy_from_slice(&bin[pos..pos + FRAME_HDR]);
         let (entry_len32, stored_crc) = wal_frame::parse_header(&hdr);
         let entry_len = entry_len32 as usize;
         if wal_frame::len_invalid(entry_len32, (slen - pos - FRAME_HDR) as u64) {
-            p = append(&mut s.out, p, b"torn header at offset ");
-            p = append_u64(&mut s.out, p, hdr_at as u64);
-            p = append(&mut s.out, p, b" after ");
-            p = append_u64(&mut s.out, p, entries);
-            p = append(&mut s.out, p, b" entry(s) - durable prefix ends here\n");
+            p = append(out, p, b"torn header at offset ");
+            p = append_u64(out, p, hdr_at as u64);
+            p = append(out, p, b" after ");
+            p = append_u64(out, p, entries);
+            p = append(out, p, b" entry(s) - durable prefix ends here\n");
             return (p, 1);
         }
         pos += FRAME_HDR;
-        let payload = &s.bin[pos..pos + entry_len];
+        let payload = &bin[pos..pos + entry_len];
         if crc32c(payload) != stored_crc {
-            p = append(&mut s.out, p, b"corrupt payload at offset ");
-            p = append_u64(&mut s.out, p, hdr_at as u64);
-            p = append(&mut s.out, p, b" after ");
-            p = append_u64(&mut s.out, p, entries);
-            p = append(&mut s.out, p, b" entry(s) - durable prefix ends here\n");
+            p = append(out, p, b"corrupt payload at offset ");
+            p = append_u64(out, p, hdr_at as u64);
+            p = append(out, p, b" after ");
+            p = append_u64(out, p, entries);
+            p = append(out, p, b" entry(s) - durable prefix ends here\n");
             return (p, 1);
         }
-        p = append(&mut s.out, p, b"  entry ");
-        p = append_u64(&mut s.out, p, entries);
+        // `append` truncates silently, so a segment with more entry lines
+        // than OUT_BUF holds would drop the verdict line itself. Stop
+        // listing while SCAN_SUMMARY_RESERVE bytes remain; the scan (and
+        // therefore the exit code) still covers the whole image.
+        if p > OUT_BUF - SCAN_SUMMARY_RESERVE {
+            if !listing_truncated {
+                listing_truncated = true;
+                p = append(out, p, b"  ... entry listing truncated\n");
+            }
+            pos += entry_len;
+            entries += 1;
+            continue;
+        }
+        p = append(out, p, b"  entry ");
+        p = append_u64(out, p, entries);
         if entry_len >= 16 {
             let term = u64::from_le_bytes([
                 payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
@@ -285,30 +340,30 @@ fn cmd_wal_scan(s: &mut State, seg_hex: &[u8]) -> (usize, i32) {
                 payload[14],
                 payload[15],
             ]);
-            p = append(&mut s.out, p, b": term=");
-            p = append_u64(&mut s.out, p, term);
-            p = append(&mut s.out, p, b" index=");
-            p = append_u64(&mut s.out, p, index);
+            p = append(out, p, b": term=");
+            p = append_u64(out, p, term);
+            p = append(out, p, b" index=");
+            p = append_u64(out, p, index);
         } else {
-            p = append(&mut s.out, p, b": (short payload, no term/index)");
+            p = append(out, p, b": (short payload, no term/index)");
         }
-        p = append(&mut s.out, p, b" len=");
-        p = append_u64(&mut s.out, p, entry_len as u64);
-        p = append(&mut s.out, p, b"\n");
+        p = append(out, p, b" len=");
+        p = append_u64(out, p, entry_len as u64);
+        p = append(out, p, b"\n");
         pos += entry_len;
         entries += 1;
     }
-    let mut q = append(&mut s.out, p, b"ok: ");
-    q = append_u64(&mut s.out, q, entries);
-    q = append(&mut s.out, q, b" entry(s), ");
-    q = append_u64(&mut s.out, q, pos as u64);
-    q = append(&mut s.out, q, b" byte(s) durable");
+    let mut q = append(out, p, b"ok: ");
+    q = append_u64(out, q, entries);
+    q = append(out, q, b" entry(s), ");
+    q = append_u64(out, q, pos as u64);
+    q = append(out, q, b" byte(s) durable");
     if slen - pos > 0 {
-        q = append(&mut s.out, q, b" (");
-        q = append_u64(&mut s.out, q, (slen - pos) as u64);
-        q = append(&mut s.out, q, b" trailing byte(s) below a frame header)");
+        q = append(out, q, b" (");
+        q = append_u64(out, q, (slen - pos) as u64);
+        q = append(out, q, b" trailing byte(s) below a frame header)");
     }
-    q = append(&mut s.out, q, b"\n");
+    q = append(out, q, b"\n");
     (q, 0)
 }
 
@@ -388,48 +443,48 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let alen = if an > 0 { an as usize } else { 0 };
 
         let mut argv = [(0usize, 0usize); 8];
-        let mut arec = [0u8; ARGV_BUF];
-        arec[..alen].copy_from_slice(&s.arec[..alen]);
-        let argc = split_argv(&arec[..alen], &mut argv);
+        let argc = split_argv(&s.arec[..alen], &mut argv);
 
+        // Commands take (start, end) spans into s.arec, not slices, so they
+        // can split-borrow the state fields themselves.
         let (olen, code): (usize, i32) = if argc == 0 {
             (cmd_help(&mut s.out), 0)
         } else {
             let (s0, e0) = argv[0];
-            let sub = &arec[s0..e0];
-            if sub == b"crc" {
+            if &s.arec[s0..e0] == b"crc" {
                 if argc >= 2 {
                     let (a, b) = argv[1];
-                    cmd_crc(s, &arec[a..b])
+                    cmd_crc(s, a, b)
                 } else {
                     (append(&mut s.out, 0, b"error: crc needs <hex>\n"), 1)
                 }
-            } else if sub == b"wal-frame" {
+            } else if &s.arec[s0..e0] == b"wal-frame" {
                 if argc >= 2 {
                     let (a, b) = argv[1];
-                    cmd_wal_frame(s, &arec[a..b])
+                    cmd_wal_frame(s, a, b)
                 } else {
                     (
                         append(&mut s.out, 0, b"error: wal-frame needs <payload_hex>\n"),
                         1,
                     )
                 }
-            } else if sub == b"wal-scan" {
+            } else if &s.arec[s0..e0] == b"wal-scan" {
                 if argc >= 2 {
                     let (a, b) = argv[1];
-                    cmd_wal_scan(s, &arec[a..b])
+                    cmd_wal_scan(s, a, b)
                 } else {
                     (
                         append(&mut s.out, 0, b"error: wal-scan needs <segment_hex>\n"),
                         1,
                     )
                 }
-            } else if sub == b"help" {
+            } else if &s.arec[s0..e0] == b"help" {
                 (cmd_help(&mut s.out), 0)
             } else {
-                let mut p = append(&mut s.out, 0, b"error: unknown command '");
-                p = append(&mut s.out, p, sub);
-                p = append(&mut s.out, p, b"' (try `help`)\n");
+                let State { arec, out, .. } = s;
+                let mut p = append(out, 0, b"error: unknown command '");
+                p = append(out, p, &arec[s0..e0]);
+                p = append(out, p, b"' (try `help`)\n");
                 (p, 1)
             }
         };

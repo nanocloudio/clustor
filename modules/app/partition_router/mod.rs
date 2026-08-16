@@ -44,8 +44,13 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
+#[path = "../../common/wal_frame.rs"]
+mod wal_frame;
 
-const PROPOSAL_BUF: usize = 2048;
+/// Proposal scratch, sized to the shared WAL entry-body cap — the one
+/// value every proposal-carrying buffer in the graph must agree on
+/// (modules/common/wal_frame.rs).
+const PROPOSAL_BUF: usize = wal_frame::MAX_ENTRY_BODY;
 
 /// Hard cap on per-router-instance fan-out. With one untagged + one
 /// tagged output port per partition we need 2N output channels; the
@@ -160,6 +165,33 @@ fn pick_chan(table: &[i32; MAX_LOCAL_PARTITIONS], partition_id: u16) -> i32 {
     if primary >= 0 { primary } else { table[0] }
 }
 
+/// True when every partition's chosen output in `table` can accept a
+/// frame right now. Checked BEFORE consuming a proposal: the
+/// destination is only known after hashing the body, so the lossless
+/// discipline is to leave the frame on the input channel
+/// (backpressuring the producer) unless every possible destination is
+/// writable — a consumed-then-dropped proposal was acked by nobody
+/// and rejected to nobody, and this module has no response path to
+/// tell the client. Unwired destinations (`pick_chan < 0`) are
+/// exempt: those proposals are a counted config-error drop either way.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn outputs_writable(
+    sys: &SyscallTable,
+    table: &[i32; MAX_LOCAL_PARTITIONS],
+    num_partitions: u16,
+) -> bool {
+    for pid in 0..num_partitions.max(1) {
+        let chan = pick_chan(table, pid);
+        if chan < 0 { continue; }
+        let poll = (sys.channel_poll)(chan, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 { return false; }
+    }
+    true
+}
+
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
@@ -175,6 +207,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Untagged proposals (in[0]) — payload is the bare body.
         for _ in 0..16 {
+            // Writability gate BEFORE consume — see outputs_writable.
+            if !outputs_writable(sys, &s.out_untagged, s.num_partitions) { break; }
             let poll_in = (sys.channel_poll)(s.in_proposals, 0x01);
             if poll_in <= 0 || (poll_in as u32 & 0x01) == 0 { break; }
 
@@ -194,18 +228,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.proposals_dropped = s.proposals_dropped.wrapping_add(1);
                 continue;
             }
-            let poll_out = (sys.channel_poll)(chan, 0x02);
-            if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
-                s.proposals_dropped = s.proposals_dropped.wrapping_add(1);
-                continue;
-            }
-            wire_channels::channel_write_partitioned(
+            let wrote = wire_channels::channel_write_partitioned(
                 sys,
                 chan,
                 partition_id,
                 wire::MSG_CLIENT_PROPOSAL,
                 &s.msg_buf[..body_len],
             );
+            if wrote <= 0 {
+                // The pre-consume gate polled writable, but poll(OUT)
+                // only promises ">=1 byte free" and the atomic write
+                // refused. Residual, counted — never silent.
+                s.proposals_dropped = s.proposals_dropped.wrapping_add(1);
+                continue;
+            }
             s.proposals_routed_untagged = s.proposals_routed_untagged.wrapping_add(1);
         }
 
@@ -216,6 +252,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // correlation_id allocation policy.
         if s.in_proposals_tagged >= 0 {
             for _ in 0..16 {
+                // Writability gate BEFORE consume — see outputs_writable.
+                if !outputs_writable(sys, &s.out_tagged, s.num_partitions) { break; }
                 let poll_in = (sys.channel_poll)(s.in_proposals_tagged, 0x01);
                 if poll_in <= 0 || (poll_in as u32 & 0x01) == 0 { break; }
 
@@ -238,23 +276,24 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.proposals_dropped = s.proposals_dropped.wrapping_add(1);
                     continue;
                 }
-                let poll_out = (sys.channel_poll)(chan, 0x02);
-                if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
-                    s.proposals_dropped = s.proposals_dropped.wrapping_add(1);
-                    continue;
-                }
                 // Forward the tagged payload as-is (correlation_id +
                 // body), wrapped in the partitioned envelope. The
                 // recipient (consensus.proposals_partitioned_tagged)
                 // strips the correlation prefix on the way into its
                 // batch.
-                wire_channels::channel_write_partitioned(
+                let wrote = wire_channels::channel_write_partitioned(
                     sys,
                     chan,
                     partition_id,
                     wire::MSG_CLIENT_PROPOSAL,
                     &s.msg_buf[..plen],
                 );
+                if wrote <= 0 {
+                    // Residual: gate polled writable but the atomic
+                    // write refused (poll(OUT) = ">=1 byte free").
+                    s.proposals_dropped = s.proposals_dropped.wrapping_add(1);
+                    continue;
+                }
                 s.proposals_routed_tagged = s.proposals_routed_tagged.wrapping_add(1);
             }
         }

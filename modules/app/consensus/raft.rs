@@ -10,8 +10,10 @@
 //! AppendEntries outbox ring → replicator; log-body outbox ring →
 //! apply; commit-horizon in-latch from commit; apply-horizon/reset
 //! out-latches → apply; read-probe reply queue → apply; voter-set
-//! latch → commit + replicator. Probe requests and committed admin
-//! entries are consumed from apply's queues at the top of this step.
+//! latch → commit + replicator; §5.4.2 term-fence latch → commit. Probe
+//! requests and committed admin entries are consumed from apply's queues
+//! at the top of this step; a deposed-leader term hint arrives from the
+//! replicator via `on_peer_term`.
 //!
 //! Per-step bound (Discipline §5): ≤8 RPCs, ≤4 each of admin /
 //! snapshot-installed / probe / admin-committed / replay drains, ≤8
@@ -22,10 +24,14 @@ use super::abi::SyscallTable;
 use super::seam::{HorizonLatch, SeamRing, PROBE_QUEUE_SLOTS};
 use super::types::*;
 use super::{
-    dev_log, dev_micros, dev_millis, dev_report_step_effect, step_effect, wire, wire_channels,
+    dev_log, dev_micros, dev_millis, dev_report_step_effect, step_effect, wal_frame, wire,
+    wire_channels,
 };
 
-const PROPOSAL_BATCH_CAP: usize = 2048;
+/// One coalesced batch = one WAL entry body. Derived from the shared
+/// frame contract so the write path can never exceed what replay
+/// accepts (`wal_frame::MAX_ENTRY_LEN = ENTRY_PROLOGUE + MAX_ENTRY_BODY`).
+const PROPOSAL_BATCH_CAP: usize = wal_frame::MAX_ENTRY_BODY;
 
 /// Per-batch correlation slot count. The slot is set non-zero only for
 /// proposals that arrived via the tagged port; legacy proposals from the
@@ -45,26 +51,22 @@ const MAX_INFLIGHT_PROBES: usize = 32;
 const PROBE_TIMEOUT_MS: u64 = 1500;
 /// Durability-backpressure window (RFC §13/§14). The leader stops pulling
 /// new proposals once its log runs this many entries ahead of `commit_index`
-/// (i.e. ahead of quorum-durable state). This bounds over-production end to
-/// end: without it, in WAL group-fsync mode the WAL absorbs writes faster
-/// than they commit, so the raft→wal channel never fills and raft never
-/// sees backpressure — it races ahead, overflowing the `log_observe` fanout
-/// and apply's 64-slot body buffer, which then evicts un-applied
-/// entries and stalls (the L2 cliff). Held strictly below
-/// apply's `PENDING_ENTRY_SLOTS` (64) so a bounded backlog never
-/// forces an eviction. At sustainable rates the in-flight window is a
-/// handful of entries (rate × commit latency), so this never throttles
-/// healthy load — it only caps the runaway. The injector/throttle
-/// upstream then backpressure (their channel to raft fills), turning the
-/// cliff into a plateau at commit throughput.
-/// Little's Law sizing: sustained write throughput ≈ in-flight window /
-/// commit latency. 48 is the knee for the Pi 5 NVMe path — deep enough to
-/// hide fsync latency behind the WAL's pipelined durability fences (see wal
-/// `fence_depth`), while past it the device's serial fsync-barrier rate
-/// (~1000/s) dominates and a wider window only adds latency. Must stay ≤
-/// apply's PENDING_ENTRY_SLOTS and within TAIL_TERM_RING /
-/// COMMIT_TS_RING (64). Uncommitted entries are WAL-fsynced-before-ack, so
-/// the window trades memory, not durability.
+/// (i.e. ahead of quorum-durable state).
+///
+/// The channel alone gives no backpressure here: in WAL group-fsync mode
+/// the WAL absorbs writes faster than they commit, so the raft→wal channel
+/// never fills and raft races ahead, overflowing the `log_observe` fanout
+/// and apply's body buffer until it evicts un-applied entries.
+///
+/// Bounds: must stay ≤ apply's `PENDING_ENTRY_SLOTS` (64) so a full backlog
+/// never forces an eviction, and within `TAIL_TERM_RING` / `COMMIT_TS_RING`
+/// (64). Little's Law sizing: sustained throughput ≈ window / commit
+/// latency; 48 is the knee for the Pi 5 NVMe path — deep enough to hide
+/// fsync latency behind the WAL's pipelined durability fences (wal
+/// `fence_depth`), past which the device's serial fsync-barrier rate
+/// (~1000/s) dominates and a wider window only adds latency. Uncommitted
+/// entries are WAL-fsynced-before-ack, so the window trades memory, not
+/// durability.
 const MAX_UNCOMMITTED_INFLIGHT: u64 = 48;
 
 /// How far `last_log_index` may run ahead of `local_durable_index` — i.e. how
@@ -244,9 +246,16 @@ pub struct Raft {
     /// True iff `joint_voters` is the active overlay (so we don't
     /// have to encode "Some via a sentinel" inside a NodeSet bitmask).
     joint_active: bool,
-    /// Log index of the most recently committed config-change entry.
-    /// Used to suppress duplicate apply on log replay.
-    last_config_index: Index,
+    /// A freshly-elected leader owes the log a current-term no-op entry
+    /// (Raft §5.4.2): prior-term entries must never be committed by
+    /// counting replicas directly, and the no-op is what lets them
+    /// commit transitively. Set in `become_leader`, cleared once
+    /// `append_noop` lands the entry in the WAL.
+    noop_pending: bool,
+    /// E12 seam: (term, first index of that term) for the commit
+    /// component's §5.4.2 gate. Latched by `append_noop`; drained by the
+    /// dispatch table into `commit::on_term_fence`.
+    pub commit_fence_out: Option<(Term, Index)>,
     /// Set on a leader once a `CONFIG_CHANGE_OP_JOINT` entry commits;
     /// the next `step_leader` tick auto-proposes the matching
     /// `CONFIG_CHANGE_OP_NEW` entry to complete the joint-consensus
@@ -322,15 +331,14 @@ pub struct Raft {
     /// its horizon there — otherwise it would gap (expecting index 1 while
     /// the WAL replay re-acks committed entries at the recovered base) and
     /// never apply post-recovery commits. Cleared once the raise lands.
-    /// (NB: a production state machine would seed from a persisted *applied*
-    /// snapshot index; for this disk-durable bench the durable index is the
-    /// recovery floor.)
+    /// (The recovery floor here is the durable index; a state machine with a
+    /// persisted *applied* snapshot index would seed from that instead.)
     pending_recovery_reset: bool,
     /// True while the boot-time metadata load is still waiting on the FS
-    /// provider (FS_OPEN returned E_AGAIN at module_new — fat32 not ready yet).
-    /// The step retries load_metadata until it resolves, so a recovering
-    /// node actually picks up its persisted term/vote/durable-index instead of
-    /// silently restarting fresh.
+    /// provider (FS_OPEN returned E_AGAIN at module_new — fat32 not ready
+    /// yet). The step retries `load_metadata` until it resolves, or a
+    /// recovering node restarts fresh instead of picking up its persisted
+    /// term/vote/durable-index.
     meta_load_pending: bool,
     /// Recovery intake hold. Set at init whenever the dedicated
     /// `wal_replay_complete` edge is wired (a disk-recovery graph) —
@@ -366,11 +374,8 @@ pub struct Raft {
     /// the WAL — and proposal intake is suspended (`drain_proposals`
     /// returns early), leaving proposals queued in their input channels so
     /// the upstream proposer backpressures rather than loses them. Cleared
-    /// on the next successful flush. This is what turns the L2
-    /// over-production cliff (garbage commit_index) into a bounded plateau
-    /// at WAL throughput, and it distinguishes transient fsync-fullness
-    /// (cleared within a tick or two) from sustained overload (stays set,
-    /// channels fill, upstream throttles) without a separate heuristic.
+    /// on the next successful flush, and on every role transition (the
+    /// batch it describes is discarded there).
     flush_deferred: bool,
     /// Count of flush deferrals — emitted as RAFT_FLUSHES_DEFERRED.
     flushes_deferred: u32,
@@ -396,13 +401,11 @@ pub struct Raft {
     frozen: bool,
 
     /// Set when this step performed a synchronous metadata FS write
-    /// (vote/term persist). The composite returns Burst for such a
-    /// step: the write is bounded, one-shot per election event, and
-    /// legitimately exceeds a steady-state step — the same
-    /// classification wal uses for its cold-FS path. Without it the
-    /// election path's fsync is charged against the normal deadline
-    /// and shows up as a scheduler budget overrun, delaying
-    /// heartbeats into a spurious election.
+    /// (vote/term persist). The composite returns Burst for such a step:
+    /// the write is bounded and one-shot per election event, and charging
+    /// it against the normal step deadline reads as a scheduler budget
+    /// overrun that delays heartbeats into a spurious election. Same
+    /// classification wal uses for its cold-FS path.
     pub meta_fs_step: bool,
     /// Cluster-wide durability mode hint (Strict=0 / GroupFsync=1 / Relaxed=2).
     /// Currently informational — not yet plumbed through the commit component.
@@ -495,7 +498,8 @@ pub fn init(s: &mut Raft) {
     s.current_voters = NodeSet::empty();
     s.joint_voters = NodeSet::empty();
     s.joint_active = false;
-    s.last_config_index = 0;
+    s.noop_pending = false;
+    s.commit_fence_out = None;
     s.pending_new_voters = NodeSet::empty();
     s.pending_new_voters_set = false;
     s.learner_mode = false;
@@ -562,11 +566,15 @@ pub fn init(s: &mut Raft) {
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
-    // `voter_count` is operator-supplied; clamp here so the
-    // initial-voter loop below and every later `quorum_index`
-    // path is slice-safe even on a typo'd cluster config.
+    // `voter_count` is operator-supplied; clamp both ends. Above
+    // MAX_NODES the initial-voter loop and every later `quorum_index`
+    // would index out of range; at 0 the voter set is empty and no
+    // quorum — election, ReadIndex or commit — can ever be reached.
     if (s.voter_count as usize) > MAX_NODES {
         s.voter_count = MAX_NODES as u8;
+    }
+    if s.voter_count == 0 {
+        s.voter_count = 1;
     }
 
     // Group commit is config-gated via `proposal_batch_max` (see the
@@ -587,6 +595,12 @@ pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
     // commits via `drain_admin_committed`.
     for i in 0..s.voter_count {
         s.current_voters.insert(i);
+    }
+    // A replica outside its own voter set can never assemble a quorum
+    // (its ballot and its match index are both discounted). That is a
+    // config error, not a state this node can recover from — say so.
+    if !s.current_voters.contains(s.self_id) {
+        dev_log(sys, 1, b"[raft] self not in voter set".as_ptr(), 28);
     }
     // Broadcast initial voter set once everything is wired.
     // The emission itself happens in the first step() call.
@@ -620,6 +634,31 @@ pub fn is_leader(s: &Raft) -> bool {
     s.role == ROLE_LEADER
 }
 
+/// Leadership snapshot for the replicator's E11 hint: (is_leader,
+/// current_term, commit_index). Catch-up AEs must carry the LEADER's
+/// term, not a read-back entry's term, and `commit_index` is the only
+/// value `leader_commit` may carry.
+pub fn leader_hint(s: &Raft) -> (bool, Term, Index) {
+    (s.role == ROLE_LEADER, s.current_term, s.commit_index)
+}
+
+/// Deliver a higher term observed by the replicator in an
+/// AppendEntriesResponse (E13). Raft §5.1: a server seeing a larger term
+/// reverts to follower — otherwise a deposed leader that can still reach
+/// followers, but not the new leader, stays "leader" forever and
+/// black-holes proposals.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn on_peer_term(s: &mut Raft, sys: &SyscallTable, term: Term) {
+    if term > s.current_term {
+        dev_log(sys, 2, b"[raft] deposed by resp term".as_ptr(), 27);
+        become_follower(s, sys, term);
+    }
+}
+
 /// One raft step. `admin_in` and `probes_in` are apply-owned seams
 /// (E9 committed admin/config ring, E7 probe-request queue) consumed
 /// here at the top of the dispatch — one step after apply filled them,
@@ -641,18 +680,15 @@ pub unsafe fn step(
     let work_before = s.proposals_received.wrapping_add(s.entries_appended);
 
     // 0a. Boot-time metadata load retry. At cold boot the fat32 provider
-    //     isn't ready when module_new ran (FS_OPEN -> E_AGAIN), so the
-    //     persisted term/vote/durable-index couldn't be read then. Retry
-    //     each step until the FS resolves — otherwise a recovering node
-    //     silently restarts fresh and its new appends collide with the
-    //     replayed index space (the L4 recovery bug).
+    //     isn't ready when module_new ran (FS_OPEN -> E_AGAIN), so retry
+    //     each step until the FS resolves.
     if s.meta_load_pending {
         s.meta_load_pending = load_metadata(s, sys);
-        // Until the persisted state is in hand, hold the whole step: don't
-        // run elections or append/intake, or raft would assign FRESH log
-        // indices that then collide when the loaded last_log_index lands.
-        // The FS resolves within a few steps of cold boot; a fresh deploy
-        // (no meta file) resolves immediately (load returns not-pending).
+        // Until the persisted state is in hand, hold the whole step: no
+        // elections, no append/intake. Otherwise raft assigns FRESH log
+        // indices that collide when the loaded last_log_index lands. The FS
+        // resolves within a few steps of cold boot; a fresh deploy (no meta
+        // file) resolves immediately.
         if s.meta_load_pending {
             return;
         }
@@ -886,14 +922,19 @@ unsafe fn handle_read_index_probe_resp(s: &mut Raft, sys: &SyscallTable, plen: u
         return;
     }
     if (replica as usize) >= MAX_NODES { return; }
-    let majority = (s.voter_count / 2) + 1;
+    // Same ballot rule as elections: only active voters confirm a
+    // ReadIndex fence (and both sets must confirm while joint).
+    if !s.current_voters.contains(replica)
+        && !(s.joint_active && s.joint_voters.contains(replica))
+    {
+        return;
+    }
     for i in 0..MAX_INFLIGHT_PROBES {
         let probe_id_slot = s.probes[i].probe_id;
         if probe_id_slot == 0 || probe_id_slot != probe_id { continue; }
         if s.probes[i].term != s.current_term { continue; }
         s.probes[i].votes.insert(replica);
-        let count = s.probes[i].votes.count();
-        if count >= majority {
+        if set_majority(s.probes[i].votes, s.current_voters, s.joint_voters, s.joint_active) {
             let corr = s.probes[i].correlation_id;
             let commit = s.probes[i].snapshot_commit;
             emit_read_probe_reply(s, sys, corr, commit, true);
@@ -980,8 +1021,7 @@ unsafe fn start_probe(
     };
 
     // Single-node cluster: we already have majority (self).
-    let majority = (s.voter_count / 2) + 1;
-    if votes.count() >= majority {
+    if set_majority(votes, s.current_voters, s.joint_voters, s.joint_active) {
         emit_read_probe_reply(s, sys, correlation_id, s.commit_index, true);
         s.probes[slot_idx] = ProbeSlot::empty();
         return;
@@ -1125,10 +1165,10 @@ unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
         s.last_log_index = last_idx;
         s.last_log_term = last_term;
         if last_idx > s.commit_index {
-            s.commit_index = last_idx;
-            // Mirror the follower-commit path so apply learns
-            // about the fast-forward and can drop any pending entries
-            // below this index from its observer buffer.
+            // Mirror the follower-commit path so apply learns about the
+            // fast-forward. advance_follower_commit must observe the OLD
+            // commit_index (its monotone guard returns early otherwise)
+            // — it performs the `commit_index = last_idx` update itself.
             advance_follower_commit(s, sys, last_idx);
         }
         save_metadata(s, sys);
@@ -1294,18 +1334,16 @@ unsafe fn drain_commit_in(s: &mut Raft, sys: &SyscallTable) {
             e += 1;
         }
         if term > s.current_term {
-            // Shouldn't happen on the leader path, but stay safe.
-            s.current_term = term;
+            // Shouldn't happen on the leader path — but a higher term
+            // must be adopted through the persistence path (term + vote
+            // clear + metadata save), never as a bare in-memory bump: an
+            // unpersisted term bump lets this node re-vote in the old
+            // term after a restart.
+            become_follower(s, sys, term);
         }
     }
 }
 
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Raft` (or shared
-/// `&Raft` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Roll our log tip back to what the WAL actually holds after a continuity
 /// rejection (`MSG_WAL_REJECT`, payload = the index the WAL wants next).
 ///
@@ -1330,24 +1368,16 @@ unsafe fn resync_to_wal(s: &mut Raft, sys: &SyscallTable, expected_index: Index)
         s.flush_deferred = false;
         return;
     }
-    // DELIBERATELY NOT a log rollback.
+    // DELIBERATELY NOT a log rollback. Apply has already consumed the
+    // entries above the WAL's tip, so rewinding re-delivers them, and
+    // evicting the tail-ring slots makes `log_term_matches` disown entries
+    // the leader still holds (AE-conflict storms on healthy nodes).
     //
-    // An earlier version of this rolled `last_log_index` back to the WAL's tip
-    // and evicted the tail-ring slots above it. That is wrong, and measurably
-    // so: the apply pipeline has ALREADY consumed those entries, so rewinding
-    // the tip re-delivers them (a deadline fired twice — 2 of 5 runs of
-    // `leader_failover_produces_one_logical_firing`) and the evicted ring slots
-    // make `log_term_matches` disown entries the leader still holds, producing
-    // `[raft] ae conflict` storms that stop the cluster forming at all. A
-    // repair that destabilises healthy nodes is worse than the fault it
-    // repairs.
-    //
-    // The divergence is now PREVENTED at its source — the boot-handshake gate
-    // in `handle_append_entries` and the `MAX_WAL_UNACKED` bound — so there is
-    // nothing legitimate left to repair here. If it somehow occurs anyway, the
-    // node stalls, but LOUDLY: counted and logged, which is the whole point of
-    // the reject signal. Clearing the stale deferral is safe and keeps intake
-    // from being wedged behind a flag whose batch is gone.
+    // The divergence is prevented at its source — the boot-handshake gate in
+    // `handle_append_entries` and the `MAX_WAL_UNACKED` bound — so nothing
+    // legitimate reaches here. If it does, the node stalls LOUDLY: counted
+    // and logged. Clearing the stale deferral keeps intake from wedging
+    // behind a flag whose batch is gone.
     s.flush_deferred = false;
     s.wal_resyncs = s.wal_resyncs.saturating_add(1);
     dev_log(sys, 1, b"[raft] wal divergence".as_ptr(), 21);
@@ -1391,22 +1421,21 @@ unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
     }
 }
 
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Raft` (or shared
-/// `&Raft` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Consume the WAL's one-shot replay-complete signal. The WAL's reconstructed
 /// on-disk high-water is the AUTHORITATIVE recovery point — the persisted
 /// metadata `last_log_index` is only a throttled hint that can either lag the
-/// true high-water (the common case: META_PERSIST_STRIDE rounds down) or, if a
-/// crash lost un-replayable tail entries, over-count it. Either way the WAL's
-/// replayed high-water is what is actually recoverable, so on a genuine
-/// recovery boot (`awaiting_replay`) we resume `last_log_index` exactly THERE,
-/// re-seed apply to that base via the existing recovery-reset path,
-/// and release the proposal-intake hold so new post-recovery traffic continues
-/// the recovered index space instead of colliding with it.
+/// true high-water (META_PERSIST_STRIDE rounds down) or, if a crash lost
+/// un-replayable tail entries, over-count it. So on a genuine recovery boot
+/// (`awaiting_replay`) `last_log_index` resumes exactly at the high-water,
+/// apply is re-seeded to that base via the recovery-reset path, and the
+/// proposal-intake hold is released so post-recovery traffic continues the
+/// recovered index space instead of colliding with it.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_wal_replay_complete(s: &mut Raft, sys: &SyscallTable) {
     if s.in_wal_replay_complete < 0 { return; }
     for _ in 0..4 {
@@ -1504,6 +1533,12 @@ unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
     }
     match op_code {
         wire::CONFIG_CHANGE_OP_JOINT => {
+            // Replay dedup: applying the same joint entry twice (log
+            // replay, duplicate committed-entry delivery) must not
+            // re-queue a duplicate C_new proposal.
+            if s.joint_active && s.joint_voters.0 == new_set.0 {
+                return;
+            }
             // Enter joint state: keep current voters, layer new set
             // as joint. Subsequent quorum checks require both.
             s.joint_voters = new_set;
@@ -1518,6 +1553,11 @@ unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
             }
         }
         wire::CONFIG_CHANGE_OP_NEW => {
+            // Replay dedup: an identical C_new against an already-exited
+            // joint state is a replayed entry — idempotent, skip.
+            if !s.joint_active && s.current_voters.0 == new_set.0 {
+                return;
+            }
             // Exit joint state: install new voters as current,
             // clear joint overlay. If our own id was removed from the
             // new set, step down to a non-voting follower AND enter
@@ -1708,6 +1748,9 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
     // 1. Term >= our term
     // 2. We haven't voted for someone else this term (or it's a pre-vote)
     // 3. Candidate's log is at least as up-to-date as ours
+    // 4. We are a voter: learners (removed from the voter set) MUST NOT
+    //    grant — an ex-voter's vote counted toward a majority is exactly
+    //    how a post-downsize cluster elects two leaders.
     let term_ok = term >= s.current_term;
     let vote_ok = is_pre_vote
         || s.voted_for == REPLICA_NONE as i8
@@ -1715,7 +1758,7 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
     let log_ok = last_term > s.last_log_term
         || (last_term == s.last_log_term && last_index >= s.last_log_index);
 
-    let granted = term_ok && vote_ok && log_ok;
+    let granted = term_ok && vote_ok && log_ok && !s.learner_mode;
 
     if granted && !is_pre_vote {
         s.voted_for = candidate as i8;
@@ -1754,13 +1797,45 @@ unsafe fn handle_vote_response(s: &mut Raft, sys: &SyscallTable, msg_type: u8, p
 
     if is_pre_vote_resp != s.pre_vote_active { return; }
 
+    // A real grant is only valid for the election it answered: the granter
+    // adopts our term before responding, so its response echoes it. A
+    // response at any other term is a delayed grant from another election,
+    // and counting it lets two candidates assemble "majorities" sharing a
+    // voter. Pre-vote responses carry the granter's own (unbumped) term, so
+    // they are exempt — a stale one can at worst trigger a real,
+    // term-checked election.
+    if !is_pre_vote_resp && term != s.current_term { return; }
+
     if voter as usize >= MAX_NODES { return; }
+
+    // Only ballots from the active voter set(s) count: a learner or an
+    // ex-voter that missed its revoke must not move the tally.
+    if !s.current_voters.contains(voter)
+        && !(s.joint_active && s.joint_voters.contains(voter))
+    {
+        return;
+    }
 
     if granted {
         s.votes_granted.insert(voter);
     } else {
         s.votes_rejected.insert(voter);
     }
+}
+
+/// Quorum rule shared by elections and ReadIndex probes: `votes` ∩
+/// current voter set must reach a majority of it, and — while a joint
+/// config is active — a majority of the joint set too. Election-side
+/// mirror of commit's dual-median rule: a joint-phase leader must win
+/// both configs (RFC §1.2).
+fn set_majority(votes: NodeSet, current: NodeSet, joint: NodeSet, joint_active: bool) -> bool {
+    let cur_needed = (current.count() / 2) + 1;
+    if NodeSet(votes.0 & current.0).count() < cur_needed { return false; }
+    if joint_active && joint.count() > 0 {
+        let joint_needed = (joint.count() / 2) + 1;
+        if NodeSet(votes.0 & joint.0).count() < joint_needed { return false; }
+    }
+    true
 }
 
 /// # Safety
@@ -1788,8 +1863,19 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
         return;
     }
 
-    if term > s.current_term || s.role != ROLE_FOLLOWER {
+    if term > s.current_term {
         become_follower(s, sys, term);
+    } else if s.role != ROLE_FOLLOWER {
+        // Same-term step-down (a candidate observing the term's elected
+        // leader). Keep `voted_for`: the vote belongs to the TERM, not
+        // the role, and clearing it would let this node vote twice in
+        // one term.
+        let voted = s.voted_for;
+        become_follower(s, sys, term);
+        if s.voted_for != voted {
+            s.voted_for = voted;
+            save_metadata(s, sys);
+        }
     }
     s.leader_id = leader as i8;
     reset_election_deadline(s, now);
@@ -1798,15 +1884,8 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
     // already enforces (`!s.awaiting_replay`). Until the WAL hands us its
     // on-disk high-water we do not know where our log actually ends, so
     // appending now and rewinding to `replay_hw` a moment later leaves raft
-    // and the WAL permanently disagreeing: the WAL keeps the entries it
-    // already accepted, raft restarts from the reported high-water, and the
-    // leader's resend arrives as an index the WAL has long passed.
-    //
-    // Rig-observed exactly this way, with `skip_replay = 1` reporting a
-    // high-water of 0: `wal fault_expected = 9, fault_got = 1` — a REWIND, not
-    // a gap. The WAL had taken 8 entries before the handshake landed, raft
-    // reset to 0, and index 1 came back around. The resulting continuity fault
-    // is unrepairable once commit passes it.
+    // and the WAL permanently disagreeing, and the resulting continuity
+    // fault is unrepairable once commit passes it.
     //
     // `busy` (not a log mismatch): the leader retries this same entry once we
     // are ready, rather than rolling next_index back into needless repair.
@@ -1845,7 +1924,11 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
         if entry_index <= s.last_log_index {
             if log_term_matches(s, entry_index, entry_term) {
                 advance_follower_commit(s, sys, leader_commit);
-                send_append_response(s, sys, true, false);
+                // Ack AT the retransmitted index, not our tip: this AE
+                // verified the log only up to `entry_index`, and a tip
+                // that still carries an old-term divergent suffix must
+                // not be quorum-counted off the back of it.
+                send_append_response_at(s, sys, true, false, entry_index);
                 return;
             }
             truncate_log_after(s, sys, entry_index.saturating_sub(1));
@@ -1857,18 +1940,13 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
         // Durability bound (the other half of RFC §13/§14's fail-closed
         // contract). `channel_write_msg` succeeding below proves only that the
         // frame entered the WAL's input channel — never that the WAL ACCEPTED
-        // it. So without a bound here our log can run arbitrarily far ahead of
-        // what is actually persisted, one accepted-but-unwritten entry per
-        // step, until something (a continuity rejection) wedges the pair.
-        // Rig-observed: last_log_index 450 entries past `wal entries_written`,
-        // with those 450 counted as COMMITTED locally — a node that would lose
-        // acknowledged entries on restart, and which no rollback can repair
-        // precisely because they are committed.
+        // it. Unbounded, our log runs arbitrarily far ahead of what is
+        // persisted, and once commit passes that point the divergence covers
+        // acknowledged entries and no rollback can repair it.
         //
         // Hold intake once we are too far ahead of our own durable index and
-        // answer `busy`, which is the existing, correct backpressure path: the
-        // leader retries this same entry rather than rolling next_index back
-        // into needless log repair.
+        // answer `busy`: the leader retries this same entry rather than
+        // rolling next_index back into needless log repair.
         if s.last_log_index.saturating_sub(s.local_durable_index) >= MAX_WAL_UNACKED {
             s.wal_unacked_holds = s.wal_unacked_holds.saturating_add(1);
             send_append_response(s, sys, false, true);
@@ -1876,21 +1954,17 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
         }
 
         // Clean append. The checks above validate `prev_log_*` only — nothing
-        // there constrains `entry_index`, so ENFORCE the contiguity this arm
-        // has always assumed. A leader whose per-peer `prev_log_index`
-        // bookkeeping disagrees with the entry it actually ships (the
-        // replicator derives it from two sources: WAL read-back and the
-        // per-batch tip) can present prev_log_index == our tip together with
-        // an entry_index that skips. Writing that punches a hole in BOTH our
-        // log and the WAL: the WAL rejects it as discontinuous and latches,
-        // and by the time anyone notices `commit_index` has advanced past the
-        // WAL's tip, so the divergence can no longer be repaired by rollback
-        // without discarding committed entries. Rig-observed at ~32.5k entries
-        // under sustained catch-up load.
+        // there constrains `entry_index`, so contiguity is enforced here. A
+        // leader whose per-peer `prev_log_index` bookkeeping disagrees with
+        // the entry it ships (the replicator derives it from two sources: WAL
+        // read-back and the per-batch tip) can present prev_log_index == our
+        // tip together with an entry_index that skips; writing that punches a
+        // hole in both our log and the WAL, unrepairable once commit passes
+        // it.
         //
         // NACK instead. The response carries our real `last_log_index`, which
-        // is exactly what the leader needs to reset `next_index` and resend
-        // from the right place — ordinary Raft log repair, no hole.
+        // is what the leader needs to reset `next_index` and resend from the
+        // right place — ordinary Raft log repair, no hole.
         if entry_index != s.last_log_index.saturating_add(1) {
             s.ae_noncontiguous = s.ae_noncontiguous.saturating_add(1);
             dev_log(sys, 3, b"[raft] ae noncontiguous".as_ptr(), 23);
@@ -1901,9 +1975,20 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
         let entry_payload_start = wire::AE_HDR_LEN;
         let entry_len = pl.saturating_sub(entry_payload_start);
 
-        let mut wal_buf = [0u8; 2048];
+        // An entry body over the shared frame cap can never be stored
+        // faithfully — truncating it here would ACK success while our
+        // applied state silently diverges from the leader's. NACK with
+        // `busy=false` instead: structurally invalid, not backpressure.
+        if entry_len > wal_frame::MAX_ENTRY_BODY {
+            s.ae_noncontiguous = s.ae_noncontiguous.saturating_add(1);
+            dev_log(sys, 3, b"[raft] ae oversize entry".as_ptr(), 24);
+            send_append_response(s, sys, false, false);
+            return;
+        }
+
+        let mut wal_buf = [0u8; wal_frame::MAX_ENTRY_LEN];
         wire::encode_term_index(&mut wal_buf, entry_term, entry_index);
-        let copy_len = entry_len.min(wal_buf.len() - 16);
+        let copy_len = entry_len;
         if copy_len > 0 {
             wal_buf[16..16 + copy_len]
                 .copy_from_slice(&s.msg_buf[entry_payload_start..entry_payload_start + copy_len]);
@@ -1968,11 +2053,28 @@ unsafe fn advance_follower_commit(s: &mut Raft, _sys: &SyscallTable, leader_comm
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn send_append_response(s: &Raft, sys: &SyscallTable, success: bool, busy: bool) {
+    send_append_response_at(s, sys, success, busy, s.last_log_index);
+}
+
+/// As `send_append_response`, but reporting an explicit index — used by
+/// the idempotent-retransmit ACK, whose verification covers only the
+/// retransmitted entry, not the whole tip.
+///
+/// # Safety
+///
+/// As `send_append_response`.
+unsafe fn send_append_response_at(
+    s: &Raft,
+    sys: &SyscallTable,
+    success: bool,
+    busy: bool,
+    ack_index: Index,
+) {
     let mut resp = [0u8; wire::AE_RESP_LEN];
     wire::encode_append_entries_resp(
         &mut resp,
         s.current_term,
-        s.last_log_index,
+        ack_index,
         s.self_id,
         success,
         s.local_durable_index,
@@ -2018,9 +2120,7 @@ unsafe fn step_follower(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn step_candidate(s: &mut Raft, sys: &SyscallTable, now: u64) {
-    let majority = (s.voter_count / 2) + 1;
-
-    if s.votes_granted.count() >= majority {
+    if set_majority(s.votes_granted, s.current_voters, s.joint_voters, s.joint_active) {
         if s.pre_vote_active {
             // Pre-vote succeeded — start real election
             start_election(s, sys, now, false);
@@ -2054,6 +2154,13 @@ unsafe fn step_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     //    own clean log slot — important for replication correctness.
     if s.pending_new_voters_set && s.proposal_batch_count == 0 {
         emit_pending_c_new(s, sys, now);
+    }
+
+    // 0b. Current-term no-op (§5.4.2). Must precede proposal intake so
+    //     the fence index lands as the first entry of this term; a full
+    //     WAL channel just retries next tick (`noop_pending` stays set).
+    if s.noop_pending && !s.awaiting_replay && s.proposal_batch_count == 0 && !s.flush_deferred {
+        append_noop(s, sys);
     }
 
     // 1. Drain proposals into batch — gated by two durability-backpressure
@@ -2314,23 +2421,23 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
     }
 }
 
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Raft` (or shared
-/// `&Raft` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Copy `&s.msg_buf[off..off+len]` into the proposal batch and record the
 /// correlation_id in the parallel array. Flushes immediately once the
-/// batch reaches `proposal_batch_max` so the operator-configured cap
-/// holds inside a single drain pass — without this, two proposals
-/// drained back-to-back would land in the same WAL index and the
-/// per-proposal `correlation_id → wal_index` mapping the apply pipeline
-/// hands to the codec would collide. The end-of-tick `should_flush`
-/// check (see `step_leader`) is still the path for the time-based
-/// flush. Returns false only when the batch buffer is byte-full or the
-/// hard `MAX_BATCH_PROPOSALS` slot cap is reached — callers should stop
-/// draining and let the next tick try again.
+/// batch reaches `proposal_batch_max`, so the operator-configured cap
+/// holds inside a single drain pass: two proposals drained back-to-back
+/// past the cap would otherwise share a WAL index and collide in the
+/// per-proposal `correlation_id → wal_index` mapping apply hands to the
+/// codec. The time-based flush stays with `step_leader`'s `should_flush`.
+///
+/// Returns false only when the batch buffer is byte-full or the hard
+/// `MAX_BATCH_PROPOSALS` slot cap is reached — callers stop draining and
+/// let the next tick try again.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn append_to_batch(
     s: &mut Raft,
     sys: &SyscallTable,
@@ -2375,29 +2482,82 @@ unsafe fn append_to_batch(
     true
 }
 
+/// Append the freshly-elected leader's current-term no-op entry
+/// (§5.4.2): a 16-byte term/index prologue with an empty body. Follows
+/// `flush_proposal_batch`'s fail-closed WAL ordering — the log advance
+/// happens only after the WAL accepts the entry — and ships the same
+/// AE/observer fanout, so followers receive it like any other entry. On
+/// success, latches the (term, first-index-of-term) fence for commit.
+///
 /// # Safety
 ///
-/// Caller must hold an exclusive `&mut Raft` (or shared
-/// `&Raft` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn append_noop(s: &mut Raft, sys: &SyscallTable) {
+    let prev_log_index = s.last_log_index;
+    let prev_log_term = if prev_log_index == 0 { 0 } else { s.last_log_term };
+    let new_index = s.last_log_index + 1;
+
+    let mut wal_buf = [0u8; 16];
+    wire::encode_term_index(&mut wal_buf, s.current_term, new_index);
+    let written =
+        wire_channels::channel_write_msg(sys, s.out_log, wire::MSG_WAL_ENTRY, &wal_buf);
+    if written <= 0 {
+        return; // WAL busy — `noop_pending` stays set, retry next tick
+    }
+
+    s.last_log_index = new_index;
+    s.last_log_term = s.current_term;
+    record_tail_term(s, new_index, s.current_term);
+
+    // Observer fanout (E5) — drop-on-full, as flush_proposal_batch.
+    let _ = s.outbox_bodies.push(wire::MSG_WAL_ENTRY, &wal_buf);
+
+    // Replicator fanout (E1): empty-body AE at the new tip.
+    {
+        let mut ae_buf = [0u8; wire::AE_HDR_LEN];
+        let total = wire::encode_append_entries(
+            &mut ae_buf,
+            s.current_term,
+            s.self_id,
+            prev_log_index,
+            prev_log_term,
+            s.commit_index,
+            s.current_term,
+            new_index,
+            &[],
+        );
+        if total > 0 {
+            let _ = s.outbox_ae.push(wire::MSG_APPEND_ENTRIES, &ae_buf[..total]);
+        }
+    }
+
+    s.entries_appended += 1;
+    s.commit_fence_out = Some((s.current_term, new_index));
+    s.noop_pending = false;
+    dev_log(sys, 3, b"[raft] noop".as_ptr(), 11);
+}
+
+/// Flush the coalesced proposal batch as one WAL entry, then fan it out
+/// to the replicator (E1) and apply's observer ring (E5).
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
     if s.proposal_batch_count == 0 { return; }
 
     // ── Durability backpressure: fail closed (RFC §13/§14) ──────────
-    // Never advance `last_log_index` past what the WAL actually accepts.
-    // We compose the WAL frame for the NEXT index and attempt the write
-    // FIRST; only on a confirmed write do we commit the index advance.
-    // `channel_write_msg` is now a single atomic frame write (see
-    // `wire_channels::write_framed`), so its return value is a reliable
-    // "did the whole entry land" signal: `<= 0` means the channel is full
-    // (WAL mid-fsync or overloaded) and NOTHING was written — so we hold
-    // the batch and retry next tick without advancing. raft's log can
-    // therefore never get ahead of the WAL: the over-production cliff
-    // (entries silently shredded → garbage commit_index) becomes a bounded
-    // plateau at WAL throughput. `step_leader` suspends intake while
-    // `flush_deferred` is set, so the proposals that would have filled
-    // this batch stay queued upstream (proposer backpressure), not dropped.
+    // `last_log_index` must never advance past what the WAL accepts, so the
+    // frame for the NEXT index is written FIRST and the index advance is
+    // gated on that write. `channel_write_msg` is a single atomic frame
+    // write (`wire_channels::write_framed`), so `<= 0` means the channel is
+    // full and NOTHING was written — hold the batch and retry next tick.
+    // `step_leader` suspends intake while `flush_deferred` is set, so the
+    // proposals that would have filled this batch stay queued upstream
+    // (proposer backpressure) rather than being dropped.
     let prev_log_index = s.last_log_index;
     let prev_log_term = if prev_log_index == 0 { 0 } else { s.last_log_term };
     let new_index = s.last_log_index + 1;
@@ -2471,16 +2631,12 @@ unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
     }
 
     s.entries_appended += 1;
-    // NOTE: metadata is intentionally NOT persisted here. Raft's durable state
-    // is `currentTerm`/`votedFor` (persisted on change — election/vote sites)
-    // plus the log itself, which is the WAL. `last_log_index`/`last_log_term`
-    // are *derived* from the log and reconstructed on recovery, so persisting
-    // them per-append is redundant. On a real disk it is also harmful: the meta
-    // path is `raft/meta`, fat32 has no mkdir, so the per-append FS_OPEN fails
-    // ENOENT yet still scans the (large, partly fresh) root directory — a
-    // ~33 ms dir walk that blows raft's step guard and wedges the pipeline.
-    // (Durable term/vote on fat32 needs a root-level 8.3 meta path — see the
-    // wal.root_path pattern — tracked separately.)
+    // Metadata is deliberately NOT persisted here. Raft's durable state is
+    // `currentTerm`/`votedFor` (persisted at the election/vote sites) plus
+    // the log itself, which is the WAL; `last_log_index`/`last_log_term` are
+    // derived from the log and reconstructed on recovery. A per-append
+    // persist would also cost a synchronous FS round-trip inside the append
+    // hot path, well past raft's step guard.
     // All proposals in this batch share the same wal_index. Emit one
     // MSG_PROPOSAL_ASSIGNED per tagged proposal so the proposer can bind
     // its correlation_id to the durable log index.
@@ -2602,20 +2758,20 @@ fn build_meta_path_ex(partition_id: u16, root: bool) -> ([u8; META_PATH_MAX], us
     (buf, i)
 }
 
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Raft` (or shared
-/// `&Raft` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-/// Load persistent Raft state from raft/[p<id>/]meta.
+/// Load persistent Raft state from `raft/[p<id>/]meta`.
 ///
 /// Returns `true` if the FS provider is still initialising (FS_OPEN returned
-/// E_AGAIN) and the caller should RETRY on a later step — at cold boot the
-/// fat32 provider isn't ready when `module_new` runs, so a one-shot load here
-/// silently misses the metadata and the node restarts fresh (the L4
-/// recovery bug). Returns `false` once the load is resolved (loaded, or the
-/// file genuinely doesn't exist = fresh deploy).
+/// E_AGAIN) and the caller must RETRY on a later step: at cold boot the fat32
+/// provider isn't ready when `module_new` runs, and a one-shot load would
+/// miss the metadata and restart the node fresh. Returns `false` once the
+/// load resolves (loaded, or the file genuinely doesn't exist = fresh
+/// deploy).
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
     s.meta_fs_step = true;
     let (mut path, plen) = build_meta_path_ex(s.partition_id, s.meta_root_path != 0);
@@ -2658,11 +2814,13 @@ unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
             }
             dev_log(sys, 3, b"[raft] meta ok".as_ptr(), 14);
         }
-        // Joint-consensus fields (RFC §1.2) — only present when META
-        // was written by a build that included them. Older meta
-        // files are accepted unchanged; voter sets fall back to the
-        // `voter_count` param defaults seeded in arm.
-        if n as usize >= 28 {
+        // Joint-consensus fields (RFC §1.2). A zero `current_voters`
+        // is NOT a valid persisted set — it is a record whose voter
+        // bytes were never written — and adopting it would leave every
+        // quorum test (elections, ReadIndex, commit) permanently
+        // unsatisfiable. Keep the `voter_count` defaults seeded in
+        // `arm` in that case.
+        if n as usize >= 28 && buf[25] != 0 {
             s.current_voters = NodeSet(buf[25]);
             s.joint_voters = NodeSet(buf[26]);
             s.joint_active = buf[27] != 0;
@@ -2738,14 +2896,10 @@ unsafe fn become_follower(s: &mut Raft, sys: &SyscallTable, term: Term) {
     s.pre_vote_active = false;
     s.proposal_batch_len = 0;
     s.proposal_batch_count = 0;
-    // `flush_deferred` means "I am holding a batch the WAL refused". The
-    // batch was just discarded, so the flag is now a lie — and a fatal one:
-    // `step_leader` gates `drain_proposals` on `!flush_deferred`, while the
-    // only code that clears it lives past `flush_proposal_batch`'s
-    // `count == 0` early return. Left set with an empty batch it is
-    // unrecoverable: intake is suspended forever, the proposal channel fills,
-    // and the proposer blocks against a raft that is idle and not
-    // backpressured. Clear it with the batch it describes.
+    // `flush_deferred` means "holding a batch the WAL refused", and the only
+    // code that clears it sits past `flush_proposal_batch`'s `count == 0`
+    // early return. Left set over a discarded batch it suspends intake
+    // permanently, so it must be cleared with the batch it describes.
     s.flush_deferred = false;
     // Drop any pending correlation ids — proposals from a prior term are
     // discarded, so the proposer will time out and retry.
@@ -2769,13 +2923,24 @@ unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     s.proposal_batch_len = 0;
     s.proposal_batch_count = 0;
     // See `become_follower`: the discarded batch takes its deferral flag with
-    // it. A node that latched `flush_deferred` while its WAL was busy (boot
-    // preallocation, mid-fsync) and then won an election would otherwise take
-    // leadership with intake permanently suspended.
+    // it, or leadership starts with intake permanently suspended.
     s.flush_deferred = false;
     for i in 0..MAX_BATCH_PROPOSALS { s.correlation_ids[i] = 0; }
 
     dev_log(sys, 3, b"[raft] leader".as_ptr(), 13);
+
+    // Owe the log a current-term no-op (Raft §5.4.2): committing it is
+    // the only safe way prior-term entries become committed.
+    //
+    // Arm the commit fence NOW, index unknown (0), so nothing commits by
+    // counting between taking office and the no-op landing; `append_noop`
+    // resolves it to the real index. Only with `out_log` wired: a graph
+    // with no WAL edge can never land the no-op, so arming there would
+    // block commit forever.
+    s.noop_pending = true;
+    if s.out_log >= 0 {
+        s.commit_fence_out = Some((s.current_term, 0));
+    }
 
     // Send immediate heartbeat to assert leadership
     send_heartbeat(s, sys);
@@ -2809,8 +2974,7 @@ unsafe fn start_election(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: b
     s.election_deadline_ms = now + s.election_timeout_ms as u64 + jitter;
 
     // Check for single-node cluster: already have quorum
-    let majority = (s.voter_count / 2) + 1;
-    if s.votes_granted.count() >= majority {
+    if set_majority(s.votes_granted, s.current_voters, s.joint_voters, s.joint_active) {
         if pre_vote {
             start_election(s, sys, now, false);
         } else {
@@ -2840,7 +3004,10 @@ unsafe fn start_election(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: b
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn reset_election_deadline(s: &mut Raft, now: u64) {
-    let mut seed = (now as u32) ^ 0xBEEF;
+    // Fold self_id into the seed: co-timed followers (heartbeat-
+    // synchronised deadlines) must not draw correlated jitter, or a
+    // leader loss degenerates into repeated split votes.
+    let mut seed = (now as u32) ^ ((s.self_id as u32) << 16) ^ 0xBEEF;
     let half_timeout2 = (s.election_timeout_ms as u32 / 2).max(1);
     let jitter = (xorshift32(&mut seed) & (half_timeout2.next_power_of_two() - 1)) as u64;
     s.election_deadline_ms = now + s.election_timeout_ms as u64 + jitter;

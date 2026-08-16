@@ -97,7 +97,7 @@ impl Snapshot {
     pub fn counter_delta(&self, start: &Snapshot, key: Key) -> i64 {
         let end = self.get(key).unwrap_or(0);
         let beg = start.get(key).unwrap_or(0);
-        (end - beg).max(0)
+        end.saturating_sub(beg).max(0)
     }
 }
 
@@ -460,14 +460,11 @@ pub fn json_str(s: &str) -> String {
 }
 
 /// FNV-1a 64-bit hash — stable config-hash for the JSON baseline metadata
-/// (RFC §2.6) without a crypto dependency.
+/// (RFC §2.6). Delegates to `clustor-common`'s `wire::fnv1a_64` — the
+/// same implementation partition routing uses on the DUT, so both sides
+/// of the wire hash identically.
 pub fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in data {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    h
+    clustor_common::wire::fnv1a_64(data)
 }
 
 #[cfg(test)]

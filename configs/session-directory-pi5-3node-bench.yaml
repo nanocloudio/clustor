@@ -113,7 +113,7 @@ modules:
       # production still succeeded on the healthy samples). Widen to
       # ride through source granularity; real regressions are far
       # larger than one tick.
-      clock_slew_tolerance_ms: 1100
+      clock_slew_tolerance_ms: 2000
   - name: consensus
     params:
       self_id: 0
@@ -235,6 +235,12 @@ wiring:
   - from: consensus.log_append
     to: durability.entries
     rate: transaction
+  # Raft §5.3 conflict-repair: a leader-divergent follower truncates its WAL
+  # suffix on this control edge (shares wal.compact_before; MSG_WAL_TRUNCATE_AFTER).
+  # Without it a follower cannot discard a divergent tail and log repair
+  # cannot converge.
+  - from: consensus.wal_compact
+    to: durability.compact_before
   - from: durability.flushed
     to: consensus.wal_flushed
     rate: transaction

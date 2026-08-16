@@ -128,6 +128,11 @@ wiring:
     to: admission.lag
   - from: consensus_p0.log_append
     to: durability_p0.entries
+  # Raft §5.3 conflict-repair: a leader-divergent follower truncates its
+  # WAL suffix on this control edge (shares wal.compact_before;
+  # MSG_WAL_TRUNCATE_AFTER). Without it log repair cannot converge.
+  - from: consensus_p0.wal_compact
+    to: durability_p0.compact_before
   - from: durability_p0.flushed
     to: consensus_p0.wal_flushed
   # Gap refetch: a restarted follower's replayed entries reach the
@@ -151,6 +156,11 @@ wiring:
     to: admission.lag
   - from: consensus_p1.log_append
     to: durability_p1.entries
+  # Raft §5.3 conflict-repair: a leader-divergent follower truncates its
+  # WAL suffix on this control edge (shares wal.compact_before;
+  # MSG_WAL_TRUNCATE_AFTER). Without it log repair cannot converge.
+  - from: consensus_p1.wal_compact
+    to: durability_p1.compact_before
   - from: durability_p1.flushed
     to: consensus_p1.wal_flushed
   # Gap refetch: a restarted follower's replayed entries reach the

@@ -19,9 +19,17 @@
 //! against that role rather than the module-wide `default_role`.
 //!
 //! Role lookup is a **prefix match against the SVID body**, driven by
-//! the `admin_svid_prefix` / `observer_svid_prefix` params. Plaintext
-//! (non-TLS-verified) identities never downgrade a TLS-verified
-//! binding.
+//! the `admin_svid_prefix` / `observer_svid_prefix` params.
+//!
+//! Bindings die with their connection. The transport emits one
+//! identity envelope per handshake (at-least-once) and an explicit
+//! revoke (`replica_id == 0xFF`, see `wire::MSG_PEER_IDENTITY`) on
+//! teardown/downgrade, so every envelope reflects the connection
+//! *currently* holding the conn_id: a revoke clears the binding and a
+//! fresh identity unconditionally rebinds — a stale OPERATOR grant is
+//! never inherited across conn_id reuse. (No transport connection-close
+//! event reaches this module directly; these two envelope semantics
+//! are the eviction path.)
 //!
 //! ## Origins
 //!
@@ -57,9 +65,10 @@ pub const ROLE_BREAKGLASS: u8 = 0x08;
 pub const SVID_PREFIX_MAX: usize = 64;
 
 /// Number of connection identity slots. Each accepted client occupies
-/// one slot for the duration of its connection; surface eviction on
-/// disconnect happens implicitly when `peer_router` reuses the
-/// `conn_id`.
+/// one slot for the duration of its connection; eviction happens on
+/// the transport's explicit revoke envelope (`replica_id == 0xFF`)
+/// and by unconditional rebind when the next handshake on a reused
+/// `conn_id` emits a fresh identity envelope.
 const IDENTITY_SLOTS: usize = 32;
 
 #[derive(Clone, Copy)]
@@ -291,11 +300,21 @@ unsafe fn drain_identity(r: &mut Rbac, sys: &SyscallTable) {
             continue;
         }
         let pl = plen as usize;
-        let (conn_id, _replica_id, verified, svid_off) =
+        let (conn_id, replica_id, verified, svid_off) =
             match wire::decode_peer_identity(&r.msg_buf[..pl]) {
                 Some(v) => v,
                 None => continue,
             };
+        // `replica_id == 0xFF` is the transport's explicit revoke
+        // (`wire::MSG_PEER_IDENTITY`: "clears any previously bound
+        // identity") — connection torn down or TLS re-handshake
+        // mismatch. The binding dies here; a later client reusing
+        // the conn_id evaluates as `default_role` until its own
+        // handshake binds an identity.
+        if replica_id == 0xFF {
+            clear_binding(r, conn_id);
+            continue;
+        }
         // Copy the SVID out of the shared scratch buffer first so the
         // subsequent `&mut r` borrow doesn't clash with the slice.
         let svid_len = pl.saturating_sub(svid_off).min(SVID_PREFIX_MAX);
@@ -308,12 +327,14 @@ unsafe fn drain_identity(r: &mut Rbac, sys: &SyscallTable) {
 }
 
 fn record_identity(r: &mut Rbac, conn_id: u8, verified: bool, svid: &[u8]) {
-    // Refuse to downgrade a TLS-verified binding via a plaintext envelope.
-    if let Some(existing) = find_binding(r, conn_id) {
-        if r.bindings[existing].tls_verified && !verified {
-            return;
-        }
-    }
+    // A fresh identity envelope is a connection-establishment event:
+    // the transport emits one per handshake, so it always describes
+    // the connection currently holding this conn_id. The rebind is
+    // therefore UNCONDITIONAL — refusing to replace a TLS-verified
+    // binding with a plaintext one would let a stale
+    // OPERATOR/BREAKGLASS grant survive conn_id reuse. At-least-once
+    // redelivery of the same envelope rewrites identical state
+    // (idempotent).
     let role = role_for_svid(r, svid);
     let slot_idx = match find_binding(r, conn_id) {
         Some(i) => i,
@@ -329,6 +350,12 @@ fn record_identity(r: &mut Rbac, conn_id: u8, verified: bool, svid: &[u8]) {
     b.tls_verified = verified;
     b.svid_len = take as u8;
     b.svid[..take].copy_from_slice(&svid[..take]);
+}
+
+fn clear_binding(r: &mut Rbac, conn_id: u8) {
+    if let Some(i) = find_binding(r, conn_id) {
+        r.bindings[i] = IdentityBinding::empty();
+    }
 }
 
 fn find_binding(r: &Rbac, conn_id: u8) -> Option<usize> {

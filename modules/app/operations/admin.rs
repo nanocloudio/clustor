@@ -3,7 +3,8 @@
 //! Authorized admin commands arrive from the [`rbac`](super::rbac)
 //! component (or pre-authorized on the module's `admin_requests`
 //! port), with the convention `[conn_id:u8][op_code:u8][op_body...]`
-//! (RFC §4.5). Each command is hashed for idempotency.
+//! (RFC §4.5). Each command is compared byte-for-byte against its
+//! immediate predecessor for idempotency.
 //!
 //! Supported ops are forwarded as a tagged admin envelope
 //! `[command_id:u32][op_code:u8][op_body...]` to
@@ -36,6 +37,17 @@ use super::{dev_log, dev_report_step_effect, step_effect};
 
 const CMD_RING: usize = 16;
 
+/// Size of every envelope staging buffer in this component (matches
+/// the 1 KiB channel-message scratch).
+const ENV_BUF: usize = 1024;
+/// Longest command (`[op_code][op_body...]`) an admin envelope can
+/// carry: the replicated form prepends `ADMIN_MAGIC` (8) +
+/// `command_id` (4) inside the same `ENV_BUF`-sized buffer, so the
+/// command must leave 12 bytes of header room. Commands past this
+/// bound are refused (`ADMIN_STATUS_REJECTED`) — staging one would
+/// overrun the envelope buffer.
+const CMD_MAX: usize = ENV_BUF - 12;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct CmdEntry {
@@ -53,10 +65,14 @@ pub struct Admin {
 
     // Idempotency collapses only a *rapid retransmit* — a command
     // identical to the one immediately preceding it within the in-flight
-    // window. `last_cmd_hash == 0` means "no prior command". A distinct
-    // or alternating op is always a fresh command. See the component header.
+    // window. The predecessor's bytes are retained and compared in
+    // full: hash-only equality would answer DUPLICATE to a distinct
+    // colliding command and silently never execute it.
+    // `last_cmd_len == 0` means "no prior command". A distinct or
+    // alternating op is always a fresh command. See the component header.
     idemp_ttl_ms: u64,
-    last_cmd_hash: u32,
+    last_cmd_len: u16,
+    last_cmd: [u8; CMD_MAX],
     last_cmd_ms: u64,
     pub commands_processed: u32,
 
@@ -65,15 +81,6 @@ pub struct Admin {
     cmd_head: u16,
 
     msg_buf: [u8; 1024],
-}
-
-fn hash_bytes(data: &[u8]) -> u32 {
-    let mut h: u32 = 0x811c_9dc5;
-    for &b in data {
-        h ^= b as u32;
-        h = h.wrapping_mul(0x0100_0193);
-    }
-    h
 }
 
 pub unsafe fn init(a: &mut Admin) {
@@ -88,7 +95,8 @@ pub unsafe fn init(a: &mut Admin) {
     // genuine later op (operator re-issuing the same command) is its
     // own entry.
     a.idemp_ttl_ms = 2_000; // 2 s
-    a.last_cmd_hash = 0;
+    a.last_cmd_len = 0;
+    a.last_cmd = [0u8; CMD_MAX];
     a.last_cmd_ms = 0;
     a.commands_processed = 0;
     a.next_command_id = 1;
@@ -100,8 +108,8 @@ pub unsafe fn init(a: &mut Admin) {
 
 /// Per-step bound: 8 apply acknowledgements + 4 direct-inject
 /// commands, plus at most 4 rbac-delivered commands (bounded by
-/// rbac's own request loop). Heaviest single item is an FNV-1a hash
-/// over ≤1023 bytes.
+/// rbac's own request loop). Heaviest single item is a byte compare
+/// over ≤`CMD_MAX` bytes.
 ///
 /// # Safety
 ///
@@ -159,7 +167,7 @@ unsafe fn drain_requests(a: &mut Admin, sys: &SyscallTable, now: u64) {
             continue;
         }
         let pl = plen as usize;
-        let mut local = [0u8; 1024];
+        let mut local = [0u8; ENV_BUF];
         local[..pl].copy_from_slice(&a.msg_buf[..pl]);
         on_command(a, sys, now, &local[..pl]);
     }
@@ -189,11 +197,10 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     let mut log = [0u8; 64];
     let n = format_recv_log(&mut log, op_code, conn_id);
     dev_log(sys, 3, log.as_ptr(), n);
-    // Copy command bytes for idempotency hashing + forwarding.
+    // Copy command bytes for the idempotency compare + forwarding.
     let cmd_len = pl - 1;
-    let mut cmd = [0u8; 1024];
+    let mut cmd = [0u8; ENV_BUF];
     cmd[..cmd_len].copy_from_slice(&payload[1..pl]);
-    let key_hash = hash_bytes(&cmd[..cmd_len]);
 
     // Client-write bridge (RFC §8): ADMIN_OP_PROPOSE carries opaque
     // application data, not an admin op. Emit it as a RAW (unmarked)
@@ -219,13 +226,24 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
         return;
     }
 
+    // Envelope-size bound: the replicated envelope below prepends 12
+    // header bytes to the command inside the same fixed buffer, so a
+    // command past `CMD_MAX` cannot be staged — refuse it outright
+    // rather than overrun (a panic here kills the whole module).
+    if cmd_len > CMD_MAX {
+        emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_REJECTED);
+        return;
+    }
+
     // Idempotency check — collapse only a rapid retransmit: a
-    // command identical to its immediate predecessor within the
-    // in-flight window. Alternating or otherwise-distinct ops each
-    // get their own entry (the alternating freeze/thaw the
-    // wal_replay test drives must produce one entry per op).
-    let dup = a.last_cmd_hash == key_hash
-        && key_hash != 0
+    // command identical (full byte compare, never hash equality) to
+    // its immediate predecessor within the in-flight window.
+    // Alternating or otherwise-distinct ops each get their own entry
+    // (the alternating freeze/thaw the wal_replay test drives must
+    // produce one entry per op).
+    let dup = a.last_cmd_len as usize == cmd_len
+        && a.last_cmd_len != 0
+        && a.last_cmd[..cmd_len] == cmd[..cmd_len]
         && now.wrapping_sub(a.last_cmd_ms) < a.idemp_ttl_ms;
     if dup {
         emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_DUPLICATE);
@@ -260,7 +278,8 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
 
     // Record this command as the predecessor for the next request's
     // retransmit check.
-    a.last_cmd_hash = key_hash;
+    a.last_cmd_len = cmd_len as u16;
+    a.last_cmd[..cmd_len].copy_from_slice(&cmd[..cmd_len]);
     a.last_cmd_ms = now;
 
     // Allocate a command_id and remember the conn_id so we can route
@@ -286,7 +305,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     );
 
     if replicable && a.out_proposal >= 0 {
-        let mut env = [0u8; 1024];
+        let mut env = [0u8; ENV_BUF];
         env[..8].copy_from_slice(&wire::ADMIN_MAGIC);
         env[8..12].copy_from_slice(&command_id.to_le_bytes());
         env[12..12 + cmd_len].copy_from_slice(&cmd[..cmd_len]);
@@ -303,7 +322,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     } else {
         // Local-only: direct envelope to `consensus.admin_proposals`.
         // `[command_id:u32 LE][op_code][op_body...]`.
-        let mut env = [0u8; 1024];
+        let mut env = [0u8; ENV_BUF];
         env[0..4].copy_from_slice(&command_id.to_le_bytes());
         env[4..4 + cmd_len].copy_from_slice(&cmd[..cmd_len]);
         let total = 4 + cmd_len;

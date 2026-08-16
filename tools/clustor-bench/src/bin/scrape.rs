@@ -15,7 +15,7 @@
 //!
 //! Any unknown/missing flag prints usage. `--out -` writes JSON to stdout.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clustor_bench::{
     fnv1a64, http_get, json_str, parse_export, JsonObj, Snapshot, KIND_COUNTER, KIND_HISTOGRAM,
@@ -90,18 +90,19 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn scrape(host: &str, path: &str) -> Snapshot {
-    match http_get(host, path, Duration::from_secs(5)) {
-        Ok(body) => match parse_export(&body) {
-            Ok(samples) => Snapshot::from_samples(&samples),
-            Err(e) => {
-                eprintln!("[scrape] parse error: {e}");
-                Snapshot::default()
-            }
-        },
+/// A failed scrape is a hard error: substituting an empty snapshot would turn
+/// the window deltas into full lifetime counters while still exiting 0,
+/// silently poisoning the baseline record.
+fn scrape(host: &str, path: &str, which: &str) -> Snapshot {
+    let body = http_get(host, path, Duration::from_secs(5)).unwrap_or_else(|e| {
+        eprintln!("[scrape] {which} scrape http error: {e}");
+        std::process::exit(1);
+    });
+    match parse_export(&body) {
+        Ok(samples) => Snapshot::from_samples(&samples),
         Err(e) => {
-            eprintln!("[scrape] http error: {e}");
-            Snapshot::default()
+            eprintln!("[scrape] {which} scrape parse error: {e}");
+            std::process::exit(1);
         }
     }
 }
@@ -117,9 +118,14 @@ fn main() {
         .unwrap_or_else(|| "none".to_string());
 
     eprintln!("[scrape] start window: {} ({}s)", a.host, a.window_secs);
-    let start = scrape(&a.host, &a.path);
+    let start = scrape(&a.host, &a.path, "start");
+    // Emitted as `elapsed_secs`: the real inter-sample interval is the sleep
+    // plus the end scrape's HTTP round-trip, so downstream rate math must
+    // divide the deltas by this, not by the nominal `window_secs`.
+    let window_start = Instant::now();
     std::thread::sleep(Duration::from_secs(a.window_secs));
-    let end = scrape(&a.host, &a.path);
+    let end = scrape(&a.host, &a.path, "end");
+    let elapsed_secs = window_start.elapsed().as_secs_f64();
     eprintln!(
         "[scrape] end window: {} start-records, {} end-records",
         start.by_key.len(),
@@ -165,6 +171,7 @@ fn main() {
         .str("config_hash", &config_hash)
         .num("run_id_unix", now_unix())
         .num("window_secs", a.window_secs)
+        .num("elapsed_secs", format!("{elapsed_secs:.3}"))
         .str("workload", &a.workload)
         .num("start_record_count", start.by_key.len())
         .num("end_record_count", end.by_key.len())

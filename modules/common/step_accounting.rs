@@ -20,7 +20,7 @@
 //! ```
 
 use super::abi::SyscallTable;
-use super::{wire, wire_channels};
+use super::wire;
 
 /// Bucket count: one per `COMP_STEP_US` bound + the `+Inf` bucket.
 pub const COMP_STEP_BUCKETS: usize = wire::hist::COMP_STEP_US.len() + 1;
@@ -48,9 +48,14 @@ impl CompStepHist {
     /// Emit the histogram on `chan` as cumulative bucket samples
     /// (`wire::hist` contract: bucket i carries the count of samples
     /// `<= bound[i]`), tagged with the component's `source_id` and the
-    /// module's `partition_id`. A full or unwired channel drops the
-    /// remainder — counts are cumulative, so the next tick
-    /// re-publishes complete state.
+    /// module's `partition_id`.
+    ///
+    /// The whole bucket set goes out in ONE `channel_write`. Ring
+    /// writes are atomic, so the snapshot lands whole or not at all; a
+    /// partial emission would expose fresh low buckets beside stale
+    /// high ones — a non-monotone cumulative set. Counts are
+    /// cumulative, so a dropped snapshot re-publishes complete next
+    /// tick.
     ///
     /// # Safety
     ///
@@ -61,24 +66,40 @@ impl CompStepHist {
         if chan < 0 {
             return;
         }
+        // Early-out only: poll(OUT) means ">=1 byte free", not "the
+        // snapshot fits" — the write below is the authority.
+        let poll = (sys.channel_poll)(chan, 0x02);
+        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+            return;
+        }
+        const FRAME_LEN: usize = wire::ENVELOPE_HDR + wire::METRIC_SAMPLE_LEN;
+        const SNAPSHOT_LEN: usize = FRAME_LEN * COMP_STEP_BUCKETS;
+        // The snapshot must fit the ring or it could never be delivered.
+        const _: () = assert!(SNAPSHOT_LEN <= super::abi::CHANNEL_BUFFER_SIZE);
+        let mut frames = [0u8; SNAPSHOT_LEN];
         let mut cum: i64 = 0;
         for i in 0..COMP_STEP_BUCKETS {
             cum += i64::from(self.buckets[i]);
-            let poll = (sys.channel_poll)(chan, 0x02);
-            if poll <= 0 || (poll as u32 & 0x02) == 0 {
-                return;
-            }
-            let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
+            let at = i * FRAME_LEN;
+            wire::encode_header(
+                &mut frames[at..at + wire::ENVELOPE_HDR],
+                wire::MSG_METRIC_SAMPLE,
+                wire::METRIC_SAMPLE_LEN as u16,
+            );
+            let mut sample = [0u8; wire::METRIC_SAMPLE_LEN];
             wire::encode_metric_sample(
-                &mut buf,
+                &mut sample,
                 source_id,
                 partition_id,
                 wire::hist::COMP_STEP_BASE + i as u16,
                 wire::METRIC_KIND_HISTOGRAM,
                 cum,
             );
-            wire_channels::channel_write_msg(sys, chan, wire::MSG_METRIC_SAMPLE, &buf);
+            frames[at + wire::ENVELOPE_HDR..at + FRAME_LEN].copy_from_slice(&sample);
         }
+        // Result unchecked: a full channel drops the whole snapshot,
+        // which the next tick re-publishes complete.
+        (sys.channel_write)(chan, frames.as_ptr(), frames.len());
     }
 
     /// Cumulative bucket values for message-shaped in-module delivery

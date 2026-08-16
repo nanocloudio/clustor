@@ -59,11 +59,21 @@ pub unsafe fn step(p: &mut ProofCache, sys: &SyscallTable, now: u64) -> Option<u
     drain_proofs(p, sys, now, 0);
     drain_proofs(p, sys, now, 1);
 
-    // 2. Compute cache state from proof age
+    // 2. Compute cache state from proof age. The CACHED band covers
+    //    the first half of the fresh→grace window and STALE the second
+    //    half, so with defaults (fresh=60s, grace=120s) the ladder is
+    //    Fresh <60s, Cached 60–90s, Stale 90–120s, Expired ≥120s. The
+    //    boundary is derived from BOTH thresholds — a bare
+    //    `grace_period_ms / 2` leaves the CACHED band empty whenever
+    //    fresh_threshold_ms >= grace_period_ms / 2 (true for the
+    //    defaults), jumping Fresh→Stale at exactly the fresh threshold
+    //    and blocking linearizable reads instead of degrading.
     let age = now.wrapping_sub(p.last_proof_ms);
+    let cached_until_ms = p.fresh_threshold_ms
+        + p.grace_period_ms.saturating_sub(p.fresh_threshold_ms) / 2;
     let new_state = if age < p.fresh_threshold_ms {
         types::CP_FRESH
-    } else if age < p.grace_period_ms / 2 {
+    } else if age < cached_until_ms {
         types::CP_CACHED
     } else if age < p.grace_period_ms {
         types::CP_STALE

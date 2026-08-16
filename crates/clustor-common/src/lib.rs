@@ -58,3 +58,7 @@ pub mod timing;
 #[rustfmt::skip]
 #[path = "../common/session_registry.rs"]
 pub mod session_registry;
+
+#[rustfmt::skip]
+#[path = "../common/wal_frame.rs"]
+pub mod wal_frame;

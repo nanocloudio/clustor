@@ -59,10 +59,16 @@ mod wire_channels;
 #[path = "../../common/replica_facade.rs"]
 mod replica_facade;
 
+#[path = "../../common/wal_frame.rs"]
+mod wal_frame;
+
 use replica_facade::{CommitOrderError, CommittedSubscriber};
 
 const HEARTBEAT_INTERVAL_MS: u64 = 1000;
-const SCRATCH_BUF_BYTES: usize = 2048 + 32;
+/// Frame-payload staging: a `MSG_COMMITTED_ENTRY` payload is the full
+/// entry (`ENTRY_PROLOGUE` + body = `MAX_ENTRY_LEN`), not just the body.
+/// The slack covers the larger `MSG_APP_SNAPSHOT_CHUNK` header.
+const SCRATCH_BUF_BYTES: usize = wal_frame::MAX_ENTRY_LEN + 32;
 
 #[repr(C)]
 struct ModuleState {

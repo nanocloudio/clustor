@@ -1,14 +1,15 @@
 [package]
-name              = "clustor-common"
-version.workspace = true
-edition           = "2021"
-license           = "Apache-2.0"
-description       = "Clustor common — no_std helpers shared across Clustor PIC modules and host consumers"
-repository        = "https://github.com/nanocloudio/clustor"
-documentation     = "https://github.com/nanocloudio/clustor/tree/main/docs"
-readme            = false
-keywords          = ["raft", "consensus", "no_std", "fluxor"]
-categories        = ["no-std", "data-structures"]
+name                   = "clustor-common"
+version.workspace      = true
+edition                = "2021"
+rust-version.workspace = true
+license                = "Apache-2.0"
+description            = "Clustor common — no_std helpers shared across Clustor PIC modules and host consumers"
+repository             = "https://github.com/nanocloudio/clustor"
+documentation          = "https://github.com/nanocloudio/clustor/tree/main/docs"
+readme                 = false
+keywords               = ["raft", "consensus", "no_std", "fluxor"]
+categories             = ["no-std", "data-structures"]
 
 # Path layout follows the fluxor-abi / fluxor-sdk pattern (RFC §6.5.1):
 # `common/` is a symlink to `../../modules/common`. Cargo follows
@@ -31,7 +32,9 @@ include = [
     "common/http_admin.rs",
     "common/replica_facade.rs",
     "common/session_registry.rs",
+    "common/timing.rs",
     "common/types.rs",
+    "common/wal_frame.rs",
     "common/wire.rs",
 ]
 
@@ -47,12 +50,13 @@ path = "src/lib.rs"
 # mounts.
 [dependencies]
 
-# Inline lints rather than `workspace = true` because clustor's
-# workspace-lints baseline forbids `unsafe_code` (correct for the
-# facade root) but the facade crate compiles `replica_facade.rs`,
-# whose embedded `#[cfg(test)]` blocks use `.unwrap()` / `panic!()`
-# legitimately. Mirror the workspace baseline minus the lints that
-# conflict with that shape.
+# Inline lints rather than `workspace = true` because cargo doesn't
+# allow mixing `lints.workspace = true` with per-lint overrides, and
+# the facade crate compiles `replica_facade.rs`, whose embedded
+# `#[cfg(test)]` blocks use `.unwrap()` / `panic!()` legitimately.
+# Mirror the workspace baseline minus the lints that conflict with
+# that shape; `unsafe_code` escalates from the workspace `deny` to
+# `forbid` per lints.md §5 (no-unsafe crate).
 [lints.rust]
 unsafe_code               = "forbid"
 unused_must_use           = "deny"

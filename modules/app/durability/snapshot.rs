@@ -20,6 +20,7 @@ use super::types::{Index, Term};
 use super::{dev_log, dev_millis, wire, wire_channels};
 
 const FS_OPEN: u32 = 0x0900;
+const FS_READ: u32 = 0x0901;
 const FS_WRITE: u32 = 0x0906;
 const FS_FSYNC: u32 = 0x0905;
 const FS_CLOSE: u32 = 0x0903;
@@ -43,20 +44,39 @@ const FS_CAP_UNLINK: u32 = 1 << 5;
 /// the WAL) against a manifest that never landed.
 const FS_E_AGAIN: i32 = -11;
 
+// ── Boot-restore phases ───────────────────────────────────────────────
+/// Read the pointer sidecar naming the durable local snapshot.
+const BOOT_PTR: u8 = 0;
+/// Load + CRC-validate the snapshot file the pointer names.
+const BOOT_LOAD: u8 = 1;
+/// Replay the app body to the state machine (RESET + chunks).
+const BOOT_EMIT: u8 = 2;
+/// Tell consensus the snapshot base exists (`MSG_SNAPSHOT_INSTALLED`):
+/// the wal tail starts ABOVE the snapshot index, and without the base
+/// marker raft sees a log with no floor and never elects.
+const BOOT_SIGNAL: u8 = 3;
+/// Restore finished (or nothing to restore) — wal replay may proceed.
+const BOOT_DONE: u8 = 4;
+/// "No FS provider at all" errnos (ENODEV / ENOSYS). ONLY these justify
+/// the in-memory-graph install path: any other open/write failure (EIO,
+/// ENOSPC, E_AGAIN…) means an FS exists but the artefact did not land,
+/// and signalling an install would let raft compact the WAL against a
+/// snapshot that is not on disk.
+const FS_E_NODEV: i32 = -19;
+const FS_E_NOSYS: i32 = -38;
+
 /// `module_step` return code for `StepOutcome::Burst` (kernel ABI:
 /// 0=Continue, 1=Done, 2=Burst, 3=Ready). Returned from a step that
-/// performed a synchronous disk op (manifest persist / chunk ingest):
-/// on this NVMe a cold first-touch FS_OPEN_CREATE/write runs tens to
-/// >100 ms, which would trip the step guard. Burst makes the scheduler
-/// forgive that one-time overrun (the Burst transition disarms the
-/// normal-deadline arm without checking it, then re-arms with the 8x
-/// burst budget) — the same mechanism the WAL replay path uses for its
-/// cold root-dir scan. Bounded work (≤4 triggers/step), so this is a
+/// performed a synchronous disk op (snapshot persist, chunk ingest,
+/// boot restore): a cold first-touch FS_OPEN_CREATE/write on this NVMe
+/// runs tens to >100 ms and would trip the step guard. Burst discards
+/// the step's elapsed instead of checking it, then re-arms with the 8×
+/// budget. Work per step is bounded (≤4 triggers), so this is a
 /// headroom grant, not unbounded I/O.
 const STEP_BURST: i32 = 2;
 
 const SNAP_PATH_MAX: usize = 64;
-const MANIFEST_LEN: usize = 32;
+
 const MAGIC_SNAP: u32 = 0x534E_4150; // "SNAP" little-endian as bytes
 
 /// Durable snapshot file layout (crash-atomic without an FS rename, which the
@@ -95,11 +115,9 @@ const APP_CAPTURE_TIMEOUT_TICKS: u32 = 2000;
 /// surfaces it aggregates) emit one `MSG_COMPACTION_FLOOR` per
 /// active kpg they care about. 32 slots covers any realistic
 /// per-partition kpg count; on overflow the engine fails closed
-/// (see `retention_floor_overflow`) — eviction would silently
-/// widen the compaction window past a floor we used to honour, and
-/// fail-open would do the same for the unrecorded floor. Adjust
-/// upwards if the lattice / quantum integration later proves it's
-/// not enough.
+/// (see `retention_floor_overflow`) — evicting a slot would silently
+/// widen the compaction window past a live floor, and fail-open would
+/// do the same for the unrecorded one.
 const RETENTION_FLOOR_SLOTS: usize = 32;
 const METRICS_INTERVAL_MS: u64 = 1000;
 
@@ -141,6 +159,17 @@ pub struct Snapshot {
     // on-demand install requests from `replicator` (§4.2).
     last_snapshot_term: u64,
     last_snapshot_index: u64,
+
+    /// Boot-restore state machine (`BOOT_*`). At boot the persisted
+    /// local snapshot (pointer sidecar → snapshot file) is loaded and
+    /// its app body replayed to the state machine BEFORE the wal
+    /// component replays its (possibly compacted) tail — otherwise the
+    /// app rebuilds only the tail and everything below the snapshot is
+    /// silently missing. `mod.rs` holds `wal::step` until this reports
+    /// done.
+    boot_phase: u8,
+    /// Snapshot index named by the pointer sidecar (BOOT_PTR → BOOT_LOAD).
+    boot_ptr_index: u64,
 
     pub partition_id: u16,
     /// Param `root_path`: 1 = 8.3 snapshot names at the FS root (bare-metal
@@ -247,6 +276,8 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.out_app_ctl = -1;
     s.last_snapshot_term = 0;
     s.last_snapshot_index = 0;
+    s.boot_phase = BOOT_PTR;
+    s.boot_ptr_index = 0;
     s.partition_id = 0;
     s.root_path = 0;
     s.fs_unlink_probe = 0;
@@ -300,7 +331,14 @@ pub unsafe fn on_trigger(s: &mut Snapshot, sys: &SyscallTable, term: Term, index
     // meaningful once we hold its state. Ask for a capture and stop
     // here; the body's own (term, index) — which may have advanced
     // past this trigger — drives finalisation in the app-body path.
-    if s.out_app_ctl >= 0 {
+    // BOTH capture ports must be wired: with `out_app_ctl` alone the
+    // request can never be answered and `app_capture_pending` never
+    // clears (the timeout lives on the reply drain), deferring every
+    // future snapshot forever.
+    if s.out_app_ctl >= 0 && s.in_app_body < 0 {
+        dev_log(sys, 2, b"[snap] app body port unwired".as_ptr(), 28);
+    }
+    if s.out_app_ctl >= 0 && s.in_app_body >= 0 {
         if s.app_capture_pending {
             // One capture in flight at a time; the next rotation
             // re-fires this trigger.
@@ -369,11 +407,9 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             if msg_type != wire::MSG_SNAPSHOT_INSTALL_REQUEST || (plen as usize) < 1 {
                 continue;
             }
-            // We currently broadcast the install; targeted routing
-            // is in flight — `peer_router` already accepts routed
-            // envelopes via `replicator.forward_snapshots`. The
-            // target byte in the request is preserved for the day
-            // we switch to a routed snapshot port.
+            // The install is broadcast, not routed: the request's
+            // target byte is decoded but unused until a routed
+            // snapshot port exists.
             emit_install_chunk(s, sys, s.last_snapshot_term, s.last_snapshot_index);
         }
     }
@@ -483,12 +519,14 @@ unsafe fn emit_metrics(s: &mut Snapshot, sys: &SyscallTable) {
     let mid = wire::SOURCE_ID_SNAPSHOT;
     let pid = s.partition_id;
     let kc = wire::METRIC_KIND_COUNTER;
-    let scalars: [(u16, i64); 5] = [
+    let scalars: [(u16, i64); 7] = [
         (wire::metric_ids::SNAP_SNAPSHOTS_TAKEN, i64::from(s.snapshots_taken)),
         (wire::metric_ids::SNAP_CHUNKS_IMPORTED, i64::from(s.chunks_imported)),
         (wire::metric_ids::SNAP_TRIGGERS_DEFERRED, i64::from(s.triggers_deferred)),
         (wire::metric_ids::SNAP_BYTES_WRITTEN, s.snap_bytes_written as i64),
         (wire::metric_ids::SNAP_INSTALL_FAILURES, i64::from(s.install_failures)),
+        (wire::metric_ids::SNAP_APP_BODIES_RECEIVED, i64::from(s.app_bodies_received)),
+        (wire::metric_ids::SNAP_APP_CAPTURES_TIMED_OUT, i64::from(s.app_captures_timed_out)),
     ];
     for &(metric_id, value) in scalars.iter() {
         emit_sample(s, sys, mid, pid, metric_id, kc, value);
@@ -552,11 +590,9 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         s.body_len = 0;
         s.in_progress_active = true;
         s.install_start_ms = dev_millis(sys);
-        // Persist the manifest on first chunk so a crash mid-install
-        // still leaves a record of (term, index). Body finalisation
-        // happens on `done` — the durable-install gate lives there, so
-        // this early record's outcome is advisory only.
-        let _ = persist_manifest(s, sys, term, last_idx);
+        // No early record at the snapshot path: the durable-install gate
+        // (body + boot pointer) lives on `done`, and a manifest-only file
+        // there would shadow the real artefact the boot restore reads.
     }
 
     // Offset gating: drop misordered chunks. The leader is expected to
@@ -590,11 +626,15 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         // write withholds the signal; the leader re-sends from offset 0.
         let (durable, had_fs) =
             write_snapshot_durable(s, sys, s.in_progress_term, s.in_progress_last_idx, s.in_progress_last_term);
+        // Boot pointer: an installed snapshot that boot can't find is
+        // as good as lost once raft compacts behind it (same gate as
+        // the local-rotation publish).
+        let durable = durable && (!had_fs || persist_snap_pointer(s, sys, s.in_progress_last_idx));
 
-        // `had_fs == false` means no FS provider (in-memory graph): there is
-        // no durable artefact possible, but the (term,index) is still a valid
-        // install for an in-memory cluster — preserve the prior behaviour.
-        // With an FS present, only signal on a confirmed durable write.
+        // `had_fs == false` means no FS provider (in-memory graph): no
+        // durable artefact is possible, but the (term, index) is still a
+        // valid install there. With an FS present, only signal on a
+        // confirmed durable write.
         // Hand the state-machine body to the app BEFORE signalling the
         // install. The install signal is what lets raft compact its log
         // to last_idx; if the app never received the state it could
@@ -668,15 +708,46 @@ unsafe fn finalize_local_snapshot(
     term: Term,
     index: Index,
 ) {
+    // `body_buf` is also the in-flight install accumulator. Staging a
+    // local body over a live install would corrupt it silently (the
+    // offset gate keys on `in_progress_offset`, not on `body_len`), and
+    // the corrupt result would still pass its own CRC. Defer instead —
+    // the next rotation re-fires this trigger.
+    if s.in_progress_active {
+        s.triggers_deferred = s.triggers_deferred.saturating_add(1);
+        return;
+    }
     let prev_index = s.last_snapshot_index;
-    let (durable, had_fs) = persist_manifest(s, sys, term, index);
+    // Persist the app BODY with the snapshot, not a bare manifest: the
+    // boot restore replays exactly this body to the state machine
+    // before the (compacted) wal tail — a body-less manifest would let
+    // raft compact the log below state nothing can ever rebuild.
+    // copy_nonoverlapping + explicit clamp: both buffers are
+    // MAX_SNAPSHOT_BODY, but rustc cannot prove the slice lengths match,
+    // and PIC modules cannot carry the resulting panic path.
+    let blen = (s.app_body_len as usize).min(MAX_SNAPSHOT_BODY);
+    core::ptr::copy_nonoverlapping(
+        s.app_body_buf.as_ptr(),
+        s.body_buf.as_mut_ptr(),
+        blen,
+    );
+    s.body_len = blen as u32;
+    let (durable, had_fs) = write_snapshot_durable(s, sys, term, index, term);
     if !durable && had_fs {
-        // FS present but the manifest didn't land (provider
+        // FS present but the snapshot didn't land (provider
         // initialising, ENOSPC, short write…). Drop it — the next
         // rotation re-fires. Signalling an install here would let raft
         // compact WAL segments against a snapshot that isn't on disk.
         return;
     }
+    if had_fs && !persist_snap_pointer(s, sys, index) {
+        // Snapshot durable but the boot pointer isn't: unfindable at
+        // boot. Withhold the install signal; the next rotation retries
+        // the whole publish.
+        dev_log(sys, 3, b"[snap] ptr fail".as_ptr(), 15);
+        return;
+    }
+    dev_log(sys, 3, b"[snap] manifest".as_ptr(), 15);
     s.last_snapshot_term = term;
     s.last_snapshot_index = index;
     // Tell raft the local snapshot is durable so it advances the WAL
@@ -741,13 +812,10 @@ unsafe fn request_app_capture(
 /// `&Snapshot` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-/// Emit an InstallSnapshot RPC out to replicator/peers as one or more
-/// chunks of up to `MAX_CHUNK_BODY` bytes. The "body" today is empty
-/// because the substrate has no state-machine snapshot — peers learn
-/// the `(term, index)` and trust their own log/WAL for everything
-/// else. Once §2.1 (app snapshot API) lands, `emit_install_body` will
-/// pull from the actual state-machine snapshot and this code path is
-/// already multi-chunk capable. See RFC §4.1.
+/// Re-broadcast the most recent snapshot as a manifest-only
+/// InstallSnapshot: peers learn the `(term, index)` and trust their own
+/// log/WAL for the rest. Body-carrying installs go out through
+/// `emit_install_staged`.
 unsafe fn emit_install_chunk(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) {
     emit_install_body(s, sys, term, index, &[]);
 }
@@ -927,25 +995,216 @@ unsafe fn emit_install_body(
     }
 }
 
+/// Fixed-name pointer sidecar naming the current durable local
+/// snapshot's index (8 bytes, u64 LE). `OPEN_CREATE` is O_RDWR|O_CREAT
+/// positioned at zero, so each persist overwrites the whole file in
+/// place. Boot follows it to the snapshot file; without it the
+/// index-named file is unfindable (the FS surface has no listing).
+///
 /// # Safety
 ///
-/// Caller must hold an exclusive `&mut Snapshot` (or shared
-/// `&Snapshot` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-/// Build snapshot path: `wal/p<NNNN>_snap_<NNNNNNNN>.bin`.
+/// Caller must hold an exclusive `&mut Snapshot`.
+unsafe fn build_snap_pointer_path(s: &mut Snapshot) -> usize {
+    let mut i = 0usize;
+    if s.root_path != 0 {
+        // 8.3 root layout, mirroring `build_snapshot_path`:
+        // "<p:1hex>SNAPPTR.SNP".
+        let p = (s.partition_id & 0xF) as u8;
+        s.path_buf[i] = if p < 10 { b'0' + p } else { b'a' + p - 10 };
+        i += 1;
+        for &b in b"SNAPPTR.SNP" {
+            s.path_buf[i] = b;
+            i += 1;
+        }
+        return i;
+    }
+    for &b in b"wal/p" {
+        if i < SNAP_PATH_MAX { s.path_buf[i] = b; i += 1; }
+    }
+    for digit in (0..4).rev() {
+        let nibble = ((s.partition_id >> (digit * 4)) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        if i < SNAP_PATH_MAX { s.path_buf[i] = ch; i += 1; }
+    }
+    for &b in b"_snapptr.bin" {
+        if i < SNAP_PATH_MAX { s.path_buf[i] = b; i += 1; }
+    }
+    i
+}
+
+/// Persist the pointer sidecar for `index`. Returns durable-or-no-fs
+/// like the other persists; the caller gates the install signal on it —
+/// a snapshot whose pointer never landed is unfindable at boot, and
+/// letting raft compact against it would strand the state below it.
+unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable, index: Index) -> bool {
+    let plen = build_snap_pointer_path(s);
+    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
+    if fd < 0 {
+        return fd == FS_E_NODEV || fd == FS_E_NOSYS;
+    }
+    let mut val = index.to_le_bytes();
+    let w = (sys.provider_call)(fd, FS_WRITE, val.as_mut_ptr(), 8);
+    let f = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    w == 8 && f == 0
+}
+
+/// Drive the boot restore one bounded slice per step. Returns true
+/// once done (successfully, or with nothing to restore) — `mod.rs`
+/// holds `wal::step` (and with it the whole replay → raft-resume
+/// handoff) until then, so the app receives the snapshot body BEFORE
+/// the wal tail replays on top of it.
 ///
-/// All partitions share the one `wal/` directory; the partition_id
-/// is stamped into the filename rather than a per-partition
-/// subdirectory. This mirrors `wal/p<NNNN>_seg_<NNNNNNNN>` (see
-/// `modules/app/durability/wal.rs::encode_segment_path`) so the operator
-/// only needs to ensure one `wal/` directory exists regardless of
-/// partition count — the Linux FS provider's `OPEN_CREATE` opcode
-/// creates files but does not auto-`mkdir` parents, so the flat
-/// layout is what makes the persisted manifest actually appear on
-/// disk in a default deployment. See
-/// `modules/app/durability/manifest.toml` for the operator
-/// note.
+/// Every arm that issues a provider call yields the step (returns
+/// false) even when the restore is finished: a cold first-touch
+/// `FS_OPEN` runs tens of ms here, and the caller classifies a
+/// still-running restore as Burst so the step guard forgives it.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Snapshot` and supply a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
+    match s.boot_phase {
+        BOOT_PTR => {
+            let plen = build_snap_pointer_path(s);
+            let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+            if fd == FS_E_AGAIN {
+                return false; // provider initialising — retry next step
+            }
+            if fd < 0 {
+                // No pointer: fresh deployment, in-memory graph, or a
+                // pre-pointer layout. Nothing to restore.
+                s.boot_phase = BOOT_DONE;
+                return false;
+            }
+            let mut val = [0u8; 8];
+            let n = (sys.provider_call)(fd, FS_READ, val.as_mut_ptr(), 8);
+            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            if n != 8 {
+                dev_log(sys, 3, b"[snap] boot ptr torn".as_ptr(), 20);
+                s.boot_phase = BOOT_DONE;
+                return false;
+            }
+            s.boot_ptr_index = u64::from_le_bytes(val);
+            s.boot_phase = BOOT_LOAD;
+            false
+        }
+        BOOT_LOAD => {
+            let plen = build_snapshot_path(s, s.boot_ptr_index);
+            let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+            if fd == FS_E_AGAIN {
+                return false;
+            }
+            if fd < 0 {
+                // Pointer names a file that is gone: restore nothing.
+                // The wal replays whatever it still holds; state below
+                // the vanished snapshot is LOST and the log says so
+                // rather than guessing.
+                dev_log(sys, 3, b"[snap] boot missing".as_ptr(), 19);
+                s.boot_phase = BOOT_DONE;
+                return false;
+            }
+            let mut hdr = [0u8; SNAP_HDR_LEN];
+            let mut ok =
+                (sys.provider_call)(fd, FS_READ, hdr.as_mut_ptr(), SNAP_HDR_LEN)
+                    == SNAP_HDR_LEN as i32
+                    && u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) == MAGIC_SNAP
+                    && u16::from_le_bytes([hdr[4], hdr[5]]) == s.partition_id;
+            let body_len = if ok {
+                u32::from_le_bytes([hdr[36], hdr[37], hdr[38], hdr[39]]) as usize
+            } else {
+                0
+            };
+            ok = ok && body_len <= MAX_SNAPSHOT_BODY;
+            if ok && body_len > 0 {
+                ok = (sys.provider_call)(fd, FS_READ, s.body_buf.as_mut_ptr(), body_len)
+                    == body_len as i32;
+            }
+            if ok {
+                let mut trailer = [0u8; SNAP_TRAILER_LEN];
+                ok = (sys.provider_call)(fd, FS_READ, trailer.as_mut_ptr(), SNAP_TRAILER_LEN)
+                    == SNAP_TRAILER_LEN as i32
+                    && u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]])
+                        == END_MAGIC_SNAP
+                    && {
+                        let mut c = Crc32c::new();
+                        c.update(&hdr);
+                        if body_len > 0 {
+                            c.update(&s.body_buf[..body_len]);
+                        }
+                        c.finalize()
+                            == u32::from_le_bytes([
+                                trailer[0], trailer[1], trailer[2], trailer[3],
+                            ])
+                    };
+            }
+            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            if !ok {
+                // Fail CLOSED on a torn/corrupt snapshot: restore
+                // nothing. Replaying a bad body is silent corruption.
+                dev_log(sys, 3, b"[snap] boot corrupt".as_ptr(), 19);
+                s.body_len = 0;
+                s.boot_phase = BOOT_DONE;
+                return false;
+            }
+            s.last_snapshot_term =
+                u64::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15]]);
+            s.last_snapshot_index =
+                u64::from_le_bytes([hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23]]);
+            s.body_len = body_len as u32;
+            s.boot_phase = if s.out_app_ctl >= 0 && body_len > 0 {
+                BOOT_EMIT
+            } else {
+                BOOT_SIGNAL
+            };
+            false
+        }
+        BOOT_EMIT => {
+            if emit_app_restore(s, sys, s.last_snapshot_term, s.last_snapshot_index) {
+                dev_log(sys, 3, b"[snap] boot restored".as_ptr(), 20);
+                s.boot_phase = BOOT_SIGNAL;
+            }
+            false // channel not ready / partial — re-send next step
+        }
+        BOOT_SIGNAL => {
+            // Consensus must learn the snapshot base BEFORE the wal
+            // tail replays: its entries start above the snapshot index,
+            // and a log with no base never elects.
+            if s.out_installed < 0 {
+                s.boot_phase = BOOT_DONE;
+                return true;
+            }
+            let poll = (sys.channel_poll)(s.out_installed, 0x02);
+            if poll <= 0 || (poll as u32 & 0x02) == 0 {
+                return false; // channel full — retry next step
+            }
+            let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
+            wire::encode_snapshot_installed(
+                &mut buf,
+                s.last_snapshot_term,
+                s.last_snapshot_index,
+                s.last_snapshot_term,
+            );
+            wire_channels::channel_write_msg(sys, s.out_installed, wire::MSG_SNAPSHOT_INSTALLED, &buf);
+            s.boot_phase = BOOT_DONE;
+            true
+        }
+        _ => true,
+    }
+}
+
+/// Build the snapshot path: `wal/p<NNNN>_snap_<NNNNNNNN>.bin`.
+///
+/// All partitions share the one `wal/` directory; the partition_id is
+/// stamped into the filename rather than a per-partition subdirectory,
+/// mirroring `wal::encode_segment_path`. `OPEN_CREATE` creates files
+/// but does not `mkdir` parents, so the flat layout is what makes the
+/// artefact appear on disk given a single operator-created `wal/`.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Snapshot`.
 unsafe fn build_snapshot_path(s: &mut Snapshot, index: Index) -> usize {
     let mut i = 0usize;
     if s.root_path != 0 {
@@ -1113,66 +1372,6 @@ fn retention_floor_allows(s: &Snapshot, index: u64) -> bool {
     true
 }
 
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Snapshot` (or shared
-/// `&Snapshot` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-/// Write a 32-byte snapshot manifest to disk and fsync.
-///
-/// Returns `(durable, had_fs)` — the same shape as
-/// `write_snapshot_durable`: `durable` iff the manifest's write AND fsync
-/// both succeeded; `had_fs = false` only when there is genuinely no FS
-/// provider (in-memory graph), so the caller can distinguish "nothing to
-/// persist" from "persist failed". A still-initialising provider
-/// (`FS_E_AGAIN`) reports `(false, true)`: the FS exists, the persist
-/// failed, and the caller must NOT signal an install against it.
-unsafe fn persist_manifest(
-    s: &mut Snapshot,
-    sys: &SyscallTable,
-    term: Term,
-    index: Index,
-) -> (bool, bool) {
-    let plen = build_snapshot_path(s, index);
-    if plen == 0 { return (false, true); }
-
-    // Snapshot manifests are always created fresh. `FS_OPEN` is
-    // read-only-if-exists per the FS contract; opening at the
-    // write tier (`FS_OPEN_CREATE`) is the only path that produces
-    // a valid fd for a not-yet-existing manifest file.
-    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
-    if fd < 0 {
-        // FS contract unwired or the `wal/` parent directory
-        // doesn't exist (`OPEN_CREATE` creates files but does not
-        // `mkdir` parents). Log so the operator knows the trigger
-        // fired but no disk artefact will appear.
-        dev_log(sys, 3, b"[snap] no fs".as_ptr(), 12);
-        return (false, fd == FS_E_AGAIN);
-    }
-
-    let mut manifest = [0u8; MANIFEST_LEN];
-    manifest[0..4].copy_from_slice(&MAGIC_SNAP.to_le_bytes());
-    manifest[4..6].copy_from_slice(&s.partition_id.to_le_bytes());
-    // bytes 6..8 reserved
-    manifest[8..16].copy_from_slice(&term.to_le_bytes());
-    manifest[16..24].copy_from_slice(&index.to_le_bytes());
-    manifest[24..28].copy_from_slice(&s.dek_epoch.to_le_bytes());
-    // bytes 28..32 reserved
-
-    let w = (sys.provider_call)(fd, FS_WRITE, manifest.as_mut_ptr(), MANIFEST_LEN);
-    let f = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    let durable = w == MANIFEST_LEN as i32 && f == 0;
-    if durable {
-        dev_log(sys, 3, b"[snap] manifest".as_ptr(), 15);
-    } else {
-        s.install_failures = s.install_failures.saturating_add(1);
-        dev_log(sys, 3, b"[snap] manifest fail".as_ptr(), 20);
-    }
-    (durable, true)
-}
-
 /// Lazily probe the FS provider's capability bitmap for `UNLINK` support
 /// (same shape as `wal::fs_unlink_supported`). A failed CAPS call stays
 /// unprobed and retries later rather than caching a transient error.
@@ -1235,8 +1434,12 @@ unsafe fn write_snapshot_durable(
     }
     let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
     if fd < 0 {
-        // FS unwired / parent dir missing — nothing to durably install.
-        return (false, false);
+        // Genuinely no FS provider (in-memory graph): nothing to durably
+        // install — the caller's `!had_fs` path applies. ANY other error
+        // (E_AGAIN during a fat32 cold boot, EIO, ENOSPC, missing parent
+        // dir) reports had_fs=true so the install signal is withheld and
+        // the leader re-sends once the provider is usable.
+        return (false, fd != FS_E_NODEV && fd != FS_E_NOSYS);
     }
     let body_len = s.body_len as usize;
     let mut hdr = [0u8; SNAP_HDR_LEN];

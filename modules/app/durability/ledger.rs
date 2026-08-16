@@ -34,10 +34,21 @@ pub struct Ledger {
 
     // Per-replica durable index tracking
     progress: [Index; MAX_NODES],
+    /// Term each replica's ack carried when its `progress` slot last
+    /// advanced — the term of that replica's durable tip. Pairs the
+    /// proof's term with its index; an ack's term alone can be ahead of
+    /// the quorum index.
+    term_at: [Term; MAX_NODES],
 
     // Quorum state
     committed_index: Index,
     committed_term: Term,
+    /// A quorum advance whose DurabilityProof has not yet been
+    /// delivered (`out_quorum` full at emit time). Retried every step:
+    /// heartbeat acks at an unchanged index never re-fire the
+    /// `new_quorum > committed_index` edge, so without this latch one
+    /// dropped proof stalls commit until the next write arrives.
+    proof_pending: bool,
 
     // Scratch
     msg_buf: [u8; 32],
@@ -50,8 +61,10 @@ pub unsafe fn init(l: &mut Ledger) {
     l.voter_count = 1;
     l.partition_id = 0;
     l.progress = [0; MAX_NODES];
+    l.term_at = [0; MAX_NODES];
     l.committed_index = 0;
     l.committed_term = 0;
+    l.proof_pending = false;
 }
 
 /// Clamp `voter_count` after params land so the downstream
@@ -72,10 +85,8 @@ pub fn on_ack(l: &mut Ledger, term: Term, index: Index, replica: ReplicaId) -> b
     let mut advanced = false;
     if index > l.progress[replica as usize] {
         l.progress[replica as usize] = index;
+        l.term_at[replica as usize] = term;
         advanced = true;
-    }
-    if term > l.committed_term {
-        l.committed_term = term;
     }
     advanced
 }
@@ -117,19 +128,47 @@ pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
         if new_quorum > l.committed_index {
             l.committed_index = new_quorum;
 
-            // Emit DurabilityProof (19 bytes; partition_id at front).
-            if l.out_quorum >= 0 {
-                let poll_out = (sys.channel_poll)(l.out_quorum, 0x02);
-                if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-                    let mut proof = [0u8; wire::DURABILITY_PROOF_LEN];
-                    wire::encode_durability_proof(
-                        &mut proof,
-                        l.partition_id,
-                        l.committed_term,
-                        l.committed_index,
-                        l.self_id,
-                    );
-                    wire_channels::channel_write_msg(sys, l.out_quorum, wire::MSG_DURABILITY_PROOF, &proof);
+            // Pair the proof's term with its index. Every supporter's
+            // durable tip is at or past `new_quorum`, so its term bounds
+            // the entry's term from above; the minimum is the tightest
+            // such bound, and is exact whenever some supporter's tip IS
+            // the quorum index. Monotone, and never moves without an
+            // index basis.
+            let mut t = Term::MAX;
+            for i in 0..MAX_NODES {
+                if l.progress[i] >= new_quorum && l.term_at[i] < t {
+                    t = l.term_at[i];
+                }
+            }
+            if t != Term::MAX && t > l.committed_term {
+                l.committed_term = t;
+            }
+            l.proof_pending = true;
+        }
+    }
+
+    // Emit DurabilityProof (19 bytes; partition_id at front). The latch
+    // stays set until a write is confirmed, so a full channel defers —
+    // never drops — the proof.
+    if l.proof_pending {
+        if l.out_quorum < 0 {
+            l.proof_pending = false; // no consumer wired
+        } else {
+            let poll_out = (sys.channel_poll)(l.out_quorum, 0x02);
+            if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+                let mut proof = [0u8; wire::DURABILITY_PROOF_LEN];
+                wire::encode_durability_proof(
+                    &mut proof,
+                    l.partition_id,
+                    l.committed_term,
+                    l.committed_index,
+                    l.self_id,
+                );
+                let w = wire_channels::channel_write_msg(
+                    sys, l.out_quorum, wire::MSG_DURABILITY_PROOF, &proof,
+                );
+                if w > 0 {
+                    l.proof_pending = false;
                     // Debug level: fires per quorum event — hot path.
                     dev_log(sys, 4, b"[dur] quorum".as_ptr(), 12);
                 }

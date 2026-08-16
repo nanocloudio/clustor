@@ -33,16 +33,22 @@ targets = ["bcm2712"]
 scripts = ["tools/ci-e2e.sh", "scripts/cli-e2e.sh"]
 
 [ci.lints]
-# The single workspace member (`clustor`) is exempted from the
-# `[lints] workspace = true` opt-in audit because cargo doesn't
-# allow mixing `lints.workspace = true` with per-lint overrides in
-# the same `[lints]` table, and the package's reality (tests +
-# benches around an empty `src/lib.rs` stub) needs `unwrap_used` /
-# `panic` / `print_stdout` relaxed. The package inlines a slightly
-# relaxed mirror of `[workspace.lints]` in its own `[lints]` block.
+# All three workspace members (`clustor`, `clustor-common`,
+# `clustor-bench`) are exempted from the `[lints] workspace = true`
+# opt-in audit because cargo doesn't allow mixing
+# `lints.workspace = true` with per-lint overrides in the same
+# `[lints]` table, and each package's reality needs some baseline
+# lints relaxed (`unwrap_used` / `panic` / `print_stdout` for the
+# test/bench shapes, plus `dead_code` for the facade crate). Each
+# package inlines a slightly relaxed mirror of `[workspace.lints]`
+# in its own `[lints]` block.
 [[ci.lints.exemption]]
 crate  = "clustor"
 reason = "test/bench-only package; cargo doesn't allow `lints.workspace = true` + per-lint overrides in the same table, so the package inlines a relaxed mirror of [workspace.lints]"
+
+[[ci.lints.exemption]]
+crate  = "clustor-common"
+reason = "no_std facade over #[path]-mounted modules/common fragments; cargo doesn't allow `lints.workspace = true` + per-lint overrides in the same table, and the crate needs `dead_code` plus the test-block lints (`unwrap_used`/`panic`) relaxed, so it inlines a relaxed mirror of [workspace.lints]"
 
 [[ci.lints.exemption]]
 crate  = "clustor-bench"
@@ -55,20 +61,6 @@ reason = "driver-host bench CLI (clustor-scrape/clustor-loadgen); prints JSON to
 forbid_inline_tests = ["modules", "src"]
 mode = "strict"
 max_inline_lines = 80
-
-# Structured exemptions. Every row carries a `rule` discriminator so
-# an inline-tests waiver doesn't accidentally also silence
-# `allow-without-reason`. See standards/tests.md §3.
-
-[[ci.hygiene.exemption]]
-path   = "modules/common/replica_facade.rs"
-rule   = "inline-tests"
-reason = "dual-target host facade: same file compiles into the no_std module ELF and is pulled into host-side cargo test via #[path]. The #[cfg(test)] block is gated away from the no_std build."
-
-[[ci.hygiene.exemption]]
-path   = "tools/clustor-bench/src/lib.rs"
-rule   = "inline-tests"
-reason = "std-only driver-host bench CLI (not a no_std module); the forbid_inline_tests `src` tier targets clustor's own no_std-adjacent src. These #[cfg(test)] units cover the binary-metrics parser and latency math against private helpers (parse_export, LatencyHist, json_str), so they belong next to the code."
 
 [ci.templates]
 dir = "configs"

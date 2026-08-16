@@ -44,21 +44,32 @@ pub unsafe fn step(c: &mut Cp, sys: &SyscallTable, now: u64) {
     if now.wrapping_sub(c.last_fetch_ms) < c.refresh_interval_ms {
         return;
     }
-    c.last_fetch_ms = now;
-    c.proof_seq += 1;
 
     // Emit a synthetic CP proof (timestamp + sequence).
     // Real implementation would fetch from CP HTTP endpoint.
+    //
+    // The refresh clock advances only once the proof actually lands: a
+    // transiently full `out_proof` at tick time means "retry next
+    // step", not "drop this proof for a whole refresh interval" —
+    // dropping it would age the proof_cache toward Stale for no reason.
+    let seq = c.proof_seq.wrapping_add(1);
     let mut buf = [0u8; 12];
     buf[0..8].copy_from_slice(&now.to_le_bytes());
-    buf[8..12].copy_from_slice(&c.proof_seq.to_le_bytes());
+    buf[8..12].copy_from_slice(&seq.to_le_bytes());
 
     if c.out_proof >= 0 {
         let poll = (sys.channel_poll)(c.out_proof, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
+        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+            return; // output full — retry next step, clock not advanced
+        }
+        let wrote =
             wire_channels::channel_write_msg(sys, c.out_proof, wire::MSG_CP_PROOF, &buf[..12]);
+        if wrote <= 0 {
+            return; // frame didn't fit (poll only means ≥1 byte free) — retry
         }
     }
+    c.last_fetch_ms = now;
+    c.proof_seq = seq;
 
     // Tenant records and capabilities ride the same refresh tick. In
     // production these come from the same CP response. Synthetic

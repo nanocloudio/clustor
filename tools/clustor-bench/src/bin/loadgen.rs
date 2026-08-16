@@ -3,14 +3,16 @@
 //! Drives the DUT over the real client path (`POST /propose` by default; any
 //! POST path via `--path`) at a fixed offered rate using a Poisson-free fixed
 //! interval arrival process, sharded across worker threads, each with its own
-//! latency histogram merged at the end. Latency is **coordinated-omission
-//! corrected**: each request's latency is measured from its *intended* send
-//! time, so a stalled server shows up as a growing tail instead of stopping
-//! the clock.
+//! latency histogram merged at the end. Pacing sleeps to within a millisecond
+//! of each intended send slot and spins the remainder, so scheduler overshoot
+//! does not shift the arrival process; latency is measured from the actual
+//! send instant, and only successful (2xx/3xx) requests enter the histogram.
 //!
-//! It also self-reports the RFC §2.4 harness-headroom verdict — achieved vs
-//! offered rate — so a run that the generator (not the DUT) bottlenecked is
-//! flagged `HARNESS_BOUND` rather than silently reported as a DUT ceiling.
+//! It also self-reports the RFC §2.4 harness-headroom verdict — achieved
+//! *successful* vs offered rate — so a run that the generator (not the DUT)
+//! bottlenecked is flagged `HARNESS_BOUND` rather than silently reported as a
+//! DUT ceiling, and a run with a material error ratio is flagged
+//! `INVALID_ERRORS` instead of passing as `DUT_ATTRIBUTABLE`.
 //!
 //! Usage:
 //!   clustor-loadgen --host 192.168.1.9:9090 --rate 2000 --duration 10 \
@@ -73,6 +75,10 @@ fn parse_args() -> Args {
     a
 }
 
+/// How far short of the intended send slot `thread::sleep` stops; the
+/// remainder is spun.
+const SPIN_MARGIN: Duration = Duration::from_millis(1);
+
 struct ShardResult {
     hist: LatencyHist,
     sent: u64,
@@ -91,36 +97,38 @@ fn run_shard(
     let mut sent = 0u64;
     let mut ok = 0u64;
     let mut errors = 0u64;
-    let interval = Duration::from_secs_f64(1.0 / per_shard_rate);
     let mut client = HttpClient::new(&host, Duration::from_secs(5));
     let start = Instant::now();
     let mut i: u64 = 0;
     loop {
-        let intended = start + interval * (i as u32);
+        // Slot offset from `start`, not an accumulated per-slot Duration: the
+        // arrival process must not drift with the per-interval rounding error,
+        // and `Duration * u32` would truncate `i` on a long high-rate run.
+        let intended = start + Duration::from_secs_f64(i as f64 / per_shard_rate);
         let now = Instant::now();
         if now >= start + duration {
             break;
         }
         if intended > now {
-            std::thread::sleep(intended - now);
+            // thread::sleep overshoots by a scheduler quantum; sleep to within
+            // SPIN_MARGIN of the slot and spin the rest, so the overshoot
+            // enters neither the arrival process nor the latency samples.
+            let wait = intended - now;
+            if wait > SPIN_MARGIN {
+                std::thread::sleep(wait - SPIN_MARGIN);
+            }
+            while Instant::now() < intended {
+                std::hint::spin_loop();
+            }
         }
-        // Coordinated-omission correction: latency measured from the INTENDED
-        // arrival, not the actual send — a slow server inflates the tail
-        // rather than pacing our loop.
         let send_instant = Instant::now();
         match client.post(&path, &body) {
-            Ok((status, _)) => {
-                if (200..400).contains(&status) {
-                    ok += 1;
-                } else {
-                    errors += 1;
-                }
+            Ok((status, _)) if (200..400).contains(&status) => {
+                ok += 1;
+                hist.record(send_instant.elapsed().as_micros() as u64);
             }
-            Err(_) => errors += 1,
+            Ok(_) | Err(_) => errors += 1,
         }
-        let done = Instant::now();
-        let latency = done.saturating_duration_since(intended.min(send_instant));
-        hist.record(latency.as_micros() as u64);
         sent += 1;
         i += 1;
     }
@@ -167,12 +175,21 @@ fn main() {
         let _ = h.join();
     }
     let elapsed = wall.elapsed().as_secs_f64().max(0.001);
-    let achieved = sent as f64 / elapsed;
+    let achieved = ok as f64 / elapsed;
 
-    // RFC §2.4 headroom verdict: if the generator couldn't offer ≥ the target
-    // rate, the run is harness-bound and excluded from DUT-ceiling baselines.
+    // RFC §2.4 headroom verdict on *successful* throughput: if the generator
+    // couldn't offer ≥ the target rate, the run is harness-bound and excluded
+    // from DUT-ceiling baselines. Above 1% errors the DUT wasn't doing the
+    // offered work, so no rate-based verdict is attributable at all.
+    let err_ratio = if sent > 0 {
+        errors as f64 / sent as f64
+    } else {
+        1.0
+    };
     let ratio = achieved / a.rate as f64;
-    let verdict = if ratio < 0.9 {
+    let verdict = if err_ratio > 0.01 {
+        "INVALID_ERRORS"
+    } else if ratio < 0.9 {
         "HARNESS_BOUND"
     } else {
         "DUT_ATTRIBUTABLE"
@@ -188,6 +205,7 @@ fn main() {
         .num("sent", sent)
         .num("ok", ok)
         .num("errors", errors)
+        .num("error_ratio", format!("{err_ratio:.4}"))
         .num("p50_us", merged.percentile(50.0))
         .num("p99_us", merged.percentile(99.0))
         .num("p999_us", merged.percentile(99.9))

@@ -46,6 +46,26 @@ const STEP_MODULES: usize = 32;
 /// past the budget are dropped and counted in `TELE_RECORDS_DROPPED`.
 pub const SAFE_EXPORT_MAX: usize = 7400;
 
+/// Records `build_export` appends unconditionally AFTER its
+/// byte-budgeted sections: 4 aggregator self-metrics, the
+/// `STEP_HIST_BUCKETS`-bucket global step histogram, and the trailing
+/// drop counter.
+const EXPORT_TAIL_RECORDS: usize = 4 + STEP_HIST_BUCKETS + 1;
+
+/// Byte budget for the size-gated export sections: the unconditional
+/// tail above is reserved out of `SAFE_EXPORT_MAX` up front, so
+/// appending it can never push the finished payload past the cap —
+/// growing the tail shrinks this budget instead of silently
+/// truncating `/metrics` downstream.
+const EXPORT_BUDGET: usize = SAFE_EXPORT_MAX - EXPORT_TAIL_RECORDS * wire::METRICS_RECORD_LEN;
+
+/// Readiness gauges go stale after this long without a fresh report.
+/// Producers republish on 250 ms – 1 s cadences (cf.
+/// `EMIT_INTERVAL_MS_DEFAULT`); three seconds forgives a couple of
+/// missed ticks, while a producer that died — whose last gauge would
+/// otherwise hold `/readyz` at 200 forever — drops the node to 503.
+const READY_STALE_MS: u64 = 3_000;
+
 /// Minimum boot delay before `/readyz` can flip to 200. Not a readiness
 /// criterion itself — just a floor so the first metric-sample window has
 /// populated the table before `compute_ready` is trusted (otherwise an empty
@@ -188,7 +208,11 @@ pub fn on_typed_sample(
 /// `RAFT_READY=1`, and — if any apply instance is present — every one
 /// reports `APPLY_CAUGHT_UP=1`. Scanning slots handles multi-partition graphs
 /// (one raft/apply pair per partition) without special-casing.
-fn compute_ready(t: &Telemetry) -> bool {
+///
+/// A gauge older than `READY_STALE_MS` counts as NOT ready: a
+/// last-reported `1` from a producer that has since died must not
+/// hold `/readyz` at 200.
+fn compute_ready(t: &Telemetry, now: u64) -> bool {
     let mut saw_raft = false;
     let mut raft_ok = true;
     let mut saw_apply = false;
@@ -197,18 +221,19 @@ fn compute_ready(t: &Telemetry) -> bool {
         if slot.module_id == 0 {
             continue;
         }
+        let stale = now.wrapping_sub(slot.last_update_ms) > READY_STALE_MS;
         if slot.module_id == wire::SOURCE_ID_RAFT
             && slot.metric_id == wire::metric_ids::RAFT_READY
         {
             saw_raft = true;
-            if slot.value == 0 {
+            if slot.value == 0 || stale {
                 raft_ok = false;
             }
         } else if slot.module_id == wire::SOURCE_ID_APPLY
             && slot.metric_id == wire::metric_ids::APPLY_CAUGHT_UP
         {
             saw_apply = true;
-            if slot.value == 0 {
+            if slot.value == 0 || stale {
                 apply_ok = false;
             }
         }
@@ -323,10 +348,13 @@ unsafe fn build_export(t: &mut Telemetry, sys: &SyscallTable) -> usize {
     let mut count = 0u16;
     let mut dropped = 0u32;
     // Each record is fixed-width; stop appending once the next record would
-    // cross the safe budget so the emitted frame fits the channel ring.
+    // cross the size-gated budget. `EXPORT_BUDGET` already reserves the
+    // unconditional tail (self-metrics + global histogram + drop counter)
+    // out of `SAFE_EXPORT_MAX`, so the finished payload fits the channel
+    // ring however full the table is.
     macro_rules! fits {
         () => {
-            pos + wire::METRICS_RECORD_LEN <= SAFE_EXPORT_MAX
+            pos + wire::METRICS_RECORD_LEN <= EXPORT_BUDGET
         };
     }
 
@@ -395,7 +423,7 @@ unsafe fn build_export(t: &mut Telemetry, sys: &SyscallTable) -> usize {
         if total == 0 {
             continue; // idle / unused slot — don't bloat the export
         }
-        if pos + STEP_HIST_BUCKETS * wire::METRICS_RECORD_LEN > SAFE_EXPORT_MAX {
+        if pos + STEP_HIST_BUCKETS * wire::METRICS_RECORD_LEN > EXPORT_BUDGET {
             dropped += STEP_HIST_BUCKETS as u32;
             continue;
         }
@@ -416,7 +444,7 @@ unsafe fn build_export(t: &mut Telemetry, sys: &SyscallTable) -> usize {
     }
 
     // 5. Drop counter last (its own value reflects this scrape). Always fits —
-    //    the budget leaves a record's headroom (SAFE_EXPORT_MAX < ring).
+    //    it is the final record of the tail `EXPORT_BUDGET` reserved for.
     t.records_dropped = dropped;
     pos = push_record(&mut t.export_buf, pos, tele, 0, wire::metric_ids::TELE_RECORDS_DROPPED, kc, i64::from(dropped));
     count += 1;
@@ -487,7 +515,7 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
     // A small `startup_ms` floor avoids a 200 before the first sample
     // window has populated the table.
     if now.wrapping_sub(t.startup_ms) >= READY_MIN_MS {
-        t.ready = compute_ready(t);
+        t.ready = compute_ready(t, now);
     }
 
     // 2. Emit readyz/why/export periodically

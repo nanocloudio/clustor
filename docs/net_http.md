@@ -12,9 +12,9 @@ allocator.
 Two `linux_net` instances run per node — one bound to the clustor
 wire socket (`peer_router`), one bound to the HTTP listener
 (`operations.net_in` / `operations.net_out`). Fluxor supports the
-multi-instance pattern by design (see fluxor's
-`src/platform/linux/providers.rs` and the YAML loader in
-`tools/src/config.rs`).
+multi-instance pattern by design (see
+`fluxor/src/platform/linux/providers.rs` and the YAML loader under
+`fluxor/tools/src/config/`).
 
 ```
                                  ┌───────── operations ─────────┐

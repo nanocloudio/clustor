@@ -10,14 +10,17 @@
 //!                          ingress ── parsed request ──▶ http
 //!                              ▲                          │
 //!                              └── response ring ◀────────┘
-//!                              │ NCMD_SEND([conn_id][HTTP/1.1 ...])
+//!                              │ NCMD_SEND([conn_id:u16 LE][HTTP/1.1 ...])
 //!                              ▼
 //!                          linux_net ──HTTP/1.1 keep-alive──▶ client
 //!
 //! Constraints (minimum viable diagnostic surface):
 //!
 //!   - Headers parsed up to `\r\n\r\n`; request bodies honoured up to
-//!     `Content-Length`, capped at `MAX_BODY`.
+//!     `Content-Length` (≤ `MAX_BODY`). A body advertised past the
+//!     cap answers 413 + close; a header block that overruns the
+//!     receive buffer answers 431 + close — never truncation, never
+//!     a wedged slot.
 //!   - Sequential HTTP/1.1 keep-alive. Pipelining is intentionally not
 //!     supported: one request may be in flight per connection.
 //!   - 32 concurrent connections, 2 KiB receive buffer per connection.
@@ -55,18 +58,38 @@ use super::{
 /// state bounded.
 const MAX_CONNS: usize = 32;
 const RX_BUF: usize = 2048;
-/// Response/TX-path buffer. Must hold the largest response body the
-/// http component can return — the `/metrics` export, capped at
-/// `telemetry::SAFE_EXPORT_MAX` (7400 B) — plus the HTTP/1.1 status
-/// line + headers (~90 B). 7680 covers the cap + headers and keeps
-/// the framed net write (3 B net hdr + payload) under the channel
-/// ring (8192).
-const TX_BUF: usize = 7680;
+/// Upper bound on the generated HTTP/1.1 response head (status line,
+/// fixed `Content-Type`/`Connection` headers and the `Content-Length`
+/// digits). The real head is ~91 B; 128 is the rounded ceiling the
+/// buffer arithmetic below reserves.
+const HTTP_RESP_HEAD_MAX: usize = 128;
+/// Response/TX-path buffer. Every stage of the response path stages
+/// through a `TX_BUF`-sized field, and each stage adds a prefix, so
+/// the bound must cover the WHOLE chain or the innermost stage
+/// truncates:
+///   * `http_buf`    = response head + body
+///   * `payload_buf` = `[conn_id:u16 LE]` + the above
+///   * `net_buf`     = net frame header + the above
+/// `net_write_frame` returns 0 (writes nothing) when the frame exceeds
+/// the scratch it is handed, and the response drain retries a failed
+/// write forever — an undersized `TX_BUF` therefore wedges the
+/// response ring rather than merely truncating. Derived so the full
+/// chain fits by construction, and stays under the channel ring
+/// (8192) that carries the finished net frame.
+const TX_BUF: usize =
+    NET_FRAME_HDR + CONN_ID_LEN + HTTP_RESP_HEAD_MAX + RESP_BODY_MAX;
 const MAX_PATH: usize = 64;
-/// Maximum request body forwarded to the http component. Bodies above
-/// this are truncated; the diagnostic / admin paths fit comfortably
-/// under 1 KiB.
+/// Maximum request body forwarded to the http component. A request
+/// advertising a larger `Content-Length` is answered 413 and the
+/// connection closed — never truncated, whose excess bytes would
+/// reparse as a smuggled pipelined request. The diagnostic / admin
+/// paths fit comfortably under 1 KiB.
 const MAX_BODY: usize = 1024;
+/// Largest response body accepted onto the response ring: the http
+/// component's `/metrics` cache bound, itself derived from
+/// `telemetry::SAFE_EXPORT_MAX` — one source for all three components
+/// (see `http::METRICS_CACHE`).
+const RESP_BODY_MAX: usize = super::http::METRICS_CACHE;
 
 /// Response ring capacity. Sized to one channel ring so the
 /// backpressure envelope matches the port it stands in for: it holds
@@ -75,15 +98,20 @@ const RESP_RING: usize = 8192;
 /// Response record header: `[conn_id:u8][status:u16 LE][len:u16 LE]`.
 const RESP_HDR: usize = 5;
 
-// net_proto constants — must match fluxor's `linux_net` / `tls`
-// module. Kept in sync with `modules/peer_router/mod.rs`.
-const NMSG_ACCEPT: u8 = 0x01;
-const NMSG_DATA: u8 = 0x02;
-const NMSG_CLOSED: u8 = 0x03;
-const NMSG_BOUND: u8 = 0x04;
-const NCMD_BIND: u8 = 0x10;
-const NCMD_SEND: u8 = 0x11;
-const NCMD_CLOSE: u8 = 0x12;
+// net_proto stream contract — the SDK contract mounted through
+// `abi.rs` (`target/fluxor/fluxor-abi/sdk/contracts/net/net_proto.rs`)
+// is authoritative: every event/command payload leads with
+// `conn_id: u16 LE`. Local aliases keep the short names used below.
+use super::abi::contracts::net::net_proto;
+const NMSG_ACCEPT: u8 = net_proto::MSG_ACCEPTED;
+const NMSG_DATA: u8 = net_proto::MSG_DATA;
+const NMSG_CLOSED: u8 = net_proto::MSG_CLOSED;
+const NMSG_BOUND: u8 = net_proto::MSG_BOUND;
+const NCMD_BIND: u8 = net_proto::CMD_BIND;
+const NCMD_SEND: u8 = net_proto::CMD_SEND;
+const NCMD_CLOSE: u8 = net_proto::CMD_CLOSE;
+/// Wire width of a connection id (`[conn_id: u16 LE]`).
+const CONN_ID_LEN: usize = net_proto::CONN_ID_LEN;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -138,6 +166,14 @@ pub struct Ingress {
     ring_head: u16,
     ring_used: u16,
 
+    /// Connections rejected because the transport's u16 conn id
+    /// exceeded 0xFF: this component keeps u8 conn ids internally
+    /// (the whole ingress↔http↔rbac↔admin chain is u8-keyed and the
+    /// linux provider allocates ids from a small slot table, so this
+    /// should never fire). Such a conn is closed and counted — never
+    /// silently misparsed.
+    wide_conn_rejects: u32,
+
     /// Scratch for the linux_net frame envelope writer.
     net_buf: [u8; TX_BUF],
     /// Scratch for un-ringing one response record.
@@ -160,6 +196,7 @@ pub unsafe fn init(g: &mut Ingress) {
     g.resp_ring = [0u8; RESP_RING];
     g.ring_head = 0;
     g.ring_used = 0;
+    g.wide_conn_rejects = 0;
     g.net_buf = [0u8; TX_BUF];
     g.resp_buf = [0u8; TX_BUF];
     g.http_buf = [0u8; TX_BUF];
@@ -191,9 +228,6 @@ pub fn queue_response(
     status: u16,
     body: &[u8],
 ) -> bool {
-    // Largest queued body: the /metrics export (http::METRICS_CACHE
-    // mirrors this bound — a change must touch both).
-    const RESP_BODY_MAX: usize = 7600;
     let body_len = body.len().min(RESP_BODY_MAX);
     let total = RESP_HDR + body_len;
     if (RESP_RING - g.ring_used as usize) < total {
@@ -217,13 +251,20 @@ fn ring_write(g: &mut Ingress, bytes: &[u8]) {
     g.ring_used += bytes.len() as u16;
 }
 
-fn ring_read(g: &mut Ingress, n: usize, dst: &mut [u8]) {
-    let mut r = g.ring_head as usize;
+/// Copy `n` ring bytes starting `off` past the head into `dst`
+/// WITHOUT consuming them — the drain below advances the head only
+/// once the atomic net write has confirmed.
+fn ring_peek(g: &Ingress, off: usize, n: usize, dst: &mut [u8]) {
+    let mut r = (g.ring_head as usize + off) % RESP_RING;
     for slot in dst.iter_mut().take(n) {
         *slot = g.resp_ring[r];
         r = (r + 1) % RESP_RING;
     }
-    g.ring_head = r as u16;
+}
+
+/// Consume `n` peeked bytes off the ring head.
+fn ring_advance(g: &mut Ingress, n: usize) {
+    g.ring_head = ((g.ring_head as usize + n) % RESP_RING) as u16;
     g.ring_used -= n as u16;
 }
 
@@ -258,6 +299,12 @@ pub enum Pull {
     Empty,
     Handled,
     Request,
+    /// A connection lifecycle edge (accept or close) for the carried
+    /// conn_id. Deferred per-connection state held by sibling
+    /// components must not outlive it — the dispatch table purges the
+    /// http component's deferred-reply state on this variant so a
+    /// reused conn_id can never inherit another client's reply.
+    ConnBoundary(u8),
 }
 
 /// Open the ingress dispatch slot: reset the step-work marker and
@@ -316,6 +363,25 @@ unsafe fn try_bind(g: &mut Ingress, sys: &SyscallTable) {
 
 // ── Inbound: linux_net events and HTTP request parsing ──────
 
+/// Per-port filter for `MSG_ACCEPTED`
+/// (`[conn_id:u16 LE][local_port:u16 LE]`). `net_in` is a shared
+/// broadcast on a multi-anchor graph, so claiming every accept makes
+/// this h1 server answer 404s on another protocol's connections —
+/// only conns accepted on OUR listen port are ours. Providers that
+/// omit the trailing port are tolerated (single-listener graphs).
+///
+/// Reads the frame still sitting in `g.net_buf`.
+fn accept_is_ours(g: &Ingress, payload_len: usize) -> bool {
+    if payload_len < CONN_ID_LEN + 2 {
+        return true;
+    }
+    let port = u16::from_le_bytes([
+        g.net_buf[NET_FRAME_HDR + CONN_ID_LEN],
+        g.net_buf[NET_FRAME_HDR + CONN_ID_LEN + 1],
+    ]);
+    port == g.listen_port
+}
+
 /// Pull ONE linux_net event. Accept/close/bound and data-buffering
 /// are handled here on the ingress's own state; a fully-received,
 /// parsed HTTP request is returned as [`Pull::Request`] in `req` for
@@ -344,10 +410,41 @@ pub unsafe fn next_event(
         if event == 0 {
             return Pull::Empty;
         }
-        if payload_len < 1 {
+        if payload_len < CONN_ID_LEN {
             return Pull::Handled;
         }
-        let conn_id = g.net_buf[NET_FRAME_HDR];
+        // Every net_proto payload leads with `[conn_id: u16 LE]`.
+        let wire_conn = net_proto::conn_id(&g.net_buf[NET_FRAME_HDR..NET_FRAME_HDR + CONN_ID_LEN]);
+        // Internal bookkeeping (and the http/rbac/admin chain behind
+        // it) is u8-keyed; the provider's slot-table allocation keeps
+        // ids small, so an id above 0xFF is rejected at this boundary
+        // rather than truncated into a colliding u8. Only conns
+        // accepted on OUR listen port are torn down — `net_in` is a
+        // shared broadcast on a multi-anchor graph, and closing
+        // another anchor's connection would be a cross-anchor kill.
+        if wire_conn > 0xFF {
+            if event == NMSG_ACCEPT && accept_is_ours(g, payload_len) {
+                g.wide_conn_rejects = g.wide_conn_rejects.wrapping_add(1);
+                let mut buf = [0u8; 64];
+                let n = format_wide_reject(&mut buf, wire_conn, g.wide_conn_rejects);
+                dev_log(sys, 2, buf.as_ptr(), n);
+                // Close it so the client sees a teardown, not a hang.
+                if g.out_net >= 0 {
+                    let close_payload = wire_conn.to_le_bytes();
+                    net_write_frame(
+                        sys,
+                        g.out_net,
+                        NCMD_CLOSE,
+                        close_payload.as_ptr(),
+                        CONN_ID_LEN,
+                        g.net_buf.as_mut_ptr(),
+                        TX_BUF,
+                    );
+                }
+            }
+            return Pull::Handled;
+        }
+        let conn_id = wire_conn as u8;
         match event {
             NMSG_BOUND => {
                 // linux_net acknowledged the bind. Nothing to do —
@@ -355,36 +452,23 @@ pub unsafe fn next_event(
                 Pull::Handled
             }
             NMSG_ACCEPT => {
-                // Per-port filter: ACCEPT carries the parent listener's
-                // local_port after the conn_id. On a shared net_out
-                // broadcast (multi-anchor graphs) claiming every accept
-                // makes this h1 server answer 404s on OTHER protocols'
-                // connections — observed polluting an h2/gRPC anchor's
-                // port. Only claim conns accepted on OUR listen port;
-                // tolerate short frames from older net providers that
-                // don't carry the port (single-listener graphs).
-                if payload_len >= 3 {
-                    let port = u16::from_le_bytes([
-                        g.net_buf[NET_FRAME_HDR + 1],
-                        g.net_buf[NET_FRAME_HDR + 2],
-                    ]);
-                    if port != g.listen_port {
-                        return Pull::Handled;
-                    }
+                if !accept_is_ours(g, payload_len) {
+                    return Pull::Handled;
                 }
                 if alloc_conn(g, conn_id).is_some() {
                     let mut buf = [0u8; 48];
                     let n = format_accepted(&mut buf, conn_id);
                     dev_log(sys, 3, buf.as_ptr(), n);
                 }
-                Pull::Handled
+                Pull::ConnBoundary(conn_id)
             }
             NMSG_DATA => {
-                if payload_len < 2 {
+                // `[conn_id: u16 LE][data…]` — need at least one data byte.
+                if payload_len <= CONN_ID_LEN {
                     return Pull::Handled;
                 }
-                let data_start = NET_FRAME_HDR + 1;
-                let data_len = payload_len - 1;
+                let data_start = NET_FRAME_HDR + CONN_ID_LEN;
+                let data_len = payload_len - CONN_ID_LEN;
                 ingest_data(g, sys, conn_id, data_start, data_len, req)
             }
             NMSG_CLOSED => {
@@ -392,7 +476,7 @@ pub unsafe fn next_event(
                 let mut buf = [0u8; 48];
                 let n = format_closed(&mut buf, conn_id);
                 dev_log(sys, 3, buf.as_ptr(), n);
-                Pull::Handled
+                Pull::ConnBoundary(conn_id)
             }
             _ => Pull::Handled,
         }
@@ -431,10 +515,28 @@ unsafe fn ingest_data(
     let total = g.conns[slot].rx_len as usize;
     if let Some(headers_end) = find_double_crlf(&g.conns[slot].rx[..total]) {
         let content_length = parse_content_length(&g.conns[slot].rx[..headers_end]);
+        if content_length > MAX_BODY || headers_end + content_length > RX_BUF {
+            // The advertised body can never be buffered — answer 413
+            // and close. Truncating instead would reparse the excess
+            // bytes as a pipelined request (smuggling); waiting would
+            // wedge the slot forever. Close (rather than an exact
+            // drain) keeps the recovery path O(1) per step. Emitted
+            // directly, like the 400 below, not through the response
+            // ring: `close_after_response` makes this terminal.
+            g.conns[slot].close_after_response = true;
+            send_http_response(g, sys, slot, 413, b"payload too large\n");
+            return Pull::Handled;
+        }
         let need = headers_end + content_length;
         if total >= need {
             return deliver_request(g, sys, slot, headers_end, content_length, req);
         }
+    } else if total >= RX_BUF {
+        // Header block filled the receive buffer without terminating —
+        // it can never complete. 431 + close, never a silent wedge.
+        g.conns[slot].close_after_response = true;
+        send_http_response(g, sys, slot, 431, b"header block too large\n");
+        return Pull::Handled;
     }
     Pull::Handled
 }
@@ -514,72 +616,94 @@ unsafe fn drain_responses(g: &mut Ingress, sys: &SyscallTable) {
             break;
         }
         // Do not consume a response record unless the complete net
-        // command has somewhere to go. The write below is atomic.
+        // command has somewhere to go. poll(OUT) only promises ">= 1
+        // byte free" and the net write is all-or-nothing, so the
+        // record is PEEKED here and consumed only after the write
+        // confirms — a record un-rung before a failed write would
+        // leave the connection's request state marked answered with
+        // no answer ever leaving, deadlocking the keep-alive slot.
         let net_poll = (sys.channel_poll)(g.out_net, POLL_OUT);
         if net_poll <= 0 || (net_poll as u32 & POLL_OUT) == 0 {
             break;
         }
         let mut hdr = [0u8; RESP_HDR];
-        ring_read(g, RESP_HDR, &mut hdr);
+        ring_peek(g, 0, RESP_HDR, &mut hdr);
         let conn_id = hdr[0];
         let status = u16::from_le_bytes([hdr[1], hdr[2]]);
         let body_len = u16::from_le_bytes([hdr[3], hdr[4]]) as usize;
-        let take = body_len.min(TX_BUF);
-        // Un-ring the body into the state-resident staging buffer —
-        // no stack arrays on this path.
+        let take = body_len.min(RESP_BODY_MAX);
+        // Stage the body into the state-resident buffer — no stack
+        // arrays on this path, and no head movement yet.
         {
-            let mut r = g.ring_head as usize;
-            for i in 0..take {
-                g.resp_buf[i] = g.resp_ring[r];
+            let Ingress { resp_buf, resp_ring, ring_head, .. } = g;
+            let mut r = (*ring_head as usize + RESP_HDR) % RESP_RING;
+            for slot in resp_buf.iter_mut().take(take) {
+                *slot = resp_ring[r];
                 r = (r + 1) % RESP_RING;
             }
-            g.ring_head = r as u16;
-            g.ring_used -= take as u16;
         }
         let slot = match find_conn(g, conn_id) {
             Some(i) => i,
-            None => continue,
+            None => {
+                // Connection died while the response was queued —
+                // the record is undeliverable; drop it.
+                ring_advance(g, RESP_HDR + body_len);
+                continue;
+            }
         };
-        respond_from_resp_buf(g, sys, slot, status, take);
+        if respond_from_resp_buf(g, sys, slot, status, take) {
+            ring_advance(g, RESP_HDR + body_len);
+        } else {
+            // The atomic write wrote NOTHING (ring full under a big
+            // /metrics frame, say). Leave the record and the conn
+            // state untouched; the next step's drain retries —
+            // bounded by this loop's 8-record budget, no busy spin.
+            break;
+        }
     }
 }
 
 /// Send a response whose body is small enough to stage through the
-/// state-resident buffer (all callers respect `TX_BUF`).
+/// state-resident buffer (all callers respect `TX_BUF`). Returns
+/// whether the atomic net write confirmed (see
+/// [`respond_from_resp_buf`]).
 unsafe fn send_http_response(
     g: &mut Ingress,
     sys: &SyscallTable,
     slot: usize,
     status: u16,
     body: &[u8],
-) {
-    let take = body.len().min(TX_BUF);
+) -> bool {
+    let take = body.len().min(RESP_BODY_MAX);
     g.resp_buf[..take].copy_from_slice(&body[..take]);
-    respond_from_resp_buf(g, sys, slot, status, take);
+    respond_from_resp_buf(g, sys, slot, status, take)
 }
 
 /// Frame and send the response whose body sits in `resp_buf[..len]`.
+/// Returns whether the atomic net write confirmed; connection state
+/// (rx reset / close) advances only on a confirmed write, so a caller
+/// that failed can retry with everything intact.
 unsafe fn respond_from_resp_buf(
     g: &mut Ingress,
     sys: &SyscallTable,
     slot: usize,
     status: u16,
     len: usize,
-) {
+) -> bool {
     let conn_id = g.conns[slot].conn_id;
     let close = g.conns[slot].close_after_response;
     // Frame an HTTP/1.1 response into state-resident scratch, then push to
-    // linux_net via NCMD_SEND with payload `[conn_id][http_bytes...]`.
+    // linux_net via NCMD_SEND with payload `[conn_id:u16 LE][http_bytes...]`.
     // resp_buf and http_buf are disjoint fields, so the split borrow is safe.
     let n = {
         let Ingress { http_buf, resp_buf, .. } = g;
         format_http_response(http_buf, status, &resp_buf[..len], !close)
     };
-    g.payload_buf[0] = conn_id;
-    let n_body = n.min(TX_BUF - 1);
+    net_proto::put_conn_id(&mut g.payload_buf, conn_id as u16);
+    let n_body = n.min(TX_BUF - CONN_ID_LEN);
     {
         let (http_buf, payload_buf) = (&g.http_buf, &mut g.payload_buf);
-        payload_buf[1..1 + n_body].copy_from_slice(&http_buf[..n_body]);
+        payload_buf[CONN_ID_LEN..CONN_ID_LEN + n_body].copy_from_slice(&http_buf[..n_body]);
     }
     let mut sent = false;
     if g.out_net >= 0 {
@@ -590,23 +714,24 @@ unsafe fn respond_from_resp_buf(
                 g.out_net,
                 NCMD_SEND,
                 g.payload_buf.as_ptr(),
-                1 + n_body,
+                CONN_ID_LEN + n_body,
                 g.net_buf.as_mut_ptr(),
                 TX_BUF,
-            ) == NET_FRAME_HDR + 1 + n_body;
+            ) == NET_FRAME_HDR + CONN_ID_LEN + n_body;
         }
     }
     if sent {
         g.step_work = true;
         dev_report_step_effect(sys, step_effect::WORK_DONE);
         if close {
-            let close_payload = [conn_id];
+            // CMD_CLOSE payload: `[conn_id: u16 LE]`.
+            let close_payload = (conn_id as u16).to_le_bytes();
             net_write_frame(
                 sys,
                 g.out_net,
                 NCMD_CLOSE,
                 close_payload.as_ptr(),
-                1,
+                CONN_ID_LEN,
                 g.net_buf.as_mut_ptr(),
                 TX_BUF,
             );
@@ -618,11 +743,21 @@ unsafe fn respond_from_resp_buf(
             g.conns[slot].sent_request = false;
         }
     }
+    sent
 }
 
 // ── Connection slot bookkeeping ──────────────────────────────
 
 fn alloc_conn(g: &mut Ingress, conn_id: u8) -> Option<usize> {
+    // A conn_id re-seen on accept means its close was missed —
+    // reclaim the stale slot rather than shadowing it with a second
+    // active entry find_conn would never reach.
+    if let Some(i) = find_conn(g, conn_id) {
+        g.conns[i] = Conn::empty();
+        g.conns[i].active = true;
+        g.conns[i].conn_id = conn_id;
+        return Some(i);
+    }
     for i in 0..MAX_CONNS {
         if !g.conns[i].active {
             g.conns[i] = Conn::empty();
@@ -658,7 +793,10 @@ fn free_conn(g: &mut Ingress, conn_id: u8) {
 /// its decimal value. Case-insensitive on the header name, ignores
 /// leading whitespace on the value. Returns 0 if the header isn't
 /// present or is malformed — a missing or unparsable header is
-/// treated as "no body".
+/// treated as "no body". The TRUE advertised value is returned,
+/// uncapped: the caller compares it against `MAX_BODY`/`RX_BUF` and
+/// refuses oversize requests outright (a silent cap here would let
+/// the excess body bytes reparse as a pipelined request).
 fn parse_content_length(headers: &[u8]) -> usize {
     let needle: &[u8] = b"Content-Length:";
     let n = needle.len();
@@ -692,7 +830,7 @@ fn parse_content_length(headers: &[u8]) -> usize {
                 val = val.saturating_mul(10).saturating_add((c - b'0') as usize);
                 j += 1;
             }
-            return val.min(MAX_BODY);
+            return val;
         }
         i += 1;
     }
@@ -783,6 +921,8 @@ fn format_http_response(dst: &mut [u8], status: u16, body: &[u8], keep_alive: bo
         403 => b"Forbidden",
         404 => b"Not Found",
         405 => b"Method Not Allowed",
+        413 => b"Payload Too Large",
+        431 => b"Request Header Fields Too Large",
         503 => b"Service Unavailable",
         _ => b"OK",
     };
@@ -822,6 +962,18 @@ fn format_closed(dst: &mut [u8], conn_id: u8) -> usize {
     let mut c = ByteCursor::new(dst);
     c.push(b"[ingress] closed conn_id=");
     c.push_usize(conn_id as usize);
+    c.pos
+}
+
+/// `[ingress] wide conn_id N rejected total=M` — the transport handed
+/// us a u16 conn id above the internal u8 namespace; the conn was
+/// closed, never truncated into a colliding id.
+fn format_wide_reject(dst: &mut [u8], conn_id: u16, total: u32) -> usize {
+    let mut c = ByteCursor::new(dst);
+    c.push(b"[ingress] wide conn_id ");
+    c.push_usize(conn_id as usize);
+    c.push(b" rejected total=");
+    c.push_usize(total as usize);
     c.pos
 }
 

@@ -32,12 +32,23 @@
 //! never misroute.
 
 use super::abi::SyscallTable;
+use super::dev_millis;
 use super::{types, wire, wire_channels};
 
 const CORR_RING: usize = 64;
 const IDX_RING: usize = 64;
 
 const LEADER_UNKNOWN: u8 = 0xFF;
+
+/// Coarse TTL backstop on correlation entries. The primary purge is
+/// the `MSG_CONN_CLOSED` path (see [`purge_conn`]); the TTL only
+/// reclaims entries whose close notice was lost, so it merely has to
+/// clear any legitimate proposal→commit inflight window (sub-second
+/// in a healthy group) by a wide margin.
+const CORR_TTL_MS: u64 = 30_000;
+
+/// TTL sweep cadence — expiry is a backstop, not a hot path.
+const CORR_SWEEP_INTERVAL_MS: u64 = 1000;
 
 /// One resolved outbound wire response. The codec never talks to the
 /// surface directly — it returns one of these and the dispatch table
@@ -74,6 +85,8 @@ pub enum Route {
 #[derive(Clone, Copy)]
 struct CorrEntry {
     corr_id: u64,
+    /// dev_millis stamp at insertion, for the TTL backstop.
+    born_ms: u64,
     conn_id: u8,
 }
 
@@ -82,6 +95,8 @@ struct CorrEntry {
 struct IdxEntry {
     partition_id: u16,
     wal_index: u64,
+    /// dev_millis stamp at insertion, for the TTL backstop.
+    born_ms: u64,
     conn_id: u8,
 }
 
@@ -108,6 +123,10 @@ pub struct Codec {
     stale_epoch_rejected: u32,
     corr_misses: u32,
     idx_misses: u32,
+    /// Entries reclaimed by the TTL backstop (lost close notice or
+    /// lost response) — non-zero means clients hung on those replies.
+    corr_expired: u32,
+    last_ttl_sweep_ms: u64,
 
     next_corr_id: u64,
     corr_ring: [CorrEntry; CORR_RING],
@@ -137,14 +156,16 @@ pub unsafe fn init(c: &mut Codec) {
     c.stale_epoch_rejected = 0;
     c.corr_misses = 0;
     c.idx_misses = 0;
+    c.corr_expired = 0;
+    c.last_ttl_sweep_ms = 0;
     c.next_corr_id = 1; // correlation_id MUST be non-zero
     c.corr_head = 0;
     c.idx_head = 0;
     for slot in c.corr_ring.iter_mut() {
-        *slot = CorrEntry { corr_id: 0, conn_id: 0 };
+        *slot = CorrEntry { corr_id: 0, born_ms: 0, conn_id: 0 };
     }
     for slot in c.idx_ring.iter_mut() {
-        *slot = IdxEntry { partition_id: 0, wal_index: 0, conn_id: 0 };
+        *slot = IdxEntry { partition_id: 0, wal_index: 0, born_ms: 0, conn_id: 0 };
     }
 }
 
@@ -163,9 +184,52 @@ pub fn work_count(c: &Codec) -> u32 {
 /// Caller must hold exclusive component borrows and a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn step(c: &mut Codec, sys: &SyscallTable) {
+    expire_stale(c, sys);
     drain_placement(c, sys);
     drain_leader_state(c, sys);
     drain_proposal_assigned(c, sys);
+}
+
+/// TTL backstop sweep (≤1/s): reclaim correlation entries older than
+/// [`CORR_TTL_MS`]. The only other reclaim is ring-overflow eviction,
+/// which under light load never comes — so without this an entry whose
+/// response or close notice was lost occupies its slot indefinitely.
+unsafe fn expire_stale(c: &mut Codec, sys: &SyscallTable) {
+    let now = dev_millis(sys);
+    if now.wrapping_sub(c.last_ttl_sweep_ms) < CORR_SWEEP_INTERVAL_MS {
+        return;
+    }
+    c.last_ttl_sweep_ms = now;
+    for slot in c.corr_ring.iter_mut() {
+        if slot.corr_id != 0 && now.wrapping_sub(slot.born_ms) > CORR_TTL_MS {
+            slot.corr_id = 0;
+            c.corr_expired += 1;
+        }
+    }
+    for slot in c.idx_ring.iter_mut() {
+        if slot.wal_index != 0 && now.wrapping_sub(slot.born_ms) > CORR_TTL_MS {
+            slot.wal_index = 0;
+            c.corr_expired += 1;
+        }
+    }
+}
+
+/// Purge every correlation entry bound to a closed connection — the
+/// dispatch table calls this on the surface's
+/// [`super::surface::Inbound::ConnClosed`] notice. peer_router reuses
+/// conn_ids, so a stale entry would route some later client's
+/// response to the wrong connection.
+pub fn purge_conn(c: &mut Codec, conn_id: u8) {
+    for slot in c.corr_ring.iter_mut() {
+        if slot.corr_id != 0 && slot.conn_id == conn_id {
+            slot.corr_id = 0;
+        }
+    }
+    for slot in c.idx_ring.iter_mut() {
+        if slot.wal_index != 0 && slot.conn_id == conn_id {
+            slot.wal_index = 0;
+        }
+    }
 }
 
 /// Count one response actually written by the surface on this
@@ -214,6 +278,7 @@ unsafe fn drain_proposal_assigned(c: &mut Codec, sys: &SyscallTable) {
     if c.in_proposal_assigned < 0 {
         return;
     }
+    let now_ms = dev_millis(sys);
     for _ in 0..16 {
         let poll = (sys.channel_poll)(c.in_proposal_assigned, 0x01);
         if poll <= 0 || (poll as u32 & 0x01) == 0 {
@@ -227,7 +292,7 @@ unsafe fn drain_proposal_assigned(c: &mut Codec, sys: &SyscallTable) {
         let (corr_id, partition_id, wal_index) = wire::decode_proposal_assigned(&c.msg_buf);
         // Look up the conn_id we recorded when emitting this proposal.
         if let Some(conn_id) = take_corr(c, corr_id) {
-            put_idx(c, partition_id, wal_index, conn_id);
+            put_idx(c, partition_id, wal_index, conn_id, now_ms);
         } else {
             c.corr_misses += 1;
         }
@@ -331,7 +396,6 @@ pub unsafe fn on_request(
                 ));
             }
             let corr_id = next_corr_id(c);
-            put_corr(c, corr_id, conn_id);
             let total = wire::TAGGED_PROPOSAL_HDR + body_len;
             if total > 2048 {
                 return Route::Done;
@@ -343,8 +407,18 @@ pub unsafe fn on_request(
             if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
                 return Route::Done;
             }
-            wire_channels::channel_write_msg(sys, c.out_reads, wire::MSG_CLIENT_READ_REQUEST, &framed[..total]);
-            c.requests_parsed += 1;
+            // Write FIRST, record on success. Recording before the
+            // write strands a correlation entry whenever the reads
+            // channel refuses the frame: the request is consumed, the
+            // table slot lingers until TTL/overflow, and the client
+            // waits on a reply that can never arrive.
+            let wrote = wire_channels::channel_write_msg(
+                sys, c.out_reads, wire::MSG_CLIENT_READ_REQUEST, &framed[..total],
+            );
+            if wrote > 0 {
+                put_corr(c, corr_id, conn_id, dev_millis(sys));
+                c.requests_parsed += 1;
+            }
             Route::Done
         }
         // Default: treat as a write proposal.
@@ -368,7 +442,7 @@ pub unsafe fn on_request(
             }
 
             let corr_id = next_corr_id(c);
-            put_corr(c, corr_id, conn_id);
+            put_corr(c, corr_id, conn_id, dev_millis(sys));
 
             // Tagged proposal `[correlation_id:u64][body]` so the
             // leader can echo MSG_PROPOSAL_ASSIGNED back on
@@ -537,9 +611,9 @@ fn next_corr_id(c: &mut Codec) -> u64 {
     id
 }
 
-fn put_corr(c: &mut Codec, corr_id: u64, conn_id: u8) {
+fn put_corr(c: &mut Codec, corr_id: u64, conn_id: u8, now_ms: u64) {
     let slot = (c.corr_head as usize) % CORR_RING;
-    c.corr_ring[slot] = CorrEntry { corr_id, conn_id };
+    c.corr_ring[slot] = CorrEntry { corr_id, born_ms: now_ms, conn_id };
     c.corr_head = c.corr_head.wrapping_add(1);
 }
 
@@ -554,9 +628,9 @@ fn take_corr(c: &mut Codec, corr_id: u64) -> Option<u8> {
     None
 }
 
-fn put_idx(c: &mut Codec, partition_id: u16, wal_index: u64, conn_id: u8) {
+fn put_idx(c: &mut Codec, partition_id: u16, wal_index: u64, conn_id: u8, now_ms: u64) {
     let slot = (c.idx_head as usize) % IDX_RING;
-    c.idx_ring[slot] = IdxEntry { partition_id, wal_index, conn_id };
+    c.idx_ring[slot] = IdxEntry { partition_id, wal_index, born_ms: now_ms, conn_id };
     c.idx_head = c.idx_head.wrapping_add(1);
 }
 

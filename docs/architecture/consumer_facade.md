@@ -31,15 +31,16 @@ at `tests/facade.rs` exercise the same file unchanged.
 
 1. [Semantic contract](#semantic-contract)
 2. [Bounded, opaque commands](#bounded-opaque-commands)
-3. [Propose lifecycle](#propose-lifecycle)
-4. [Per-entry committed stream](#per-entry-committed-stream)
-5. [Membership and topology invariance](#membership-and-topology-invariance)
-6. [Leader change](#leader-change)
-7. [Snapshot install and export](#snapshot-install-and-export)
-8. [Read-gate inputs](#read-gate-inputs)
-9. [Invariants and out-of-scope](#invariants-and-out-of-scope)
-10. [Test surface](#test-surface)
-11. [Per-entry stream configuration](#per-entry-stream-configuration)
+3. [Channel envelope](#channel-envelope)
+4. [Propose lifecycle](#propose-lifecycle)
+5. [Per-entry committed stream](#per-entry-committed-stream)
+6. [Membership and topology invariance](#membership-and-topology-invariance)
+7. [Leader change](#leader-change)
+8. [Snapshot install and export](#snapshot-install-and-export)
+9. [Read-gate inputs](#read-gate-inputs)
+10. [Invariants and out-of-scope](#invariants-and-out-of-scope)
+11. [Test surface](#test-surface)
+12. [Per-entry stream configuration](#per-entry-stream-configuration)
 
 ---
 
@@ -116,6 +117,59 @@ Command bytes are opaque to clustor. Neither `consensus` nor
 `durability` inspects, parses, or schema-validates a command body at
 any stage — proposal intake, replication, WAL framing, commit, or
 apply. Consumers own their own command schema.
+
+---
+
+## Channel envelope
+
+Every message on a clustor channel carries a 3-byte envelope,
+`[msg_type:u8][payload_len:u16 LE]`, ahead of its payload. A consumer
+attaches to byte-stream channels, so it frames what it writes and
+reassembles what it reads: one channel read returns whatever bytes have
+arrived, which may be half a frame or several.
+
+The facade owns the whole of that surface, so no consumer imports
+`wire.rs`:
+
+| Item | Purpose |
+|---|---|
+| `ENVELOPE_HDR`, `MAX_PAYLOAD` | Envelope geometry |
+| `MSG_CLIENT_PROPOSAL` | Offer an opaque command to the group |
+| `MSG_COMMITTED_ENTRY` | Per-entry committed stream |
+| `frame(dst, msg_type, payload)` | Compose envelope + payload for one write |
+| `next_frame(buf)` | Split one complete frame off a reassembly buffer |
+
+`frame` composes into a single buffer so the caller issues one channel
+write; that is what keeps a frame atomic against a reader splitting the
+stream. `next_frame` returns `None` until a whole frame is present, so a
+reader loops it, then compacts the unconsumed tail to the front:
+
+```rust
+let n = frame(&mut out, MSG_CLIENT_PROPOSAL, command)?;
+channel_write(port, out.as_ptr(), n);
+
+// reading
+let mut off = 0;
+while let Some((msg_type, payload, consumed)) = next_frame(&asm[off..asm_len]) {
+    if msg_type == MSG_COMMITTED_ENTRY {
+        let entry = CommittedEntry::decode(payload)?;
+        // ...
+    }
+    off += consumed;
+}
+asm.copy_within(off..asm_len, 0);
+asm_len -= off;
+```
+
+A consumer that carries its own correlation inside the command body
+writes `MSG_CLIENT_PROPOSAL` to `consensus.proposals` and recovers the
+body from `consensus.committed_entries`; one that wants clustor to
+correlate on its behalf wraps a [`build_tagged_proposal`](#propose-lifecycle)
+payload and writes to `consensus.proposals_tagged` instead.
+
+`tests/facade.rs::facade_envelope_constants_track_the_substrate` holds
+the facade's constants against `wire.rs`, so renumbering a message in the
+substrate fails there rather than silently mis-framing in a consumer.
 
 ---
 

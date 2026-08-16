@@ -56,15 +56,16 @@ use super::abi::SyscallTable;
 use super::seam::{SeamRing, PROBE_QUEUE_SLOTS};
 use super::types::*;
 use super::{
-    dev_log, dev_micros, dev_millis, dev_report_step_effect, step_effect, wire, wire_channels,
+    dev_log, dev_micros, dev_millis, dev_report_step_effect, step_effect, wal_frame, wire,
+    wire_channels,
 };
 
 const DEDUP_SHARDS: usize = 16;
 
-/// Maximum body size held in a pending-entry slot. Mirrors the leader's
-/// `PROPOSAL_BATCH_CAP` so any batch raft can flush also fits
-/// here unmodified.
-const PENDING_BODY_CAP: usize = 2048;
+/// Maximum body size held in a pending-entry slot. Derived from the
+/// shared frame contract (= the leader's `PROPOSAL_BATCH_CAP`) so any
+/// batch raft can flush also fits here unmodified.
+const PENDING_BODY_CAP: usize = wal_frame::MAX_ENTRY_BODY;
 
 /// Number of pending entries buffered awaiting commit. Sized to absorb
 /// the typical in-flight window between WAL persist and quorum commit.
@@ -89,7 +90,10 @@ const READ_TIMEOUT_MS: u64 = 5_000;
 
 /// CP permit "freshness" TTL — if we haven't seen a permit in this
 /// many ms, treat the cache as stale and refuse new ready-emit.
-const READ_PERMIT_TTL_MS: u64 = 1_000;
+/// Must span several ticks of the pi5's ~1 s-granular UNIX_MILLIS: on a
+/// 1 s-quantised clock a 1 s TTL expires the moment the clock steps,
+/// turning fresh permits into spurious read FALLBACK bursts.
+const READ_PERMIT_TTL_MS: u64 = 3_000;
 const METRICS_INTERVAL_MS: u64 = 1_000;
 
 /// Minimum spacing between re-issues of the SAME missing-index WAL refetch
@@ -619,7 +623,9 @@ unsafe fn drain_pending_entries(s: &mut Apply, sys: &SyscallTable) {
                     request_missing_entry(s, sys, s.apply_index + 1);
                     break;
                 }
-                emit_committed_entry(s, sys, slot_idx);
+                if !emit_committed_entry(s, sys, slot_idx) {
+                    break; // ack channel saturated — retry next step
+                }
             }
         }
     }
@@ -679,7 +685,11 @@ pub unsafe fn on_entry_reply(s: &mut Apply, _sys: &SyscallTable, msg: &[u8], ple
             None => return,
         };
     if index == 0 { return; }
-    if plen <= hdr {
+    // NOT_FOUND is signalled by term == 0 (the WAL's header-only reply),
+    // NOT by an empty body: a leader-election no-op is a real entry with
+    // an empty body, and reading it as missing wedges the refetch loop on
+    // the first index of every term.
+    if term == 0 {
         // NOT_FOUND (below WAL retention) — the gap stands. Leave
         // awaiting_entry SET so request_missing_entry's retry throttle
         // holds the re-request to once per ENTRY_REFETCH_RETRY_MS rather
@@ -700,15 +710,38 @@ pub unsafe fn on_entry_reply(s: &mut Apply, _sys: &SyscallTable, msg: &[u8], ple
     }
 }
 
+/// Emit one committed entry: client ack, admin/config fanout, observer
+/// stream, then retire the slot.
+///
+/// Returns false — leaving the slot intact and `apply_index` unmoved —
+/// when the per-index client ack could not be written. The caller's poll
+/// only guarantees ≥1 byte free, not a whole frame, so retiring the slot
+/// on a failed write would break the "every proposal gets an ack"
+/// contract under `out_applied` saturation.
+///
 /// # Safety
 ///
-/// Caller must hold an exclusive `&mut Apply` (or shared
-/// `&Apply` where the signature uses one) and supply a valid
+/// Caller must hold an exclusive `&mut Apply` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn emit_committed_entry(s: &mut Apply, sys: &SyscallTable, slot_idx: usize) {
+unsafe fn emit_committed_entry(s: &mut Apply, sys: &SyscallTable, slot_idx: usize) -> bool {
     let slot = s.pending[slot_idx];
     let body_len = slot.body_len as usize;
+
+    // Client ack FIRST, with everything else gated on its confirmed
+    // write, so the retry next step cannot double-deliver the
+    // admin/observer fanouts below.
+    if s.out_applied >= 0 {
+        let mut resp = [0u8; 18];
+        resp[0..2].copy_from_slice(&s.partition_id.to_le_bytes());
+        wire::encode_term_index(&mut resp[2..18], slot.term, slot.index);
+        let w = wire_channels::channel_write_msg(
+            sys, s.out_applied, wire::MSG_CLIENT_RESPONSE, &resp,
+        );
+        if w <= 0 {
+            return false;
+        }
+    }
 
     // Admin-replicated entries (RFC §3.1) start with `ADMIN_MAGIC`.
     // Config-change entries (RFC §1.2) start with `CONFIG_CHANGE_MAGIC`.
@@ -754,15 +787,6 @@ unsafe fn emit_committed_entry(s: &mut Apply, sys: &SyscallTable, slot_idx: usiz
         // via a snapshot install when it recovers.
     }
 
-    if s.out_applied >= 0 {
-        let mut resp = [0u8; 18];
-        resp[0..2].copy_from_slice(&s.partition_id.to_le_bytes());
-        wire::encode_term_index(&mut resp[2..18], slot.term, slot.index);
-        wire_channels::channel_write_msg(
-            sys, s.out_applied, wire::MSG_CLIENT_RESPONSE, &resp,
-        );
-    }
-
     s.apply_index = slot.index;
     s.entries_applied += 1;
     // Apply signal — the only external proof a committed entry
@@ -773,6 +797,7 @@ unsafe fn emit_committed_entry(s: &mut Apply, sys: &SyscallTable, slot_idx: usiz
     // hot-path syscall (test harnesses opt in via RUST_LOG=debug).
     dev_log(sys, 4, b"[apply] ok".as_ptr(), 10);
     s.pending[slot_idx] = PendingEntry::empty();
+    true
 }
 
 /// # Safety
@@ -1001,8 +1026,9 @@ unsafe fn emit_read_response(
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&correlation_id.to_le_bytes());
     buf[8..].copy_from_slice(&required_commit.to_le_bytes());
-    wire_channels::channel_write_msg(sys, s.out_applied, wire::MSG_CLIENT_READ_RESPONSE, &buf);
-    true
+    // The poll above only proves ≥1 byte free; success is the WRITE
+    // landing, or the caller retires the read and hangs its client.
+    wire_channels::channel_write_msg(sys, s.out_applied, wire::MSG_CLIENT_READ_RESPONSE, &buf) > 0
 }
 
 /// # Safety
@@ -1016,10 +1042,10 @@ unsafe fn emit_read_reject(s: &mut Apply, sys: &SyscallTable, correlation_id: u6
     if poll <= 0 || (poll as u32 & 0x02) == 0 { return false; }
     let mut env = [0u8; wire::CLIENT_REJECT_INTERNAL_LEN];
     wire::encode_client_reject_internal(&mut env, correlation_id, status, 0, 0, 0);
+    // See emit_read_response: success is the confirmed write, not the poll.
     wire_channels::channel_write_msg(
         sys, s.out_applied,
         wire::MSG_CLIENT_REJECT_INTERNAL,
         &env[..wire::CLIENT_REJECT_INTERNAL_LEN],
-    );
-    true
+    ) > 0
 }

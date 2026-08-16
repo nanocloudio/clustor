@@ -117,6 +117,12 @@ const SCAN_RECORDS_PER_STEP: usize = 16;
 /// one-record-per-tick ceiling while keeping a worst-case step auditable.
 const MAX_ENTRY_PUMP_RECORDS: usize = 8;
 
+/// Pump cap when every record pays a SYNCHRONOUS fsync (`fsync_mode ==
+/// 0` on a provider without the async fence tier). Eight × the ~250 µs
+/// device fsync floor is ~2 ms — exactly the step-guard kill threshold —
+/// so per-entry-sync mode halves the batch to keep headroom.
+const MAX_SYNC_FSYNC_RECORDS: usize = 4;
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct EntryLoc {
@@ -213,6 +219,18 @@ const STEP_BURST: i32 = 2;
 /// genuinely empty.
 const REPLAY_GAP_TOLERANCE: u8 = 16;
 
+/// Frames replayed per step once a segment is open. Each frame costs
+/// two FS_READs plus a CRC over ≤2 KiB, so four keeps the step inside
+/// the guard while still draining a multi-hundred-thousand-frame
+/// segment in reasonable wall-clock.
+const REPLAY_FRAMES_PER_STEP: usize = 4;
+
+/// Physical segment deletions per step. FS_UNLINK is synchronous
+/// (fat32 tombstones the dirent in-call), so a deep post-snapshot trim
+/// is paced across steps by `continue_compaction` instead of unlinking
+/// the whole droppable range inside one step.
+const COMPACT_UNLINKS_PER_STEP: usize = 4;
+
 #[repr(C)]
 pub struct Wal {
     // Channels (composite indices per `mod.rs::module_new`)
@@ -308,8 +326,7 @@ pub struct Wal {
     /// failure can never punch a hole in the index sequence.
     stashed_len: u16,
     /// Times a record was stashed rather than dropped. Non-zero is healthy
-    /// backpressure (the WAL is the bottleneck); it is what prevents the
-    /// discontinuity, not a symptom of one.
+    /// backpressure (the WAL is the bottleneck), not a fault signal.
     stashed_holds: u32,
     /// The (expected, got) index pair at the FIRST continuity break. Exposed
     /// as metrics because the pair is the whole diagnosis: a `got` far above
@@ -351,6 +368,17 @@ pub struct Wal {
     /// new `segment_seq` for fresh appends after replay. Zero until
     /// the first successful open.
     replay_last_found: u32,
+    /// The persisted-floor sidecar (`persist_segment_floor`) was
+    /// consulted at replay start (one-shot). Without it, replay probes
+    /// from seq 1 and a long-lived log whose leading segments were
+    /// compacted past `REPLAY_GAP_TOLERANCE` would be orphaned wholesale.
+    replay_floor_checked: bool,
+    /// Latched when replay hits a mid-log fault (CRC mismatch, torn
+    /// frame, short read, or an index gap across segments). From then
+    /// on later segments are walked for their seq numbers only — no
+    /// entry is acked or recorded — so a durable high-water can never
+    /// be asserted across a hole (the pre-fault prefix is the log).
+    replay_tainted: bool,
 
     // Group-fsync batching (active iff fsync_mode == 1).
     pub fsync_mode: u8,
@@ -482,6 +510,15 @@ pub struct Wal {
     compact_floor: u64,
     /// One-shot latch for the loud unservable-(compacted)-index log.
     entryreq_unservable_logged: bool,
+    /// Highest segment seq compaction still owes physical deletion for
+    /// (0 = none pending). Unlinks are paced `COMPACT_UNLINKS_PER_STEP`
+    /// per step by `continue_compaction` so a deep trim can't blow the
+    /// step budget on synchronous FS_UNLINK calls.
+    compact_pending_to: u32,
+    /// Floor value (new `oldest_segment_seq`) already persisted to the
+    /// sidecar file; deletion never runs ahead of a durable floor, so a
+    /// crash mid-compaction can't strand replay behind the gap tolerance.
+    floor_persisted: u32,
 
     // ── In-module delivery latches (composite seams) ─────────
     /// Highest durable (term, index) this step, for the ledger
@@ -607,6 +644,10 @@ pub unsafe fn init(s: &mut Wal) {
     s.replay_misses = 0;
     s.replay_first_found = 0;
     s.replay_last_found = 0;
+    s.replay_floor_checked = false;
+    s.replay_tainted = false;
+    s.compact_pending_to = 0;
+    s.floor_persisted = 0;
     s.entry_ring = [EntryLoc::zero(); ENTRY_LOC_RING_SIZE];
     s.memory_entries = [MemoryEntry::zero(); ENTRY_RING_SIZE];
     s.entryreq_floor_logged = false;
@@ -723,7 +764,12 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     s.input_budget_bytes = grant.min(u32::MAX as u64) as u32;
     let mut consumed = 0u64;
     let mut records = 0usize;
-    while records < MAX_ENTRY_PUMP_RECORDS && (grant == 0 || consumed < grant) {
+    let pump_cap = if s.fsync_mode == 0 && !s.fs_async {
+        MAX_SYNC_FSYNC_RECORDS
+    } else {
+        MAX_ENTRY_PUMP_RECORDS
+    };
+    while records < pump_cap && (grant == 0 || consumed < grant) {
         let before_entries = s.entries_written;
         let before_bytes = s.bytes_written;
         process_entries(s, sys);
@@ -774,23 +820,13 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
 unsafe fn maybe_emit_replay_complete(s: &mut Wal, sys: &SyscallTable) {
     if !s.replay_complete_pending { return; }
     // Re-seed the ledger with the locally recovered durable high-water.
-    //
-    // The ledger only ever advances through `on_ack`, which fires on the
-    // fsync completion of a NEW write. Replay produces no such ack, so
-    // after a restart the ledger sits at 0 even though `current_index`
-    // entries are on disk and fsynced. No durability proof is emitted,
-    // `commit` never advances past 0, and raft's uncommitted-inflight
-    // gate (`last_log_index - commit_index >= MAX_UNCOMMITTED_INFLIGHT`)
-    // holds proposal intake closed permanently: a recovered node accepts
-    // no writes at all, and — because apply's recovery horizon raise is
-    // likewise never satisfied — its state machine is never rebuilt from
-    // the log either.
-    //
-    // Asserting this replica's own durable index is exactly what a
-    // DurabilityAck means, so quorum semantics are unchanged: a
-    // multi-voter cluster still needs the other replicas' acks before
-    // `commit` moves. `note_ledger_ack` is monotone, so a duplicate
-    // seed would be harmless anyway.
+    // The ledger only advances through `on_ack`, which fires on the fsync
+    // of a NEW write; replay produces no such ack, so without this seed a
+    // recovered node's ledger sits at 0 and raft's uncommitted-inflight
+    // gate holds proposal intake closed forever. Asserting this replica's
+    // own durable index is exactly what a DurabilityAck means, so quorum
+    // semantics are unchanged; `note_ledger_ack` is monotone, so a
+    // duplicate seed is harmless.
     if !s.replay_ledger_seeded && s.replay_recovered_index > 0 {
         s.replay_ledger_seeded = true;
         note_ledger_ack(s, s.replay_recovered_term, s.replay_recovered_index);
@@ -991,21 +1027,83 @@ unsafe fn serve_entry_request(
         return;
     }
 
-    // Read the entry body from disk. The body that lands in the WAL is
-    // `[term:u64][index:u64][body...]` (16-byte header + body). We pass
-    // the whole payload back so the replicator can reconstruct an AE.
-    // WAL payload = [term:u64][index:u64][body ≤ PROPOSAL_BATCH_CAP] —
-    // up to 2064 bytes, so this buffer must exceed that or a full
-    // batch entry falls into the NOT_FOUND branch below, which the
-    // replicator reads as needs-snapshot.
+    // Read the entry body from disk and pass the whole payload back so
+    // the replicator can reconstruct an AE. A WAL payload is
+    // `[term:u64][index:u64][body]` capped at `wal_frame::MAX_ENTRY_LEN`,
+    // so both buffers clear it comfortably.
     let mut body = [0u8; 4096];
     let payload_len = loc.payload_len as usize;
-    if payload_len == 0 || payload_len > body.len() {
+    // The reply is `WAL_ENTRY_REPLY_HDR + (payload_len - 16)` bytes and
+    // is staged in a 4096-byte buffer, so bound the payload by what the
+    // REPLY can hold, not just by `body` — the slice write below has no
+    // panic path to fall back on.
+    let payload_max = body.len().min(4096 + 16 - wire::WAL_ENTRY_REPLY_HDR);
+    if payload_len < 16 || payload_len > payload_max {
         // Defensive: shouldn't happen given the write-path payload cap.
         s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
         let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
         wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
         wire_channels::channel_write_msg(sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr);
+        return;
+    }
+
+    // If the frame is still in the staged batch (its location was recorded
+    // at stage time, before any provider write), serve it straight from
+    // `write_buf`: the on-disk bytes for that region are undefined — EOF-
+    // short on a growing file, preallocated garbage on a fixed one.
+    let staged_logical =
+        (s.write_pos as usize).saturating_sub(if s.staged_terminator { 4 } else { 0 });
+    if loc.seg_seq == s.segment_seq && staged_logical > 0 {
+        let batch_start = s.cursor.saturating_sub(staged_logical as u32);
+        let frame_start = loc.payload_offset.saturating_sub(FRAME_HDR);
+        if frame_start >= batch_start {
+            let off = (frame_start - batch_start) as usize + FRAME_HDR as usize;
+            if off + payload_len > staged_logical {
+                // Recorded as staged but outside the staged range —
+                // inconsistent bookkeeping; NOT_FOUND beats serving garbage.
+                s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
+                let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
+                wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
+                wire_channels::channel_write_msg(sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr);
+                return;
+            }
+            let rest_len = payload_len.saturating_sub(16);
+            let total = wire::WAL_ENTRY_REPLY_HDR + rest_len;
+            let prev_term = if loc.index > 1 {
+                lookup_entry_loc(s, loc.index - 1).map_or(0, |p| p.term)
+            } else {
+                0
+            };
+            let mut reply = [0u8; 4096];
+            let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
+            wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, loc.term, loc.index, prev_term);
+            reply[..wire::WAL_ENTRY_REPLY_HDR].copy_from_slice(&hdr);
+            if rest_len > 0 {
+                // copy_nonoverlapping: the slice lengths are equal by
+                // construction (rest_len = payload_len - 16) but not
+                // provably so to rustc — copy_from_slice would link in a
+                // len-mismatch panic path, which PIC modules cannot carry.
+                core::ptr::copy_nonoverlapping(
+                    s.write_buf.as_ptr().add(off + 16),
+                    reply.as_mut_ptr().add(wire::WAL_ENTRY_REPLY_HDR),
+                    rest_len,
+                );
+            }
+            wire_channels::channel_write_msg(
+                sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &reply[..total],
+            );
+            s.entryreq_served = s.entryreq_served.saturating_add(1);
+            return;
+        }
+    }
+
+    // Under the async write tier there is no read-your-writes until the
+    // fence completes, so a submitted-but-not-durable frame reads back as
+    // undefined bytes, fails the CRC check below, and escalates to a
+    // snapshot install for an entry that becomes servable one fence
+    // round-trip later. Don't reply at all — the requester's retry
+    // throttle re-asks after the fence lands.
+    if loc.seg_seq == s.segment_seq && !s.no_fs && wal_index > s.ledger_ack.1 {
         return;
     }
 
@@ -1025,13 +1123,35 @@ unsafe fn serve_entry_request(
         fd
     };
 
-    let seek_arg = (loc.payload_offset as i32).to_le_bytes();
+    // Read the frame header with the payload and re-verify the stored
+    // CRC32C before shipping: read-back feeds followers, so an unchecked
+    // corrupt sector propagates cluster-wide as a valid entry.
+    let hdr_off = loc.payload_offset.saturating_sub(FRAME_HDR);
+    let seek_arg = (hdr_off as i32).to_le_bytes();
     let seek_rc =
         (sys.provider_call)(read_fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, 4);
     let mut ok = seek_rc >= 0;
+    let mut frame_hdr = [0u8; FRAME_HDR as usize];
+    if ok {
+        let n = (sys.provider_call)(read_fd, FS_READ, frame_hdr.as_mut_ptr(), FRAME_HDR as usize);
+        ok = n >= FRAME_HDR as i32;
+    }
     if ok {
         let n = (sys.provider_call)(read_fd, FS_READ, body.as_mut_ptr(), payload_len);
         ok = (n as usize) >= payload_len;
+    }
+    if ok {
+        let (entry_len32, stored_crc) = wal_frame::parse_header(&frame_hdr);
+        let actual_crc = {
+            let mut c = Crc32c::new();
+            c.update(&body[..payload_len]);
+            c.finalize()
+        };
+        if entry_len32 as usize != payload_len || actual_crc != stored_crc {
+            s.checksum_failures = s.checksum_failures.saturating_add(1);
+            dev_log(sys, 2, b"[wal] serve CRC FAIL".as_ptr(), 20);
+            ok = false;
+        }
     }
 
     // Restore write-fd position to end-of-segment so the next write
@@ -1131,9 +1251,7 @@ unsafe fn begin_entry_scan(s: &mut Wal, sys: &SyscallTable, request_id: u32, wal
     s.scan_request_id = request_id;
     s.scan_active = true;
     // Informative one-shot: below-floor requests are being served via
-    // the segment scan (the old hard-failure signature at this site,
-    // `entry req below ring floor`, is retired; the loud path is now
-    // `entry req unservable`).
+    // the segment scan. The loud path is `entry req unservable`.
     if !s.entryreq_floor_logged {
         s.entryreq_floor_logged = true;
         dev_log(sys, 3, b"[wal] entry req below floor: seg scan".as_ptr(), 37);
@@ -1352,13 +1470,34 @@ unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
     let payload_len = loc.payload_len as usize;
     let mut body = [0u8; 4096];
     let mut ok = s.scan_fd >= 0 && payload_len > 0 && payload_len <= body.len();
+    // Verify the stored CRC32C before shipping — scan-served bytes feed
+    // followers just like ring-served ones.
+    let mut frame_hdr = [0u8; FRAME_HDR as usize];
     if ok {
-        let seek_arg = (loc.payload_offset as i32).to_le_bytes();
+        let hdr_off = loc.payload_offset.saturating_sub(FRAME_HDR);
+        let seek_arg = (hdr_off as i32).to_le_bytes();
         ok = (sys.provider_call)(s.scan_fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, 4) >= 0;
+    }
+    if ok {
+        let n = (sys.provider_call)(s.scan_fd, FS_READ, frame_hdr.as_mut_ptr(), FRAME_HDR as usize);
+        ok = n >= FRAME_HDR as i32;
     }
     if ok {
         let n = (sys.provider_call)(s.scan_fd, FS_READ, body.as_mut_ptr(), payload_len);
         ok = (n as usize) >= payload_len;
+    }
+    if ok {
+        let (entry_len32, stored_crc) = wal_frame::parse_header(&frame_hdr);
+        let actual_crc = {
+            let mut c = Crc32c::new();
+            c.update(&body[..payload_len]);
+            c.finalize()
+        };
+        if entry_len32 as usize != payload_len || actual_crc != stored_crc {
+            s.checksum_failures = s.checksum_failures.saturating_add(1);
+            dev_log(sys, 2, b"[wal] serve CRC FAIL".as_ptr(), 20);
+            ok = false;
+        }
     }
     if !ok {
         // The segment vanished (or shrank) under the cursor — most
@@ -1406,13 +1545,23 @@ unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
 unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) {
     if s.in_compact_before < 0 { return; }
 
+    // Continue any unlink work a previous compaction left pending
+    // (paced COMPACT_UNLINKS_PER_STEP per step).
+    continue_compaction(s, sys);
+
     // A truncate/compaction changes the file cursor and segment topology. Do
     // not let it overtake records that are already accepted into the current
-    // durability batch but still live only in `write_buf`.
+    // durability batch but still live only in `write_buf` — NOR records whose
+    // async write/fence is still in flight: a fence completing after a
+    // truncation would ack the discarded suffix, and the in-flight write
+    // races the rewound region. Wait until the pipeline is empty.
     let ready = (sys.channel_poll)(s.in_compact_before, 0x01);
-    if ready > 0 && (ready as u32 & 0x01) != 0 && s.has_batch {
+    if ready > 0
+        && (ready as u32 & 0x01) != 0
+        && (s.has_batch || s.fence_pending || s.fence_ring_count > 0)
+    {
         flush_batch(s, sys);
-        if s.has_batch { return; }
+        if s.has_batch || s.fence_pending || s.fence_ring_count > 0 { return; }
     }
 
     for _ in 0..4 {
@@ -1450,44 +1599,72 @@ unsafe fn truncate_after(s: &mut Wal, sys: &SyscallTable, keep_through_index: u6
     // Nothing to do if we hold nothing past the keep point.
     if s.current_index <= keep_through_index { return; }
 
-    // The byte offset where the discarded suffix begins. If the keep point
-    // is still in our offset ring AND lives in the current segment, rewind
-    // to just past its frame; otherwise (keep point compacted out of the
-    // ring, or in an older segment) rewind the whole current segment.
+    // Locate the keep point. `keep == 0` discards the whole log (no frame
+    // to rewind to). Otherwise the offset ring must still hold the keep
+    // entry: raft only truncates its uncommitted tail, bounded by the
+    // in-flight window (≪ ENTRY_LOC_RING_SIZE). A miss means upstream
+    // state corruption — fail-stop rather than guess a rewind point, since
+    // a wrong one leaves the suffix on disk for replay to resurrect.
+    let mut keep_seg: u32 = 0;
     let mut new_cursor: u32 = 0;
     let mut new_term: Term = 0;
     if keep_through_index > 0 {
-        if let Some(loc) = lookup_entry_loc(s, keep_through_index) {
-            if loc.seg_seq == s.segment_seq {
+        match lookup_entry_loc(s, keep_through_index) {
+            Some(loc) => {
+                keep_seg = loc.seg_seq;
                 new_cursor = loc.payload_offset + loc.payload_len;
+                new_term = loc.term;
             }
-            new_term = loc.term;
+            None => {
+                s.fence_failed = true;
+                s.write_errors = s.write_errors.saturating_add(1);
+                dev_log(sys, 1, b"[wal] FATAL truncate unlocatable".as_ptr(), 31);
+                return;
+            }
         }
     }
 
     // Drop in-memory ring slots above the keep point so lookups and
-    // entry-request serves no longer surface the discarded suffix.
-    let mut i = keep_through_index + 1;
-    while i <= s.entry_ring_max_index {
-        let loc_slot = (i & ENTRY_LOC_RING_MASK) as usize;
-        if s.entry_ring[loc_slot].index == i {
-            s.entry_ring[loc_slot].index = 0;
+    // entry-request serves no longer surface the discarded suffix. The
+    // per-index walk is clamped to one ring revolution: past that, slots
+    // repeat and a full-array sweep is both cheaper and complete.
+    if s.entry_ring_max_index > keep_through_index {
+        let span = s.entry_ring_max_index - keep_through_index;
+        if span >= ENTRY_LOC_RING_SIZE as u64 {
+            for slot in s.entry_ring.iter_mut() {
+                if slot.index > keep_through_index { slot.index = 0; }
+            }
+        } else {
+            let mut i = keep_through_index + 1;
+            while i <= s.entry_ring_max_index {
+                let loc_slot = (i & ENTRY_LOC_RING_MASK) as usize;
+                if s.entry_ring[loc_slot].index == i {
+                    s.entry_ring[loc_slot].index = 0;
+                }
+                i += 1;
+            }
         }
-        let slot = (i & ENTRY_RING_MASK) as usize;
-        if s.memory_entries[slot].index == i {
-            s.memory_entries[slot].index = 0;
-            s.memory_entries[slot].body_len = 0;
+        if span >= ENTRY_RING_SIZE as u64 {
+            for m in s.memory_entries.iter_mut() {
+                if m.index > keep_through_index {
+                    m.index = 0;
+                    m.body_len = 0;
+                }
+            }
+        } else {
+            let mut i = keep_through_index + 1;
+            while i <= s.entry_ring_max_index {
+                let slot = (i & ENTRY_RING_MASK) as usize;
+                if s.memory_entries[slot].index == i {
+                    s.memory_entries[slot].index = 0;
+                    s.memory_entries[slot].body_len = 0;
+                }
+                i += 1;
+            }
         }
-        i += 1;
     }
     s.entry_ring_max_index = keep_through_index;
 
-    // Mark the stale region and rewind. The trailing-terminator logic in
-    // process_entries keeps replay honest until appends overwrite past it.
-    if s.cursor > s.seg_high_water {
-        s.seg_high_water = s.cursor;
-    }
-    s.cursor = new_cursor;
     s.current_index = keep_through_index;
     s.current_term = new_term;
     s.truncations = s.truncations.saturating_add(1);
@@ -1508,6 +1685,23 @@ unsafe fn truncate_after(s: &mut Wal, sys: &SyscallTable, keep_through_index: u6
         }
     }
 
+    if keep_through_index == 0 || keep_seg != s.segment_seq {
+        // The discarded suffix spans segment files beyond the current
+        // one — a rewind of the current segment alone would leave the
+        // suffix on disk for replay to resurrect.
+        truncate_cross_segment(s, sys, keep_seg, new_cursor);
+        dev_log(sys, 3, b"[wal] truncate".as_ptr(), 14);
+        return;
+    }
+
+    // Keep point lives in the current segment: mark the stale region and
+    // rewind. The trailing-terminator logic in process_entries keeps
+    // replay honest until appends overwrite past it.
+    if s.cursor > s.seg_high_water {
+        s.seg_high_water = s.cursor;
+    }
+    s.cursor = new_cursor;
+
     // Persist the new tail: seek to the cursor, write a zero-length frame
     // terminator (4 bytes of 0 = entry_len 0, which replay treats as
     // end-of-segment), and fsync so the truncation survives a crash.
@@ -1524,6 +1718,122 @@ unsafe fn truncate_after(s: &mut Wal, sys: &SyscallTable, keep_through_index: u6
         }
     }
     dev_log(sys, 3, b"[wal] truncate".as_ptr(), 14);
+}
+
+/// Cross-segment truncation: the keep point lives in an older segment
+/// (`keep_seg`), or the whole log is discarded (`keep_seg == 0`). The
+/// terminator must land in the keep segment itself and every segment
+/// file above it must be made replay-inert, else a crash after this
+/// conflict repair resurrects the discarded suffix at replay. The
+/// suffix is raft's uncommitted tail (≤ the in-flight window), so the
+/// loops here are bounded by that, not by the log size.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn truncate_cross_segment(s: &mut Wal, sys: &SyscallTable, keep_seg: u32, new_cursor: u32) {
+    if s.fd >= 0 {
+        (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.fd = -1;
+    }
+    let old_seq = s.segment_seq;
+
+    if keep_seg == 0 {
+        // Whole-log discard: invalidate every segment and continue in a
+        // FRESH file at the next seq — never reuse a stale file in place.
+        let mut seq = s.oldest_segment_seq;
+        while seq <= old_seq {
+            invalidate_segment(s, sys, seq);
+            seq = seq.saturating_add(1);
+        }
+        s.segment_seq = old_seq.saturating_add(1);
+        // Every prior segment is gone: the floor must follow the fresh
+        // seq, or compaction and the below-floor scan keep addressing
+        // files that no longer exist.
+        s.oldest_segment_seq = s.segment_seq;
+        if s.scan_active { s.scan_seg = s.oldest_segment_seq; }
+        s.cursor = 0;
+        s.seg_high_water = 0;
+        s.fixed_segment_active = false;
+        return;
+    }
+
+    // Re-open the keep segment for writing, learn its physical extent
+    // (the stale-suffix high-water), and persist the terminator at the
+    // new tail before anything is deleted.
+    let mut path = [0u8; WAL_PATH_MAX];
+    let plen = encode_segment_path(s.partition_id, keep_seg, s.root_path != 0, &mut path);
+    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+    if fd < 0 {
+        // Can't place the terminator — the discarded suffix would replay
+        // as valid after a crash. Fail-stop (see `fence_failed`).
+        s.fence_failed = true;
+        s.write_errors = s.write_errors.saturating_add(1);
+        dev_log(sys, 1, b"[wal] FATAL truncate reopen".as_ptr(), 27);
+        return;
+    }
+    let mut stat_buf = [0u8; 8];
+    let stat_rc = (sys.provider_call)(fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
+    let size = if stat_rc < 0 { 0 } else {
+        u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
+    };
+    let seek = (new_cursor as i32).to_le_bytes();
+    let sr = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+    let zero = [0u8; 4];
+    let w = (sys.provider_call)(fd, FS_WRITE, zero.as_ptr() as *mut u8, 4);
+    let fr = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+    if sr < 0 || w != 4 || fr != 0 {
+        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.fence_failed = true;
+        s.write_errors = s.write_errors.saturating_add(1);
+        dev_log(sys, 1, b"[wal] FATAL truncate term write".as_ptr(), 30);
+        return;
+    }
+    // Next append overwrites the terminator we just wrote.
+    (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+
+    // Only now delete/neutralise the fully-discarded segments above.
+    let mut seq = keep_seg.saturating_add(1);
+    while seq <= old_seq {
+        invalidate_segment(s, sys, seq);
+        seq = seq.saturating_add(1);
+    }
+
+    s.fd = fd;
+    s.segment_seq = keep_seg;
+    s.cursor = new_cursor;
+    s.seg_high_water = size.max(new_cursor);
+}
+
+/// Make a discarded segment file replay-inert: unlink it where the
+/// provider supports it; otherwise (or on unlink failure) overwrite its
+/// first frame header with a zero-length terminator so replay stops at
+/// offset 0 even though the file still exists.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) {
+    let mut path = [0u8; WAL_PATH_MAX];
+    let plen = encode_segment_path(s.partition_id, seq, s.root_path != 0, &mut path);
+    if fs_unlink_supported(s, sys) {
+        let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
+        if rc == 0 { return; }
+    }
+    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+    if fd < 0 { return; } // never existed (or FS gone) — nothing to neutralise
+    let seek = 0i32.to_le_bytes();
+    let sr = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+    let zero = [0u8; 4];
+    let w = (sys.provider_call)(fd, FS_WRITE, zero.as_ptr() as *mut u8, 4);
+    let fr = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    if sr < 0 || w != 4 || fr != 0 {
+        s.write_errors = s.write_errors.saturating_add(1);
+        dev_log(sys, 3, b"[wal] invalidate FAIL".as_ptr(), 21);
+    }
 }
 
 /// # Safety
@@ -1552,18 +1862,29 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
     // Drop segments whose max-index is strictly below the requested
     // floor. The current write segment is exempt — we never delete it
     // while we're still appending to it.
-    let mut max_safe_seq_to_drop: u32 = 0;
+    //
+    // A segment is safe to drop ONLY if EVERY entry it holds is below
+    // the floor. The boundary segment — where the floor falls
+    // mid-segment — also holds the first entries of the live tail, so
+    // dropping it for its reclaimable half destroys acked, committed,
+    // unsnapshotted state. Find the lowest segment holding any
+    // at-or-above-floor entry; only segments strictly below BOTH that
+    // and the live one may be dropped.
+    let mut max_below: u32 = 0;
+    let mut min_keep_seq: u32 = u32::MAX;
     for slot in s.entry_ring.iter() {
         if slot.index == 0 { continue; }
-        // If the entry is still relevant (>= floor), the segment that
-        // holds it stays. We deliberately scan the whole ring rather
-        // than rely on segment_seq monotonicity, because a recent
-        // entry's segment may equal an older entry's segment.
-        if slot.index < before_index && slot.seg_seq < s.segment_seq {
-            if slot.seg_seq > max_safe_seq_to_drop {
-                max_safe_seq_to_drop = slot.seg_seq;
+        if slot.index < before_index {
+            if slot.seg_seq > max_below {
+                max_below = slot.seg_seq;
             }
+        } else if slot.seg_seq < min_keep_seq {
+            min_keep_seq = slot.seg_seq;
         }
+    }
+    let mut max_safe_seq_to_drop = max_below.min(s.segment_seq.saturating_sub(1));
+    if min_keep_seq != u32::MAX && max_safe_seq_to_drop >= min_keep_seq {
+        max_safe_seq_to_drop = min_keep_seq.saturating_sub(1);
     }
     if max_safe_seq_to_drop == 0 { return; }
     // Segments are about to be deleted: the scan cursor (and any
@@ -1572,16 +1893,48 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
     // in-flight scan for a surviving target restarts from there.
     s.scan_found = false;
     reset_scan_cursor(s, sys);
-    // Delete segments [oldest_segment_seq .. max_safe_seq_to_drop] from
-    // disk via FS_UNLINK where the provider supports it (probed once via
-    // FS_CAPS — linux and fat32 both advertise `caps::UNLINK`; fat32's
-    // unlink tombstones the dirent synchronously and reclaims the cluster
-    // chain lazily in its own steps). On a provider without the cap — or
-    // on a per-file error — the floor still advances and the file is
-    // merely orphaned (the pre-unlink posture): compaction correctness
-    // never depends on physical deletion, only replay/entry-serving does.
-    while s.oldest_segment_seq <= max_safe_seq_to_drop
+    // Record the deletion target; `continue_compaction` (called every
+    // step) persists the floor first and then unlinks a few segments per
+    // step, so a deep trim never blows the step budget on synchronous
+    // FS_UNLINK calls.
+    if max_safe_seq_to_drop > s.compact_pending_to {
+        s.compact_pending_to = max_safe_seq_to_drop;
+    }
+    continue_compaction(s, sys);
+}
+
+/// Paced physical side of compaction. Two invariants:
+///
+/// 1. The floor sidecar is durably persisted BEFORE the first unlink, so
+///    replay can always find the surviving log even when the trim removes
+///    more leading segments than `REPLAY_GAP_TOLERANCE` covers. A failed
+///    persist just defers deletion to the next step — correctness never
+///    depends on physical deletion.
+/// 2. At most `COMPACT_UNLINKS_PER_STEP` segments per step (fat32's
+///    unlink tombstones the dirent synchronously). Without the UNLINK
+///    cap, or on a per-file error, the floor still advances and the file
+///    is merely orphaned.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) {
+    if s.compact_pending_to == 0 { return; }
+    if s.oldest_segment_seq > s.compact_pending_to
+        || s.oldest_segment_seq >= s.segment_seq
+    {
+        s.compact_pending_to = 0;
+        return;
+    }
+    let new_oldest = s.compact_pending_to.saturating_add(1).min(s.segment_seq);
+    if !persist_segment_floor(s, sys, new_oldest) {
+        return; // retry next step; nothing deleted until the floor is durable
+    }
+    let mut unlinks = 0usize;
+    while s.oldest_segment_seq <= s.compact_pending_to
         && s.oldest_segment_seq < s.segment_seq
+        && unlinks < COMPACT_UNLINKS_PER_STEP
     {
         if fs_unlink_supported(s, sys) {
             let mut path = [0u8; WAL_PATH_MAX];
@@ -1597,10 +1950,18 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
         } else {
             dev_log(sys, 3, b"[wal] compacted".as_ptr(), 15);
         }
+        unlinks += 1;
         s.oldest_segment_seq += 1;
     }
+    if s.oldest_segment_seq > s.compact_pending_to
+        || s.oldest_segment_seq >= s.segment_seq
+    {
+        s.compact_pending_to = 0;
+    }
     // Restart any surviving in-flight scan at the new oldest segment.
-    s.scan_seg = s.oldest_segment_seq;
+    if s.scan_seg < s.oldest_segment_seq {
+        s.scan_seg = s.oldest_segment_seq;
+    }
 }
 
 /// Lazily probe the FS provider's capability bitmap for `UNLINK` support.
@@ -1634,12 +1995,12 @@ unsafe fn ensure_fs_caps(s: &mut Wal, sys: &SyscallTable) {
 
 // ── Replay phase ────────────────────────────────────────────
 //
-// On startup, scans for existing WAL segment files and re-emits
-// their entries through the flushed output. This allows the
-// downstream pipeline (ledger → commit) to
-// reconstruct committed state.
+// On startup, scans for existing WAL segment files and re-emits their
+// entries through the flushed output so the downstream pipeline
+// (ledger → commit) reconstructs committed state.
 //
-// Processes one chunk per step (bounded work per tick).
+// Bounded per tick: one segment open, or up to
+// `REPLAY_FRAMES_PER_STEP` frames from an already-open segment.
 
 /// # Safety
 ///
@@ -1666,6 +2027,32 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
     // Size 0 still terminates replay (an empty segment is the
     // tombstone an in-flight rotation may leave behind).
     if s.replay_fd < 0 {
+        // Consult the persisted segment floor once per replay pass. A
+        // long-lived log compacts more leading segments away than
+        // REPLAY_GAP_TOLERANCE covers, so probing blindly from seq 1
+        // exhausts the miss budget before reaching the survivors and
+        // orphans the whole durable log. Missing sidecar = fresh
+        // deployment or pre-floor layout: probe from seq 1.
+        if !s.replay_floor_checked {
+            let mut path = [0u8; WAL_PATH_MAX];
+            let plen = encode_floor_path(s.partition_id, s.root_path != 0, &mut path);
+            let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+            if fd == FS_E_AGAIN { return 0; } // provider initialising — retry
+            if fd >= 0 {
+                let mut val = [0u8; 4];
+                let n = (sys.provider_call)(fd, FS_READ, val.as_mut_ptr(), 4);
+                (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                if n == 4 {
+                    let floor = u32::from_le_bytes(val);
+                    if floor > s.replay_seg { s.replay_seg = floor; }
+                    s.floor_persisted = floor;
+                    dev_log(sys, 3, b"[wal] replay floor".as_ptr(), 18);
+                }
+            }
+            s.replay_floor_checked = true;
+            // The open may have paid the cold directory-scan penalty.
+            return STEP_BURST;
+        }
         build_segment_path(s, s.replay_seg);
         let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), s.path_len as usize);
         if fd == FS_E_AGAIN {
@@ -1683,16 +2070,11 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
                 // Skip and try the next seq on the following tick.
                 // Bounded work per tick (one open).
                 s.replay_seg = s.replay_seg.saturating_add(1);
-                // Burst: this FS_OPEN may have paid the one-time cold
-                // directory-scan penalty (a first-touch read of a
-                // bloated/cold root-dir cluster on this NVMe runs tens of
-                // ms — measured 38 ms). Returning Burst makes the scheduler
-                // re-arm with the 8× burst budget for the *next* step and,
-                // critically, discard this step's elapsed without checking
-                // it against the normal deadline — so a legitimate one-time
-                // boot scan never faults the module. Replay is bounded
-                // (terminates when segments are exhausted), so this is a
-                // headroom grant, not unbounded work. See RFC §14 item 3b.
+                // A first-touch FS_OPEN against a cold root-dir cluster on
+                // this NVMe runs tens of ms — far past the step deadline.
+                // Burst discards this step's elapsed instead of checking it,
+                // and re-arms the next step with the 8× budget. Replay is
+                // bounded, so this is headroom, not unbounded work.
                 return STEP_BURST;
             }
             // Bound reached: replay is done. Finding no segments here
@@ -1736,9 +2118,6 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         if size == 0 {
             (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
             // Freeze the durable high-water reconstructed by replay.
-            // Everything up to here is ON DISK; `current_index` keeps
-            // moving as new entries are STAGED, so it must never be
-            // used to assert durability.
             s.replay_recovered_index = s.current_index;
             s.replay_recovered_term = s.current_term;
             dev_log(sys, 3, b"[wal] replay done".as_ptr(), 17);
@@ -1764,100 +2143,142 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         }
         s.replay_last_found = s.replay_seg;
 
+        if s.replay_tainted {
+            // Past a mid-log fault the prefix already replayed IS the
+            // recoverable log. Later segments are walked only so
+            // `segment_seq` lands past every existing file (fresh appends
+            // must never land in a stale segment) — their entries are
+            // never read, acked, or recorded.
+            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.replay_seg = s.replay_seg.saturating_add(1);
+            return STEP_BURST;
+        }
+
         s.replay_fd = fd;
         s.replay_file_size = size;
         s.replay_pos = 0;
         dev_log(sys, 3, b"[wal] replay seg".as_ptr(), 16);
-        // The FS_OPEN above may have paid the one-time cold directory-scan
-        // penalty (tens of ms). Forgive it via Burst and read entries on
-        // subsequent (warm, fast) steps rather than falling through here —
-        // this keeps per-entry replay paced one-per-step (no over-drain of
-        // the downstream ack channel) while the cold open never faults.
+        // The FS_OPEN above may have paid the cold directory-scan penalty
+        // (tens of ms). Forgive it via Burst and read frames on subsequent
+        // warm steps rather than falling through here.
         return STEP_BURST;
     }
 
-    // Read one framed entry: [entry_len: u32 LE] [crc32c: u32 LE] [entry_data]
-    let remaining = s.replay_file_size - s.replay_pos;
-    if remaining < FRAME_HDR {
-        // Not enough data for a frame header — segment done
-        (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        s.replay_fd = -1;
-        s.replay_seg += 1;
-        return 0;
-    }
-
-    // Read the 8-byte header (length + CRC32C)
-    let mut hdr = [0u8; FRAME_HDR as usize];
-    let n = (sys.provider_call)(s.replay_fd, FS_READ, hdr.as_mut_ptr(), FRAME_HDR as usize);
-    if n < FRAME_HDR as i32 {
-        (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        s.replay_fd = -1;
-        s.replay_seg += 1;
-        return 0;
-    }
-    s.replay_pos += FRAME_HDR;
-
-    let (entry_len32, stored_crc) = wal_frame::parse_header(&hdr);
-    let entry_len = entry_len32 as usize;
-    if wal_frame::len_invalid(entry_len32, u64::from(s.replay_file_size - s.replay_pos)) {
-        // Invalid / impossible length — a torn header. Stop replay for this
-        // segment at the last good entry.
-        (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        s.replay_fd = -1;
-        s.replay_seg += 1;
-        return 0;
-    }
-
-    // Read entry data
-    let entry_payload_offset = s.replay_pos;
-    let n2 = (sys.provider_call)(s.replay_fd, FS_READ, s.msg_buf.as_mut_ptr(), entry_len);
-    if (n2 as usize) < entry_len {
-        (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        s.replay_fd = -1;
-        s.replay_seg += 1;
-        return 0;
-    }
-    s.replay_pos += entry_len as u32;
-
-    // Integrity check: recompute the payload CRC32C and compare. A mismatch
-    // means a torn or corrupt payload — stop replay here (the durable prefix
-    // up to this frame is the recoverable log) rather than replaying garbage.
-    let actual_crc = {
-        let mut c = Crc32c::new();
-        c.update(&s.msg_buf[..entry_len]);
-        c.finalize()
-    };
-    if actual_crc != stored_crc {
-        s.checksum_failures = s.checksum_failures.saturating_add(1);
-        dev_log(sys, 3, b"[wal] replay CRC FAIL".as_ptr(), 21);
-        (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        s.replay_fd = -1;
-        s.replay_seg += 1;
-        return 0;
-    }
-
-    // Parse: first 16 bytes are term(8) + index(8)
-    if entry_len >= 16 {
-        let (term, index) = wire::decode_term_index(&s.msg_buf);
-
-        if index > s.current_index {
-            s.current_index = index;
-            s.current_term = term;
-        }
-        record_entry_loc(s, index, term, s.replay_seg, entry_payload_offset, entry_len as u32);
-        note_ledger_ack(s, term, index);
-
-        // Re-emit as FsyncAck — entry is already durable on disk
-        let poll = (sys.channel_poll)(s.out_flushed, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
-            let mut ack = [0u8; 17];
-            wire::encode_fsync_ack(&mut ack, term, index, s.self_id);
-            wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack[..17]);
-            dev_log(sys, 3, b"[wal] replayed".as_ptr(), 14);
+    // Read framed entries: [entry_len: u32 LE] [crc32c: u32 LE] [entry_data].
+    // Up to REPLAY_FRAMES_PER_STEP per step (warm reads — the cold open
+    // already got its Burst); any segment transition or fault ends the step.
+    let mut frames = 0usize;
+    while frames < REPLAY_FRAMES_PER_STEP {
+        frames += 1;
+        let remaining = s.replay_file_size - s.replay_pos;
+        if remaining < FRAME_HDR {
+            // Not enough data for a frame header — segment done
+            (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.replay_fd = -1;
+            s.replay_seg += 1;
+            return 0;
         }
 
-        s.entries_written += 1;
-        s.replayed_count += 1;
+        // Read the 8-byte header (length + CRC32C)
+        let mut hdr = [0u8; FRAME_HDR as usize];
+        let n = (sys.provider_call)(s.replay_fd, FS_READ, hdr.as_mut_ptr(), FRAME_HDR as usize);
+        if n < FRAME_HDR as i32 {
+            // Short read despite `remaining >= FRAME_HDR`: a device fault,
+            // not a clean end. Taint so no later segment is acked over it.
+            s.replay_tainted = true;
+            (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.replay_fd = -1;
+            s.replay_seg += 1;
+            return 0;
+        }
+        s.replay_pos += FRAME_HDR;
+
+        let (entry_len32, stored_crc) = wal_frame::parse_header(&hdr);
+        let entry_len = entry_len32 as usize;
+        if wal_frame::len_invalid(entry_len32, u64::from(s.replay_file_size - s.replay_pos)) {
+            // Stop this segment at the last good entry. A zero-length
+            // frame is the live-tail terminator — a clean per-segment stop
+            // (fixed segments end every rotated segment with one) — so it
+            // does not taint. A nonzero-but-impossible length is a torn
+            // header, which does.
+            if entry_len32 != 0 { s.replay_tainted = true; }
+            (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.replay_fd = -1;
+            s.replay_seg += 1;
+            return 0;
+        }
+
+        // Read entry data
+        let entry_payload_offset = s.replay_pos;
+        let n2 = (sys.provider_call)(s.replay_fd, FS_READ, s.msg_buf.as_mut_ptr(), entry_len);
+        if (n2 as usize) < entry_len {
+            s.replay_tainted = true;
+            (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.replay_fd = -1;
+            s.replay_seg += 1;
+            return 0;
+        }
+        s.replay_pos += entry_len as u32;
+
+        // Integrity check: recompute the payload CRC32C and compare. A
+        // mismatch means a torn or corrupt payload — stop replay here (the
+        // durable prefix up to this frame is the recoverable log) rather
+        // than replaying garbage, and taint the rest of the walk.
+        let actual_crc = {
+            let mut c = Crc32c::new();
+            c.update(&s.msg_buf[..entry_len]);
+            c.finalize()
+        };
+        if actual_crc != stored_crc {
+            s.checksum_failures = s.checksum_failures.saturating_add(1);
+            s.replay_tainted = true;
+            dev_log(sys, 3, b"[wal] replay CRC FAIL".as_ptr(), 21);
+            (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.replay_fd = -1;
+            s.replay_seg += 1;
+            return 0;
+        }
+
+        // Parse: first 16 bytes are term(8) + index(8)
+        if entry_len >= 16 {
+            let (term, index) = wire::decode_term_index(&s.msg_buf);
+
+            // An index jump means the records between the last replayed
+            // entry and this one are gone. Acking across that hole would
+            // assert a durable high-water over missing records, which is
+            // unrepairable once commit passes it. Stop; the prefix is the
+            // log.
+            if s.current_index != 0 && index > s.current_index.saturating_add(1) {
+                s.continuity_errors = s.continuity_errors.saturating_add(1);
+                s.replay_tainted = true;
+                dev_log(sys, 1, b"[wal] replay gap".as_ptr(), 16);
+                (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                s.replay_fd = -1;
+                s.replay_seg += 1;
+                return 0;
+            }
+
+            if index > s.current_index {
+                s.current_index = index;
+                s.current_term = term;
+            }
+            record_entry_loc(s, index, term, s.replay_seg, entry_payload_offset, entry_len as u32);
+            note_ledger_ack(s, term, index);
+
+            // Re-emit as FsyncAck — entry is already durable on disk.
+            // Best-effort: the ledger latch above carries the high-water
+            // even when the external ack channel is momentarily full.
+            let poll = (sys.channel_poll)(s.out_flushed, 0x02);
+            if poll > 0 && (poll as u32 & 0x02) != 0 {
+                let mut ack = [0u8; 17];
+                wire::encode_fsync_ack(&mut ack, term, index, s.self_id);
+                wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack[..17]);
+                dev_log(sys, 3, b"[wal] replayed".as_ptr(), 14);
+            }
+
+            s.entries_written += 1;
+            s.replayed_count += 1;
+        }
     }
 
     0
@@ -1933,14 +2354,66 @@ fn encode_segment_path(partition_id: u16, seq: u32, root: bool, out: &mut [u8]) 
     i
 }
 
-// ── Normal operation ────────────────────────────────────────
+/// Write the segment-floor sidecar path for `partition_id` into `out`
+/// and return the length. Non-root: `wal/p<NNNN>_floor`. Root (8.3
+/// bare-metal FAT32): `<p:1hex>FLOOR.WAL` — six-char basename, so it
+/// can never collide with the eight-hex-digit segment names.
+fn encode_floor_path(partition_id: u16, root: bool, out: &mut [u8]) -> usize {
+    let cap = out.len();
+    let mut i = 0usize;
+    if root {
+        let p = (partition_id & 0xF) as u8;
+        out[i] = if p < 10 { b'0' + p } else { b'a' + p - 10 };
+        i += 1;
+        for &b in b"FLOOR.WAL" {
+            if i < cap { out[i] = b; i += 1; }
+        }
+        return i;
+    }
+    for &b in b"wal/p" {
+        if i < cap { out[i] = b; i += 1; }
+    }
+    for digit in (0..4).rev() {
+        let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
+        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        if i < cap { out[i] = ch; i += 1; }
+    }
+    for &b in b"_floor" {
+        if i < cap { out[i] = b; i += 1; }
+    }
+    i
+}
 
+/// Durably persist `new_oldest` (the segment seq replay must start
+/// probing from) to the floor sidecar. Returns true on success. Called
+/// BEFORE compaction unlinks anything: physical deletion never runs
+/// ahead of a durable floor, so replay can always find the log even
+/// when more than `REPLAY_GAP_TOLERANCE` leading segments are gone.
+///
 /// # Safety
 ///
-/// Caller must hold an exclusive `&mut Wal` (or shared
-/// `&Wal` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn persist_segment_floor(s: &mut Wal, sys: &SyscallTable, new_oldest: u32) -> bool {
+    if s.floor_persisted >= new_oldest { return true; }
+    let mut path = [0u8; WAL_PATH_MAX];
+    let plen = encode_floor_path(s.partition_id, s.root_path != 0, &mut path);
+    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+    if fd < 0 { return false; }
+    let val = new_oldest.to_le_bytes();
+    let w = (sys.provider_call)(fd, FS_WRITE, val.as_ptr() as *mut u8, 4);
+    let fr = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    if w == 4 && fr == 0 {
+        s.floor_persisted = new_oldest;
+        true
+    } else {
+        false
+    }
+}
+
+// ── Normal operation ────────────────────────────────────────
+
 /// Tell raft which index this WAL will accept next, so it can resync its tip
 /// instead of diverging silently. Best-effort: a full output channel just
 /// means the next `recover_continuity` pass re-sends it.
@@ -1963,27 +2436,14 @@ unsafe fn emit_wal_reject(s: &mut Wal, sys: &SyscallTable, expected: u64) {
 }
 
 unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
-    // Continuity is fail-closed but RECOVERABLE. `current_index` still never
-    // advances across a hole, so a high-water is never acknowledged across one
-    // — the durability invariant is unchanged. What changed: we no longer
-    // return here forever.
-    //
-    // The old behaviour ("leave the input full so backpressure propagates")
-    // assumed raft would notice the backpressure and stop. It cannot: raft's
-    // only signal is `channel_write_msg` failing once the channel fills, which
-    // it reads as a transient WAL-busy condition and latches `flush_deferred`
-    // — suspending intake forever with no error anywhere. Rig-observed as a
-    // leader with role=2, stable term, heartbeats flowing, and zero
-    // replication (`wal entries_written` frozen 95 behind `raft
-    // last_log_index`).
-    //
-    // So instead we tell raft (`MSG_WAL_REJECT` carrying the index we want
-    // next) and keep draining below, discarding records until raft resyncs and
-    // replays from `expected`. Those discarded records are uncommitted by
-    // construction — the WAL never acked them, so no quorum ever counted them
-    // durable, and raft re-derives them from the leader (follower) or
-    // re-proposes them (leader). The latch clears on the first record that
-    // lands exactly on `expected` (see the index check below).
+    // Continuity is fail-closed but RECOVERABLE. On a hole the WAL must NOT
+    // stop draining: raft reads a full input channel as transient WAL-busy and
+    // latches `flush_deferred`, which suspends intake with no error anywhere.
+    // Instead it emits `MSG_WAL_REJECT` (the index it wants next) and keeps
+    // discarding until raft replays from `expected`. Discarded records are
+    // uncommitted by construction — never acked, so no quorum counted them
+    // durable. `current_index` never advances across the hole, so no
+    // high-water is ever acked across one.
 
     // An async durability fence is outstanding for the current batch. Do NOT
     // stage new records: they would advance `pending_max_index` past what the
@@ -2064,13 +2524,37 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     }
 
     // Frame: [entry_len: u32 LE] [crc32c: u32 LE] [entry_data]. The CRC32C
-    // covers the payload bytes so replay can distinguish a torn/corrupt
-    // payload from a valid entry (RFC §5: "the current replay framing cannot
-    // reliably distinguish a torn payload from a valid entry"). Track the
-    // payload offset (after the 8-byte header) so MSG_WAL_ENTRY_REQUEST can
-    // read it back. In group mode the FS_FSYNC is deferred to flush_batch —
-    // emitting the ack before that fsync would signal durability that doesn't
-    // yet hold on disk.
+    // covers the payload bytes so replay can tell a torn payload from a
+    // valid entry. The payload offset (after the 8-byte header) is tracked
+    // so MSG_WAL_ENTRY_REQUEST can read it back. In group mode the FS_FSYNC
+    // is deferred to flush_batch — acking before that fsync would claim
+    // durability that doesn't yet hold on disk.
+
+    // A fixed segment's physical capacity is exactly `segment_limit + 4`
+    // (records + live-tail terminator), so rotate BEFORE a frame that would
+    // cross the limit: an overshooting append short-writes and the flush
+    // retries the same overshooting batch forever. EOF-sized segments keep
+    // the grow-then-rotate path below.
+    if s.fixed_segment_active
+        && s.cursor > 0
+        && s.cursor
+            .saturating_add(FRAME_HDR + payload_len as u32)
+            .saturating_add(4)
+            > s.segment_limit
+    {
+        if s.has_batch {
+            flush_batch(s, sys);
+            if s.has_batch {
+                // Batch undrainable this step — the record is already out
+                // of the channel; stash and re-drive next step.
+                s.stashed_len = plen;
+                s.stashed_holds = s.stashed_holds.saturating_add(1);
+                return;
+            }
+        }
+        rotate_segment(s, sys);
+    }
+
     let entry_payload_offset = s.cursor.saturating_add(FRAME_HDR);
     ensure_segment_open(s, sys);
     if s.fd < 0 {
@@ -2139,12 +2623,9 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         if s.has_batch {
             // The buffer could not be drained this step (fsync in flight, ack
             // channel full, segment rolling). This record is already out of
-            // the channel — stash and re-drive it next step instead of
-            // dropping it. THIS was the source of the WAL discontinuity: the
-            // drop left `current_index` un-advanced, so the following record
-            // arrived as `current_index + 2` and latched the continuity fault
-            // ~one segment's worth of entries in (rig-observed at ~32.5k with
-            // an 8 MiB segment at ~258 B/entry).
+            // the channel — stash and re-drive it next step. Dropping it
+            // would leave `current_index` un-advanced, so the next record
+            // arrives as `current_index + 2` and latches a continuity fault.
             s.stashed_len = plen as u16;
             s.stashed_holds = s.stashed_holds.saturating_add(1);
             return;
@@ -2216,21 +2697,33 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
             flush_batch(s, sys);
             if s.has_batch { return; }
         }
-        flush_block(s, sys);
-        fsync_segment(s, sys);
-        close_segment(s, sys);
-
-        note_trigger(s, s.current_term, s.current_index);
-        if s.out_compaction >= 0 {
-            let mut trig = [0u8; 16];
-            wire::encode_term_index(&mut trig, s.current_term, s.current_index);
-            wire_channels::channel_write_msg(sys, s.out_compaction, wire::MSG_SNAPSHOT_TRIGGER, &trig[..16]);
-        }
-        s.segment_seq += 1;
-        s.cursor = 0;
-        s.seg_high_water = 0;
-        s.crc.reset();
+        rotate_segment(s, sys);
     }
+}
+
+/// Close the current segment and advance to the next seq. The caller
+/// must have drained any staged batch first (acks are ordered relative
+/// to the close).
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn rotate_segment(s: &mut Wal, sys: &SyscallTable) {
+    flush_block(s, sys);
+    fsync_segment(s, sys);
+    close_segment(s, sys);
+
+    note_trigger(s, s.current_term, s.current_index);
+    if s.out_compaction >= 0 {
+        let mut trig = [0u8; 16];
+        wire::encode_term_index(&mut trig, s.current_term, s.current_index);
+        wire_channels::channel_write_msg(sys, s.out_compaction, wire::MSG_SNAPSHOT_TRIGGER, &trig[..16]);
+    }
+    s.segment_seq += 1;
+    s.cursor = 0;
+    s.seg_high_water = 0;
+    s.crc.reset();
 }
 
 /// Fence-pipelined flush (config `fence_depth > 1`, async FS only).
@@ -2569,15 +3062,9 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
             &mut ack_buf, s.pending_max_term, s.pending_max_index, s.self_id,
         );
         wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17]);
-        // Batch-durability signal, group mode only: per-entry mode
-        // (`fsync_mode == 0`) also flows through this function (every
-        // append flushes its own singleton batch immediately — see
-        // the call site's condition), but its durability signal is
-        // already `[wal] entry ok` at stage time, which coincides
-        // exactly since the batch never holds more than that one
-        // entry. Logging `group fsync` there too would be redundant
-        // and would break the per-entry/group dichotomy the wal
-        // group-fsync test suite asserts on.
+        // Group mode only. Per-entry mode flushes a singleton batch per
+        // append, so its durability signal is already `[wal] entry ok` at
+        // stage time; the test suite keys on that dichotomy.
         if s.fsync_mode != 0 {
             dev_log(sys, 3, b"[wal] group fsync".as_ptr(), 17);
         }
@@ -2647,6 +3134,22 @@ unsafe fn ensure_segment_open(s: &mut Wal, sys: &SyscallTable) {
         // ENOSYS/unsupported is an intentional compatibility fallback: this
         // descriptor remains a normal EOF-sized append file.
     }
+    if s.fd >= 0 && !s.fixed_segment_active {
+        // A pre-existing file at this seq (skip_replay orphan, reuse on a
+        // provider without UNLINK) may hold stale frames beyond our write
+        // cursor. Learn its size so that region is treated like a
+        // post-truncate suffix — every append stages a trailing terminator
+        // until fresh writes overwrite past it, else replay reads our
+        // fresh frames and continues straight into the stale ones.
+        let mut stat_buf = [0u8; 8];
+        let rc = (sys.provider_call)(s.fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
+        if rc >= 0 {
+            let size = u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]]);
+            if size > s.seg_high_water {
+                s.seg_high_water = size;
+            }
+        }
+    }
     // DIAG: surface the create rc (E_AGAIN=-11 = fat32 not ready, retry;
     // a hard negative = no/failed FS provider; >=0 = disk-backed).
     if s.fd != s.dbg_last_open_rc {
@@ -2691,21 +3194,20 @@ unsafe fn flush_block(s: &mut Wal, sys: &SyscallTable) {
     s.write_pos = 0;
 }
 
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Wal` (or shared
-/// `&Wal` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Fsync the current segment file, timing the call and folding the
-/// elapsed µs into the `clustor.wal.fsync_latency_ms` histogram
-/// (RFC §4.1). All durable-write fsync sites route through here so the
-/// histogram covers both strict per-entry and group-deferred fsyncs.
+/// elapsed µs into the `clustor.wal.fsync_latency_ms` histogram. All
+/// durable-write fsync sites route through here so the histogram covers
+/// both strict per-entry and group-deferred fsyncs.
 ///
 /// Returns 0 on success, the provider's negative errno on failure, or -1 when
 /// there is no open segment. A failed fsync is NOT folded into the latency
 /// histogram (it isn't a real durability measurement); callers must treat a
 /// non-zero return as "not durable" and withhold the FsyncAck.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
 unsafe fn fsync_segment(s: &mut Wal, sys: &SyscallTable) -> i32 {
     if s.fd < 0 { return -1; }
     let start = dev_micros(sys);
@@ -2717,13 +3219,12 @@ unsafe fn fsync_segment(s: &mut Wal, sys: &SyscallTable) -> i32 {
     0
 }
 
+/// Close the current segment and prepare for rotation.
+///
 /// # Safety
 ///
-/// Caller must hold an exclusive `&mut Wal` (or shared
-/// `&Wal` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-/// Close current segment and prepare for rotation.
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
 unsafe fn close_segment(s: &mut Wal, sys: &SyscallTable) {
     if s.fd >= 0 {
         (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
@@ -2751,14 +3252,11 @@ unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
     let mut hb = [0u8; 96];
     let mut pos = 0usize;
     pos += emit_field(hb.as_mut_ptr(), pos, b"[wal] hb mode=", s.fsync_mode as u32);
-    // Durability state, on the heartbeat rather than only in the
-    // one-shot `open rc=` line: 1 = a real segment descriptor is open
-    // (disk-backed), 0 = not (provider still initialising, or the
-    // in-memory retention path). An observer that attaches after boot
-    // — the UDP log monitor does exactly that, and rig pass rules may
-    // only key on recurring signals (`standards/rig.md`) — otherwise
-    // has no way to tell a disk-durable node from an ephemeral one.
-    // The same fact is a gauge (`WAL_OPEN_RC`) for /metrics consumers.
+    // Durability state on the heartbeat, not only in the one-shot
+    // `open rc=` line: 1 = a real segment descriptor is open
+    // (disk-backed), 0 = not. Rig pass rules may only key on recurring
+    // signals (`standards/rig.md`), and the UDP log monitor attaches
+    // after boot, so a one-shot marker is invisible to both.
     pos += emit_field(hb.as_mut_ptr(), pos, b" fs=", (s.fd >= 0) as u32);
     pos += emit_field(hb.as_mut_ptr(), pos, b" seg=", s.segment_seq);
     pos += emit_field(hb.as_mut_ptr(), pos, b" entries=", s.entries_written);

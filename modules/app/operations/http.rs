@@ -32,18 +32,23 @@
 //! feedback drains below never consume an event they cannot answer.
 
 use super::abi::SyscallTable;
-use super::{http_admin, wire, wire_channels};
+use super::{http_admin, telemetry, wire, wire_channels};
 use super::{dev_log, dev_millis, dev_report_step_effect, step_effect};
 
 /// Bound on the small cached envelopes — `/readyz` and `/why` carry a
 /// single status byte, so 1 KiB is ample.
 const ENVELOPE_CACHE: usize = 1024;
 
-/// Bound on the cached `/metrics` body: the telemetry export, capped
-/// at `telemetry::SAFE_EXPORT_MAX` (7400). 7600 clears the cap and
-/// keeps the framed response under the ingress response ring record
-/// limit.
-pub const METRICS_CACHE: usize = 7600;
+/// Slack the `/metrics` cache keeps above the telemetry export cap so
+/// the framed response still clears the ingress response ring record
+/// limit with room to spare. Expressed as a named delta off the one
+/// source (`telemetry::SAFE_EXPORT_MAX`) rather than a second literal.
+const METRICS_CACHE_SLACK: usize = 200;
+
+/// Bound on the cached `/metrics` body: the telemetry export cap plus
+/// slack. Derived, not duplicated — `ingress::RESP_BODY_MAX` mirrors
+/// this const directly, so all three components resize together.
+pub const METRICS_CACHE: usize = telemetry::SAFE_EXPORT_MAX + METRICS_CACHE_SLACK;
 
 // Two bounded phase tables (correlation→connection and index→connection).
 // Sized above ingress's 32 live connections so phase handoff and an
@@ -243,6 +248,27 @@ fn mark_ext(h: &mut Http, conn_id: u8) {
     h.ext_conns[(conn_id >> 5) as usize] |= 1u32 << (conn_id & 31);
 }
 
+/// Drop every deferred per-connection artefact for `conn_id`: the
+/// ext-source bit and any in-flight correlation/index slots. The
+/// dispatch table calls this on a listener connection boundary
+/// (accept or close — `ingress::Pull::ConnBoundary`) so a deferred
+/// `/propose` reply can never land on a client that merely inherited
+/// the conn_id; the 10 s proposal timeout remains the coarse backstop
+/// for graphs whose close events are lost.
+pub fn purge_conn(h: &mut Http, conn_id: u8) {
+    h.ext_conns[(conn_id >> 5) as usize] &= !(1u32 << (conn_id & 31));
+    for slot in h.correlations.iter_mut() {
+        if slot.correlation_id != 0 && slot.conn_id == conn_id {
+            *slot = CorrSlot::empty();
+        }
+    }
+    for slot in h.indices.iter_mut() {
+        if slot.index != 0 && slot.conn_id == conn_id {
+            *slot = IndexSlot::empty();
+        }
+    }
+}
+
 /// Consume the source flag for `conn_id`. `true` means the request
 /// arrived on the `request` port and its reply belongs on `response`.
 fn take_ext(h: &mut Http, conn_id: u8) -> bool {
@@ -400,8 +426,10 @@ pub fn cache_export(h: &mut Http, ready: bool, timing_pause: u8, export: &[u8]) 
     let len = export.len().min(METRICS_CACHE);
     if len > 0 {
         h.metrics_buf[..len].copy_from_slice(&export[..len]);
-        h.metrics_len = len as u16;
     }
+    // An empty export invalidates the cache: `/metrics` then serves
+    // an empty body rather than silently replaying stale data.
+    h.metrics_len = len as u16;
 }
 
 /// Own-state drains only: ≤16 proposal assignments. The response-

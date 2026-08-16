@@ -1,86 +1,56 @@
-# clustor Makefile — the lifecycle only: clean / build / test /
-# lint / ci / publish, plus the two project targets that earn their
+# clustor Makefile — the lifecycle only: help / build / test / lint /
+# ci / publish / clean, plus the two project targets that earn their
 # names under standards/make.md §1: `bench` (canonicalizes the
 # criterion flags the CI-fast run uses) and `e2e` (composes the
 # sequential, thread-bounded cluster/chaos/partition/wal harness
-# runs). Anything else is the `fluxor` CLI directly.
-
-.PHONY: help build test bench lint ci e2e publish clean
+# runs). Anything else is the `fluxor` CLI directly
+# (`fluxor modules build`, `fluxor run`, `fluxor update`, `fluxor sync`,
+# `fluxor build --check …`) — a make target that merely renames one CLI
+# command is bloat, not convenience.
 
 SHELL       := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
 
 .DEFAULT_GOAL := build
 
-# The registry-resolved fluxor tree — SDK sources, the fmod palette
-# and the `fluxor-linux` runtime — is staged under `target/fluxor/`,
-# so `cargo clean` takes it with it. That tree is a build *input*, not
-# an output: `modules/app/*/mod.rs` and `tests/wal_scan.rs` `include!`
-# the SDK sources at compile time, so without it even `cargo build
-# --all-targets` fails to resolve its includes.
-#
-# Declared as a file prerequisite rather than a `sync` target:
-# standards/make.md §1 reserves the target namespace for lifecycle
-# stages and forbids aliasing a CLI command, and this adds no name to
-# type — it just lets the lifecycle targets restage their own input.
-# Re-staging is a no-op when the tree is already present (~50ms), and
-# `cargo clean` removes it wholesale, so the sentinel never goes stale
-# against a partially-populated tree.
-FLUXOR_SDK := target/fluxor/fluxor-abi/sdk/abi.rs
-
-$(FLUXOR_SDK):
-	fluxor sync
+.PHONY: help build test bench lint ci e2e publish clean
 
 help:
-	@echo "clustor lifecycle:"
-	@echo "  make build     cargo build --workspace --all-targets"
-	@echo "  make test      cargo test --workspace (TEST_THREADS=$(TEST_THREADS))"
-	@echo "  make lint      rustfmt --check + clippy -D warnings"
-	@echo "  make ci        fluxor ci — the full gate (lints, hygiene,"
-	@echo "                 tests, strict module build, lockfile checks)"
-	@echo "  make publish   fluxor publish — canonical registry publish"
-	@echo "  make clean     cargo clean + module artefacts (the staged"
-	@echo "                 tree restages itself on next build)"
-	@echo "clustor-specific:"
-	@echo "  make bench     host L0/L1 micro-benches (criterion, --quick)"
-	@echo "  make e2e       strict cluster/chaos/partition/wal e2e"
-	@echo "                 (sequential, thread-bounded; hard-fails on skip)"
-	@echo ""
-	@echo "Not make targets (use the CLI / scripts directly):"
-	@echo "  fluxor modules build [--target …]   PIC modules"
-	@echo "  fluxor run / up                     bring-up"
-	@echo "  fluxor update / sync                registry consumption"
-	@echo "  tools/palette-lint.sh               palette text lint — enforced inside"
-	@echo "                                      'fluxor ci' via tools/ci-e2e.sh"
-	@echo "  tools/attach-surface.sh             published attach-surface report (TSV)"
-	@echo "  scripts/cli-e2e.sh                  CLI applet e2e (ci phase 3.5)"
-	@echo "One-time setup: make -C ../fluxor install"
+	@fluxor help --make
 
-build: $(FLUXOR_SDK)
-	cargo build --workspace --all-targets
+build:
+	fluxor build
 
-# Cluster e2e tests (`tests/cluster.rs`, `chaos.rs`, `partition.rs`)
-# each spin up 1–3 `fluxor-linux` child processes. Default cargo
-# parallelism saturates a 4-core Pi-class host and Raft commit
-# budgets miss their deadlines. `--test-threads=4` keeps the
-# concurrent-cluster count bounded; individual unit-test binaries
-# (fast, no children) still run with full intra-binary parallelism.
-TEST_THREADS ?= 4
-test: $(FLUXOR_SDK)
-	cargo test --workspace -- --test-threads=$(TEST_THREADS)
+test:
+	fluxor test
+
+lint:
+	fluxor lint
+
+ci:
+	fluxor ci
+
+publish:
+	fluxor publish
+
+clean:
+	fluxor clean
+
+# ---------------------------------------------------------------------
+# Project targets (standards/make.md §1: flag canonicalizer / genuine
+# composition). These run cargo directly, so each first restages the
+# registry-resolved fluxor tree (SDK sources, fmod palette,
+# `fluxor-linux` runtime) under `target/fluxor/` — a build *input*,
+# not output: `modules/app/*/mod.rs` and `tests/wal_scan.rs`
+# `include!` the SDK sources at compile time, and `cargo clean` takes
+# the tree with it. Re-staging is a no-op when present (~50ms).
 
 # Host L0/L1 micro-benches (RFC §7.1). `--quick` keeps it CI-fast;
 # drop the flag for full criterion sampling when chasing a
 # regression.
-bench: $(FLUXOR_SDK)
+bench:
+	fluxor sync
 	cargo bench --benches -- --quick
-
-lint: $(FLUXOR_SDK)
-	cargo fmt --all -- --check
-	cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-ci: $(FLUXOR_SDK)
-	fluxor ci
 
 # End-to-end cluster/chaos/partition/wal tests. Each spins up real
 # `fluxor-linux` child processes, so they need the clustor modules
@@ -102,7 +72,8 @@ ci: $(FLUXOR_SDK)
 # budgets. One binary at a time, at a modest intra-binary thread
 # count, keeps it to a few concurrent 3-node clusters.
 E2E_THREADS ?= 2
-e2e: $(FLUXOR_SDK)
+e2e:
+	fluxor sync
 	fluxor modules build --all
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test wal_replay -- --test-threads=$(E2E_THREADS)
 	# wal_group_fsync's 4 tests all launch single-node clusters through
@@ -119,10 +90,3 @@ e2e: $(FLUXOR_SDK)
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test chaos -- --test-threads=$(E2E_THREADS)
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test cluster -- --test-threads=$(E2E_THREADS)
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test session_directory_e2e --test timing_cluster_e2e -- --test-threads=1
-
-publish:
-	fluxor publish
-
-clean:
-	cargo clean
-	fluxor modules clean

@@ -128,7 +128,12 @@ pub unsafe fn step(f: &mut Flow, sys: &SyscallTable, now: u64) {
         let d = fp_mul(f.kd, error - f.last_error);
         f.last_error = error;
 
-        let output = (p + i + d) >> 16; // scale back from Q16.16
+        // Scale: gains are Q16.16, error is a plain integer (lag
+        // entries), and fp_mul already descales (>>16) — so p/i/d are
+        // plain-integer credit deltas and their sum is the output
+        // directly. A further >>16 here would double-descale and zero
+        // the output for any realistic error.
+        let output = p + i + d;
 
         if f.entry_rate_per_sec > 0 {
             // Convert the wall-clock rate to this interval's absolute

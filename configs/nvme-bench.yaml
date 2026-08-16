@@ -41,7 +41,11 @@ modules:
       seq_blocks: 16384     # 64 MiB sequential at 4 KiB
       fsync_every: 1        # per-write fsync = the strict-WAL floor
       rand_blocks: 4096     # 16 MiB random
-      step_batch: 64        # blocks per cooperative step
+      step_batch: 64        # upper bound on blocks per cooperative step;
+                            # step_budget_us is the real limiter below
+      step_budget_us: 1500  # default 2000 us step deadline, minus heartbeat
+                            # headroom. Raise this AND step_deadline_us
+                            # together to let a fast device do more per step.
 
   - name: operations
     params:

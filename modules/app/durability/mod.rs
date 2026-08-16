@@ -309,8 +309,19 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         s.wal.dek_epoch = epoch;
         s.snapshot.dek_epoch = epoch;
 
+        // Boot restore FIRST: the persisted local snapshot's app body
+        // must reach the state machine before the wal replays its
+        // (possibly compacted) tail on top of it. Holding `wal::step`
+        // holds the whole replay → raft-resume handoff, so nothing is
+        // applied out of order and proposal intake stays closed. A
+        // running restore is Burst — its cold FS_OPEN is the same
+        // tens-of-ms first touch the wal replay path is forgiven for.
         let t0 = dev_micros(sys);
-        let wal_rc = wal::step(&mut s.wal, sys);
+        let wal_rc = if snapshot::boot_restore(&mut s.snapshot, sys) {
+            wal::step(&mut s.wal, sys)
+        } else {
+            STEP_BURST
+        };
         s.comp_step[1].record(dev_micros(sys).wrapping_sub(t0));
 
         // Drain the wal's seam latches (monotone latest-wins).

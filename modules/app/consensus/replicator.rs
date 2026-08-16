@@ -68,22 +68,14 @@ struct PeerState {
 }
 
 impl PeerState {
-    /// The pre-leadership peer slot: every field zero, matching the
-    /// kernel-zeroed module state the standalone `replicator` booted
-    /// from (it activated slots in `module_new` without ever writing
-    /// the rest of the struct).
+    /// The pre-leadership peer slot: every field zero.
     ///
-    /// `next_index` MUST start at 0, not 1. It is the "have I ever
+    /// `next_index` MUST start at 0, not 1. It doubles as the "have I ever
     /// replicated to this peer" flag that `drive_catchup` reads
-    /// (`next > 0 && next <= tip`): a node that has never led has no
-    /// idea where any peer's log ends, so it must not ship
-    /// AppendEntries. Seeding it to 1 makes every replica — followers
-    /// included — fan catch-up AEs at the current term as soon as a
-    /// WAL tip probe answers, and a leader that receives an AE at its
-    /// own term steps down (`handle_append_entries`, `role !=
-    /// ROLE_FOLLOWER`). The result is perpetual leadership churn.
-    /// Real values arrive from `process_acks` / `on_voter_set` once
-    /// this node is actually the leader.
+    /// (`next > 0 && next <= tip`): a node that has never led has no idea
+    /// where any peer's log ends, so it must not ship AppendEntries. Real
+    /// values arrive from `process_acks` / `on_voter_set` once this node is
+    /// actually the leader.
     const fn zero() -> Self {
         Self {
             next_index: 0,
@@ -188,6 +180,21 @@ pub struct Repl {
     last_emitted_prev_index: Index,
     last_emitted_prev_term: Term,
 
+    /// Raft's current term, from the E11 leadership hint. Stamps
+    /// catch-up AEs; also the reference for the E13 deposed-leader
+    /// term hint below.
+    current_term: Term,
+    /// Raft's commit index, from the E11 hint — the only legal
+    /// `leader_commit` for catch-up AEs.
+    commit_hint: Index,
+    /// E13 seam: highest response term seen above `current_term`.
+    /// Drained by the dispatch table into `raft::on_peer_term` so a
+    /// deposed leader steps down.
+    pub term_hint_out: Option<Term>,
+    /// Most recent peer that requested a snapshot install — the
+    /// forward target for snapshot chunks (broadcast only when unknown).
+    snapshot_target: Option<u8>,
+
     /// Current voter set bitmask from raft (RFC §1.2). A peer
     /// id present here is a current voter; peers not in the set are
     /// either non-existent or non-voting catch-up.
@@ -256,6 +263,10 @@ pub fn init(s: &mut Repl) {
     s.last_forwarded_durable = [0; MAX_NODES];
     s.last_emitted_index = 0;
     s.last_emitted_term = 0;
+    s.current_term = 0;
+    s.commit_hint = 0;
+    s.term_hint_out = None;
+    s.snapshot_target = None;
     s.last_emitted_prev_index = 0;
     s.last_emitted_prev_term = 0;
     s.current_voters = 0;
@@ -306,9 +317,15 @@ pub unsafe fn arm(s: &mut Repl, sys: &SyscallTable) {
 /// Deliver raft's current leadership state (E11). Message-shaped
 /// per Discipline §2: the dispatch table calls this after `raft::step`
 /// and before `replicator::step`, so the replicator acts on the
-/// leadership state raft holds THIS step.
-pub fn on_leader_state(s: &mut Repl, is_leader: bool) {
+/// leadership state raft holds THIS step. `term` stamps catch-up AEs — a
+/// stale term is rejected by followers already at the new term, which
+/// livelocks NACK/read-back on an idle cluster. `commit` is the ONLY value
+/// `leader_commit` may carry: shipping the log tip lets followers apply
+/// uncommitted entries the next leader may legally truncate.
+pub fn on_leader_state(s: &mut Repl, is_leader: bool, term: Term, commit: Index) {
     s.is_leader = is_leader;
+    s.current_term = term;
+    s.commit_hint = commit;
 }
 
 /// One replicator step. `ae` is raft's AppendEntries outbox ring (E1),
@@ -437,6 +454,19 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         None => continue,
                     };
 
+                // E13: a response term above ours means we are deposed
+                // (Raft §5.1). Latch the highest such term for raft — the
+                // dispatch table drains it at the top of the NEXT step,
+                // before raft steps — and stop treating this response as
+                // replication feedback.
+                if term > s.current_term && s.current_term > 0 {
+                    match s.term_hint_out {
+                        Some(t) if t >= term => {}
+                        _ => s.term_hint_out = Some(term),
+                    }
+                    continue;
+                }
+
                 // Forward the follower's `local_wal_durable_index` to
                 // the leader's durability `ack` as a synthesized
                 // MSG_FSYNC_ACK keyed by the follower's replica id
@@ -452,13 +482,20 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                     if poll_d > 0 && (poll_d as u32 & 0x02) != 0 {
                         let mut ack = [0u8; 17];
                         wire::encode_fsync_ack(&mut ack, term, durable_index, replica);
-                        wire_channels::channel_write_msg(
+                        let w = wire_channels::channel_write_msg(
                             sys,
                             s.out_cross_durability_ack,
                             wire::MSG_FSYNC_ACK,
                             &ack[..17],
                         );
-                        s.last_forwarded_durable[replica as usize] = durable_index;
+                        // Only mark forwarded on a CONFIRMED write: the
+                        // strictly-advancing filter above suppresses any
+                        // re-send, so recording a failed write here would
+                        // permanently drop this follower's fsync evidence
+                        // and stall quorum-fsync commit on a quiescent tail.
+                        if w > 0 {
+                            s.last_forwarded_durable[replica as usize] = durable_index;
+                        }
                     }
                 }
 
@@ -499,9 +536,7 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         // leader's tip, pipeline the next missing entry NOW via
                         // a WAL read-back instead of waiting for the periodic
                         // tip-broadcast to NACK. Converges a lagging follower in
-                        // O(gap) read-backs rather than O(gap) NACK round-trips
-                        // — the difference between a follower that recovers in
-                        // ~ms and one that wedges commit after a failover.
+                        // O(gap) read-backs rather than O(gap) NACK round-trips.
                         let pn = s.peers[replica as usize].next_index;
                         if s.peers[replica as usize].active
                             && pn > 0
@@ -524,7 +559,6 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         if peer.inflight > 0 { peer.inflight -= 1; }
                         peer.inflight_age = 0;
                         s.backpressure_responses = s.backpressure_responses.saturating_add(1);
-                        let _ = term;
                     } else {
                         // NACK: follower's log doesn't agree with our
                         // prev_log_* at this index (a gap because it's behind,
@@ -543,8 +577,6 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         s.nacks_received = s.nacks_received.saturating_add(1);
                         let new_next = index.saturating_add(1).max(1);
                         peer.next_index = new_next;
-                        // Term advance: stay safe if the follower bumped term.
-                        let _ = term;
                         // Read back the entry the follower is MISSING — the one
                         // at next_index (the first it doesn't have), NOT
                         // next_index-1 (an entry it already holds, which would
@@ -554,9 +586,8 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                 }
             }
             wire::MSG_HEARTBEAT_RESP | wire::MSG_REQUEST_VOTE_RESP | wire::MSG_PRE_VOTE_RESP => {
-                // Forward vote/heartbeat responses to raft via net_out
-                // (they'll be routed back through the peer surface → raft's rpc)
-                // For now, these pass through the same path.
+                // Vote/heartbeat responses reach raft on its own `rpc`
+                // input via the peer surface; nothing to do here.
             }
             wire::MSG_INSTALL_SNAPSHOT | wire::MSG_SNAPSHOT_CHUNK => {
                 // Inbound snapshot chunk from leader. Forward to
@@ -577,12 +608,6 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
     }
 }
 
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Repl` (or shared
-/// `&Repl` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Nudge every active follower that is behind the leader's tip toward it via
 /// a targeted WAL read-back. Idempotent per tick: `issue_wal_request` dedups
 /// by `(peer, index)` and the table caps in-flight requests, so calling this
@@ -608,13 +633,25 @@ unsafe fn drive_catchup(s: &mut Repl, sys: &SyscallTable) {
         }
     }
 
+    // Inflight decay (see PeerState::inflight_age). Must run before every
+    // early return below, or a slot left at inflight >= 1 across an
+    // unresolved tip or a leadership change never ages out and blocks that
+    // peer's catch-up.
+    for i in 0..MAX_NODES {
+        if s.peers[i].inflight > 0 {
+            s.peers[i].inflight_age = s.peers[i].inflight_age.saturating_add(1);
+            if s.peers[i].inflight_age >= 500 {
+                s.peers[i].inflight = 0;
+                s.peers[i].inflight_age = 0;
+            }
+        }
+    }
+
     // AppendEntries is leader-only. A follower (or a demoted ex-leader,
     // whose `next_index` values survive the transition) must not ship
-    // catch-up AEs: they carry the CURRENT term, and a leader that
-    // receives an AE at its own term steps down — so a single stray
-    // catch-up from a follower unseats the cluster's leader and the
-    // churn repeats. The tip probe is gated with it: `last_emitted_index`
-    // only feeds the catch-up path.
+    // catch-up AEs: they carry the CURRENT term, and a leader receiving an
+    // AE at its own term steps down. The tip probe is gated with it —
+    // `last_emitted_index` only feeds the catch-up path.
     if !s.is_leader {
         return;
     }
@@ -638,12 +675,11 @@ unsafe fn drive_catchup(s: &mut Repl, sys: &SyscallTable) {
     }
     let tip = s.last_emitted_index;
     if tip == 0 {
-        // A leader that cannot learn its own tip replicates NOTHING — and
-        // until now did so completely silently: role=2, stable term,
-        // heartbeats flowing, peers connected, zero AppendEntries, followers
-        // pinned forever. Nothing distinguished "no catch-up work" from "the
-        // WAL never answered my probe". Count the stall so it is visible, and
-        // say so once it is clearly not a cold start.
+        // A leader that cannot learn its own tip replicates NOTHING, and
+        // every other signal (role, term, heartbeats, peer connections)
+        // looks healthy. Count the stall so "no catch-up work" and "the WAL
+        // never answered my probe" are distinguishable, and say so once it
+        // is clearly not a cold start.
         s.tip_unresolved = s.tip_unresolved.saturating_add(1);
         if s.tip_unresolved == TIP_UNRESOLVED_ALARM {
             dev_log(sys, 1, b"[repl] tip unresolved - not replicating".as_ptr(), 38);
@@ -654,14 +690,6 @@ unsafe fn drive_catchup(s: &mut Repl, sys: &SyscallTable) {
     for i in 0..MAX_NODES {
         if i == s.self_id as usize {
             continue;
-        }
-        // Inflight decay (see PeerState::inflight_age).
-        if s.peers[i].inflight > 0 {
-            s.peers[i].inflight_age = s.peers[i].inflight_age.saturating_add(1);
-            if s.peers[i].inflight_age >= 500 {
-                s.peers[i].inflight = 0;
-                s.peers[i].inflight_age = 0;
-            }
         }
         if !s.peers[i].active {
             continue;
@@ -790,25 +818,22 @@ pub unsafe fn on_voter_set(
             s.peers[i].active = false;
             s.peers[i].voting = false;
             dev_log(sys, 3, b"[repl] drop peer".as_ptr(), 16);
-        } else if in_union && s.peers[i].active && !s.peers[i].voting {
-            // Peer is in current_voters (not just joint) → eligible
-            // for promotion to voting status. The promotion itself
-            // happens once match_index is close enough; until then
-            // leave the flag false.
-            let _ = i;
         }
+        // An already-active non-voting peer keeps its flag here:
+        // promotion is `maybe_promote`'s call, once match_index is close
+        // enough to the tip AND the peer is in `current_voters`.
     }
 }
 
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Repl` (or shared
-/// `&Repl` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Promote a non-voting peer to voting once its match_index is
 /// within `VOTING_LAG_THRESHOLD` of the leader's last-emitted tip.
 /// Called from the AE-success branch in `process_acks`.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Repl` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel
+/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn maybe_promote(s: &mut Repl, sys: &SyscallTable, peer: u8) {
     let i = peer as usize;
     if i >= MAX_NODES {
@@ -841,13 +866,14 @@ unsafe fn maybe_promote(s: &mut Repl, sys: &SyscallTable, peer: u8) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn request_snapshot_install(s: &mut Repl, sys: &SyscallTable, target: u8) {
+    // Remember who needs the install so the chunk forward below can be
+    // routed to that peer instead of broadcast to the whole cluster.
+    s.snapshot_target = Some(target);
     if s.out_snapshot_request < 0 {
-        // The ONLY recovery for a follower that has fallen past what our WAL
-        // can still serve — and with the port unwired it is a silent no-op, so
-        // the follower stalls forever while we spin on NOT_FOUND. Every config
-        // in the repo shipped without this edge, which is precisely why that
-        // went unnoticed. Count it and say so once: an unrecoverable follower
-        // must not be invisible.
+        // Snapshot install is the ONLY recovery for a follower that has
+        // fallen past what our WAL can still serve. With the port unwired
+        // that follower is unrecoverable in this graph and we would spin on
+        // NOT_FOUND forever, so count it and say so once.
         s.snapshot_escalations_dropped = s.snapshot_escalations_dropped.saturating_add(1);
         if s.snapshot_escalations_dropped == 1 {
             dev_log(sys, 1, b"[repl] snapshot_request unwired".as_ptr(), 31);
@@ -897,19 +923,21 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
     s.pending[slot_idx] = PendingWalReq::zero();
     if peer == PROBE_PEER {
         // Tip probe answered. NOT_FOUND echoes the requested index
-        // with term=0 and NO body, so it must never advance the
-        // tip. Only a FOUND reply (term != 0, body present) does.
-        if term != 0 && body_off < pl && index > s.last_emitted_index {
+        // with term=0, so it must never advance the tip. Only a FOUND
+        // reply (term != 0) does — including a body-less election
+        // no-op, which is a real log entry at the tip.
+        if term != 0 && index > s.last_emitted_index {
             s.last_emitted_index = index;
         }
         return;
     }
     if peer as usize >= MAX_NODES || !s.peers[peer as usize].active { return; }
 
-    // Empty body means the WAL doesn't have the index any more —
-    // snapshot install is the recovery path. Issue a targeted
-    // install request to the snapshot side; see RFC §4.2.
-    if pl <= body_off {
+    // term == 0 (header-only NOT_FOUND reply) means the WAL doesn't have
+    // the index any more — snapshot install is the recovery path. An
+    // empty BODY with a real term is a leader-election no-op entry and
+    // ships like any other. See RFC §4.2.
+    if term == 0 {
         request_snapshot_install(s, sys, peer);
         return;
     }
@@ -922,15 +950,12 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
     let prev_idx = index.saturating_sub(1);
     let body = &s.msg_buf[body_off..pl];
 
-    let peer_state = &s.peers[peer as usize];
-    let leader_commit = peer_state.match_index; // conservative — follower clamps anyway
-    let _ = leader_commit;
-
-    // The AE's `term` is the LEADER's current term (so a higher-term
-    // follower accepts the leader's authority), NOT the read-back entry's
-    // term — those differ exactly in the cross-term failover catch-up
-    // case. `entry_term` is the entry's own term (`term`).
-    let ae_term = if s.last_emitted_term >= term { s.last_emitted_term } else { term };
+    // The AE's `term` is the LEADER's current term from the E11 hint, so a
+    // higher-term follower accepts the leader's authority. NOT the read-back
+    // entry's term and NOT `last_emitted_term` — both go stale after a
+    // failover onto an idle log, and a stale term is rejected by followers
+    // already at the new term. `entry_term` stays the entry's own.
+    let ae_term = if s.current_term >= term { s.current_term } else { term };
     let mut ae_buf = [0u8; 4096];
     let total = wire::encode_append_entries(
         &mut ae_buf,
@@ -938,8 +963,10 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
         s.self_id,
         prev_idx,
         prev_term,
-        // leader_commit: use our last-emitted index (clamped on follower).
-        s.last_emitted_index,
+        // leader_commit: raft's ACTUAL commit index (E11 hint). The log
+        // tip would let a follower apply entries replicated to only
+        // leader+itself, which the next leader may legally truncate.
+        s.commit_hint,
         term,
         index,
         body,
@@ -990,16 +1017,28 @@ unsafe fn forward_snapshots(s: &mut Repl, sys: &SyscallTable) {
         );
         if !pass_through { continue; }
 
-        // Forward to peers. Broadcast for now — a lagging-follower
-        // detector that targets a specific peer is a future
-        // improvement (RFC §5.13).
-        let target = wire::TARGET_BROADCAST;
+        // Forward routed to the peer that requested the install;
+        // broadcast only when no request is outstanding (a proactive
+        // leader-side push).
+        let target = match s.snapshot_target {
+            Some(t) => t,
+            None => wire::TARGET_BROADCAST,
+        };
+        // The final chunk ends this install: clear the target so the
+        // next stream is routed by its OWN request rather than at this
+        // peer, and so a later broadcast push is not captured by it.
+        let last_chunk = msg_type == wire::MSG_INSTALL_SNAPSHOT
+            && wire::decode_install_snapshot(&s.msg_buf[..plen as usize])
+                .is_some_and(|(_, _, _, _, done, _)| done);
         let poll_out = (sys.channel_poll)(s.out_net, 0x02);
         if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
-            wire_channels::channel_write_routed_partitioned(
+            let w = wire_channels::channel_write_routed_partitioned(
                 sys, s.out_net, target, s.partition_id,
                 msg_type, &s.msg_buf[..plen as usize],
             );
+            if w > 0 && last_chunk {
+                s.snapshot_target = None;
+            }
         }
     }
 }
@@ -1024,9 +1063,11 @@ unsafe fn emit_metrics(s: &mut Repl, sys: &SyscallTable) {
     let kc = wire::METRIC_KIND_COUNTER;
     let kg = wire::METRIC_KIND_GAUGE;
     // §4.2 saturation gauge: AppendEntries dispatched but not yet
-    // acked/nacked — the in-flight replication depth. Each response retires
-    // exactly one RPC and increments exactly one of acks/nacks/backpressure,
-    // so subtracting all three keeps the gauge exact.
+    // acked/nacked — the in-flight replication depth. A response from an
+    // active peer at our term increments exactly one of
+    // acks/nacks/backpressure, so subtracting all three retires it once.
+    // Responses dropped before that (inactive peer, higher term) leave the
+    // gauge biased high; it is a saturation signal, not a ledger.
     let inflight = s.rpcs_sent
         .saturating_sub(s.acks_received)
         .saturating_sub(s.nacks_received)

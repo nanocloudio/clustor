@@ -18,6 +18,12 @@ pub enum Inbound {
     Empty,
     Handled,
     Client { msg_type: u8, len: usize },
+    /// peer_router reported a client connection closed
+    /// (`MSG_CONN_CLOSED`, 1-byte `[conn_id]` payload). The dispatch
+    /// table purges that conn's correlation state in the codec —
+    /// conn_ids are reused, so a stale entry would route a later
+    /// client's response to the wrong connection.
+    ConnClosed { conn_id: u8 },
     /// The record's payload exceeds the proposal cap. Truncating and
     /// forwarding a prefix would commit a corrupted entry while acking
     /// the full write, so the dispatch table sends a
@@ -39,6 +45,16 @@ pub struct Surface {
 
     requests_routed: u32,
     responses_sent: u32,
+    /// One-slot retry stash: a fully-built response frame whose atomic
+    /// `channel_write` refused AFTER the backing correlation entry was
+    /// already retired (poll(OUT) only promises ">=1 byte free").
+    /// Retained and flushed ahead of any new send so acks are never
+    /// silently lost under saturation. Length 0 = empty.
+    retry_len: u16,
+    retry_frame: [u8; 256],
+    /// Responses dropped because the retry slot was still occupied
+    /// when another send arrived (bounded stash, counted loss).
+    responses_dropped: u32,
     /// Must hold peer_router's largest MSG_CLIENT_FRAME payload:
     /// conn_id byte + a full 4 KiB client record. `channel_read_msg`
     /// silently discards any payload larger than this buffer, so
@@ -58,6 +74,8 @@ pub unsafe fn init(su: &mut Surface) {
     su.out_responses = -1;
     su.requests_routed = 0;
     su.responses_sent = 0;
+    su.retry_len = 0;
+    su.responses_dropped = 0;
 }
 
 pub fn work_count(su: &Surface) -> u32 {
@@ -95,6 +113,12 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
     // on the channel instead backpressures peer_router (and
     // ultimately the client) losslessly.
     if su.out_responses >= 0 {
+        // A retained response frame counts against the gate too: until
+        // it flushes, consuming another request could strand a second
+        // terminal reply behind the one-slot stash.
+        if !flush_retry(su, sys) {
+            return Inbound::Empty;
+        }
         let poll_resp = (sys.channel_poll)(su.out_responses, 0x02);
         if poll_resp <= 0 || (poll_resp as u32 & 0x02) == 0 {
             return Inbound::Empty;
@@ -105,7 +129,17 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
         return Inbound::Empty;
     }
 
-    let (_frame_type, plen) = wire_channels::channel_read_msg(sys, su.in_requests, &mut su.msg_buf);
+    let (frame_type, plen) = wire_channels::channel_read_msg(sys, su.in_requests, &mut su.msg_buf);
+    // peer_router's close notice is a 1-byte `[conn_id]` payload, so
+    // it must be matched BEFORE the `plen < 4` client-frame gate
+    // below — that gate would discard it and per-conn correlation
+    // state would never be purged.
+    if frame_type == wire::MSG_CONN_CLOSED {
+        if plen >= 1 {
+            return Inbound::ConnClosed { conn_id: su.msg_buf[0] };
+        }
+        return Inbound::Handled;
+    }
     if plen < 4 {
         return Inbound::Handled; // need at least conn_id + 3-byte envelope header
     }
@@ -218,6 +252,7 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
 /// Caller must hold an exclusive `&mut Surface` and a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn finish_step(su: &mut Surface, sys: &SyscallTable) {
+    let _ = flush_retry(su, sys);
     forward_admin_responses(su, sys);
 
     // Drain telemetry/status inputs (these produce diagnostic
@@ -248,7 +283,10 @@ pub unsafe fn send_outbound(su: &mut Surface, sys: &SyscallTable, out: &codec::O
 /// `[conn_id:u8]` prefix set by the producer; it is stripped and used
 /// as the per-message routing tag (RFC §4.5). Wire bytes written:
 /// `[conn_id:u8][msg_type:u8][len:u16 LE][payload-without-conn-id]`.
-/// Returns whether the frame was written.
+/// Returns whether the frame was written OR retained in the retry
+/// stash (either way the response will reach the wire); false means
+/// it was not accepted and, if a prior frame still occupies the
+/// stash, was dropped and counted.
 ///
 /// # Safety
 ///
@@ -263,8 +301,11 @@ pub unsafe fn send_response(
     if su.out_responses < 0 || payload.is_empty() {
         return false;
     }
-    let poll_out = (sys.channel_poll)(su.out_responses, 0x02);
-    if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
+    // A previously retained frame goes first (ordering). If it still
+    // can't flush, this response has nowhere to wait — one bounded
+    // slot, never an unbounded queue — so it is dropped AND counted.
+    if !flush_retry(su, sys) {
+        su.responses_dropped += 1;
         return false;
     }
     let conn_id = payload[0];
@@ -282,9 +323,75 @@ pub unsafe fn send_response(
     if inner_len > 0 {
         frame[4..4 + inner_len].copy_from_slice(&payload[1..1 + inner_len]);
     }
-    (sys.channel_write)(su.out_responses, frame.as_ptr(), total);
-    su.responses_sent += 1;
+    let poll_out = (sys.channel_poll)(su.out_responses, 0x02);
+    let wrote = if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+        (sys.channel_write)(su.out_responses, frame.as_ptr(), total)
+    } else {
+        0
+    };
+    if wrote == total as i32 {
+        su.responses_sent += 1;
+        return true;
+    }
+    // The atomic write landed NOTHING and the correlation entry
+    // backing this response is already retired — the ack cannot be
+    // rebuilt, so retain the built frame for retry next step. Reporting
+    // success on an unchecked write here hangs the client forever.
+    su.retry_frame[..total].copy_from_slice(&frame[..total]);
+    su.retry_len = total as u16;
     true
+}
+
+/// Flush the one-slot retry stash. Returns true when it is empty
+/// afterwards (nothing retained, or the resend just succeeded).
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Surface` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn flush_retry(su: &mut Surface, sys: &SyscallTable) -> bool {
+    let total = su.retry_len as usize;
+    if total == 0 {
+        return true;
+    }
+    if su.out_responses < 0 {
+        su.retry_len = 0;
+        return true;
+    }
+    let poll_out = (sys.channel_poll)(su.out_responses, 0x02);
+    if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
+        return false;
+    }
+    let wrote = (sys.channel_write)(su.out_responses, su.retry_frame.as_ptr(), total);
+    if wrote == total as i32 {
+        su.retry_len = 0;
+        su.responses_sent += 1;
+        true
+    } else {
+        false
+    }
+}
+
+/// True when the response egress can take a new frame right now: the
+/// retry stash is clear AND the channel reports writable. The dispatch
+/// table gates the applied-response drain on this, because pulling an
+/// applied response retires its correlation entry — it must only be
+/// consumed when its ack can actually leave.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Surface` and supply a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn ready_to_send(su: &mut Surface, sys: &SyscallTable) -> bool {
+    if su.out_responses < 0 {
+        // Unwired responses port: drain-and-drop, as before.
+        return true;
+    }
+    if !flush_retry(su, sys) {
+        return false;
+    }
+    let poll_out = (sys.channel_poll)(su.out_responses, 0x02);
+    poll_out > 0 && (poll_out as u32 & 0x02) != 0
 }
 
 /// Forward admin responses from the `admin_responses` port. Each

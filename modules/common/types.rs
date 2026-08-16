@@ -140,11 +140,20 @@ pub fn quorum_index_for_set(progress: &[Index; MAX_NODES], voters: NodeSet) -> I
     if n == 0 {
         return 0;
     }
-    let mut scratch = [0u64; MAX_NODES];
+    // NodeSet holds NODE_SET_CAPACITY (8) ids but `progress` has
+    // MAX_NODES (7) slots. A member with no progress slot still counts
+    // toward the majority denominator, as a permanent zero: otherwise a
+    // 4-voter set containing id 7 would take its median over 3 and
+    // commit without a true majority.
+    let mut scratch = [0u64; NODE_SET_CAPACITY as usize];
     let mut k = 0;
-    for (id, &p) in progress.iter().enumerate() {
-        if voters.contains(id as ReplicaId) {
-            scratch[k] = p;
+    for id in 0..NODE_SET_CAPACITY {
+        if voters.contains(id) {
+            scratch[k] = if (id as usize) < MAX_NODES {
+                progress[id as usize]
+            } else {
+                0
+            };
             k += 1;
         }
     }

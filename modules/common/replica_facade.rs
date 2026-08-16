@@ -116,6 +116,78 @@ pub const MAX_NODES: usize = 7;
 /// with a larger `N`.
 pub const DEFAULT_INFLIGHT_CAPACITY: usize = 64;
 
+// ── Channel envelope ───────────────────────────────────────────────────────
+//
+// Every message on a Clustor channel carries a 3-byte envelope ahead of its
+// payload. A consumer attaches to byte-stream channels, so it needs both to
+// frame what it writes and to reassemble what it reads across arbitrary read
+// boundaries. These are the only envelope facts a consumer depends on; the
+// full `MSG_*` registry in `wire.rs` stays internal to the substrate.
+
+/// Envelope header size: `[msg_type:u8][payload_len:u16 LE]`.
+pub const ENVELOPE_HDR: usize = 3;
+
+/// Largest payload one envelope carries.
+pub const MAX_PAYLOAD: usize = 0xFFFF;
+
+/// Envelope type for an opaque command offered to the replica group.
+///
+/// Written to `consensus.proposals` when the consumer carries its own
+/// correlation inside the command body, or — wrapping a
+/// [`build_tagged_proposal`] payload — to `consensus.proposals_tagged` when
+/// it wants Clustor to correlate on its behalf.
+pub const MSG_CLIENT_PROPOSAL: u8 = 0x10;
+
+/// Envelope type of the per-entry committed stream on
+/// `consensus.committed_entries`. The payload is
+/// `[term:u64 LE][index:u64 LE][body]` — see [`CommittedEntry::decode`].
+pub const MSG_COMMITTED_ENTRY: u8 = 0x24;
+
+/// Frame `payload` into `dst` as `[msg_type][len:u16 LE][payload]`,
+/// returning the total bytes written.
+///
+/// Envelope and payload are composed into one buffer so the caller issues a
+/// single channel write. That is what keeps a frame atomic against a reader
+/// reassembling the stream.
+pub fn frame(dst: &mut [u8], msg_type: u8, payload: &[u8]) -> Result<usize, ProposeError> {
+    if payload.len() > MAX_PAYLOAD {
+        return Err(ProposeError::CommandTooLarge {
+            len: payload.len(),
+            max: MAX_PAYLOAD,
+        });
+    }
+    let needed = ENVELOPE_HDR + payload.len();
+    if dst.len() < needed {
+        return Err(ProposeError::EncodeBufferTooSmall {
+            needed,
+            actual: dst.len(),
+        });
+    }
+    dst[0] = msg_type;
+    dst[1..3].copy_from_slice(&(payload.len() as u16).to_le_bytes());
+    dst[ENVELOPE_HDR..needed].copy_from_slice(payload);
+    Ok(needed)
+}
+
+/// Split one complete frame off the front of `buf`.
+///
+/// Returns `(msg_type, payload, consumed)`. Returns `None` when `buf` holds
+/// less than a whole frame, in which case the caller retains the bytes and
+/// retries after its next read. Consumers drain in a loop, then compact the
+/// unconsumed remainder to the front of their reassembly buffer.
+pub fn next_frame(buf: &[u8]) -> Option<(u8, &[u8], usize)> {
+    if buf.len() < ENVELOPE_HDR {
+        return None;
+    }
+    let msg_type = buf[0];
+    let payload_len = u16::from_le_bytes([buf[1], buf[2]]) as usize;
+    let total = ENVELOPE_HDR + payload_len;
+    if buf.len() < total {
+        return None;
+    }
+    Some((msg_type, &buf[ENVELOPE_HDR..total], total))
+}
+
 // ── Public surface types ───────────────────────────────────────────────────
 
 /// Outcome of a committed proposal: the Raft term at which the entry

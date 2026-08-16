@@ -170,8 +170,10 @@ name = "net_out"
 direction = "output"
 content_type = "OctetStream"
 buffer_size = 8192
-# NCMD_SEND header (3) + the bounded 7680-byte response payload.
-max_record = 7683
+# The largest NCMD_SEND this module frames: net header (3) + conn_id
+# (2) + HTTP response head (128) + the bounded 7600-byte body. Mirrors
+# `ingress::TX_BUF`, which the code derives from the same four terms.
+max_record = 7733
 rate_class_max = "transaction"
 # See net_in above: this edge's consumer (linux_net.net_in / ip.net_in)
 # is NetProto, whose generic default (audio) would otherwise exceed
@@ -207,7 +209,9 @@ direction = "output"
 content_type = "OctetStream"
 buffer_size = 8192
 # Envelope (3) + `[conn_id][status:u16][body_len:u16]` (5) + the
-# bounded 7600-byte response body.
+# bounded 7600-byte response body (`http::METRICS_CACHE` =
+# `telemetry::SAFE_EXPORT_MAX` 7400 + 200 slack — the code derives it,
+# this literal just mirrors it).
 max_record = 7608
 rate_class_max = "transaction"
 # Replies to requests that arrived on `request`. See that port.

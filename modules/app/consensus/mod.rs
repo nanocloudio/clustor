@@ -82,6 +82,8 @@ mod types;
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
+#[path = "../../common/wal_frame.rs"]
+mod wal_frame;
 #[path = "../../common/step_accounting.rs"]
 mod step_accounting;
 
@@ -359,13 +361,31 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 1b. E11 leader-state hint → replicator. AppendEntries is a
         //     leader-only RPC; the replicator's catch-up fan-out must
         //     stop the moment raft leaves ROLE_LEADER.
-        replicator::on_leader_state(&mut s.repl, raft::is_leader(&s.raft));
+        {
+            let (lead, term, commit) = raft::leader_hint(&s.raft);
+            replicator::on_leader_state(&mut s.repl, lead, term, commit);
+        }
 
         // 2. E10 voter-set latch → commit + replicator, in the same
         //    step raft applied the config change.
         if let Some((current, joint, joint_active)) = s.raft.voter_out.take() {
             commit::on_voter_set(&mut s.commit, current, joint, joint_active != 0);
             replicator::on_voter_set(&mut s.repl, sys, current, joint, joint_active != 0);
+        }
+
+        // 2b. E12 term-fence latch → commit (§5.4.2 gate), raised when a
+        //     fresh leader lands its no-op entry. Same-step delivery so
+        //     the gate is armed before any match tallies of the new term.
+        if let Some((fence_term, fence_index)) = s.raft.commit_fence_out.take() {
+            commit::on_term_fence(&mut s.commit, fence_term, fence_index);
+        }
+
+        // 2c. E13 term hint ← replicator: a higher term observed in an
+        //     AppendEntriesResponse means this leader is deposed; hand
+        //     it to raft so it steps down instead of black-holing
+        //     proposals behind a partition it cannot see.
+        if let Some(resp_term) = s.repl.term_hint_out.take() {
+            raft::on_peer_term(&mut s.raft, sys, resp_term);
         }
 
         // 3. replicator — drains raft's E1 AE outbox.

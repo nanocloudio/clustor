@@ -27,9 +27,23 @@
 /// Frame header size: `[entry_len: u32 LE][crc32c: u32 LE]`.
 pub const FRAME_HDR: usize = 8;
 
-/// Replay's per-entry payload cap. A header whose `entry_len` exceeds
-/// this is treated as torn, not as a large entry.
-pub const MAX_ENTRY_LEN: usize = 2048;
+/// Payload prologue size: `[term: u64 LE][index: u64 LE]`
+/// (`wire::encode_term_index` / `wire::decode_term_index`).
+pub const ENTRY_PROLOGUE: usize = 16;
+
+/// Cap on the entry body (the bytes after the prologue): one coalesced
+/// proposal batch. This is the same value every proposal-carrying
+/// buffer in the graph must size against — raft's batch, the gateway's
+/// proposal frames, the session directory's message buffer.
+pub const MAX_ENTRY_BODY: usize = 2048;
+
+/// Replay's per-entry payload cap: prologue + max body. A header whose
+/// `entry_len` exceeds this is treated as torn, not as a large entry,
+/// so a write path emitting more silently truncates the durable log at
+/// replay. Buffers staging a whole entry (frame payloads, `wal-frame`
+/// output) size against this; buffers holding only command bytes size
+/// against `MAX_ENTRY_BODY`.
+pub const MAX_ENTRY_LEN: usize = ENTRY_PROLOGUE + MAX_ENTRY_BODY;
 
 /// Split a frame header into `(entry_len, crc32c)`.
 #[inline]

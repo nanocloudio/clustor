@@ -42,6 +42,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
+#[path = "../../common/log_fmt.rs"]
+mod log_fmt;
+use log_fmt::log_field;
 
 const METRICS_INTERVAL_MS: u64 = 1000;
 const BODY_MAX: usize = 1024;
@@ -159,15 +162,6 @@ pub extern "C" fn module_new(
     }
 }
 
-/// Append `tag` + decimal `val` into `buf` at `pos`; returns new pos.
-///
-/// # Safety
-/// `buf` must have room for `tag.len() + 10` bytes at `pos`.
-unsafe fn log_field(buf: *mut u8, pos: usize, tag: &[u8], val: u32) -> usize {
-    core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.add(pos), tag.len());
-    pos + tag.len() + fmt_u32_raw(buf.add(pos + tag.len()), val)
-}
-
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
 pub extern "C" fn module_step(state: *mut u8) -> i32 {
@@ -242,11 +236,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if s.sent >= s.total {
                     let elapsed = now.wrapping_sub(s.start_ms);
                     let mut p = 0usize;
-                    let lb = s.log_buf.as_mut_ptr();
-                    p = log_field(lb, p, b"[cbench] done sent=", s.sent);
-                    p = log_field(lb, p, b" ms=", elapsed as u32);
-                    p = log_field(lb, p, b" blocked=", s.blocked);
-                    dev_log(sys, 3, lb, p);
+                    p = log_field(&mut s.log_buf, p, b"[cbench] done sent=", s.sent);
+                    p = log_field(&mut s.log_buf, p, b" ms=", elapsed as u32);
+                    p = log_field(&mut s.log_buf, p, b" blocked=", s.blocked);
+                    dev_log(sys, 3, s.log_buf.as_ptr(), p);
                     s.phase = PH_DONE;
                 }
             }

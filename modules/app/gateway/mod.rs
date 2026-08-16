@@ -73,6 +73,8 @@ mod wire;
 mod wire_channels;
 #[path = "../../common/step_accounting.rs"]
 mod step_accounting;
+#[path = "../../common/wal_frame.rs"]
+mod wal_frame;
 
 mod codec;
 mod surface;
@@ -205,12 +207,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // Dispatch table — see the module header for the ordering
         // contract. All cross-component routing lives in these loops.
-        let mut frame = [0u8; 2048];
+        // Frame buffers size against the shared WAL entry-body cap —
+        // the one value every proposal-carrying buffer in the graph
+        // must agree on (modules/common/wal_frame.rs).
+        let mut frame = [0u8; wal_frame::MAX_ENTRY_BODY];
 
         // 1. codec drains, then the applied-response loop.
         let mut t0 = dev_micros(sys);
         codec::step(&mut s.codec, sys);
         for _ in 0..8 {
+            // Consume-gate: pulling an applied response retires its
+            // correlation entry inside next_applied, so only pull one
+            // while the surface can actually carry the ack out
+            // (retry stash clear + egress writable).
+            if !surface::ready_to_send(&mut s.surface, sys) {
+                break;
+            }
             match codec::next_applied(&mut s.codec, sys) {
                 None => break,
                 Some(out) => {
@@ -258,6 +270,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if surface::send_outbound(&mut s.surface, sys, &out) {
                         codec::note_response_sent(&mut s.codec);
                     }
+                }
+                surface::Inbound::ConnClosed { conn_id } => {
+                    // Client conn closed: purge its correlation state
+                    // so the reused conn_id can't route a later
+                    // client's response to the dead (or wrong) socket.
+                    codec::purge_conn(&mut s.codec, conn_id);
                 }
             }
         }
@@ -318,9 +336,9 @@ unsafe fn route_client(
     sys: &SyscallTable,
     msg_type: u8,
     len: usize,
-    frame: &[u8; 2048],
+    frame: &[u8; wal_frame::MAX_ENTRY_BODY],
 ) {
-    let mut proposal = [0u8; 2048];
+    let mut proposal = [0u8; wal_frame::MAX_ENTRY_BODY];
     match codec::on_request(&mut s.codec, sys, msg_type, &frame[..len], &mut proposal) {
         codec::Route::Done => {}
         codec::Route::Respond(out) => {

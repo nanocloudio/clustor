@@ -10,9 +10,25 @@
 //!     directly comparable),
 //!   - random write throughput (seek + write within the file).
 //!
-//! All I/O is single-stream (queue depth 1); QD scaling and the device's
-//! rated ceiling are covered by the `fio` cross-check documented in the
-//! rig run procedure, not from inside a cooperative module.
+//! The sequential phase runs in one of two tiers, selected by `io_mode`:
+//!
+//!   - L1a (`io_mode = 0`): synchronous queue-depth-1 durable writes —
+//!     `FS_WRITE` plus a blocking `FS_FSYNC`. One durability round-trip is
+//!     outstanding at a time, so this is a LATENCY measurement; its KB/s is
+//!     the reciprocal of that latency and is not a device-bandwidth number.
+//!   - L1b (`io_mode = 1`): pipelined async durability — `FS_WRITE_ASYNC`
+//!     with up to `fence_depth` `FS_FSYNC_SUBMIT` fences outstanding, reaped
+//!     by `FS_FSYNC_POLL`. Per-step work is O(1) submissions and O(1) polls
+//!     instead of a device round-trip, so its KB/s does measure how much
+//!     bandwidth the durable-write path sustains. Requires the FS provider
+//!     to advertise `FS_CAP_FSYNC_ASYNC`; without it the run aborts rather
+//!     than degrading to L1a behind an L1b label.
+//!
+//! Both tiers fold their durability latency (submit→durable for a fence)
+//! into the same `FSYNC_LATENCY_US` buckets, so they share one axis. The
+//! device's rated ceiling and QD scaling below the FS contract are covered
+//! by the `fio` cross-check documented in the rig run procedure, not from
+//! inside a cooperative module.
 //!
 //! Results are emitted two ways: parseable `[nvbench] ...` lines over
 //! `dev_log` (the rig's UDP `log_net` channel) and typed
@@ -47,6 +63,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
+#[path = "../../common/log_fmt.rs"]
+mod log_fmt;
+use log_fmt::{log_field, log_field_i32};
 
 // dev_fs opcodes (mirror `abi::dev_fs`; see modules/app/wal/mod.rs).
 const FS_OPEN: u32 = 0x0900;
@@ -56,12 +75,55 @@ const FS_CLOSE: u32 = 0x0903;
 const FS_FSYNC: u32 = 0x0905;
 const FS_WRITE: u32 = 0x0906;
 const FS_OPEN_CREATE: u32 = 0x0909;
+/// Async durable-write tier (`fs.rs::{WRITE_ASYNC, FSYNC_SUBMIT,
+/// FSYNC_POLL}`). `FS_WRITE_ASYNC` takes the same args as `FS_WRITE` and
+/// returns bytes accepted; a short count is backpressure, not an error.
+/// `FS_FSYNC_SUBMIT` fills an 8-byte out buffer with a u64 LE ticket and
+/// returns 0; `FS_FSYNC_POLL` takes that ticket and returns 0 = durable,
+/// 1 = in flight, negative errno = a fenced write failed.
+const FS_WRITE_ASYNC: u32 = 0x090F;
+const FS_FSYNC_SUBMIT: u32 = 0x0910;
+const FS_FSYNC_POLL: u32 = 0x0911;
+/// Capability discovery + the bit that gates the tier above. A provider
+/// that does not advertise it (the linux host FS) cannot serve `io_mode = 1`.
+const FS_CAPS: u32 = 0x09FF;
+const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
+
+/// `io_mode` selectors. `IO_MODE_SYNC` is the latency tier: queue-depth-1
+/// `FS_WRITE` + blocking `FS_FSYNC`, whose throughput number is the
+/// reciprocal of durability latency, not device bandwidth. `IO_MODE_ASYNC`
+/// is the pipelined tier: `FS_WRITE_ASYNC` with up to `fence_depth`
+/// durability fences outstanding, which is what the throughput number
+/// there actually measures.
+const IO_MODE_SYNC: u16 = 0;
+const IO_MODE_ASYNC: u16 = 1;
+
+/// Outstanding-fence ring capacity, and therefore the ceiling on
+/// `fence_depth`. Matches the nvme driver's async bulk-write ring, past
+/// which extra fences queue in the driver rather than overlapping on the
+/// device. A power of two so the head/tail wrap is a mask the compiler can
+/// prove in range — no bounds-check panic path in a `no_std` PIC module.
+const FENCE_RING_MAX: usize = 8;
 
 /// Largest single `FS_WRITE` the module buffers. Covers the WAL-relevant
 /// 4 KiB–64 KiB range; the `fio` cross-check covers larger blocks.
 const BLOCK_MAX: usize = 64 * 1024;
 
 const METRICS_INTERVAL_MS: u64 = 1000;
+
+/// Sized for the longest line the module composes: the PH_DONE
+/// fsync-histogram heartbeat — "[nvbench] fsyncus" (17 B) + " <u32>"
+/// (11 B) per bucket (`FSYNC_LATENCY_US` bounds + overflow) +
+/// " seqKBps=" (9 B) + 10 digits. The `log_fmt` helpers drop a field
+/// that would not fit, so undersizing truncates rather than overruns.
+const LOG_BUF_LEN: usize = 17 + (wire::hist::FSYNC_LATENCY_US.len() + 1) * 11 + 9 + 10;
+
+/// Fallback per-step work budget when `step_budget_us` is unset, in µs.
+/// Sized under the kernel's 2000 µs default step deadline with room
+/// for the heartbeat. A deployment that raises `step_deadline_us`
+/// raises `step_budget_us` with it — the module cannot read the
+/// scheduler's deadline, so the two are declared together.
+const DEFAULT_STEP_BUDGET_US: u32 = 1500;
 
 // Phases.
 const PH_OPEN: u8 = 0;
@@ -134,6 +196,17 @@ define_params! {
     // Blocks processed per module_step (step-budget bound).
     5, step_batch, u16, 64
         => |s, d, len| { s.step_batch = p_u16(d, len, 0, 64); };
+
+    // Per-step work budget (µs). `step_batch` is the UPPER bound on
+    // blocks per step; this is the real limiter — the batch stops early
+    // once the step has consumed its budget. Declare it just under the
+    // deployment's `step_deadline_us`: a fast device then does more work
+    // per step and a stalled one (fat32/NVMe cache flushes run 35-150 ms
+    // on the rig) yields immediately, instead of a fixed block count
+    // that is simultaneously unsafe on the default deadline and an
+    // override of a deliberately raised one.
+    11, step_budget_us, u32, DEFAULT_STEP_BUDGET_US
+        => |s, d, len| { s.step_budget_us = p_u32(d, len, 0, DEFAULT_STEP_BUDGET_US); };
     // 1 = write to a root-directory file "nvbench.bin"; 0 = "wal/nvbench.bin"
     // (the parent dir must already exist for 0). pi5/FAT32 has no mkdir, so
     // the bare-metal bench uses root. Default 0 preserves the linux path.
@@ -162,6 +235,25 @@ define_params! {
     // independent of the write-run's in-boot verify (which can read cache).
     10, verify_only, u16, 0
         => |s, d, len| { s.verify_only = p_u16(d, len, 0, 0); };
+
+    // I/O tier for the sequential phase. 0 = synchronous queue-depth-1
+    // durable writes (FS_WRITE + blocking FS_FSYNC): a LATENCY measurement,
+    // bounded by one device round-trip at a time. 1 = pipelined async
+    // durability (FS_WRITE_ASYNC + FS_FSYNC_SUBMIT/FS_FSYNC_POLL) with
+    // `fence_depth` fences in flight: a BANDWIDTH measurement. Mode 1
+    // requires the provider to advertise FS_CAP_FSYNC_ASYNC; on a provider
+    // without it the run aborts rather than degrading to mode 0, so an
+    // async baseline can never be a synchronous number under another name.
+    12, io_mode, u16, IO_MODE_SYNC
+        => |s, d, len| { s.io_mode = p_u16(d, len, 0, IO_MODE_SYNC); };
+    // Durability fences kept outstanding in `io_mode = 1`, clamped to
+    // FENCE_RING_MAX. This is the swept variable of the pipelined tier: it
+    // sets how much device latency the bench overlaps. Each fence covers
+    // `fsync_every` blocks, so blocks per step is bounded by
+    // `fence_depth * fsync_every` — size both against the tick so the sweep
+    // measures the device rather than the scheduler. Ignored in mode 0.
+    13, fence_depth, u16, 1
+        => |s, d, len| { s.fence_depth = p_u16(d, len, 0, 1); };
 }
 
 #[repr(C)]
@@ -176,11 +268,35 @@ struct ModuleState {
     fsync_every: u16,
     rand_blocks: u32,
     step_batch: u16,
+    step_budget_us: u32,
     root_path: u16,
     verify: u16,
     open_retry_max: u32,
     start_delay_ms: u32,
     verify_only: u16,
+    io_mode: u16,
+    fence_depth: u16,
+
+    // FS capability probe (one-shot, once the provider has returned an fd).
+    fs_caps: u32,
+    /// 1 when the provider advertises `FS_CAP_FSYNC_ASYNC`.
+    fs_async: u16,
+    // Outstanding-fence ring (FIFO): ticket and its submit timestamp, so a
+    // completion folds submit→durable latency into the fsync histogram.
+    fence_tickets: [u64; FENCE_RING_MAX],
+    fence_t0: [u64; FENCE_RING_MAX],
+    fence_head: u8,
+    fence_count: u8,
+    fences_submitted: u32,
+    fences_done: u32,
+    /// FS_WRITE_ASYNC backpressure events (E_AGAIN or a short count).
+    write_again: u32,
+    /// FS_FSYNC_SUBMIT backpressure events (fence ring full at the provider).
+    fence_again: u32,
+    /// Bytes of the in-progress block the provider has already accepted. A
+    /// short `FS_WRITE_ASYNC` resumes from here, so the file still holds one
+    /// contiguous copy of the block pattern and the read-back verify holds.
+    part: u32,
 
     // Run state
     phase: u8,
@@ -209,7 +325,7 @@ struct ModuleState {
 
     data_buf: [u8; BLOCK_MAX],
     vbuf: [u8; 512],
-    log_buf: [u8; 128],
+    log_buf: [u8; LOG_BUF_LEN],
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -259,6 +375,17 @@ pub extern "C" fn module_new(
         s.fsync_buckets = [0u32; wire::hist::FSYNC_LATENCY_US.len() + 1];
         s.last_metrics_ms = 0;
         s.reported = false;
+        s.fs_caps = 0;
+        s.fs_async = 0;
+        s.fence_tickets = [0u64; FENCE_RING_MAX];
+        s.fence_t0 = [0u64; FENCE_RING_MAX];
+        s.fence_head = 0;
+        s.fence_count = 0;
+        s.fences_submitted = 0;
+        s.fences_done = 0;
+        s.write_again = 0;
+        s.fence_again = 0;
+        s.part = 0;
 
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
@@ -267,6 +394,13 @@ pub extern "C" fn module_new(
         if s.block_size as usize > BLOCK_MAX { s.block_size = BLOCK_MAX as u32; }
         if s.block_size == 0 { s.block_size = 4096; }
         if s.step_batch == 0 { s.step_batch = 64; }
+        // One fence per block is the floor of the grouping knob in both
+        // tiers; 0 would ask the async path to open a fence covering
+        // nothing before it has written anything.
+        if s.fsync_every == 0 { s.fsync_every = 1; }
+        if s.fence_depth == 0 { s.fence_depth = 1; }
+        if s.fence_depth as usize > FENCE_RING_MAX { s.fence_depth = FENCE_RING_MAX as u16; }
+        if s.step_budget_us == 0 { s.step_budget_us = DEFAULT_STEP_BUDGET_US; }
         if s.open_retry_max == 0 { s.open_retry_max = OPEN_RETRY_MAX_DEFAULT; }
         // Durability mode skips create/write and goes straight to the
         // read-back verify of the file a prior write run persisted.
@@ -290,6 +424,17 @@ fn xorshift32(state: &mut u32) -> u32 {
     x ^= x << 5;
     *state = x;
     x
+}
+
+/// True once this step has consumed its declared work budget. Checked
+/// after each completed block so the batch ends on elapsed time rather
+/// than a fixed count: a fast device gets through more blocks per step,
+/// a stalled one yields after the block that stalled.
+///
+/// # Safety
+/// `sys` must be live.
+unsafe fn step_budget_spent(sys: &SyscallTable, step_t0: u64, budget_us: u32) -> bool {
+    dev_micros(sys).wrapping_sub(step_t0) >= u64::from(budget_us)
 }
 
 /// Timed `FS_FSYNC` folded into the fsync-latency histogram. Returns the
@@ -321,39 +466,190 @@ unsafe fn fsync_timed(s: &mut ModuleState, sys: &SyscallTable) -> i32 {
 /// # Safety
 /// `sys` must be live.
 unsafe fn bench_abort(s: &mut ModuleState, sys: &SyscallTable, what: &[u8], rc: i32) {
-    let mut p = 0usize;
-    let lb = s.log_buf.as_mut_ptr();
-    p = log_field_i32(lb, p, what, rc);
-    dev_log(sys, 3, lb, p);
+    let p = log_field_i32(&mut s.log_buf, 0, what, rc);
+    dev_log(sys, 3, s.log_buf.as_ptr(), p);
     s.phase = PH_REPORT;
 }
 
-/// Append `tag` + decimal `val` into `log_buf` at `pos`; returns new pos.
+/// One-shot FS capability probe, issued once the provider has proved
+/// itself ready by returning an fd (a `FS_CAPS` call against an
+/// initialising provider answers nothing useful). A provider that does not
+/// implement the opcode at all leaves `fs_caps` zero, which reads as "no
+/// async tier" — the conservative disposition.
 ///
 /// # Safety
-/// `log_buf` must have room for `tag.len() + 10` bytes at `pos`.
-unsafe fn log_field(buf: *mut u8, pos: usize, tag: &[u8], val: u32) -> usize {
-    core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.add(pos), tag.len());
-    pos + tag.len() + fmt_u32_raw(buf.add(pos + tag.len()), val)
+/// `sys` must be live.
+unsafe fn probe_fs_caps(s: &mut ModuleState, sys: &SyscallTable) {
+    let mut caps = [0u8; 4];
+    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+    s.fs_caps = if rc == 4 { u32::from_le_bytes(caps) } else { 0 };
+    s.fs_async = u16::from(s.fs_caps & FS_CAP_FSYNC_ASYNC != 0);
 }
 
-/// Like `log_field` but for a possibly-negative `i32` (e.g. an errno-style
-/// FS return code): writes `tag`, a leading `-` when negative, then the
-/// magnitude. `FS_OPEN_CREATE` returns a tagged fd (positive) or `-errno`.
+/// Open one durability fence over everything written so far and queue it at
+/// the tail of the ring with its submit timestamp. Returns true when a fence
+/// was opened.
+///
+/// `FS_E_AGAIN` is the provider's own fence ring signalling full: counted as
+/// backpressure and retried next step, with `since_fsync` left standing so
+/// the blocks it covers stay unfenced until one lands. Any other non-zero rc
+/// is a hard failure and aborts the run.
+///
+/// The caller must have checked that the ring has room (`fence_count <
+/// effective depth`).
 ///
 /// # Safety
-/// `buf` must have room for `tag.len() + 11` bytes at `pos`.
-unsafe fn log_field_i32(buf: *mut u8, pos: usize, tag: &[u8], val: i32) -> usize {
-    core::ptr::copy_nonoverlapping(tag.as_ptr(), buf.add(pos), tag.len());
-    let mut p = pos + tag.len();
-    let mag = if val < 0 {
-        *buf.add(p) = b'-';
-        p += 1;
-        (val as i64).unsigned_abs() as u32
-    } else {
-        val as u32
-    };
-    p + fmt_u32_raw(buf.add(p), mag)
+/// `s.fd` must be a valid open descriptor and `sys` live.
+unsafe fn fence_submit(s: &mut ModuleState, sys: &SyscallTable) -> bool {
+    let mut tb = [0u8; 8];
+    let t0 = dev_micros(sys);
+    let rc = (sys.provider_call)(s.fd, FS_FSYNC_SUBMIT, tb.as_mut_ptr(), 8);
+    if rc == FS_E_AGAIN {
+        s.fence_again = s.fence_again.saturating_add(1);
+        return false;
+    }
+    if rc != 0 {
+        s.io_errors = s.io_errors.saturating_add(1);
+        bench_abort(s, sys, b"[nvbench] FAIL fence submit rc=", rc);
+        return false;
+    }
+    let tail = (s.fence_head as usize + s.fence_count as usize) % FENCE_RING_MAX;
+    s.fence_tickets[tail] = u64::from_le_bytes(tb);
+    s.fence_t0[tail] = t0;
+    s.fence_count += 1;
+    s.fences_submitted = s.fences_submitted.saturating_add(1);
+    s.since_fsync = 0;
+    true
+}
+
+/// One step of the pipelined-async sequential phase (`io_mode = 1`).
+///
+/// Per-step work is O(1) by construction: at most `fence_depth`
+/// `FS_FSYNC_POLL`s — the reap stops at the oldest fence still in flight, so
+/// it never waits on the device — followed by at most `step_batch`
+/// `FS_WRITE_ASYNC` submissions, cut short by `step_budget_us`. Nothing here
+/// blocks, which is the whole point of the tier: throughput is bounded by
+/// device bandwidth and `fence_depth`, not by one durability round-trip.
+///
+/// Backpressure (`FS_E_AGAIN` or a short count from `FS_WRITE_ASYNC`,
+/// `FS_E_AGAIN` from `FS_FSYNC_SUBMIT`, or a full fence ring) ends the
+/// step's submissions and is counted, not treated as an error: the accepted
+/// prefix of the in-flight block (`part`) and the unfenced block count
+/// (`since_fsync`) both persist, so the next step resumes exactly where this
+/// one stopped. A negative rc that is not E_AGAIN, and a poll reporting that
+/// a fenced write failed, are hard errors that abort the run — a durability
+/// gap must never be reported as throughput.
+///
+/// # Safety
+/// `s.fd` must be a valid open descriptor and `sys` live.
+unsafe fn step_seq_async(s: &mut ModuleState, sys: &SyscallTable, step_t0: u64) {
+    let bs = s.block_size as usize;
+    let depth = (s.fence_depth as usize).min(FENCE_RING_MAX);
+
+    // ── Reap durable fences, oldest first (FIFO → in-order latencies). ──
+    while s.fence_count > 0 {
+        let head = s.fence_head as usize % FENCE_RING_MAX;
+        let mut tb = s.fence_tickets[head].to_le_bytes();
+        let rc = (sys.provider_call)(s.fd, FS_FSYNC_POLL, tb.as_mut_ptr(), 8);
+        if rc == 1 { break; } // oldest still in flight; nothing newer can be done
+        if rc != 0 {
+            s.io_errors = s.io_errors.saturating_add(1);
+            bench_abort(s, sys, b"[nvbench] FAIL fence poll rc=", rc);
+            return;
+        }
+        // Submit→durable, folded into the same buckets the synchronous
+        // FS_FSYNC uses, so the two tiers share one latency axis.
+        let elapsed = dev_micros(sys).wrapping_sub(s.fence_t0[head]);
+        let b = wire::hist::bucket(&wire::hist::FSYNC_LATENCY_US, elapsed);
+        s.fsync_buckets[b] = s.fsync_buckets[b].saturating_add(1);
+        s.fsyncs = s.fsyncs.saturating_add(1);
+        s.fences_done = s.fences_done.saturating_add(1);
+        s.fence_head = ((head + 1) % FENCE_RING_MAX) as u8;
+        s.fence_count -= 1;
+    }
+
+    // ── Submit writes, opening a fence every `fsync_every` blocks. ──
+    let mut n = 0u32;
+    while n < s.step_batch as u32 && s.blocks_done < s.seq_blocks {
+        if s.since_fsync >= s.fsync_every {
+            if (s.fence_count as usize) >= depth { break; } // pipeline full
+            if !fence_submit(s, sys) { break; }
+        }
+        // A short count leaves `part` bytes of this block accepted; the
+        // remainder is offered again next step at the same file position,
+        // so the on-disk pattern stays one contiguous copy per block.
+        let off = s.part as usize;
+        let rem = bs - off;
+        let w = (sys.provider_call)(s.fd, FS_WRITE_ASYNC, s.data_buf.as_mut_ptr().add(off), rem);
+        if w == FS_E_AGAIN || w == 0 {
+            s.write_again = s.write_again.saturating_add(1);
+            break;
+        }
+        if w < 0 {
+            s.io_errors = s.io_errors.saturating_add(1);
+            bench_abort(s, sys, b"[nvbench] FAIL write async rc=", w);
+            return;
+        }
+        s.bytes_written += w as u64;
+        if (w as usize) < rem {
+            s.part += w as u32;
+            s.write_again = s.write_again.saturating_add(1);
+            break;
+        }
+        s.part = 0;
+        s.blocks_done += 1;
+        s.since_fsync += 1;
+        n += 1;
+        if step_budget_spent(sys, step_t0, s.step_budget_us) { break; }
+    }
+
+    // ── Drain: fence the tail, then let the ring empty across steps. ──
+    // Each drain step costs one poll pass and returns, so waiting out the
+    // last fences never spins inside a step.
+    if s.blocks_done >= s.seq_blocks && s.since_fsync > 0 && (s.fence_count as usize) < depth {
+        fence_submit(s, sys);
+    }
+    if s.phase == PH_SEQ
+        && s.blocks_done >= s.seq_blocks
+        && s.since_fsync == 0
+        && s.fence_count == 0
+    {
+        seq_complete(s, sys);
+    }
+}
+
+/// Score the sequential phase and route to the next one. Every byte counted
+/// here is durable: the synchronous tier has fsynced its tail and the
+/// pipelined tier has reaped its last fence before this is called.
+///
+/// # Safety
+/// `sys` must be live.
+unsafe fn seq_complete(s: &mut ModuleState, sys: &SyscallTable) {
+    let elapsed = dev_micros(sys).wrapping_sub(s.phase_start_us);
+    s.seq_kbps = kbps(s.bytes_written, elapsed);
+    let mut p = 0usize;
+    p = log_field(&mut s.log_buf, p, b"[nvbench] seq bs=", s.block_size);
+    p = log_field(&mut s.log_buf, p, b" blocks=", s.seq_blocks);
+    p = log_field(&mut s.log_buf, p, b" us=", elapsed as u32);
+    p = log_field(&mut s.log_buf, p, b" KBps=", s.seq_kbps);
+    dev_log(sys, 3, s.log_buf.as_ptr(), p);
+
+    if s.io_mode == IO_MODE_ASYNC {
+        // The async tier is an append-only durable-write pipeline; random
+        // overwrite is not part of that contract, so the phase is announced
+        // as skipped rather than silently scoring zero.
+        if s.rand_blocks > 0 {
+            dev_log(sys, 3, b"[nvbench] rand skipped io_mode=1".as_ptr(), 32);
+        }
+        s.phase = if s.verify != 0 { PH_VERIFY } else { PH_REPORT };
+        return;
+    }
+    // Reset for the random phase over the same file.
+    s.phase = PH_RAND;
+    s.blocks_done = 0;
+    s.since_fsync = 0;
+    s.bytes_written = 0;
+    s.phase_start_us = dev_micros(sys);
 }
 
 /// Throughput in KB/s = `bytes / elapsed_ms` = `bytes * 1000 / us`.
@@ -382,7 +678,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         let s = &mut *(state as *mut ModuleState);
         let sys = &*s.syscalls;
         let bs = s.block_size as usize;
+        // `step_batch` bounds the batch; `step_budget_us` ends it early
+        // (see `step_budget_deadline`). Both loops below re-check the
+        // budget after each block, so one slow device op costs at most
+        // one overrun instead of the whole batch.
         let batch = s.step_batch as u32;
+        let step_t0 = dev_micros(sys);
 
         // Liveness: proves the (input-less) bench is actually being stepped
         // each tick on bare metal — i.e. that module_deferred_ready() took.
@@ -424,10 +725,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // fault. Fires once, right before the first FS_OPEN_CREATE.
                 if s.dbg & DBG_OPEN_TRY == 0 {
                     s.dbg |= DBG_OPEN_TRY;
-                    let mut p = 0usize;
-                    let lb = s.log_buf.as_mut_ptr();
-                    p = log_field(lb, p, b"[nvbench] open try ms=", dev_millis(sys) as u32);
-                    dev_log(sys, 3, lb, p);
+                    let now32 = dev_millis(sys) as u32;
+                    let p = log_field(&mut s.log_buf, 0, b"[nvbench] open try ms=", now32);
+                    dev_log(sys, 3, s.log_buf.as_ptr(), p);
                 }
                 // Path is ptr+len with NO null terminator (the FS provider
                 // takes exactly `len` bytes — a trailing \0 becomes part of
@@ -447,27 +747,40 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let give_up = s.open_retries >= s.open_retry_max
                         || (hard && s.open_retries >= OPEN_HARD_FAIL_RETRIES);
                     if give_up {
-                        let mut p = 0usize;
-                        let lb = s.log_buf.as_mut_ptr();
-                        p = log_field(lb, p, b"[nvbench] no fs rc=", (-s.fd) as u32);
-                        dev_log(sys, 3, lb, p);
+                        let rc = (-s.fd) as u32;
+                        let p = log_field(&mut s.log_buf, 0, b"[nvbench] no fs rc=", rc);
+                        dev_log(sys, 3, s.log_buf.as_ptr(), p);
                         s.phase = PH_NOFS;
                     }
                 } else {
                     if s.dbg & DBG_OPEN_OK == 0 {
                         s.dbg |= DBG_OPEN_OK;
-                        let mut p = 0usize;
-                        let lb = s.log_buf.as_mut_ptr();
-                        p = log_field_i32(lb, p, b"[nvbench] open ok fd=", s.fd);
-                        dev_log(sys, 3, lb, p);
+                        let p = log_field_i32(&mut s.log_buf, 0, b"[nvbench] open ok fd=", s.fd);
+                        dev_log(sys, 3, s.log_buf.as_ptr(), p);
                     }
-                    s.phase = PH_SEQ;
-                    s.blocks_done = 0;
-                    s.since_fsync = 0;
-                    s.bytes_written = 0;
-                    s.phase_start_us = dev_micros(sys);
+                    // The fd proves the provider is up, so its capability
+                    // bitmap is now meaningful. `io_mode = 1` on a provider
+                    // without FS_CAP_FSYNC_ASYNC aborts with a named reason:
+                    // falling back to the synchronous path would publish a
+                    // queue-depth-1 latency number as a pipelined-bandwidth
+                    // one, which is the mislabelling this tier exists to end.
+                    probe_fs_caps(s, sys);
+                    if s.io_mode == IO_MODE_ASYNC && s.fs_async == 0 {
+                        let p = log_field(
+                            &mut s.log_buf, 0, b"[nvbench] FAIL async unsupported caps=", s.fs_caps,
+                        );
+                        dev_log(sys, 3, s.log_buf.as_ptr(), p);
+                        s.phase = PH_REPORT;
+                    } else {
+                        s.phase = PH_SEQ;
+                        s.blocks_done = 0;
+                        s.since_fsync = 0;
+                        s.bytes_written = 0;
+                        s.phase_start_us = dev_micros(sys);
+                    }
                 }
             }
+            PH_SEQ if s.io_mode == IO_MODE_ASYNC => step_seq_async(s, sys, step_t0),
             PH_SEQ => {
                 let mut n = 0u32;
                 while n < batch && s.blocks_done < s.seq_blocks {
@@ -475,18 +788,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     // module goes silent here, the write path is the fault.
                     if s.dbg & DBG_W_BEGIN == 0 {
                         s.dbg |= DBG_W_BEGIN;
-                        let mut p = 0usize;
-                        let lb = s.log_buf.as_mut_ptr();
-                        p = log_field(lb, p, b"[nvbench] w begin bs=", bs as u32);
-                        dev_log(sys, 3, lb, p);
+                        let p = log_field(&mut s.log_buf, 0, b"[nvbench] w begin bs=", bs as u32);
+                        dev_log(sys, 3, s.log_buf.as_ptr(), p);
                     }
                     let wrc = (sys.provider_call)(s.fd, FS_WRITE, s.data_buf.as_mut_ptr(), bs);
                     if s.dbg & DBG_W_DONE == 0 {
                         s.dbg |= DBG_W_DONE;
-                        let mut p = 0usize;
-                        let lb = s.log_buf.as_mut_ptr();
-                        p = log_field_i32(lb, p, b"[nvbench] w0 rc=", wrc);
-                        dev_log(sys, 3, lb, p);
+                        let p = log_field_i32(&mut s.log_buf, 0, b"[nvbench] w0 rc=", wrc);
+                        dev_log(sys, 3, s.log_buf.as_ptr(), p);
                     }
                     // A correct FS_WRITE returns exactly `bs`. A short write or
                     // negative errno (e.g. disk full) must not advance the
@@ -513,6 +822,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     s.blocks_done += 1;
                     n += 1;
+                    if step_budget_spent(sys, step_t0, s.step_budget_us) { break; }
                 }
                 if s.phase == PH_SEQ && s.blocks_done >= s.seq_blocks {
                     if s.since_fsync > 0 {
@@ -522,21 +832,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                 }
                 if s.phase == PH_SEQ && s.blocks_done >= s.seq_blocks {
-                    let elapsed = dev_micros(sys).wrapping_sub(s.phase_start_us);
-                    s.seq_kbps = kbps(s.bytes_written, elapsed);
-                    let mut p = 0usize;
-                    let lb = s.log_buf.as_mut_ptr();
-                    p = log_field(lb, p, b"[nvbench] seq bs=", s.block_size);
-                    p = log_field(lb, p, b" blocks=", s.seq_blocks);
-                    p = log_field(lb, p, b" us=", elapsed as u32);
-                    p = log_field(lb, p, b" KBps=", s.seq_kbps);
-                    dev_log(sys, 3, lb, p);
-                    // Reset for the random phase over the same file.
-                    s.phase = PH_RAND;
-                    s.blocks_done = 0;
-                    s.since_fsync = 0;
-                    s.bytes_written = 0;
-                    s.phase_start_us = dev_micros(sys);
+                    seq_complete(s, sys);
                 }
             }
             PH_RAND => {
@@ -547,7 +843,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let off = (blk as u64 * bs as u64) as u32;
                     let arg = off.to_le_bytes();
                     let src = (sys.provider_call)(s.fd, FS_SEEK, arg.as_ptr() as *mut u8, 4);
-                    if src != 0 {
+                    // Success is any non-negative rc: providers may
+                    // return the resulting absolute offset.
+                    if src < 0 {
                         s.io_errors = s.io_errors.saturating_add(1);
                         bench_abort(s, sys, b"[nvbench] FAIL seek rc=", src);
                         break;
@@ -567,6 +865,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     }
                     s.blocks_done += 1;
                     n += 1;
+                    if step_budget_spent(sys, step_t0, s.step_budget_us) { break; }
                 }
                 if s.phase == PH_RAND && s.blocks_done >= s.rand_blocks {
                     if s.since_fsync > 0 {
@@ -579,12 +878,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let elapsed = dev_micros(sys).wrapping_sub(s.phase_start_us);
                     s.rand_kbps = kbps(s.bytes_written, elapsed);
                     let mut p = 0usize;
-                    let lb = s.log_buf.as_mut_ptr();
-                    p = log_field(lb, p, b"[nvbench] rand bs=", s.block_size);
-                    p = log_field(lb, p, b" blocks=", s.rand_blocks);
-                    p = log_field(lb, p, b" us=", elapsed as u32);
-                    p = log_field(lb, p, b" KBps=", s.rand_kbps);
-                    dev_log(sys, 3, lb, p);
+                    p = log_field(&mut s.log_buf, p, b"[nvbench] rand bs=", s.block_size);
+                    p = log_field(&mut s.log_buf, p, b" blocks=", s.rand_blocks);
+                    p = log_field(&mut s.log_buf, p, b" us=", elapsed as u32);
+                    p = log_field(&mut s.log_buf, p, b" KBps=", s.rand_kbps);
+                    dev_log(sys, 3, s.log_buf.as_ptr(), p);
                     s.phase = if s.verify != 0 { PH_VERIFY } else { PH_REPORT };
                 }
             }
@@ -631,10 +929,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // Hard open failure (file absent / provider gone) — a
                         // durability failure in verify_only mode.
                         s.verify_fail = 1;
-                        let mut p = 0usize;
-                        let lb = s.log_buf.as_mut_ptr();
-                        p = log_field_i32(lb, p, b"[nvbench] verify FAIL open rfd=", s.fd);
-                        dev_log(sys, 3, lb, p);
+                        let p = log_field_i32(
+                            &mut s.log_buf, 0, b"[nvbench] verify FAIL open rfd=", s.fd,
+                        );
+                        dev_log(sys, 3, s.log_buf.as_ptr(), p);
                         s.phase = PH_REPORT;
                     } else {
                         // Open succeeded — do the read-back on subsequent steps
@@ -672,16 +970,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
                         s.fd = -1;
                         let mut p = 0usize;
-                        let lb = s.log_buf.as_mut_ptr();
                         if !bad {
-                            p = log_field(lb, p, b"[nvbench] verify ok blocks=", s.seq_blocks);
-                            p = log_field(lb, p, b" bytes=", total as u32);
+                            p = log_field(&mut s.log_buf, p, b"[nvbench] verify ok blocks=", s.seq_blocks);
+                            p = log_field(&mut s.log_buf, p, b" bytes=", total as u32);
                         } else {
                             s.verify_fail = 1;
-                            p = log_field(lb, p, b"[nvbench] verify FAIL off=", s.verify_off as u32);
-                            p = log_field(lb, p, b" bytes=", total as u32);
+                            let off32 = s.verify_off as u32;
+                            p = log_field(&mut s.log_buf, p, b"[nvbench] verify FAIL off=", off32);
+                            p = log_field(&mut s.log_buf, p, b" bytes=", total as u32);
                         }
-                        dev_log(sys, 3, lb, p);
+                        dev_log(sys, 3, s.log_buf.as_ptr(), p);
                         s.phase = PH_REPORT;
                     }
                 }
@@ -692,11 +990,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.fd = -1;
                 }
                 let mut p = 0usize;
-                let lb = s.log_buf.as_mut_ptr();
-                p = log_field(lb, p, b"[nvbench] done fsyncs=", s.fsyncs);
-                p = log_field(lb, p, b" seqKBps=", s.seq_kbps);
-                p = log_field(lb, p, b" randKBps=", s.rand_kbps);
-                dev_log(sys, 3, lb, p);
+                p = log_field(&mut s.log_buf, p, b"[nvbench] done fsyncs=", s.fsyncs);
+                p = log_field(&mut s.log_buf, p, b" seqKBps=", s.seq_kbps);
+                p = log_field(&mut s.log_buf, p, b" randKBps=", s.rand_kbps);
+                dev_log(sys, 3, s.log_buf.as_ptr(), p);
                 s.reported = true;
                 s.phase = PH_DONE;
             }
@@ -727,15 +1024,30 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
     // and what is FS_OPEN_CREATE returning?" on every boot.
     {
         let mut p = 0usize;
-        let lb = s.log_buf.as_mut_ptr();
-        p = log_field(lb, p, b"[nvbench] hb ph=", u32::from(s.phase));
-        p = log_field(lb, p, b" steps=", s.steps as u32);
-        p = log_field_i32(lb, p, b" rc=", s.last_open_rc);
-        p = log_field(lb, p, b" retries=", s.open_retries);
-        p = log_field_i32(lb, p, b" fd=", s.fd);
-        p = log_field(lb, p, b" fsyncs=", s.fsyncs);
-        p = log_field(lb, p, b" vfail=", s.verify_fail);
-        dev_log(sys, 3, lb, p);
+        p = log_field(&mut s.log_buf, p, b"[nvbench] hb ph=", u32::from(s.phase));
+        p = log_field(&mut s.log_buf, p, b" steps=", s.steps as u32);
+        p = log_field_i32(&mut s.log_buf, p, b" rc=", s.last_open_rc);
+        p = log_field(&mut s.log_buf, p, b" retries=", s.open_retries);
+        p = log_field_i32(&mut s.log_buf, p, b" fd=", s.fd);
+        p = log_field(&mut s.log_buf, p, b" fsyncs=", s.fsyncs);
+        p = log_field(&mut s.log_buf, p, b" vfail=", s.verify_fail);
+        dev_log(sys, 3, s.log_buf.as_ptr(), p);
+
+        // Pipeline occupancy, emitted every heartbeat (not one-shot) so a
+        // `fence_depth` sweep is interpretable: a depth that never fills
+        // (`outst` below `depth`, `wagain`/`fagain` at zero) was not the
+        // limiter, and a run whose `cap` is 0 measured nothing at all.
+        if s.io_mode == IO_MODE_ASYNC {
+            let mut p = 0usize;
+            p = log_field(&mut s.log_buf, p, b"[nvbench] async cap=", u32::from(s.fs_async));
+            p = log_field(&mut s.log_buf, p, b" depth=", u32::from(s.fence_depth));
+            p = log_field(&mut s.log_buf, p, b" subm=", s.fences_submitted);
+            p = log_field(&mut s.log_buf, p, b" done=", s.fences_done);
+            p = log_field(&mut s.log_buf, p, b" outst=", u32::from(s.fence_count));
+            p = log_field(&mut s.log_buf, p, b" wagain=", s.write_again);
+            p = log_field(&mut s.log_buf, p, b" fagain=", s.fence_again);
+            dev_log(sys, 3, s.log_buf.as_ptr(), p);
+        }
 
         // Once the run is DONE, re-emit the fsync-latency histogram every
         // heartbeat. The one-shot PH_REPORT line is unreliable on the rig —
@@ -744,17 +1056,16 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
         // log pressure, so this line lands and is capturable at any time.
         // Bucket bounds: wire::hist::FSYNC_LATENCY_US (250 µs … 100 ms) + 1
         // overflow bucket. This is the L0/L1 WAL-path number the WAL lives on.
+        // This is the line LOG_BUF_LEN is sized for.
         if s.phase == PH_DONE {
-            let hb = s.log_buf.as_mut_ptr();
             let tag = b"[nvbench] fsyncus";
-            core::ptr::copy_nonoverlapping(tag.as_ptr(), hb, tag.len());
+            s.log_buf[..tag.len()].copy_from_slice(tag);
             let mut q = tag.len();
             for i in 0..s.fsync_buckets.len() {
-                *hb.add(q) = b' '; q += 1;
-                q += fmt_u32_raw(hb.add(q), s.fsync_buckets[i]);
+                q = log_field(&mut s.log_buf, q, b" ", s.fsync_buckets[i]);
             }
-            q = log_field(hb, q, b" seqKBps=", s.seq_kbps);
-            dev_log(sys, 3, hb, q);
+            q = log_field(&mut s.log_buf, q, b" seqKBps=", s.seq_kbps);
+            dev_log(sys, 3, s.log_buf.as_ptr(), q);
         }
     }
 
@@ -770,6 +1081,14 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
     emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_OPEN_RETRIES, wire::METRIC_KIND_COUNTER, i64::from(s.open_retries));
     emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_VERIFY_FAIL, wire::METRIC_KIND_GAUGE, i64::from(s.verify_fail));
     emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_IO_ERRORS, wire::METRIC_KIND_COUNTER, i64::from(s.io_errors));
+    // Pipeline occupancy: a depth sweep is only interpretable if the
+    // scrape can tell a full pipeline from a starved one.
+    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_IO_MODE, wire::METRIC_KIND_GAUGE, i64::from(s.io_mode));
+    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_FENCES_SUBMITTED, wire::METRIC_KIND_COUNTER, i64::from(s.fences_submitted));
+    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_FENCES_DONE, wire::METRIC_KIND_COUNTER, i64::from(s.fences_done));
+    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_FENCES_OUTSTANDING, wire::METRIC_KIND_GAUGE, i64::from(s.fence_count));
+    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_WRITE_AGAIN, wire::METRIC_KIND_COUNTER, i64::from(s.write_again));
+    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_FENCE_AGAIN, wire::METRIC_KIND_COUNTER, i64::from(s.fence_again));
     // Cumulative bucket counts per the wire contract (wire::hist): emit the
     // running prefix sum so bucket i = count of samples <= bound[i].
     let base = wire::hist::HIST_BASE;

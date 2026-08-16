@@ -47,7 +47,7 @@ When the host tool encounters a module entry like
    from the project root.
 
 The first matching `<dir>/<type_name>/manifest.toml` wins. See
-`fluxor/tools/src/config.rs::resolve_module_root` for the canonical
+`fluxor/tools/src/config/manifest.rs::resolve_module_root` for the canonical
 implementation.
 
 ## Published attach surface
