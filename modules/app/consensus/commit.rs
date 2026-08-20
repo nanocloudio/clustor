@@ -288,10 +288,21 @@ unsafe fn emit_retention_floor(s: &mut Commit, sys: &SyscallTable) {
 ///
 /// Caller must supply a valid `&SyscallTable` per the module ABI.
 unsafe fn emit_metrics(s: &mut Commit, sys: &SyscallTable) {
-    if s.out_metrics < 0 { return; }
     let now = dev_millis(sys);
     if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
     s.last_metrics_ms = now;
+
+    // Recurring commit heartbeat: the only commit-progress signal that
+    // is visible to log-line matchers (the gauges below are binary
+    // /metrics only). Rig scenarios key on this line advancing; an
+    // append-side heartbeat cannot detect a commit wedge.
+    let mut line = [0u8; 40];
+    let mut pos = 0usize;
+    pos = super::log_fmt::log_field(&mut line, pos, b"[commit] hb commit=",
+        s.committed_index.min(u32::MAX as u64) as u32);
+    super::dev_log(sys, 3, line.as_ptr(), pos);
+
+    if s.out_metrics < 0 { return; }
 
     let mid = wire::SOURCE_ID_COMMIT;
     let pid = s.partition_id;

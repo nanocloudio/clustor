@@ -257,6 +257,16 @@ struct Conn {
     /// to classify the conn as peer or client.
     frag_len: u8,
     frag: [u8; ID_MSG_LEN],
+    /// Our identity frame is still owed on this conn (outbound after
+    /// CONNOK; inbound reply after the peer identified). The transport
+    /// write is atomic and returns 0 on backpressure — a dropped
+    /// identity with no retry leaves the peer's side of the handshake
+    /// incomplete FOREVER (the peer keeps `connected = false`, redials
+    /// on its cadence, and the fresh conn's identity dedup then kills
+    /// the previous one — a 2 s dial/close loop that carries no raft
+    /// traffic). `flush_pending_identity` retries every step until the
+    /// write commits.
+    identity_pending: bool,
 }
 
 impl Conn {
@@ -270,6 +280,7 @@ impl Conn {
             tls_verified: false,
             frag_len: 0,
             frag: [0; ID_MSG_LEN],
+            identity_pending: false,
         }
     }
 }
@@ -462,12 +473,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Tear down any silently-dead peer link BEFORE redialing, so the
         // reconnect happens in the same step the staleness is detected.
         reconnect_stale_peers(s, sys, now);
+        // Retry identity frames that hit transport backpressure — a
+        // half-done handshake never completes on its own.
+        flush_pending_identity(s, sys);
         connect_peers(s, sys, now);
         // Drain TLS identity bindings BEFORE processing inbound net
         // events so a per-connection identity is in place by the time
         // any in-band handshake arrives. See RFC §5.1.
         drain_tls_identity(s, sys);
         process_net_events(s, sys, now);
+        // Second flush, after inbound processing: an identity owed by
+        // a handshake that completed THIS step would otherwise stay
+        // pending until the next one, and routing below skips a conn
+        // whose identity is still owed — so the frames it drops would
+        // be dropped for a whole step longer than necessary.
+        flush_pending_identity(s, sys);
         route_outbound_chan(s, sys, s.peer_tx);
         route_outbound_chan(s, sys, s.repl_tx);
         route_client_responses(s, sys);
@@ -825,6 +845,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                     s.listen_port
                 };
                 if payload_len >= 2 && local_port == s.listen_port {
+                    reap_conn_id(s, sys, conn_id);
                     if let Some(slot) = alloc_conn(s) {
                         s.conns[slot] = Conn {
                             conn_id,
@@ -838,6 +859,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                 // Outbound connection established — send identity
                 dev_log(sys, 2, b"[pr] dial-ok".as_ptr(), 11);
                 if payload_len >= 2 {
+                    reap_conn_id(s, sys, conn_id);
                     if let Some(slot) = alloc_conn(s) {
                         s.conns[slot] = Conn {
                             conn_id,
@@ -878,8 +900,13 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                 }
 
                 if !s.conns[slot].identified {
-                    // Try to parse identity message
-                    handle_identity(s, sys, slot, &local[..cl], now);
+                    // Try to parse identity message. `true` = a
+                    // coalesced tail was stashed for a backpressured
+                    // destination: stop draining so the stream stays
+                    // continuous (same rule as the stash below).
+                    if handle_identity(s, sys, slot, &local[..cl], now) {
+                        break;
+                    }
                 } else {
                     // Route based on replica_id
                     let rid = s.conns[slot].replica_id;
@@ -895,31 +922,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                             continue;
                         }
                         let peer_msg_type = local[2];
-
-                        let dest = match peer_msg_type {
-                            wire::MSG_APPEND_ENTRIES_RESP
-                            | wire::MSG_INSTALL_SNAPSHOT_RESP
-                            | wire::MSG_INSTALL_SNAPSHOT
-                            | wire::MSG_SNAPSHOT_CHUNK => s.peer_rx,
-                            wire::MSG_APPEND_ENTRIES
-                            | wire::MSG_REQUEST_VOTE
-                            | wire::MSG_REQUEST_VOTE_RESP
-                            | wire::MSG_PRE_VOTE
-                            | wire::MSG_PRE_VOTE_RESP
-                            | wire::MSG_HEARTBEAT
-                            | wire::MSG_HEARTBEAT_RESP
-                            // ReadIndex leadership-confirm round (RFC §1.3):
-                            // follower receives the leader's PROBE, leader
-                            // receives the follower's RESP — consensus
-                            // handles both on its rpc input. Omitting these
-                            // silently killed multi-node linearizable reads
-                            // (every probe timed out → LIN-BOUND reject);
-                            // dormant until lattice wired the read fence.
-                            | wire::MSG_READ_INDEX_PROBE
-                            | wire::MSG_READ_INDEX_PROBE_RESP
-                            | wire::MSG_TIMEOUT_NOW => s.raft_rpc,
-                            _ => -1,
-                        };
+                        let dest = peer_dest(s, peer_msg_type);
 
                         if dest >= 0 {
                             let p = (sys.channel_poll)(dest, 0x02);
@@ -972,6 +975,18 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
             }
             NMSG_CLOSED => {
                 dev_log(sys, 2, b"[pr] net-closed".as_ptr(), 15);
+                {
+                    // Attribute peer-link closes: an anonymous
+                    // net-closed is undiagnosable when a reconnect
+                    // misbehaves (this arm also fires for every HTTP
+                    // client close on shared-transport graphs).
+                    let slot0 = find_conn(s, conn_id);
+                    if slot0 < MAX_CONNS && s.conns[slot0].replica_id >= 0 {
+                        let mut m = *b"[pr] peer closed p=?";
+                        m[19] = b'0' + (s.conns[slot0].replica_id as u8 % 10);
+                        dev_log(sys, 3, m.as_ptr(), m.len());
+                    }
+                }
                 if payload_len >= 2 {
                     let slot = find_conn(s, conn_id);
                     if slot < MAX_CONNS {
@@ -1035,6 +1050,17 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn send_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize) {
+    // Mark the identity owed, then try to flush it immediately. The
+    // pending flag is what makes the handshake robust: a write that
+    // hits transport backpressure is retried every step by
+    // `flush_pending_identity` instead of being silently dropped.
+    s.conns[slot].identity_pending = true;
+    try_send_identity(s, sys, slot);
+}
+
+/// One identity write attempt for `slot`. Clears `identity_pending`
+/// only when the transport committed the whole frame.
+unsafe fn try_send_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize) {
     if s.net_out < 0 {
         return;
     }
@@ -1047,7 +1073,7 @@ unsafe fn send_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize) {
     payload[3] = magic[1];
     payload[4] = s.self_id;
 
-    net_write_frame(
+    let written = net_write_frame(
         sys,
         s.net_out,
         NCMD_SEND,
@@ -1056,6 +1082,21 @@ unsafe fn send_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize) {
         s.buf.as_mut_ptr(),
         BUF_SIZE,
     );
+    if written > 0 {
+        s.conns[slot].identity_pending = false;
+    }
+}
+
+/// Retry every owed identity frame (bounded by MAX_CONNS; almost
+/// always a no-op). Runs once per step so a handshake frame dropped
+/// under transport backpressure completes on a later step instead of
+/// never.
+unsafe fn flush_pending_identity(s: &mut ModuleState, sys: &SyscallTable) {
+    for slot in 0..MAX_CONNS {
+        if s.conns[slot].active && s.conns[slot].identity_pending {
+            try_send_identity(s, sys, slot);
+        }
+    }
 }
 
 /// # Safety
@@ -1070,9 +1111,9 @@ unsafe fn handle_identity(
     slot: usize,
     data: &[u8],
     now: u64,
-) {
+) -> bool {
     if data.is_empty() {
-        return;
+        return false;
     }
 
     // Classification needs the full 3-byte handshake message. The
@@ -1083,7 +1124,7 @@ unsafe fn handle_identity(
     if fl + data.len() < ID_MSG_LEN {
         s.conns[slot].frag[fl..fl + data.len()].copy_from_slice(data);
         s.conns[slot].frag_len = (fl + data.len()) as u8;
-        return;
+        return false;
     }
     let mut hdr = [0u8; ID_MSG_LEN];
     hdr[..fl].copy_from_slice(&s.conns[slot].frag[..fl]);
@@ -1091,15 +1132,35 @@ unsafe fn handle_identity(
     let total_len = fl + data.len();
     s.conns[slot].frag_len = 0;
 
-    // Exact classification: the identity message is exactly
-    // `[magic:2][replica_id:1]` and a peer sends it as its own frame,
-    // so only a magic match at EXACTLY that length with an in-range
-    // replica_id is a peer handshake. Anything longer is client
-    // traffic whose first bytes merely collide with the magic (0xA0
-    // 0xC1 is a perfectly ordinary start for a binary client record).
+    // Classification: the identity message is `[magic:2][replica_id:1]`
+    // and a peer sends it as its own frame. On an INBOUND conn only a
+    // magic match at EXACTLY that length is a peer handshake — anything
+    // longer is client traffic whose first bytes merely collide with
+    // the magic (0xA0 0xC1 is a perfectly ordinary start for a binary
+    // client record). An OUTBOUND conn is a peer link BY CONSTRUCTION
+    // (this module only ever dials configured peer addresses), so a
+    // longer first chunk carrying the magic is the peer's identity
+    // COALESCED with its first raft frames: TCP segments freely merge
+    // the reply with the heartbeat behind it. Accept the identity and
+    // route the tail as normal peer data. Classifying such a conn as
+    // a client instead strands the handshake — the dialer never sees
+    // `connected`, redials forever, and the pair carries no raft
+    // traffic at all.
+    //
+    // The claimed id must be a CONFIGURED peer and not our own. Our
+    // own id would bind a slot the liveness reaper skips by
+    // construction (`reconnect_stale_peers` passes over `self_id`),
+    // leaving an unreapable slot that broadcast routing keeps
+    // feeding; an unconfigured id cannot be a peer of this graph at
+    // all. Both also narrow the coalesced-length relaxation below to
+    // frames that really can be a peer handshake.
     let magic = u16::from_le_bytes([hdr[0], hdr[1]]);
-    let is_peer_identity =
-        magic == ID_MAGIC && total_len == ID_MSG_LEN && (hdr[2] as usize) < MAX_NODES;
+    let claimed = hdr[2];
+    let is_peer_identity = magic == ID_MAGIC
+        && (claimed as usize) < MAX_NODES
+        && claimed != s.self_id
+        && s.peer_addrs[claimed as usize].configured
+        && (total_len == ID_MSG_LEN || (s.conns[slot].outbound && total_len > ID_MSG_LEN));
     if !is_peer_identity {
         // Not a peer — treat as client (no identity exchange)
         s.conns[slot].identified = true;
@@ -1121,7 +1182,7 @@ unsafe fn handle_identity(
             if total_len > ROUTE_FRAME_MAX {
                 s.frames_dropped = s.frames_dropped.wrapping_add(1);
                 dev_log(sys, 2, b"[pr] oversize first".as_ptr(), 19);
-                return;
+                return false;
             }
             let mut tagged = [0u8; 1 + ROUTE_FRAME_MAX];
             tagged[0] = slot as u8;
@@ -1134,7 +1195,7 @@ unsafe fn handle_identity(
                 &tagged[..1 + total_len],
             );
         }
-        return;
+        return false;
     }
 
     let peer_id = hdr[2];
@@ -1149,7 +1210,7 @@ unsafe fn handle_identity(
             dev_log(&*s.syscalls, 2, b"[pr] tls/plain mismatch".as_ptr(), 23);
             s.conns[slot].replica_id = -1;
             s.conns[slot].identified = false;
-            return;
+            return false;
         }
         // Match — keep the existing (TLS-verified) binding.
     } else {
@@ -1166,14 +1227,22 @@ unsafe fn handle_identity(
     // isn't immediately judged stale before its first data frame.
     s.peer_addrs[peer_id as usize].last_rx_ms = now;
 
-    // Dedupe: keep only this (newest) conn for the peer. A peer pair holds two
-    // directional conns (each side dials the other), and after a reconnect the
-    // OLD conn can linger half-open — `find_conn_by_replica` (outbound routing)
-    // would then keep sending AEs into the dead conn and the peer never hears
-    // from us. Closing every other conn bound to this replica forces routing
-    // onto the live conn (TCP is full-duplex, so one conn carries both
-    // directions). This is what lets a reconnected follower actually receive
-    // AEs and catch up, not just complete the handshake.
+    // Dedupe: this (newest) conn is the live one for the peer. Only
+    // one direction is ever in play — `connect_peers` dials strictly
+    // upward (`peer_id <= self_id` is skipped), so every slot bound
+    // to a given peer here shares one `outbound` value and a pair
+    // holds exactly one link. Duplicates therefore mean the OLD conn
+    // lingered half-open past a reconnect, and `find_conn_by_replica`
+    // (outbound routing) would keep posting AEs into the dead one.
+    // Closing every other conn bound to this replica forces routing
+    // onto the live conn; TCP is full-duplex, so one conn carries
+    // both directions. This is what lets a reconnected follower
+    // receive AEs rather than merely complete the handshake.
+    //
+    // The closing side keeps `connected`: the slot is emptied before
+    // the transport's NMSG_CLOSED notice lands, so that arm's
+    // `find_conn` misses and never clears the flag — nobody redials
+    // into fresh churn.
     for other in 0..MAX_CONNS {
         if other == slot {
             continue;
@@ -1181,6 +1250,9 @@ unsafe fn handle_identity(
         if s.conns[other].active && s.conns[other].replica_id == peer_id as i8 {
             close_conn(s, sys, s.conns[other].conn_id);
             s.conns[other] = Conn::empty();
+            let mut m = *b"[pr] dedup close p=?";
+            m[19] = b'0' + (peer_id % 10);
+            dev_log(sys, 3, m.as_ptr(), m.len());
         }
     }
 
@@ -1190,6 +1262,55 @@ unsafe fn handle_identity(
     }
 
     dev_log(&*s.syscalls, 3, b"[pr] peer ok".as_ptr(), 12);
+
+    // Coalesced tail after the identity prefix (outbound conns only —
+    // inbound identity is exact-length by classification): the peer's
+    // first raft frames, merged into the same TCP segment as its
+    // identity reply. Route them exactly like steady-state peer data —
+    // dropping them here would desync the framed byte stream for good,
+    // so a backpressured destination stashes the tail instead (the
+    // single-slot inbound stash is empty by invariant while an event
+    // is being processed; `true` tells the caller to stop draining).
+    let consumed = ID_MSG_LEN - fl;
+    if s.conns[slot].outbound && data.len() > consumed {
+        let tail_len = data.len() - consumed;
+        if tail_len >= wire::PARTITIONED_HDR && tail_len <= ROUTE_FRAME_MAX {
+            let dest = peer_dest(s, data[consumed + 2]);
+            if dest < 0 {
+                // Untrusted frame shape from a peer — same drop policy
+                // as the steady-state path, and counted the same way.
+                s.frames_dropped = s.frames_dropped.wrapping_add(1);
+            }
+            if dest >= 0 {
+                let p = (sys.channel_poll)(dest, 0x02);
+                let wrote = if p > 0 && (p as u32 & 0x02) != 0 {
+                    (sys.channel_write)(dest, data.as_ptr().add(consumed), tail_len)
+                } else {
+                    0
+                };
+                if wrote != tail_len as i32 {
+                    s.inb_stash[..tail_len].copy_from_slice(&data[consumed..]);
+                    s.inb_stash_len = tail_len as u16;
+                    s.inb_stash_dest = dest;
+                    return true;
+                }
+            }
+        } else {
+            // A tail too short to classify (a mid-frame TCP split
+            // inside the first 5 envelope bytes) or over the route
+            // budget cannot be routed, and dropping a partial frame
+            // desyncs everything after it on this conn. The liveness
+            // reaper cannot rescue us — `last_rx_ms` is refreshed by
+            // arriving bytes, not by routed ones, so a desynced link
+            // looks alive forever. Tear it down here and let the
+            // dialer re-establish a clean stream.
+            s.frames_dropped = s.frames_dropped.wrapping_add(1);
+            dev_log(sys, 2, b"[pr] tail desync; closing".as_ptr(), 25);
+            close_conn(s, sys, s.conns[slot].conn_id);
+            s.conns[slot] = Conn::empty();
+        }
+    }
+    false
 }
 
 // ── Outbound routing ────────────────────────────────────────
@@ -1250,6 +1371,15 @@ unsafe fn route_outbound_chan(s: &mut ModuleState, sys: &SyscallTable, chan: i32
             let slot = find_conn_by_replica(s, target);
             if slot < MAX_CONNS {
                 send_to_conn(s, sys, slot, partition_id, msg_type, &local[..pl]);
+            } else {
+                // The frame is already off the channel and there is no
+                // live link to carry it. Raft re-covers its own RPCs on
+                // the next heartbeat, but a snapshot chunk is
+                // offset-ordered and never re-sent, so a silent loss
+                // here strands an install. Count and say so once per
+                // occurrence rather than dropping invisibly.
+                s.frames_dropped = s.frames_dropped.wrapping_add(1);
+                dev_log(sys, 2, b"[pr] no route to peer".as_ptr(), 21);
             }
         }
     }
@@ -1486,6 +1616,56 @@ fn alloc_conn(s: &mut ModuleState) -> Option<usize> {
     None
 }
 
+/// Reap any slot still holding `conn_id` before registering a NEW
+/// transport conn under that id. Transport conn ids are recycled
+/// (lowest free slot), and a slot can go stale without an
+/// `NMSG_CLOSED` ever landing (event pressure during a proposal
+/// burst, a peer killed mid-stream). A stale slot with a recycled id
+/// is poison: the identity dedup "close the other conns to this
+/// peer" then calls `close_conn` with the ghost's id — which the
+/// transport resolves to the FRESH connection and kills it, every
+/// redial, indefinitely (the identity refresh keeps the ghost from
+/// ever aging past the staleness reaper). The transport never has
+/// two live conns under one id, so a collision at registration
+/// PROVES the old slot is dead: clear it slot-only — no
+/// `close_conn`, the id now belongs to the new conn — and drop the
+/// peer's `connected` claim if the ghost was its last identified
+/// link, so `connect_peers` may redial for real.
+unsafe fn reap_conn_id(s: &mut ModuleState, sys: &SyscallTable, conn_id: u16) {
+    for i in 0..MAX_CONNS {
+        if !s.conns[i].active || s.conns[i].conn_id != conn_id {
+            continue;
+        }
+        let rid = s.conns[i].replica_id;
+        s.conns[i] = Conn::empty();
+        // A reaped CLIENT slot must be announced exactly as a normal
+        // close is: the gateway keys correlation state, codec
+        // reassembly and session membership by the SLOT INDEX we
+        // stamp on MSG_CLIENT_FRAME, and `alloc_conn` hands the
+        // lowest free index straight back to the next conn. Skipping
+        // the notice would let a new client inherit the previous
+        // occupant's in-flight state and receive its responses.
+        if rid < 0 && s.cleartext >= 0 {
+            wire_channels::channel_write_msg(sys, s.cleartext, wire::MSG_CONN_CLOSED, &[i as u8]);
+        }
+        if rid >= 0 && (rid as usize) < MAX_NODES {
+            let mut still_linked = false;
+            for other in 0..MAX_CONNS {
+                if s.conns[other].active
+                    && s.conns[other].identified
+                    && s.conns[other].replica_id == rid
+                {
+                    still_linked = true;
+                    break;
+                }
+            }
+            if !still_linked {
+                s.peer_addrs[rid as usize].connected = false;
+            }
+        }
+    }
+}
+
 fn find_conn(s: &ModuleState, conn_id: u16) -> usize {
     for i in 0..MAX_CONNS {
         if s.conns[i].active && s.conns[i].conn_id == conn_id {
@@ -1495,9 +1675,48 @@ fn find_conn(s: &ModuleState, conn_id: u16) -> usize {
     MAX_CONNS
 }
 
+/// Destination channel for one peer frame type: replication responses
+/// and snapshot streams → `peer_rx`; Raft control RPCs → `raft_rpc`.
+/// -1 = untrusted shape from a peer, dropped by the caller. Single
+/// source for both the steady-state data path and the
+/// coalesced-identity tail path.
+fn peer_dest(s: &ModuleState, peer_msg_type: u8) -> i32 {
+    match peer_msg_type {
+        wire::MSG_APPEND_ENTRIES_RESP
+        | wire::MSG_INSTALL_SNAPSHOT_RESP
+        | wire::MSG_INSTALL_SNAPSHOT
+        | wire::MSG_SNAPSHOT_CHUNK => s.peer_rx,
+        wire::MSG_APPEND_ENTRIES
+        | wire::MSG_REQUEST_VOTE
+        | wire::MSG_REQUEST_VOTE_RESP
+        | wire::MSG_PRE_VOTE
+        | wire::MSG_PRE_VOTE_RESP
+        | wire::MSG_HEARTBEAT
+        | wire::MSG_HEARTBEAT_RESP
+        // ReadIndex leadership-confirm round (RFC §1.3): follower
+        // receives the leader's PROBE, leader receives the follower's
+        // RESP — consensus handles both on its rpc input. Omitting
+        // these silently killed multi-node linearizable reads (every
+        // probe timed out → LIN-BOUND reject); dormant until lattice
+        // wired the read fence.
+        | wire::MSG_READ_INDEX_PROBE
+        | wire::MSG_READ_INDEX_PROBE_RESP
+        | wire::MSG_TIMEOUT_NOW => s.raft_rpc,
+        _ => -1,
+    }
+}
+
 fn find_conn_by_replica(s: &ModuleState, replica_id: u8) -> usize {
     for i in 0..MAX_CONNS {
-        if s.conns[i].active && s.conns[i].identified && s.conns[i].replica_id == replica_id as i8 {
+        // `identity_pending` gates outbound routing: raft frames must
+        // never overtake our identity frame on a fresh conn, or the
+        // peer's classifier sees non-identity first bytes and the
+        // handshake never completes.
+        if s.conns[i].active
+            && s.conns[i].identified
+            && !s.conns[i].identity_pending
+            && s.conns[i].replica_id == replica_id as i8
+        {
             return i;
         }
     }

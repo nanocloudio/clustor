@@ -160,6 +160,19 @@ pub struct Snapshot {
     last_snapshot_term: u64,
     last_snapshot_index: u64,
 
+    /// Seam latch → wal (monotone latest-wins, drained by the dispatch
+    /// table): `(last_included_term, last_included_index)` of an
+    /// accepted peer install, so the wal fast-forwards its append
+    /// contract past the prefix the snapshot subsumes.
+    pub wal_fast_forward: (u64, u64),
+    pub wal_fast_forward_dirty: bool,
+
+    /// Seam ← wal (latest-wins): the wal's `(term, index)` high-water,
+    /// delivered by the dispatch table each step via
+    /// [`on_wal_high_water`]. The capture point for a demand-triggered
+    /// snapshot.
+    wal_high_water: (Term, Index),
+
     /// Boot-restore state machine (`BOOT_*`). At boot the persisted
     /// local snapshot (pointer sidecar → snapshot file) is loaded and
     /// its app body replayed to the state machine BEFORE the wal
@@ -276,6 +289,9 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.out_app_ctl = -1;
     s.last_snapshot_term = 0;
     s.last_snapshot_index = 0;
+    s.wal_fast_forward = (0, 0);
+    s.wal_fast_forward_dirty = false;
+    s.wal_high_water = (0, 0);
     s.boot_phase = BOOT_PTR;
     s.boot_ptr_index = 0;
     s.partition_id = 0;
@@ -303,6 +319,15 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.app_bodies_received = 0;
     s.app_captures_timed_out = 0;
     s.app_body_len = 0;
+}
+
+/// Deliver the wal component's current `(term, index)` high-water.
+/// Message-shaped seam (§8 rule 2): the same payload a rotation
+/// trigger carries, in the same direction, so `snapshot` keeps its
+/// port-only `step` signature and stays liftable into a standalone
+/// module without edits inside the component.
+pub fn on_wal_high_water(s: &mut Snapshot, term: Term, index: Index) {
+    s.wal_high_water = (term, index);
 }
 
 /// Handle one snapshot trigger at `(term, index)` — the single
@@ -359,15 +384,22 @@ pub unsafe fn on_trigger(s: &mut Snapshot, sys: &SyscallTable, term: Term, index
 
 /// Per-step bound: ≤4 frames per input family (retention floors,
 /// external triggers, install requests, import chunks) + at most one
-/// app-body chunk. Returns whether this step performed a synchronous
-/// disk op whose cold first-touch can exceed the step deadline (the
-/// module returns Burst for it — see the composite dispatch).
+/// app-body chunk + at most one demand-triggered capture. Returns
+/// whether this step performed a synchronous disk op whose cold
+/// first-touch can exceed the step deadline (the module returns Burst
+/// for it — see the composite dispatch).
+///
+/// The wal's current high-water is delivered beforehand by
+/// [`on_wal_high_water`]; it is the capture point for a
+/// demand-triggered snapshot, exactly what a rotation trigger would
+/// carry.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
+    let (hw_term, hw_index) = s.wal_high_water;
     let mut cold_fs = false;
 
     // 1. Drain retention-floor updates from compaction_coordinator so
@@ -398,7 +430,16 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     //     follower's next_index falls below our WAL retention floor,
     //     the replicator hits a NOT_FOUND WAL reply and asks us to
     //     re-broadcast the most recent snapshot.
-    if s.in_install_request >= 0 && s.last_snapshot_index > 0 {
+    //
+    //     A request arriving BEFORE any snapshot exists triggers a
+    //     capture on demand at the wal high-water. Without this, a
+    //     graph whose snapshot cadence has not fired yet (rotation
+    //     triggers at segment_bytes of appends; a volatile wal in
+    //     particular never rotates) leaves every install request
+    //     unread and the lagging follower livelocks on NOT_FOUND
+    //     refetches forever.
+    if s.in_install_request >= 0 {
+        let mut demand_trigger = false;
         for _ in 0..4 {
             let poll = (sys.channel_poll)(s.in_install_request, 0x01);
             if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
@@ -407,10 +448,31 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             if msg_type != wire::MSG_SNAPSHOT_INSTALL_REQUEST || (plen as usize) < 1 {
                 continue;
             }
-            // The install is broadcast, not routed: the request's
-            // target byte is decoded but unused until a routed
-            // snapshot port exists.
-            emit_install_chunk(s, sys, s.last_snapshot_term, s.last_snapshot_index);
+            if s.last_snapshot_index > 0 {
+                // The install is broadcast, not routed: the request's
+                // target byte is decoded but unused until a routed
+                // snapshot port exists.
+                emit_install_chunk(s, sys, s.last_snapshot_term, s.last_snapshot_index);
+            } else {
+                demand_trigger = true;
+            }
+        }
+        // At most one demand capture per step, and none while an app
+        // capture is already in flight (requests re-arrive every
+        // follower renudge; funnelling them all into on_trigger would
+        // spam triggers_deferred without adding work).
+        if demand_trigger && !s.app_capture_pending && hw_index > 0 {
+            // Debug, not info: install requests re-arrive on every
+            // follower renudge, and a blocked retention floor or a
+            // refused app capture leaves this branch re-entered.
+            dev_log(sys, 4, b"[snap] demand trigger".as_ptr(), 21);
+            if on_trigger(s, sys, hw_term, hw_index) {
+                cold_fs = true;
+            }
+            // Manifest-only graphs finalise synchronously: the NEXT
+            // request (the follower re-requests on a steady cadence)
+            // is served from `last_snapshot_index`. App-state graphs
+            // finalise via the app-body path above.
         }
     }
 
@@ -669,6 +731,15 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
                 let prev_index = s.last_snapshot_index;
                 s.last_snapshot_term = s.in_progress_term;
                 s.last_snapshot_index = s.in_progress_last_idx;
+                // Seam latch → wal: the installed prefix will never
+                // arrive on `entries`, so the wal must fast-forward its
+                // append contract to `last_idx` or the very next
+                // post-install append (`last_idx + 1` against an
+                // expected `current_index + 1`) latches a continuity
+                // fault. Monotone latest-wins; drained by the dispatch
+                // table after this component's step.
+                s.wal_fast_forward = (s.in_progress_last_term, s.in_progress_last_idx);
+                s.wal_fast_forward_dirty = true;
                 dev_log(sys, 3, b"[snap] installed".as_ptr(), 16);
                 // Exactly-one-snapshot steady state (mirrors the local
                 // trigger path): retire the superseded snapshot file only

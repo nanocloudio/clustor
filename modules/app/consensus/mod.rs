@@ -39,6 +39,10 @@
 //!      `apply::on_entry_reply` (gap refetch), clear →
 //!      `replicator::on_wal_reply` (catch-up AE synthesis). ≤16/step.
 //!   6. match drain  — E2 coalesced per-replica max → `commit::on_match`.
+//!   6b. relaxed self-match — in `durability_mode: relaxed` there is
+//!      no durability-proof source to advance commit's self slot, so
+//!      raft's log tip is delivered to `commit::on_match` for it
+//!      (same read-then-deliver shape as the E11 leader hint). O(1).
 //!   7. `commit`     — quorum recompute; raises the horizon latches.
 //!   8. latch drain  — E4 → raft's `commit_in` (consumed NEXT step,
 //!      one-tick feedback); E3/E6 horizons + the E6 RESET are
@@ -84,6 +88,8 @@ mod wire;
 mod wire_channels;
 #[path = "../../common/wal_frame.rs"]
 mod wal_frame;
+#[path = "../../common/log_fmt.rs"]
+mod log_fmt;
 #[path = "../../common/step_accounting.rs"]
 mod step_accounting;
 
@@ -150,6 +156,15 @@ define_params! {
 
     11, durability_mode, u8, 1, enum { strict=0, group_fsync=1, relaxed=2 }
         => |s, d, len| { s.commit.durability_mode = p_u8(d, len, 0, 1); };
+
+    // 0 = no metadata persistence: the declared volatile posture. No
+    // load or saves; instead a boot vote hold-off (one election
+    // timeout) plus a heard-term floor mitigate the restarted-node
+    // double-vote hazard. Pair with the durability module's `volatile`
+    // variant and `durability_mode: relaxed`. Default 1 persists via
+    // the FS contract (`root_path` selects the layout).
+    12, persist_meta, u8, 1, enum { none=0, fs=1 }
+        => |s, d, len| { s.raft.persist_meta = p_u8(d, len, 0, 1); };
 }
 
 #[repr(C)]
@@ -426,6 +441,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     commit::on_match(&mut s.commit, r as u8, index);
                 }
             }
+        }
+
+        // 4b. Relaxed-mode self-match seed. In strict/group_fsync the
+        //     self slot advances on durability proofs; in relaxed mode
+        //     there is no barrier to wait for — "self has the entry" is
+        //     exactly "self appended the entry" — and a volatile
+        //     composition has no proof source at all (quorum_durable is
+        //     structurally absent), so without this seed the self slot
+        //     pins at 0: single-node graphs never commit and 3-node
+        //     medians degrade to min(followers).
+        if s.commit.durability_mode == types::DUR_RELAXED {
+            commit::on_match(&mut s.commit, s.self_id, raft::log_tip(&s.raft));
         }
 
         // 5. commit — quorum recompute; raises the E3/E4 horizon latches.

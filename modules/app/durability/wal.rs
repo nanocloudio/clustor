@@ -175,6 +175,16 @@ const FS_OPEN_CREATE: u32 = 0x0909;
 /// Remove a file by path (`modules/sdk/contracts/storage/fs.rs::UNLINK`).
 /// Gated on the provider's `caps::UNLINK` bit — see `fs_unlink_supported`.
 const FS_UNLINK: u32 = 0x090A;
+/// Directory create (single-level, EEXIST-idempotent on the linux
+/// provider; bare-metal FAT32 answers a clean ENOSYS). Used once per
+/// boot to self-heal a missing `wal/` parent in dir-mode layouts.
+///
+/// Deliberately NOT gated on `caps::MKDIR` the way `FS_UNLINK` is
+/// (`fs_unlink_supported`): this fires at most once per boot, only
+/// after an open has already hard-failed, and the retried open — not
+/// the mkdir's return — decides the outcome. A caps probe would cost
+/// the same round-trip it saves.
+const FS_MKDIR: u32 = 0x090B;
 const FS_PREALLOCATE: u32 = 0x090E;
 /// Async durable-write tier (`fs.rs::{WRITE_ASYNC, FSYNC_SUBMIT,
 /// FSYNC_POLL}` + `caps::FSYNC_ASYNC`). Used only when the FS provider
@@ -281,16 +291,23 @@ pub struct Wal {
 
     // File I/O
     fd: i32,                    // file descriptor for current segment, -1 = not open
-    /// Set once `OPEN_CREATE` has failed on the write path so the
-    /// `[wal] no fs` in-memory-fallback signal is emitted exactly once,
-    /// not per flush. This is the *real* fs-unavailable marker (a fresh
-    /// deployment with a writable empty `wal/` never trips it).
+    /// One-shot guard for the `[wal] open fail` hard-error log.
     no_fs_logged: bool,
-    /// Set once a HARD FS error (not E_AGAIN) has been seen: the provider is
-    /// genuinely absent, so the WAL degrades to in-memory permanently. While
-    /// this is false and `fd < 0`, the WAL treats the FS as "coming up" and
-    /// waits (E_AGAIN-patient) instead of acking entries it can't persist.
+    /// In-memory retention marker. Set ONLY by the `volatile` build
+    /// variant (where it is the declared, honest mode). A disk build
+    /// never sets it: a hard open error fail-closes (stash +
+    /// `write_errors`, retry next step) so raft backpressures instead
+    /// of the WAL acking entries it can't persist — a disk graph must
+    /// never silently certify durability it doesn't have. While
+    /// `fd < 0` the WAL treats the FS as "coming up" (E_AGAIN-patient)
+    /// or broken (hard error), and waits either way.
     no_fs: bool,
+    /// One-shot guard for the dir-mode `wal/` parent self-heal: nothing
+    /// creates `wal/` outside the test harness, and the provider maps
+    /// every open failure to one errno, so a missing parent is
+    /// indistinguishable from a dead disk until mkdir+retry has been
+    /// tried once.
+    mkdir_attempted: bool,
     dbg_last_open_rc: i32,
     dbg_steps: u64,
     input_budget_bytes: u32,
@@ -616,6 +633,7 @@ pub unsafe fn init(s: &mut Wal) {
     s.fd = -1;
     s.no_fs_logged = false;
     s.no_fs = false;
+    s.mkdir_attempted = false;
     s.dbg_last_open_rc = 1; // sentinel != any real fd/errno so first rc logs
     s.dbg_steps = 0;
     s.input_budget_bytes = 0;
@@ -673,17 +691,20 @@ pub fn arm(s: &mut Wal) {
         s.oldest_segment_seq = 1;
     }
     if VOLATILE {
-        // In-memory retention is selected, not a fallback: mark the
-        // path up front and never emit the `[wal] no fs` signal.
+        // In-memory retention is the variant's declared mode, not a
+        // fallback: mark the path up front. The disk build's
+        // `[wal] open fail` signal is unreachable here by
+        // construction (`ensure_segment_open` returns early).
         s.no_fs = true;
-        s.no_fs_logged = true;
     }
 }
 
 /// Step the WAL. Return codes follow the kernel step ABI (0=Continue,
 /// 2=Burst); the composite propagates Burst. Per-step bounds: replay
 /// is one FS open OR one frame; normal mode is the byte-granted input
-/// pump (≤8 records), ≤4 control frames, ≤8 gap-refetch serves.
+/// pump (≤8 records), ≤4 control frames, ≤8 gap-refetch serves, plus
+/// at most one cold segment open (which in dir mode may add a one-shot
+/// `FS_MKDIR` and a single retried open before it concludes anything).
 ///
 /// # Safety
 ///
@@ -697,12 +718,14 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
         return step_replay(s, sys);
     }
 
-    // FS-readiness gate. While the segment isn't open and we haven't
-    // decided the FS is genuinely absent, (re)try the open every step.
-    // On E_AGAIN (provider still initialising — fat32 reading the BPB on
-    // a pi5 cold boot) HOLD: don't drain new entries, so raft backpressures
-    // and nothing is acked that can't be persisted. Once the open succeeds
-    // (disk) or hard-fails (in-memory), fall through to normal processing.
+    // FS-readiness gate. While the segment isn't open, (re)try the open
+    // every step and HOLD: don't drain new entries, so raft
+    // backpressures and nothing is acked that can't be persisted. This
+    // covers both E_AGAIN (provider still initialising — fat32 reading
+    // the BPB on a pi5 cold boot) and hard failures (broken path/disk;
+    // `[wal] open fail` + write_errors say so). A disk build never
+    // falls through to in-memory operation — that is the `volatile`
+    // variant's declared mode (`no_fs`, set at arm), never a fallback.
     if s.fd < 0 && !s.no_fs {
         ensure_segment_open(s, sys);
         if s.fd < 0 && !s.no_fs {
@@ -2081,10 +2104,10 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             // is NOT proof the filesystem is unavailable — a fresh
             // deployment has an empty (but perfectly writable) `wal/`.
             // Whether the FS is actually missing is only known on the
-            // write path (`ensure_segment_open`), which emits
-            // `[wal] no fs` if `OPEN_CREATE` fails. So replay just
-            // reports completion either way and lets the writer make
-            // the fallback call.
+            // write path (`ensure_segment_open`), which self-heals
+            // the parent and then fails closed with `[wal] open fail`
+            // if `OPEN_CREATE` still fails. So replay just reports
+            // completion either way and lets the writer make the call.
             // Freeze the durable high-water reconstructed by replay.
             // Everything up to here is ON DISK; `current_index` keeps
             // moving as new entries are STAGED, so it must never be
@@ -2307,13 +2330,11 @@ unsafe fn build_segment_path(s: &mut Wal, seq: u32) {
 /// contains one consistent filename shape and operators see at a
 /// glance which partition a segment belongs to.
 ///
-/// Operator requirement: `wal/` must exist and be writable in the
-/// process working directory. The Linux FS provider's
-/// `OPEN_CREATE` opcode creates files but does not `mkdir`
-/// parents (there is no `FS_MKDIR` opcode today). The single-
-/// directory layout means a single `mkdir wal` (or a symlink to
-/// the operator's preferred path, e.g. `ln -s /var/lib/quantum/wal
-/// wal`) suffices for any partition count. See
+/// The `wal/` parent is self-healed at first open (`FS_MKDIR`, once
+/// per boot) when absent, so a fresh working directory needs no
+/// manual `mkdir`. An operator who wants the segments elsewhere
+/// pre-creates a symlink (e.g. `ln -s /var/lib/quantum/wal wal`);
+/// the single-directory layout serves any partition count. See
 /// `modules/app/durability/manifest.toml` for the wider deployment note.
 fn encode_segment_path(partition_id: u16, seq: u32, root: bool, out: &mut [u8]) -> usize {
     let cap = out.len();
@@ -3083,8 +3104,9 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
 /// still uses `FS_OPEN` so it can detect "no more segments" via
 /// ENODEV; the write side needs the create tier.
 ///
-/// fd < 0 means FS unavailable (e.g. bare-metal without a mounted
-/// filesystem) — module degrades to in-memory only.
+/// A persistent `fd < 0` means the FS is initialising (E_AGAIN) or
+/// broken (hard error, after the one-shot `wal/` self-heal): the
+/// caller's readiness gate holds entry intake either way.
 ///
 /// # Safety
 ///
@@ -3094,8 +3116,8 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
 unsafe fn ensure_segment_open(s: &mut Wal, sys: &SyscallTable) {
     if s.fd >= 0 { return; }
     if VOLATILE {
-        // The volatile variant selects in-memory retention by design —
-        // never a fallback, so no `[wal] no fs` signal.
+        // The volatile variant selects in-memory retention by
+        // design, never as a fallback, so no failure signal.
         s.no_fs = true;
         return;
     }
@@ -3166,13 +3188,76 @@ unsafe fn ensure_segment_open(s: &mut Wal, sys: &SyscallTable) {
         // Disk-backed, or the provider is initialising (retry next step).
         return;
     }
-    // Hard error (no FS provider / missing parent): degrade to in-memory
-    // permanently and emit the fallback signal once.
-    s.no_fs = true;
+    // Hard error. The provider maps every open failure to one errno, so
+    // a missing `wal/` parent (nothing creates it outside the test
+    // harness) is indistinguishable from a dead disk — self-heal the
+    // parent once and retry before concluding anything.
+    if s.root_path == 0 && !s.mkdir_attempted {
+        s.mkdir_attempted = true;
+        let mut dir = [0u8; 4];
+        dir[..3].copy_from_slice(b"wal");
+        let _ = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), 3);
+        dev_log(sys, 3, b"[wal] mkdir wal".as_ptr(), 15);
+        s.fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), s.path_len as usize);
+        if s.fd >= 0 || s.fd == FS_E_AGAIN {
+            return; // healed, or the provider is still settling
+        }
+    }
+    // Hard failure in a DISK build: fail closed, loudly. `fd` stays -1,
+    // appends stash with `write_errors` and are never acked, raft
+    // backpressures, and the open retries every step — the graph holds
+    // rather than certifying durability it doesn't have. (In-memory
+    // operation is the `volatile` variant's declared mode, never a
+    // fallback.)
+    // Count the TRANSITION into hard failure, not every retry: the
+    // open is re-attempted each step while the path stays broken, and
+    // a per-step increment would bury the per-entry durable-write
+    // failures this counter exists to surface.
     if !s.no_fs_logged {
         s.no_fs_logged = true;
-        dev_log(sys, 3, b"[wal] no fs".as_ptr(), 11);
+        s.write_errors = s.write_errors.saturating_add(1);
+        dev_log(sys, 1, b"[wal] open fail".as_ptr(), 15);
     }
+}
+
+/// The WAL's current `(term, index)` high-water — the same value a
+/// rotation trigger would carry. The dispatch table hands it to the
+/// snapshot component so a demand-triggered snapshot (install request
+/// with no snapshot taken yet) captures at the same point a rotation
+/// capture would.
+pub fn high_water(s: &Wal) -> (Term, Index) {
+    (s.current_term, s.current_index)
+}
+
+/// Seam delivery from the snapshot component: a peer snapshot was
+/// accepted at `(term, index)`. The subsumed prefix will never arrive
+/// on `entries`, so fast-forward the append contract — otherwise the
+/// first post-install append (`index + 1`) collides with the
+/// continuity gate's `current_index + 1` and latches a fault whose
+/// reject would roll raft's freshly installed tip straight back.
+///
+/// Entries at or below `index` are no longer locally servable
+/// (compaction semantics — raft's post-install `compact_before`
+/// carries the same floor); the ledger learns the installed
+/// high-water as durable, matching the durable artefact the install
+/// path just wrote (or, with no FS, the in-memory image the install
+/// IS on this graph).
+///
+/// Disk note: a later boot replays the on-disk prefix and stops at
+/// the index gap this jump leaves ("[wal] replay gap") — recovery
+/// then resumes from the durable prefix and the cluster re-installs,
+/// which is conservative, loud, and preferred over serving a log
+/// with a silent hole.
+pub fn on_snapshot_installed(s: &mut Wal, term: Term, index: Index) {
+    if index <= s.current_index {
+        return;
+    }
+    s.current_term = term;
+    s.current_index = index;
+    if index.saturating_add(1) > s.entry_ring_min_index {
+        s.entry_ring_min_index = index.saturating_add(1);
+    }
+    note_ledger_ack(s, term, index);
 }
 
 /// # Safety

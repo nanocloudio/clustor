@@ -17,8 +17,14 @@
 //!
 //! Per-step bound (Discipline §5): ≤8 RPCs, ≤4 each of admin /
 //! snapshot-installed / probe / admin-committed / replay drains, ≤8
-//! WAL-flushed acks, ≤4×16 proposal reads, plus O(1) role logic and at
-//! most one metadata FS round-trip.
+//! WAL-flushed acks, ≤4×16 proposal reads, plus O(1) role logic.
+//! Metadata persistence is bounded per DRAINED RPC, not per step: a
+//! vote grant or a term adoption writes one 28-byte record
+//! (seek+write+fsync) each, so a step draining 8 vote requests can
+//! issue 8 — plus, once per boot in dir mode, an `FS_MKDIR` and one
+//! retried open. Any step that touched metadata is reported Burst
+//! (`meta_fs_step`), which is what keeps the guard honest rather than
+//! the count.
 
 use super::abi::SyscallTable;
 use super::seam::{HorizonLatch, SeamRing, PROBE_QUEUE_SLOTS};
@@ -152,6 +158,21 @@ const FS_WRITE: u32 = 0x0906;
 const FS_FSYNC: u32 = 0x0905;
 const FS_CLOSE: u32 = 0x0903;
 const FS_SEEK: u32 = 0x0902;
+/// Directory create (single-level, EEXIST-idempotent on the linux
+/// provider; bare-metal FAT32 answers ENOSYS). Used once per boot to
+/// self-heal a missing `raft/` parent in dir-mode persistence.
+const FS_MKDIR: u32 = 0x090B;
+
+/// Outcome of a metadata persist attempt. Voting-relevant callers gate
+/// on `Persisted`; `Transient` (FS provider initialising) carries no
+/// error accounting; `Failed` counts into `meta_write_errors` and
+/// invalidates the cached fd so the next attempt reopens.
+#[derive(Clone, Copy, PartialEq)]
+enum PersistOutcome {
+    Persisted,
+    Transient,
+    Failed,
+}
 
 // Metadata file path scheme (RFC partition_groups):
 //   single-partition graphs (partition_id = 0):  raft/meta
@@ -317,10 +338,38 @@ pub struct Raft {
     /// FAT32 (no mkdir, so the `raft/meta` path can't be created). Default 0
     /// keeps the `raft/meta` layout for the linux volatile-FS provider.
     pub meta_root_path: u8,
-    /// Cached metadata fd (root_path mode): opened once with FS_OPEN_CREATE
-    /// and reused for every persist, so a save never pays a cold dir-scan
-    /// re-open. -1 = not yet opened.
+    /// Cached metadata fd (both path modes): opened once with
+    /// FS_OPEN_CREATE and reused for every persist, so a save never pays
+    /// a cold dir-scan re-open. -1 = not yet opened. Invalidated (closed
+    /// and reset to -1) on any write/fsync failure so a transiently
+    /// broken path never permanently disenfranchises the node.
     meta_fd: i32,
+    /// 0 = no metadata persistence at all (the declared volatile
+    /// posture: no load, no saves, boot vote hold-off + term floor
+    /// instead). 1 (default) = persist via the FS contract.
+    pub persist_meta: u8,
+    /// Hard metadata persist failures (counter; metric
+    /// RAFT_META_WRITE_ERRORS). Transient E_AGAIN outcomes are not
+    /// counted.
+    meta_write_errors: u32,
+    /// One-shot guard for the `[raft] meta write fail` log.
+    meta_fail_logged: bool,
+    /// One-shot guard for the dir-mode `raft/` parent self-heal.
+    meta_mkdir_attempted: bool,
+    /// Error-side backoff: steps remaining during which the throttled
+    /// durable-hint persist is skipped after a hard failure. The
+    /// vote/election persist sites always attempt regardless.
+    meta_backoff_steps: u16,
+    /// Volatile posture only: wall-clock until which real vote grants
+    /// and real election starts are held off after boot (0 = inactive).
+    holdoff_until_ms: u64,
+    /// One-shot guard for the `[raft] holdoff over` log.
+    holdoff_over_logged: bool,
+    /// Volatile posture only: highest term observed in AppendEntries
+    /// traffic since boot. Real vote grants require a term strictly
+    /// above this floor — a restarted memoryless node that has heard
+    /// the current leader can never re-vote in that leader's election.
+    vote_floor_term: Term,
     /// Highest `local_durable_index` already persisted to the metadata file.
     /// Throttles the durable-path persist so we don't fsync metadata on every
     /// single durable-index advance (which would double the WAL fsync load).
@@ -521,6 +570,14 @@ pub fn init(s: &mut Raft) {
     s.local_durable_index = 0;
     s.meta_root_path = 0;
     s.meta_fd = -1;
+    s.persist_meta = 1;
+    s.meta_write_errors = 0;
+    s.meta_fail_logged = false;
+    s.meta_mkdir_attempted = false;
+    s.meta_backoff_steps = 0;
+    s.holdoff_until_ms = 0;
+    s.holdoff_over_logged = true;
+    s.vote_floor_term = 0;
     s.meta_persisted_durable = 0;
     s.pending_recovery_reset = false;
     s.meta_load_pending = false;
@@ -610,18 +667,43 @@ pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
     // on-disk high-water. Independent of the meta hint (which can be 0).
     s.awaiting_replay = s.in_wal_replay_complete >= 0;
 
-    // Restore persistent state from metadata file. At cold boot the FS
-    // provider may not be ready (E_AGAIN); if so, retry on later steps
-    // (see step) rather than silently starting fresh. Only the
-    // disk-persistent (`root_path`) configuration retries — without it
-    // there is no metadata file to wait for, so a non-persistent graph
-    // (in-memory / linux) proceeds immediately as before.
-    let load_again = load_metadata(s, sys);
-    s.meta_load_pending = load_again && s.meta_root_path != 0;
-
-    // Set initial election deadline
     let now = dev_millis(sys);
-    s.election_deadline_ms = now + s.election_timeout_ms as u64;
+
+    if s.persist_meta == 0 {
+        // Declared volatile posture: no metadata file exists or is
+        // wanted — no load, no retry hold. A memoryless node cannot
+        // know whether it voted in an election still in flight across
+        // its restart, so real votes and real elections are held off
+        // for one full election timeout after boot. A single-voter set
+        // has no second voter to double-vote with: skip the hold-off
+        // so a restarted single-node graph resumes immediately.
+        let single_voter = s.current_voters.count() == 1
+            && s.current_voters.contains(s.self_id)
+            && !s.joint_active;
+        if !single_voter {
+            s.holdoff_until_ms = now + s.election_timeout_ms as u64;
+            s.holdoff_over_logged = false;
+            dev_log(sys, 3, b"[raft] holdoff".as_ptr(), 14);
+        }
+    } else {
+        // Restore persistent state from metadata file. At cold boot the
+        // FS provider may not be ready (E_AGAIN); if so, retry on later
+        // steps (see step) rather than silently starting fresh. Only
+        // the disk-persistent (`root_path`) configuration retries —
+        // without it there is no metadata file to wait for, so a
+        // non-persistent graph (in-memory / linux) proceeds
+        // immediately as before.
+        let load_again = load_metadata(s, sys);
+        s.meta_load_pending = load_again && s.meta_root_path != 0;
+    }
+
+    // Set initial election deadline, jittered per node: an unjittered
+    // first deadline synchronises the first election wave whenever a
+    // whole cluster (re)boots together.
+    let mut seed = (now as u32) ^ ((s.self_id as u32) << 16) ^ 0xBEEF;
+    let half_timeout = (s.election_timeout_ms as u32 / 2).max(1);
+    let jitter = (xorshift32(&mut seed) & (half_timeout.next_power_of_two() - 1)) as u64;
+    s.election_deadline_ms = now + s.election_timeout_ms as u64 + jitter;
     s.last_heartbeat_ms = now;
 
     dev_log(sys, 3, b"[raft] init".as_ptr(), 11);
@@ -632,6 +714,13 @@ pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
 /// raft already publishes externally).
 pub fn is_leader(s: &Raft) -> bool {
     s.role == ROLE_LEADER
+}
+
+/// The local log tip (`last_log_index`), for the dispatch table's
+/// relaxed-mode self-match seed into commit: with no durability
+/// barrier, "self has the entry" is exactly "self appended the entry".
+pub fn log_tip(s: &Raft) -> Index {
+    s.last_log_index
 }
 
 /// Leadership snapshot for the replicator's E11 hint: (is_leader,
@@ -728,6 +817,19 @@ pub unsafe fn step(
         s.pending_recovery_reset = false;
         // Horizon is seeded — now it is safe to accept new proposals.
         s.awaiting_replay = false;
+    }
+
+    // 0b. Metadata persist-error backoff drains one step at a time
+    //     (consulted only by the throttled durable-hint save).
+    if s.meta_backoff_steps > 0 {
+        s.meta_backoff_steps -= 1;
+    }
+
+    // 0c. Volatile posture: one-shot marker when the boot vote
+    //     hold-off window ends, so the window is externally visible.
+    if !s.holdoff_over_logged && now >= s.holdoff_until_ms {
+        s.holdoff_over_logged = true;
+        dev_log(sys, 3, b"[raft] holdoff over".as_ptr(), 19);
     }
 
     // 1. Process inbound RPCs (all roles)
@@ -1164,6 +1266,16 @@ unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
         dev_log(sys, 3, b"[raft] snap install".as_ptr(), 19);
         s.last_log_index = last_idx;
         s.last_log_term = last_term;
+        // The snapshot subsumes every entry up to `last_idx`; the local
+        // WAL never held them and can never ack them. Without this
+        // fast-forward the unacked-window gate (MAX_WAL_UNACKED)
+        // compares a post-install log tip against a durable index of 0
+        // and answers `busy` to every catch-up append forever — a
+        // rebuilt follower would install the image and then never
+        // resume the replication stream.
+        if last_idx > s.local_durable_index {
+            s.local_durable_index = last_idx;
+        }
         if last_idx > s.commit_index {
             // Mirror the follower-commit path so apply learns about the
             // fast-forward. advance_follower_commit must observe the OLD
@@ -1414,7 +1526,9 @@ unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
     // catches durable-index growth. META_PERSIST_STRIDE bounds how much
     // durable progress a crash can lose from the metadata hint (replay
     // re-derives the exact index from the WAL regardless).
-    if s.meta_root_path != 0
+    if s.persist_meta != 0
+        && s.meta_root_path != 0
+        && s.meta_backoff_steps == 0
         && s.local_durable_index >= s.meta_persisted_durable.wrapping_add(META_PERSIST_STRIDE)
     {
         save_metadata(s, sys);
@@ -1739,9 +1853,14 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
 
     let is_pre_vote = msg_type == wire::MSG_PRE_VOTE;
 
-    // Step down if term is higher (only for real votes, not pre-votes)
-    if !is_pre_vote && term > s.current_term {
-        become_follower(s, sys, term);
+    // Step down if term is higher (only for real votes, not pre-votes).
+    // IN MEMORY only: the persisted record is written exactly once
+    // below, folded with the grant decision, so this path never costs
+    // two metadata round-trips and never persists a state it later
+    // amends.
+    let term_advanced = !is_pre_vote && term > s.current_term;
+    if term_advanced {
+        become_follower_mem(s, term);
     }
 
     // Grant conditions:
@@ -1758,11 +1877,38 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
     let log_ok = last_term > s.last_log_term
         || (last_term == s.last_log_term && last_index >= s.last_log_index);
 
-    let granted = term_ok && vote_ok && log_ok && !s.learner_mode;
+    let mut granted = term_ok && vote_ok && log_ok && !s.learner_mode;
 
-    if granted && !is_pre_vote {
-        s.voted_for = candidate as i8;
-        save_metadata(s, sys);
+    // Volatile posture mitigations for real votes: no grants inside the
+    // boot hold-off window (this node may have voted in an election
+    // still in flight across its restart), and none in any term at or
+    // below the highest term heard from a leader since boot.
+    if granted && !is_pre_vote && s.persist_meta == 0 {
+        let now = dev_millis(sys);
+        if now < s.holdoff_until_ms || term <= s.vote_floor_term {
+            granted = false;
+        }
+    }
+
+    // Write-then-adopt: persist the prospective record, and only on
+    // success adopt the vote in memory and answer `granted`. On
+    // failure the grant is withheld and NOTHING was mutated by the
+    // grant path — no rollback exists or is needed. A failed persist
+    // after a term advance leaves the term adopted in memory (the
+    // become_follower liveness exception) with the vote unset.
+    if !is_pre_vote && (granted || term_advanced) {
+        let vote = if granted { candidate as i8 } else { s.voted_for };
+        let current = s.current_term;
+        match persist_meta_record(s, sys, current, vote) {
+            PersistOutcome::Persisted => {
+                if granted {
+                    s.voted_for = candidate as i8;
+                }
+            }
+            _ => {
+                granted = false;
+            }
+        }
     }
 
     // Send response routed to the specific candidate
@@ -1863,19 +2009,18 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
         return;
     }
 
+    // Volatile posture: remember the highest term seen from a leader —
+    // real vote grants require a term strictly above this floor.
+    if s.persist_meta == 0 && term > s.vote_floor_term {
+        s.vote_floor_term = term;
+    }
+
     if term > s.current_term {
         become_follower(s, sys, term);
     } else if s.role != ROLE_FOLLOWER {
-        // Same-term step-down (a candidate observing the term's elected
-        // leader). Keep `voted_for`: the vote belongs to the TERM, not
-        // the role, and clearing it would let this node vote twice in
-        // one term.
-        let voted = s.voted_for;
-        become_follower(s, sys, term);
-        if s.voted_for != voted {
-            s.voted_for = voted;
-            save_metadata(s, sys);
-        }
+        // Keep `voted_for`: the vote belongs to the TERM, not the role,
+        // and the persisted record is unchanged — so no metadata write.
+        step_down_same_term(s);
     }
     s.leader_id = leader as i8;
     reset_election_deadline(s, now);
@@ -2829,54 +2974,144 @@ unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
     false // resolved (loaded or empty) — no retry needed
 }
 
+/// Hard-failure accounting for a metadata persist: counter, one-shot
+/// log, fd invalidation (so the next attempt reopens), and the
+/// error-side backoff consulted by the throttled durable-hint save.
+///
 /// # Safety
 ///
-/// Caller must hold an exclusive `&mut Raft` (or shared
-/// `&Raft` where the signature uses one) and supply a valid
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn mark_meta_failure(s: &mut Raft, sys: &SyscallTable) -> PersistOutcome {
+    if s.meta_fd >= 0 {
+        (sys.provider_call)(s.meta_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.meta_fd = -1;
+    }
+    s.meta_write_errors = s.meta_write_errors.saturating_add(1);
+    s.meta_backoff_steps = 200;
+    if !s.meta_fail_logged {
+        s.meta_fail_logged = true;
+        dev_log(sys, 1, b"[raft] meta write fail".as_ptr(), 22);
+    }
+    PersistOutcome::Failed
+}
+
+/// One-shot dir-mode self-heal: create the `raft/` parent chain (and
+/// the per-partition subdirectory) via FS_MKDIR. Single-level and
+/// EEXIST-idempotent on the linux provider; bare-metal FAT32 answers a
+/// clean ENOSYS, but root-path mode never reaches here anyway.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn meta_mkdir_parents(s: &mut Raft, sys: &SyscallTable) {
+    let mut root = [0u8; 4];
+    root[..4].copy_from_slice(b"raft");
+    let _ = (sys.provider_call)(-1, FS_MKDIR, root.as_mut_ptr(), 4);
+    if s.partition_id != 0 {
+        // "raft/p<NNNN>" — the parent of the per-partition meta file.
+        let (mut path, plen) = build_meta_path(s.partition_id);
+        // Strip the trailing "/meta" (5 bytes) to get the directory.
+        let dir_len = plen - 5;
+        let _ = (sys.provider_call)(-1, FS_MKDIR, path.as_mut_ptr(), dir_len);
+    }
+    dev_log(sys, 3, b"[raft] mkdir raft".as_ptr(), 17);
+}
+
+/// Persist the Raft metadata record with an EXPLICIT `(term, voted_for)`
+/// pair — the write-then-adopt primitive. Voting-relevant callers
+/// persist the prospective record first and mutate in-memory state only
+/// on `Persisted`; there is no rollback logic anywhere because nothing
+/// is adopted before the record is durable.
+///
+/// The persisted `last_log_index` slot carries the DURABLE watermark
+/// (`local_durable_index`), not the volatile appended index, so a
+/// recovered node never claims durability it didn't have on disk.
+///
+/// In the `persist_meta: 0` posture this is a no-op returning
+/// `Persisted`: nothing is supposed to persist, and the posture's own
+/// safety mitigations (hold-off, term floor) live at the grant sites.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-/// Save persistent Raft state to raft/[p<id>/]meta.
-unsafe fn save_metadata(s: &mut Raft, sys: &SyscallTable) {
+unsafe fn persist_meta_record(
+    s: &mut Raft,
+    sys: &SyscallTable,
+    term: Term,
+    voted_for: i8,
+) -> PersistOutcome {
+    if s.persist_meta == 0 {
+        return PersistOutcome::Persisted;
+    }
     s.meta_fs_step = true;
-    // Root-path mode (bare-metal FAT32): open-create ONCE and cache the fd
-    // so each persist is just seek+write+fsync — no cold dir-scan re-open.
-    // The persisted `last_log_index` is the DURABLE watermark
-    // (`local_durable_index`), not the volatile appended index, so a
-    // recovered node never claims durability it didn't have on disk.
-    let fd = if s.meta_root_path != 0 {
-        if s.meta_fd < 0 {
-            let (mut path, plen) = build_meta_path_ex(s.partition_id, true);
-            let opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
-            if opened < 0 { return; } // FS not ready (E_AGAIN) or unavailable — retry later
-            s.meta_fd = opened;
+    // Open-create ONCE (both path modes) and cache the fd so each
+    // persist is just seek+write+fsync — no cold dir-scan re-open. The
+    // dir-mode parent (`raft/`) is self-healed once per boot: nothing
+    // else creates it outside the test harness.
+    if s.meta_fd < 0 {
+        let (mut path, plen) = build_meta_path_ex(s.partition_id, s.meta_root_path != 0);
+        let mut opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+        if opened == FS_E_AGAIN {
+            return PersistOutcome::Transient; // provider initialising — retry later
         }
-        s.meta_fd
-    } else {
-        let (mut path, plen) = build_meta_path(s.partition_id);
-        let opened = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
-        if opened < 0 { return; } // FS not available (no mkdir → raft/ absent)
-        opened
-    };
+        if opened < 0 && s.meta_root_path == 0 && !s.meta_mkdir_attempted {
+            s.meta_mkdir_attempted = true;
+            meta_mkdir_parents(s, sys);
+            opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+            if opened == FS_E_AGAIN {
+                return PersistOutcome::Transient;
+            }
+        }
+        if opened < 0 {
+            return mark_meta_failure(s, sys);
+        }
+        s.meta_fd = opened;
+    }
+    let fd = s.meta_fd;
 
     // Seek to start (overwrite)
     let zero = 0i32.to_le_bytes();
-    (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4);
+    if (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4) < 0 {
+        return mark_meta_failure(s, sys);
+    }
 
     let durable = s.local_durable_index;
     let mut buf = [0u8; META_SIZE];
-    buf[0..8].copy_from_slice(&s.current_term.to_le_bytes());
-    buf[8] = s.voted_for as u8;
+    buf[0..8].copy_from_slice(&term.to_le_bytes());
+    buf[8] = voted_for as u8;
     buf[9..17].copy_from_slice(&durable.to_le_bytes());
     buf[17..25].copy_from_slice(&s.last_log_term.to_le_bytes());
     buf[25] = s.current_voters.0;
     buf[26] = s.joint_voters.0;
     buf[27] = s.joint_active as u8;
-    (sys.provider_call)(fd, FS_WRITE, buf.as_mut_ptr(), META_SIZE);
-    (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
-    if s.meta_root_path == 0 {
-        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    if (sys.provider_call)(fd, FS_WRITE, buf.as_mut_ptr(), META_SIZE) != META_SIZE as i32 {
+        return mark_meta_failure(s, sys);
+    }
+    if (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) < 0 {
+        return mark_meta_failure(s, sys);
     }
     s.meta_persisted_durable = durable;
+    PersistOutcome::Persisted
+}
+
+/// Persist the CURRENT in-memory `(term, voted_for)` — for call sites
+/// where the record content is already adopted (durable-hint advance,
+/// voter-set changes, snapshot fast-forward, higher-term adoption's
+/// liveness exception). Failures are counted inside; callers that must
+/// gate externally visible effects use `persist_meta_record` directly.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn save_metadata(s: &mut Raft, sys: &SyscallTable) -> PersistOutcome {
+    let term = s.current_term;
+    let voted = s.voted_for;
+    persist_meta_record(s, sys, term, voted)
 }
 
 // ── State transitions ───────────────────────────────────────
@@ -2888,6 +3123,22 @@ unsafe fn save_metadata(s: &mut Raft, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn become_follower(s: &mut Raft, sys: &SyscallTable, term: Term) {
+    become_follower_mem(s, term);
+    // Liveness exception to write-then-adopt: refusing to observe a
+    // higher term would wedge the cluster, so the adoption stands even
+    // if the persist fails (counted inside). Safety holds because the
+    // `(term, voted_for)` record is atomic and both voting sites gate
+    // on their own persist — an unpersisted term can never pair with a
+    // persisted vote at that term.
+    save_metadata(s, sys);
+}
+
+/// In-memory follower transition: term adoption, vote clear, candidacy
+/// and batch state reset — with NO metadata write. Callers that need
+/// the record persisted do it themselves (`become_follower` for the
+/// adopt-then-count liveness path; `handle_vote_request` folds the
+/// adoption into its single grant-gated persist).
+fn become_follower_mem(s: &mut Raft, term: Term) {
     s.current_term = term;
     s.role = ROLE_FOLLOWER;
     s.voted_for = REPLICA_NONE as i8;
@@ -2904,7 +3155,19 @@ unsafe fn become_follower(s: &mut Raft, sys: &SyscallTable, term: Term) {
     // Drop any pending correlation ids — proposals from a prior term are
     // discarded, so the proposer will time out and retry.
     for i in 0..MAX_BATCH_PROPOSALS { s.correlation_ids[i] = 0; }
-    save_metadata(s, sys);
+}
+
+/// Same-term step-down (a candidate observing the term's elected
+/// leader). The vote belongs to the TERM and is kept; the persisted
+/// `(term, vote)` record is therefore UNCHANGED and no metadata write
+/// happens. Clearing the vote here and restoring it in a second write
+/// would leave a window whose crash erases a granted vote from disk,
+/// and the restarted node could then vote twice in one term.
+fn step_down_same_term(s: &mut Raft) {
+    let voted = s.voted_for;
+    let term = s.current_term;
+    become_follower_mem(s, term);
+    s.voted_for = voted;
 }
 
 /// # Safety
@@ -2953,13 +3216,35 @@ unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn start_election(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: bool) {
-    s.pre_vote_active = pre_vote;
-
     if !pre_vote {
-        s.current_term += 1;
-        s.voted_for = s.self_id as i8;
-        save_metadata(s, sys);
+        // Volatile posture: no REAL elections inside the boot hold-off.
+        // Gated here — not just at the timeout site — so the
+        // pre-vote→real conversion and the single-node fast path are
+        // covered too. The deadline re-arms; the node retries after
+        // the window.
+        if s.persist_meta == 0 && now < s.holdoff_until_ms {
+            s.election_deadline_ms = s.holdoff_until_ms + s.election_timeout_ms as u64;
+            return;
+        }
+        // Write-then-adopt: persist the prospective `(term+1, self)`
+        // self-vote FIRST; only on success bump the in-memory term and
+        // take candidacy. On failure nothing changed — no term
+        // inflation leaks through response terms to depose healthy
+        // leaders — and the re-armed deadline retries later.
+        let prospective = s.current_term + 1;
+        let self_vote = s.self_id as i8;
+        match persist_meta_record(s, sys, prospective, self_vote) {
+            PersistOutcome::Persisted => {
+                s.current_term = prospective;
+                s.voted_for = self_vote;
+            }
+            _ => {
+                s.election_deadline_ms = now + s.election_timeout_ms as u64;
+                return;
+            }
+        }
     }
+    s.pre_vote_active = pre_vote;
 
     s.role = ROLE_CANDIDATE;
     s.votes_granted = NodeSet::empty();
@@ -3052,7 +3337,7 @@ unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
     let raft_ready = (!s.awaiting_replay
         && !s.meta_load_pending
         && (s.role == ROLE_LEADER || s.leader_id >= 0)) as i64;
-    let samples: [(u16, u8, i64); 21] = [
+    let samples: [(u16, u8, i64); 22] = [
         // RAFT_READY leads the array: the emit loop stops at a full
         // metrics channel, so readiness must be the last casualty under
         // backpressure, not the first.
@@ -3081,6 +3366,7 @@ unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
         (wire::metric_ids::RAFT_WAL_RESYNCS, kc, s.wal_resyncs as i64),
         (wire::metric_ids::RAFT_WAL_UNACKED_HOLDS, kc, s.wal_unacked_holds as i64),
         (wire::metric_ids::RAFT_AE_NONCONTIGUOUS, kc, s.ae_noncontiguous as i64),
+        (wire::metric_ids::RAFT_META_WRITE_ERRORS, kc, s.meta_write_errors as i64),
     ];
     for &(metric_id, kind, value) in samples.iter() {
         let poll = (sys.channel_poll)(s.out_metrics, 0x02);

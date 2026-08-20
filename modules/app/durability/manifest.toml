@@ -22,9 +22,12 @@ hardware_targets = ["bcm2712"]
 #     emitting a durability proof. Acknowledgements on `flushed` mean
 #     replicated-volatile at best.
 #
-# Deployment note (disk): `wal/` must exist and be writable in the
-# process working directory unless `root_path = 1` (bare-metal FAT32
-# 8.3 layout at the FS root, shared by segments and snapshots).
+# Deployment note (disk): segments live under `wal/` in the process
+# working directory unless `root_path = 1` (bare-metal FAT32 8.3
+# layout at the FS root, shared by segments and snapshots). A missing
+# `wal/` is created at first open; a hard FS failure holds entry
+# intake (raft backpressures) rather than degrading — in-memory
+# operation is only ever the volatile variant's declared mode.
 
 permissions = []
 
@@ -77,6 +80,12 @@ name = "trigger"
 direction = "input"
 content_type = "OctetStream"
 
+# A request re-broadcasts the most recent snapshot. One arriving
+# BEFORE any snapshot exists triggers a capture at the wal high-water
+# instead (synchronous finalise, so the step is classified Burst, on
+# manifest-only graphs; an `app_snapshot_ctl` capture request when an
+# app state machine is wired). Volatile graphs never rotate a segment,
+# so this is their only snapshot trigger.
 [[ports]]
 name = "install_request"
 direction = "input"

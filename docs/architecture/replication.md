@@ -12,10 +12,11 @@ here is grounded in the `consensus`, `durability`, and `admission` sources.
 1. [Elections and pre-vote](#elections-and-pre-vote)
 2. [Log replication and conflict repair](#log-replication-and-conflict-repair)
 3. [Durability and the quorum-fsync path](#durability-and-the-quorum-fsync-path)
-4. [ACK contract](#ack-contract)
-5. [Read gate predicate](#read-gate-predicate)
-6. [Flow control](#flow-control)
-7. [Compaction](#compaction)
+4. [Agreement without durability](#agreement-without-durability)
+5. [ACK contract](#ack-contract)
+6. [Read gate predicate](#read-gate-predicate)
+7. [Flow control](#flow-control)
+8. [Compaction](#compaction)
 
 ---
 
@@ -145,8 +146,12 @@ The flow, leader side:
    proof as its `durable_index` and computes the commit index as
    `min(quorum match index, durable_index)` in the strict and
    group_fsync modes. In relaxed mode the durable-index clamp is
-   dropped and the quorum match index commits directly. The
-   current-term fence from the election no-op applies in every mode.
+   dropped and the quorum match index commits directly; because the
+   leader's own slot in the match array is otherwise fed by durability
+   proofs, relaxed mode seeds it from the leader's log tip each step:
+   with no barrier to wait for, "self has the entry" is exactly "self
+   appended the entry". The current-term fence from the election no-op
+   applies in every mode.
 
 <a id="commit-visibility-modes"></a>
 There are no named commit-visibility modes: what a read can observe is
@@ -158,6 +163,67 @@ supporting replicas' ack terms, so a proof never names a term ahead of
 its index. A proof that cannot be delivered because the channel is
 momentarily full is latched and retried every step — deferred, never
 dropped.
+
+---
+
+<a id="agreement-without-durability"></a>
+## Agreement without durability
+
+Raft gives two separable guarantees: **agreement** (a single leader,
+one ordered log, entries applied identically on every replica) and
+**durability** (agreed state survives restarts). Everything above this
+section builds the second on top of the first; the first also stands
+alone, and clustor composes it as a declared posture rather than a
+degraded mode.
+
+An agreement-only node combines three settings:
+
+- the durability module's `volatile` variant: entry retention is
+  in-memory, the ledger component is compiled out, and the `ack` /
+  `quorum_durable` ports are structurally absent, so the composition
+  *cannot* emit a durability proof (a graph that expects one fails
+  validation rather than running against fabricated acks);
+- the consensus module's `durability_mode: relaxed`: commit is the
+  quorum match index, with the leader's own match seeded from its log
+  tip (there is no barrier to wait for);
+- the consensus module's `persist_meta: none`: no term/vote metadata
+  is read or written; the FS contract goes unused.
+
+What the composition guarantees: **committed means replicated in
+memory on a quorum of live voters.** Consequences, stated plainly:
+
+- A single node that restarts rejoins with the same identity and an
+  empty log, and is rebuilt from the cluster. The in-memory log serves
+  random-access refetch only for the most recent 256 entry bodies; a
+  replica further behind (a restarted node is the extreme case) is
+  caught up by snapshot install, so agreement-only graphs must wire
+  the consensus snapshot-request edge to the durability module's
+  install input.
+- A node with no stable term or vote could, in principle, vote twice
+  in an election that spans its restart. Two mitigations narrow the
+  window: for one election timeout after boot the node grants no real
+  votes and starts no elections (skipped when it is the only voter;
+  pre-vote traffic, which confers no quorum right, is unaffected), and
+  it refuses grants in any term at or below the highest term it has
+  heard from a leader since boot. These are mitigations, not proofs;
+  the provable form, rejoining as a non-voting learner and being
+  re-admitted through a membership change, is a design target, not
+  wired.
+- Simultaneous restart of a quorum of voters can elect an empty-log
+  leader and discard all prior committed state, even when a
+  surviving minority node still holds every entry. Such a survivor
+  holds applied state the new cluster will never re-issue and must be
+  restarted as well. Membership changes are forgotten along with the
+  log, so a removed node that restarts believes its configured voter
+  set again: live nodes discount its ballots, but restarted nodes
+  cannot.
+
+Three invariants hold across the layers: acknowledgements on
+`flushed` mean replicated-volatile, the readiness signal carries no
+durability claim, and a disk composition never falls back to memory.
+A hard storage failure there holds the log (appends go unacknowledged
+and the proposer backpressures) instead of acknowledging what was
+never persisted.
 
 ---
 

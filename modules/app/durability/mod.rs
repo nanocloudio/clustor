@@ -41,9 +41,17 @@
 //!   4. `ledger`   — cross-node ack drain + quorum recompute (disk
 //!      variant only). Bound (`ledger::step`): ≤32 acks + ≤1 quorum
 //!      recompute and proof emit.
+//!   4b. high-water seam — the wal's current `(term, index)` is
+//!      delivered to `snapshot::on_wal_high_water`: the capture point
+//!      for a demand-triggered snapshot. O(1).
 //!   5. `snapshot` — floors, external triggers, install transfer.
 //!      Bound (`snapshot::step`): ≤4 frames per input family + ≤1
-//!      app-body chunk.
+//!      app-body chunk + ≤1 demand-triggered capture (a synchronous
+//!      finalise, reported as a cold-FS step → Burst).
+//!   5b. install fast-forward — an accepted peer install latches
+//!      `(term, index)` for `wal::on_snapshot_installed`, so the wal
+//!      advances its append contract past the prefix the snapshot
+//!      subsumes before the next entry arrives. O(1).
 //!
 //! The wal's Burst classifications and the snapshot component's
 //! cold-FS steps propagate as the module's step return.
@@ -351,8 +359,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
         let t0 = dev_micros(sys);
+        // 4b. Deliver the wal high-water: the capture point for a
+        //     demand-triggered snapshot (an install request arriving
+        //     before any snapshot exists — see snapshot::step 2b).
+        let (hw_term, hw_index) = wal::high_water(&s.wal);
+        snapshot::on_wal_high_water(&mut s.snapshot, hw_term, hw_index);
         if snapshot::step(&mut s.snapshot, sys) {
             cold_fs = true;
+        }
+        // Return seam: an accepted peer install fast-forwards the wal's
+        // append contract past the subsumed prefix (next step's appends
+        // at `last_idx + 1` must be contiguous, not a continuity fault).
+        if s.snapshot.wal_fast_forward_dirty {
+            s.snapshot.wal_fast_forward_dirty = false;
+            let (ff_term, ff_index) = s.snapshot.wal_fast_forward;
+            wal::on_snapshot_installed(&mut s.wal, ff_term, ff_index);
         }
         s.comp_step[3].record(dev_micros(sys).wrapping_sub(t0));
 

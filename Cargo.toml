@@ -233,6 +233,12 @@ path = "tests/wal_group_fsync.rs"
 name = "wal_replay"
 path = "tests/wal_replay.rs"
 
+# Volatile (agreement-only) 3-node composition + disk-mode state-dir
+# self-heal. Binds real ports; run with `--test-threads=1`.
+[[test]]
+name = "volatile_cluster"
+path = "tests/volatile_cluster.rs"
+
 # Host-side unit coverage for the WAL's below-ring-floor segment-scan
 # fallback. Pulls `modules/app/durability/wal.rs` in via `#[path]`
 # against a mock SyscallTable (in-memory FS + byte-FIFO channels);
@@ -240,6 +246,15 @@ path = "tests/wal_replay.rs"
 [[test]]
 name = "wal_scan"
 path = "tests/wal_scan.rs"
+
+# Host-side unit coverage for raft's write-then-adopt metadata
+# persistence discipline. Pulls `modules/app/consensus/raft.rs` in via
+# `#[path]` against a mock SyscallTable (in-memory FS with fault
+# injection + byte-FIFO channels); no fluxor-linux / .fmod prereqs,
+# always runs.
+[[test]]
+name = "raft_meta"
+path = "tests/raft_meta.rs"
 
 # Criterion benches. Each uses `harness = false` so criterion's own
 # main runs instead of the default libtest harness. Run with

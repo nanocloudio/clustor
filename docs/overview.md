@@ -33,8 +33,8 @@ single node or a three-node cluster; only the config changes.
 - [architecture/wire.md](architecture/wire.md) — envelope formats,
   message catalog, WAL frame contract
 - [architecture/replication.md](architecture/replication.md) —
-  elections, log replication, durable watermarks, the read gate,
-  flow control
+  elections, log replication, durable watermarks, agreement without
+  durability, the read gate, flow control
 - [architecture/lifecycle.md](architecture/lifecycle.md) — boot and
   replay, durability modes, strict fallback, snapshots, admin
   operations, membership

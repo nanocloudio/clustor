@@ -75,6 +75,11 @@ E2E_THREADS ?= 2
 e2e:
 	fluxor sync
 	fluxor modules build --all
+	# Host-only module-core suites: no fluxor-linux or .fmod prereqs, so
+	# they cannot skip. They ride this target because it is the only
+	# gate `fluxor ci` reaches for anything under tests/ (phase 4 needs
+	# a tests/harness sub-workspace, which this project does not have).
+	cargo test --test raft_meta --test wal_scan
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test wal_replay -- --test-threads=$(E2E_THREADS)
 	# wal_group_fsync's 4 tests all launch single-node clusters through
 	# `Cluster::launch`, which wipes and recreates one hardcoded, shared
@@ -89,4 +94,8 @@ e2e:
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test partition -- --test-threads=$(E2E_THREADS)
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test chaos -- --test-threads=$(E2E_THREADS)
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test cluster -- --test-threads=$(E2E_THREADS)
+	# volatile_cluster binds real ports per test and its deep-catch-up
+	# case drives hundreds of proposals through one 3-node cluster:
+	# serialise the binary like the other port-heavy suites.
+	CLUSTOR_REQUIRE_E2E=1 cargo test --test volatile_cluster -- --test-threads=1
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test session_directory_e2e --test timing_cluster_e2e -- --test-threads=1

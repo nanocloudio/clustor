@@ -63,7 +63,7 @@ responses on `client_resp`. `tls_identity` carries TLS-verified
 | Inputs | `net_in`, `peer_tx`, `repl_tx`, `client_resp`, `tls_identity` |
 | Outputs | `net_out`, `cleartext`, `peer_rx`, `raft_rpc`, `metrics` |
 | Params | `self_id`, `peer_count`, `listen_port`, `peer{0..4}_port`, `peer{0..4}_host` |
-| Metrics | `bytes_in`, `bytes_out`, `connections.open` |
+| Metrics | `bytes_in`, `bytes_out`, `connections.open`, `frames_dropped` |
 
 ### `consensus`
 
@@ -96,7 +96,7 @@ feedback, the same shape a channel edge has.
 |---|---|
 | Inputs | `rpc`, `proposals`, `admin_proposals`, `proposals_tagged`, `proposals_partitioned`, `proposals_partitioned_tagged`, `snapshot_installed`, `wal_flushed`, `wal_replay_complete`, `ack`, `snapshot_rx`, `durable`, `cp_state`, `read_permits`, `read`, `entry_reply` |
 | Outputs | `rpc_out`, `net_out`, `log_append`, `metrics`, `proposal_assigned`, `leader_state`, `admin_applied`, `wal_compact`, `lag_signal`, `snapshot_import`, `snapshot_request`, `cross_durability_ack`, `retention_floor`, `committed_entries`, `applied`, `entry_request` |
-| Params | `self_id`, `voter_count`, `election_timeout_ms`, `heartbeat_interval_ms`, `proposal_batch_max`, `proposal_batch_timeout_ms`, `partition_id`, `root_path`, `peer_count`, `pipeline_depth`, `durability_mode` |
+| Params | `self_id`, `voter_count`, `election_timeout_ms`, `heartbeat_interval_ms`, `proposal_batch_max`, `proposal_batch_timeout_ms`, `partition_id`, `root_path`, `peer_count`, `pipeline_depth`, `durability_mode`, `persist_meta` |
 
 Two inputs and one output are shared handles with an in-module
 demux, because fluxor caps a module at 16 ports per direction:
@@ -111,9 +111,15 @@ demux, because fluxor caps a module at 16 ports per direction:
 
 `consensus` requires an `fs` write contract: `raft` persists term,
 `voted_for` and the durable-index hint to `RAFT<pppp>.MET` (a
-root-level 8.3 name when `root_path = 1`, `raft/meta` otherwise).
-Without the declaration the contract grant returns `ENOSYS` and
-the cluster silently degrades to non-persistent.
+root-level 8.3 name when `root_path = 1`, `raft/meta` otherwise, and
+the `raft/` parent is created at first persist). A persist failure
+is counted (`meta_write_errors`), logged once, and withholds vote
+grants and election starts until the store recovers. Setting
+`persist_meta = none` disables metadata persistence deliberately:
+the agreement-only posture described in
+[replication.md](replication.md#agreement-without-durability),
+paired with the durability module's `volatile` variant and
+`durability_mode = relaxed`.
 
 ### `durability`
 

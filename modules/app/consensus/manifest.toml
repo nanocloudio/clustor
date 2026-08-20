@@ -35,8 +35,11 @@ capabilities = ["replication.state_machine"]
 
 # raft persists term + voted_for + durable-index metadata via the FS
 # contract (root-level RAFT<pppp>.MET when root_path = 1, raft/meta
-# otherwise). Without this declaration check_contract_grant returns
-# ENOSYS and the cluster silently degrades to non-persistent.
+# otherwise — the raft/ parent is self-healed at first persist).
+# Persist failures are counted (meta_write_errors) and withhold vote
+# grants and election starts. The `persist_meta: 0` posture disables
+# metadata persistence deliberately (volatile graphs); the declaration
+# stays for the default posture.
 [[resources]]
 requires_contract = "fs"
 access = "write"
@@ -318,7 +321,7 @@ rate_class_max = "transaction"
 
 [observability]
 # Exactly what the code emits as typed MSG_METRIC_SAMPLE, per
-# component: raft (18 — `ready` is emitted FIRST so it is the last
+# component: raft (22 — `ready` is emitted FIRST so it is the last
 # casualty under metric-channel backpressure), replicator (6),
 # commit (2), apply (6). Partition-stamped for multi-Raft graphs.
 metrics = [
@@ -329,6 +332,8 @@ metrics = [
   "frozen_flag", "strict_fallback_flag",
   "flushes_deferred", "uncommitted_inflight",
   "awaiting_replay", "replay_hw", "meta_hint", "log_truncations",
+  "wal_resyncs", "wal_unacked_holds", "ae_noncontiguous",
+  "meta_write_errors",
   # replicator
   "rpcs_sent", "acks_received", "nacks_received", "catchup_sent",
   "inflight_depth", "backpressure",

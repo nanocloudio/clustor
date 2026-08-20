@@ -62,8 +62,9 @@ direction = "output"
 content_type = "OctetStream"
 
 [observability]
-# Per-peer / per-client envelope routing over TCP. All three emitted as
+# Per-peer / per-client envelope routing over TCP. All four emitted as
 # typed MSG_METRIC_SAMPLE (RFC §4.2): connections_open gauge (active
 # conn-table slots), bytes_in counter (NMSG_DATA ingress), bytes_out
-# counter (send_to_conn egress). Node-level (partition 0).
-metrics = ["bytes_in", "bytes_out", "connections.open"]
+# counter (send_to_conn egress), frames_dropped counter (unroutable or
+# over-budget frames in either direction). Node-level (partition 0).
+metrics = ["bytes_in", "bytes_out", "connections.open", "frames_dropped"]

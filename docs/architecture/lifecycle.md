@@ -64,8 +64,22 @@ multiplexed onto `wal.flushed`, which also fans out durability
 acknowledgements.
 
 Raft persists its own metadata (current term, vote, durable-index
-hint) in `RAFT<pppp>.MET` on bare-metal FAT32 or `raft/meta`
-otherwise, written before votes and term changes take effect.
+hint) as one 28-byte record: `RAFT<pppp>.MET` on bare-metal FAT32,
+`raft/meta` otherwise (the `raft/` parent is created at first persist
+if absent). The persist gates the actions that must never outlive a
+crash unrecorded: a vote is granted, and an election started, only
+after the prospective `(term, vote)` record is on stable storage.
+Write first, adopt in memory second, so there is no rollback path. A
+same-term step-down changes neither field and writes nothing. The one
+deliberate exception is adopting a *higher observed term*, which takes
+effect in memory even if its persist fails, because refusing to
+observe a term wedges the cluster; the failure is counted. Any hard
+persist failure increments the `meta_write_errors` counter and logs
+once; a node whose metadata store is broken keeps following and
+serving but cannot grant votes or start elections until the store
+recovers. Graphs that opt out of durability entirely set
+`persist_meta: none`; see
+[replication.md](replication.md#agreement-without-durability).
 
 ---
 

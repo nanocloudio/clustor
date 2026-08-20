@@ -1061,6 +1061,13 @@ pub mod metric_ids {
     /// leader shipped a mis-sequenced entry. Refusing turns what would have
     /// been an unrepairable WAL hole into ordinary Raft log repair.
     pub const RAFT_AE_NONCONTIGUOUS: u16 = 0x0015;
+    /// Counter: hard Raft metadata persist failures (term/vote/durable
+    /// hint could not be written). Steady state 0. Non-zero means the
+    /// node's stable term/vote store is broken: vote grants and
+    /// election starts are being withheld (they gate on the persist),
+    /// so the node follows and serves but cannot move elections.
+    /// Transient FS-initialising outcomes are not counted.
+    pub const RAFT_META_WRITE_ERRORS: u16 = 0x0016;
 
     // wal (module_id = 0x02)
     pub const WAL_ENTRIES_WRITTEN: u16 = 0x0001;
