@@ -3,16 +3,11 @@
 //! Every message uses a 3-byte envelope:
 //!   [msg_type: u8] [len: u16 LE] [payload: len bytes]
 //!
-//! ## Stability — DRAFT (do not pin consumers to these encodings yet)
+//! ## Stability
 //!
-//! Every `MSG_*` constant and payload layout in this file is treated as
-//! draft until the Clustor module-coherence work in
-//! `.context/rfc_fluxor_native_module_coherence.md` lands its facade
-//! stabilization pass (§11, §12 Phase 2). External consumers
-//! (Quantum, Lattice, Chronicle, Loam) MUST go through
-//! `modules/common/replica_facade.rs` instead of importing these
-//! constants directly. Numeric ids and payload field orders may change
-//! without notice until the registry is promoted to v1.
+//! External consumers (Quantum, Lattice, Chronicle, Loam) MUST go
+//! through `modules/common/replica_facade.rs` instead of importing
+//! these constants directly.
 
 #![allow(
     dead_code,

@@ -5,9 +5,8 @@ plus `example_consumer` as a minimal downstream demo wired into the
 smoke graph. The modules implement Raft consensus, durability, and
 a small control plane. They ship as position-independent `no_std`
 ELFs, communicate over mailbox channels, and run on the fluxor
-runtime — Pi 5 hardware or a `linux` host harness. The graph
-is the implementation; there is no separate "library" layer
-underneath.
+runtime — Pi 5 hardware or a `linux` host harness. There is no
+separate library layer beneath the graph.
 
 Each module is one source tree, one `manifest.toml`, one scheduler
 entity, one arena. Inside a module the work is split into
@@ -16,8 +15,7 @@ on — one state struct each, interacting only through
 message-shaped functions with the same payloads the wire layer
 uses. The module's step function is an explicit ordered dispatch
 table over those components, so intra-tick delivery order is
-owned in exactly one place. The rules are
-`standards/fluxor-modules.md` §8; the practical consequence is
+owned in exactly one place. The practical consequence is
 that a component is liftable back out into a standalone graph node
 by reintroducing a manifest and replacing its message-shaped calls
 with ports.
@@ -27,8 +25,7 @@ with bounded step time — each component declares its own per-step
 bound and the dispatch table cites them, because the ~2 ms step
 guard budgets the *sum*. Modules with shared deadlines and tight
 data dependencies sit on the same core; cross-core hops use
-SEV/WFE-woken mailbox channels (~200ns latency on the Pi 5's coherent
-L3). The consensus hot path is interior: `raft → replicator →
+SEV/WFE-woken mailbox channels. The consensus hot path is interior: `raft → replicator →
 commit → apply` runs as one fused dispatch inside `consensus`
 with no scheduler dispatch and no tick boundary between the
 components, and the log-append leg reaches `durability` over a
@@ -81,7 +78,7 @@ explicitly until a fluxor validator/resolver consumes the name.
 |---|---|
 | `raft` | Elections with pre-vote, proposal batching, follower log matching and §5.3 conflict repair, admin/config apply, `RAFT<pppp>.MET` metadata persistence. |
 | `replicator` | AppendEntries pipelining to followers, ack processing, WAL read-back catch-up, snapshot chunk transfer. |
-| `commit` | Fuses quorum match indices with durability acks into the commit horizon, gated on durability mode (Strict / GroupFsync / Relaxed). |
+| `commit` | Fuses quorum match indices with durability acks into the commit horizon, gated on durability mode (strict / group_fsync / relaxed). |
 | `apply` | Ordered, deduplicated delivery of committed entries plus the linearizable-read queue. |
 
 The dispatch order is `raft → replicator → commit → apply`. The
@@ -147,12 +144,10 @@ themselves rather than behind channel capacity.
 snapshots, quorum proofs on `quorum_durable`. `volatile` selects
 the WAL's in-memory retention at compile time, skips replay, and
 **compiles the ledger component out** — `ack` and `quorum_durable`
-are absent from its port set, so a volatile composition is
-structurally incapable of emitting a durability proof.
-Acknowledgements on `flushed` mean replicated-volatile at best.
-This is fail-closed by construction: there is no runtime flag to
-get wrong, and graph validation rejects a wiring that expects a
-proof from a volatile node.
+are absent from its port set, so a volatile composition cannot
+emit a durability proof. Acknowledgements on `flushed` mean
+replicated-volatile at best, and graph validation rejects a
+wiring that expects a proof from a volatile node.
 
 `partition_id`, `self_id` and `root_path` are shared across all
 four components, so the on-disk layout for segments and snapshots
@@ -178,7 +173,7 @@ design, rather than inheriting a hidden bootstrap ceiling.
 
 | | |
 |---|---|
-| Inputs | `requests`, `throttle_status`, `admin_responses`, `readyz_data`, `why_data`, `metrics_data`, `applied`, `placement`, `proposal_assigned`, `leader_state`, `credit_supply`, `proposals`, `client_requests` |
+| Inputs | `requests`, `admin_responses`, `readyz_data`, `why_data`, `metrics_data`, `applied`, `placement`, `proposal_assigned`, `leader_state`, `credit_supply`, `proposals`, `client_requests` |
 | Outputs | `raft_rpc`, `responses`, `admin_req`, `proposals_tagged`, `rejected`, `reads`, `metrics` |
 | Params | `self_id`, `min_epoch` |
 | Metrics | `requests_admitted`, `requests_rejected` |
@@ -203,7 +198,7 @@ control.
 |---|---|
 | `proof_cache` | CP proof age ladder (Fresh / Cached / Stale / Expired); publishes transitions and the strict-fallback signal when proofs age past the grace period. |
 | `read_gate` | Issues standing linearizable-read permits while the cache is Fresh or Cached; withholds them during strict fallback. |
-| `flow` | Dual-token PID admission controller (entry credits + byte credits) driven by replication lag; publishes credits and the throttle envelope. |
+| `flow` | Dual-token PID admission controller (entry credits + byte credits) driven by replication lag; publishes credits, carrying the throttle envelope on the same `credits` path. |
 
 Dispatch order is `proof_cache → read_gate → flow`; a ladder
 transition is delivered into the read gate in the same step it
@@ -213,7 +208,7 @@ tick.
 | | |
 |---|---|
 | Inputs | `proof`, `input`, `lag` |
-| Outputs | `cache_state`, `fresh_state`, `strict_fallback`, `permits`, `credits`, `envelope`, `metrics` |
+| Outputs | `cache_state`, `fresh_state`, `strict_fallback`, `permits`, `credits`, `metrics` |
 | Params | `entry_credit_max`, `byte_credit_max_kib`, `sample_period_ms`, `entry_rate_per_sec`, `fresh_threshold_s`, `grace_period_s` |
 | Metrics | `entry_credits`, `byte_credits` |
 
@@ -225,15 +220,16 @@ name they wire; all four are part of the published surface.
 
 | Component | Responsibility |
 |---|---|
-| `cp` | Periodic control-plane proofs on a state-dependent schedule (Fresh → 5s, Stale → 600ms), plus tenant records and capability manifests. |
+| `cp` | Periodic control-plane proofs on a fixed 5 s refresh tick (`REFRESH_FRESH_MS`), plus tenant records and capability manifests. |
 | `placement` | Epoch-based partition-to-node routing and kpg-keyed epoch events. |
 
 Both components are pure timer-driven sources; the module has no
-inputs and no data-plane telemetry of its own.
+inputs. Its `metrics` output carries only per-component step
+accounting, not data-plane telemetry.
 
 | | |
 |---|---|
-| Outputs | `proof`, `tenant_records`, `capabilities`, `routing`, `epoch_events` |
+| Outputs | `proof`, `tenant_records`, `capabilities`, `routing`, `epoch_events`, `metrics` |
 | Params | — |
 
 `tenant_records`, `capabilities` and `epoch_events` are optional:
@@ -246,11 +242,11 @@ HTTP diagnostic surface.
 
 | Component | Responsibility |
 |---|---|
-| `rbac` | Evaluates RBAC manifests (Operator / TenantAdmin / Observer / BreakGlass); validates break-glass SPIFFE SVIDs with TTL ≤ 300ms; writes the signed audit stream on `audit_events`. |
+| `rbac` | Evaluates RBAC roles (Operator / TenantAdmin / Observer / BreakGlass) by SPIFFE-SVID prefix match against `admin_svid_prefix` / `observer_svid_prefix` — an admin match grants Operator plus BreakGlass; writes the audit stream on `audit_events`. |
 | `admin` | Idempotency-keyed admin envelope. Routes `FREEZE` / `THAW` / `TRANSFER_LEADER` / `DURABILITY_MODE` / `SNAPSHOT` to `consensus` and replies `ADMIN_STATUS_OK` / `ADMIN_STATUS_DUPLICATE`. `ADD_VOTER` / `REMOVE_VOTER` return `ADMIN_STATUS_UNSUPPORTED`; the joint-consensus path is documented in [lifecycle.md](lifecycle.md#membership-changes-and-joint-consensus). |
 | `telemetry` | Metrics fan-in with fixed histogram buckets, incident correlation under a storm guard, feature-gate state, and the `/readyz` / `/why` / `/metrics` payloads. |
 | `http` | Maps parsed requests to op codes and frames replies; serves `/readyz`, `/why`, `/metrics`, `POST /admin/<op>` and `POST /propose`. |
-| `ingress` | HTTP/1.1 listener and parser on a dedicated `linux_net` port — by convention `LISTEN_PORT + 10000`. See [../net_http.md](../net_http.md). |
+| `ingress` | HTTP/1.1 listener and parser on a dedicated `linux_net` port — by convention `LISTEN_PORT + 10000`. See [../net_http.md](../guides/net_http.md). |
 
 Every admin command is admitted through `rbac` and there is no
 path around it. Wire commands arriving on `admin_req` are
@@ -307,29 +303,39 @@ and the example consumer are driver-side.
 
 | Module | Description |
 |--------|-------------|
-| `session_directory` | Session directory / reservation authority (fluxor rfc_protocols.md §8.3/§13.7): single-writer session bindings, quorum-committed counter-block grants, wrapped-key custody, fence-ordering, and unsafe-recovery voiding, as a replicated consumer over `modules/common/session_registry.rs`. Replies only from the committed-entry stream (R2/R5 ack boundary). See [session_directory.md](session_directory.md). |
+| `session_directory` | Session directory / reservation authority: single-writer session bindings, quorum-committed counter-block grants, wrapped-key custody, fence ordering, and unsafe-recovery voiding, as a replicated consumer over `modules/common/session_registry.rs`. Replies only from the committed-entry stream. See [session_directory.md](session_directory.md). |
 | `partition_router` | Routes proposals to the correct per-partition `consensus` instance by partition id, preserving the correlation prefix on tagged proposals. |
-| `consensus_bench` | Load injector and scrape driver for the consensus path; used by `configs/consensus-bench*.yaml`. |
-| `nvme_bench` | Device-floor and WAL-path storage driver; used by `configs/nvme-bench*.yaml`. |
-| `example_consumer` | Minimal downstream consumer module that `#[path]`-includes `modules/common/replica_facade.rs` and wires to `consensus.committed_entries`. Built alongside every clustor module on every `make ci` run — the gate that catches `no_std` regressions in the facade or in the per-entry emitter. See [consumer_facade.md](consumer_facade.md). |
-| `clustor_cli` | The operator CLI as a fluxor cli-applet (rfc_cli_execution.md): one PIC module behind `fluxor exec clustor -- <cmd>` (graph + workload manifest in `packaging/cli/`). `crc`, `wal-frame`, and `wal-scan` run the same Crc32c core and frame validation the `durability` module runs at replay, so a `wal-scan` reports exactly the durable prefix a replica would recover. Gated by `scripts/cli-e2e.sh`. |
+| `consensus_bench` | Load injector and scrape driver for the consensus path (bench graphs only). |
+| `nvme_bench` | Device-floor and WAL-path storage driver (bench graphs only). |
+| `example_consumer` | Minimal downstream consumer module that `#[path]`-includes `modules/common/replica_facade.rs` and wires to `consensus.committed_entries`; building it alongside the palette proves the facade stays `no_std`-clean. See [consumer_facade.md](consumer_facade.md). |
+| `clustor_cli` | The operator CLI as a fluxor cli-applet: one PIC module behind `fluxor exec clustor -- <cmd>` (graph + workload manifest in `packaging/cli/`). `crc`, `wal-frame`, and `wal-scan` run the same Crc32c core and frame validation the `durability` module runs at replay, so a `wal-scan` reports exactly the durable prefix a replica would recover. |
 
 ---
 
 ## Graph definition
 
-The canonical graph definition lives in
-[../../configs/single.yaml](../../configs/single.yaml). It enumerates:
+The canonical graph definition is embedded in
+[the run guide](../guides/running.md). It enumerates:
 
-- **7 substrate modules** (plus `example_consumer` in the smoke
-  graph) across four execution domains (ops, consensus, network,
-  apply).
-- **48 wiring edges**, including cross-core mailbox edges with
-  SEV/WFE wake.
-- **Platform integration** via `platform: net: {}` (virtio_net + ip
-  injected) and `services: socket: ip` for TCP connection management.
+- **7 substrate modules** — `peer_router`, `gateway`, `consensus`,
+  `durability`, `control_plane`, `admission`, `operations` — with
+  no execution-domain block; every module runs in the default
+  domain.
+- **The full edge set**, grouped by concern: `linux_net` ↔
+  `peer_router` (no TLS in this config), peer_router → application
+  routes, HTTP routing, the client pipeline, the HTTP `/propose`
+  bridge (`operations.proposal` → `gateway.proposals`,
+  `consensus.proposal_assigned` → `operations.proposal_assigned`,
+  `gateway.rejected` → `operations.proposal_rejected`,
+  `consensus.applied` → `operations.applied`), flow control, Raft
+  replication, persistence, commit → apply, snapshots, keys,
+  control plane, admin, telemetry, and the HTTP diagnostic
+  surface.
+- **Platform integration** via `platform: net: {}`, which injects
+  the target's network module (`linux_net` on the host harness);
+  `peer_router` wires to it directly.
 - **Response path:** `consensus.applied` → `gateway.applied` →
-  `gateway.responses` → `peer_router.client_resp` → `tls` → `ip`
+  `gateway.responses` → `peer_router.client_resp` → `linux_net`
   → client. Throttle rejects (`MSG_CLIENT_REJECT`) ride the same
   path, framed by the gateway's surface component.
 
@@ -363,8 +369,9 @@ graph LR
   cp[control_plane] -->|proof| adm
   cp -->|routing| gw
   adm -->|cache_state, strict_fallback, permits| cons
-  adm -->|credits, envelope| gw
+  adm -->|credits| gw
   ops -->|raft_commands, raft_proposal| cons
+  ops -->|proposal| gw
   cons -->|admin_applied| ops
   ops -->|readyz, why, export| gw
   ops -->|denied, responses| gw
@@ -377,23 +384,27 @@ graph LR
 
 ---
 
-## Four-domain core layout
+## Four-domain core layout (design target)
 
-The graph is partitioned across four execution domains so the
-consensus hot path never waits for a tick boundary.
+The intended layout partitions the graph across four execution
+domains so the consensus hot path never waits for a tick boundary.
+**No shipped config wires this yet.** The only configs that define
+execution domains (`single-pi5-throughput.yaml` and its siblings)
+define a single `main` domain on core 0; a second Pi 5 execution
+domain currently fails the boot/readiness gate on this firmware.
 
 | Core | Domain | Tier | Modules | Rationale |
 |------|--------|------|---------|-----------|
 | 0 | ops | Tier 0, 1ms | `operations`, `control_plane` | Neither is latency-critical. A 1ms tick is fine for CP proof refresh (5s intervals), admin operations, telemetry aggregation, and the HTTP diagnostic surface. |
 | 1 | consensus | Tier 3, poll | `consensus`, `durability` | The persistence pipeline must never wait for a tick boundary. Poll-mode steps continuously: log append → WAL write → group fsync → durability ack → commit advance. Everything except the append hop is interior to one of the two modules. |
-| 2 | network | Tier 3, poll | NIC driver (`rp1_gem`), `ip`, `tls`, `peer_router` | Dedicated NIC driver with zero-copy mailbox edges. `peer_router` sits with the network stack so an AppendEntries dispatch is a single channel write followed by immediate TLS framing and NIC TX. |
+| 2 | network | Tier 3, poll | NIC driver (`rp1_gem`), `ip`, `tls`, `peer_router` | `peer_router` sits with the network stack so an AppendEntries dispatch is a single channel write followed by immediate TLS framing and NIC TX. |
 | 3 | apply | Tier 1, 250µs | `gateway`, `admission` | 250µs tick gives a 4 kHz client-admission rate. The flow controller and the throttle are one hop apart — the credit path is `admission.credits` → `gateway.credit_supply` — and the admitted proposal leaves on `proposals_tagged`. |
 
 ### Cross-domain edges
 
-Edges between domains use CrossCore mailbox channels with SEV/WFE
-hardware wake signalling (~200ns latency on the Pi 5's coherent L3
-cache). The write commit path crosses two domain boundaries:
+In this layout, edges between domains use CrossCore mailbox
+channels with SEV/WFE hardware wake signalling. The write commit
+path crosses two domain boundaries:
 
 ```
 client request (apply) →[cross-core]→ consensus (consensus domain)
@@ -405,17 +416,17 @@ client request (apply) →[cross-core]→ consensus (consensus domain)
                                                        → peer_router (network)
 ```
 
-Two crossings × ~200ns ≈ 400ns of scheduling overhead — negligible
-relative to NVMe fsync latency (~50µs) and network RTT (~1-2ms LAN).
+The two crossings cost mailbox-wake latency, small against the
+fsync and network legs of the same path.
 
 ---
 
 ## Hot-path properties
 
-**Single-domain Raft state.** Each domain is single-threaded. The
-consensus domain owns all Raft state exclusively — no mutexes, no
-atomics, no contention. Fluxor's cooperative scheduling provides
-the serialisation guarantee Raft requires for free.
+**Single-owner Raft state.** Each module steps single-threaded,
+and the `consensus` module owns all Raft state exclusively: no
+mutexes, no atomics, no contention. Fluxor's cooperative scheduling provides
+the serialisation guarantee Raft requires.
 
 **Interior consensus loop.** The `raft`, `replicator`, `commit` and
 `apply` components step 1:1 with their module, in one dispatch
@@ -434,18 +445,19 @@ writes. The default is 1 — raising it requires the committed-entry
 consumer to split the entry body back into its N self-delimiting
 proposals.
 
-**Zero-copy WAL path.** The `consensus.log_append` →
-`durability.entries` edge uses mailbox channels. `raft` acquires a
-write buffer, fills it with the batched entry, and releases it;
-the WAL component acquires the same buffer for `pwrite` — zero
-memcpy. For 4 MiB batches this avoids ~1ms of copy time.
+**Single-hop WAL path.** The `consensus.log_append` →
+`durability.entries` edge is one mailbox channel hop. `raft`
+frames the batched entry into a stack buffer and sends it with a
+single atomic channel write (`flush_proposal_batch` in
+`consensus/raft.rs`); a batch is capped at
+`PROPOSAL_BATCH_CAP = MAX_ENTRY_BODY` (2048 bytes), so the copy
+cost is bounded and small.
 
-**Replication fan-out.** The `replicator` component writes to all peer channels
-in a single step (sequential memcpy to ring buffers, ~µs total for
-a 5-node cluster), and `peer_router` frames them onward. The NIC
-driver (`rp1_gem` on Pi 5) then transmits all queued frames in its next poll
-iteration. From the network's perspective every AppendEntries RPC
-is dispatched within microseconds of every other one.
+**Replication fan-out.** The `replicator` component writes to all
+peer channels in a single step, and `peer_router` frames them
+onward. The NIC driver (`rp1_gem` on Pi 5) then transmits all
+queued frames in its next poll iteration, so the AppendEntries
+RPCs for one batch leave close together.
 
 **Per-entry fsync.** The WAL component fsyncs each appended entry
 and hands the resulting durable high-water to the ledger component
@@ -474,11 +486,10 @@ checked in application code).
 Expired) drives strict-fallback transitions to `consensus` over
 `cache_state` and `strict_fallback`, both landing on the
 `cp_state` fan-in and demuxed to the commit and raft components.
-When CP proofs expire, the graph degrades to Strict durability
-mode and blocks linearizable reads — all through channel wiring,
-not runtime conditionals.
+When CP proofs expire, the graph degrades to strict durability
+mode and blocks linearizable reads.
 
-## Observability is structural
+## Observability
 
 Every module emits metrics through its `.metrics` output port, and
 merged modules stamp a `component` label so per-component
@@ -486,9 +497,9 @@ granularity survives the merge. `operations` aggregates the fan-in
 on `ingest` (best-effort, never blocking the hot path) and reports
 per-component step accounting inside the module's step histogram
 export. The `/readyz` and `/why` diagnostic endpoints are
-first-class graph outputs. Fluxor's per-step metering gives
-microsecond-level visibility into consensus latency, WAL
-throughput, and replication lag without instrumentation overhead.
+first-class graph outputs. Fluxor's per-step metering exposes
+consensus latency, WAL throughput and replication lag through the
+same export.
 
 ## Security boundaries
 
@@ -496,12 +507,11 @@ mTLS termination (`tls`), RBAC evaluation (the `rbac` component of
 `operations`), and key custody (the `keys` component of
 `durability`) sit behind explicit boundaries. Every admin request
 — wire or HTTP — traverses `rbac` before reaching the admin
-component, and that is a property of the module's dispatch table
-rather than of the deployment's wiring: there is no edge a config
-could add that routes around it. Key material flows
+component; the module's dispatch table enforces this, so no edge a
+config could add routes around it. Key material flows
 unidirectionally from `keys` to the WAL and snapshot components.
-Break-glass tokens are validated and audit-logged in `rbac` before
-any privileged operation executes.
+Break-glass authority is granted by the admin SVID-prefix match
+and every admission decision is audit-logged on `audit_events`.
 
 ---
 
@@ -512,13 +522,13 @@ plug into `consensus.committed_entries`. The graph exposes the full
 consensus, persistence, and control-plane machinery while the
 application only implements the state machine transform. The
 `gateway` module can be extended with application-specific routes
-by wiring additional modules to its request fan-out ports. The
-application's state machine module runs on Core 3 (apply domain),
-co-located with the gateway for low-latency committed-entry
-delivery.
+by wiring additional modules to its request fan-out ports. In the
+four-domain design target above, the application's state-machine
+module sits in the apply domain with the gateway for low-latency
+committed-entry delivery.
 
 The ports a downstream graph may attach to are enumerated in
-[../substrate_sharing.md](../substrate_sharing.md). Ports are the
+[../substrate_sharing.md](../guides/substrate_sharing.md). Ports are the
 API; the message-shaped functions between components inside a
 module carry no stability promise.
 

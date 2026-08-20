@@ -1,314 +1,258 @@
 # Clustor Wire Format
 
-How bytes flow between clustor nodes and between clustor and its
-clients. Encoding rules are uniform across Raft RPCs, admin APIs,
-control envelopes, and the diagnostic surface, with two carve-outs:
-gRPC payloads keep HTTP/2 framing, and the Explain / Throttle / Why
-envelopes have their own size ceiling.
+How bytes flow between clustor's modules and between clustor nodes.
+One shared file, `modules/common/wire.rs`, defines every message id,
+payload layout, and envelope helper; each module compiles it in via
+`#[path]`, so producers and consumers agree by construction. The WAL's
+on-disk frame layout lives in its own shared file,
+`modules/common/wal_frame.rs`, summarised in
+[WAL frame contract](#wal-frame-contract).
 
-The wire format is **frozen for v0.1.x**. Additive fields append at
-the tail; new mandatory fields demand a schema bump or a new message
-ID. The same rules apply when the manifests under `modules/*/`
-introduce a new envelope.
+## Stability
 
-## Table of Contents
-
-1. [Encoding rules](#encoding-rules)
-2. [Message catalog](#message-catalog)
-3. [Handshake and negotiation](#handshake-and-negotiation)
-4. [Error codes](#error-codes)
-5. [Worked examples](#worked-examples)
-
----
+External consumers go through `modules/common/replica_facade.rs`
+rather than importing `MSG_*` constants directly; the facade is the
+integration surface, and this file documents the encodings behind
+it.
 
 ## Encoding rules
 
-### 1) Length-prefixed framing
+All on-wire integers are fixed-width little-endian. There is no
+schema-version header, no handshake or extension negotiation, and no
+numeric wire-error registry: a decoder that receives a truncated or
+malformed payload returns a failure value (`None`, or inert zeros on
+the infallible paths) and the frame is dropped.
 
-Clustor raw TCP envelopes and other non-gRPC frames begin with a
-32-bit little-endian length prefix that counts only the body bytes.
-Receivers raise `WireBodyTooShort` whenever fewer body bytes arrive
-than promised.
+Every message travels in an envelope. Four envelope shapes exist, on
+distinct channels — the shape is a property of the port, never
+signalled in-band. Source: `modules/common/wire.rs`.
 
-gRPC payloads keep their native 5-byte header framing on HTTP/2; that
-layer is the runtime's job.
+### Plain envelope (3-byte header, `ENVELOPE_HDR`)
 
-### 2) Little-endian integers
+| Offset | Field | Type |
+|---|---|---|
+| 0 | `msg_type` | `u8` |
+| 1 | `len` | `u16` LE |
+| 3 | payload | `len` bytes |
 
-All on-wire integers are fixed-width little-endian. Length prefixes
-precede slices and strings.
+### Partitioned envelope (5-byte header, `PARTITIONED_HDR`)
 
-The one exception is the AEAD IV-derivation preimage in
-[security.md](security.md#aead-and-storage-encryption), which is
-big-endian. AAD and on-wire fields stay little-endian even there.
+Used between partition-aware modules (multi-Raft channels).
 
-### 3) Body caps by surface
+| Offset | Field | Type |
+|---|---|---|
+| 0 | `partition_id` | `u16` LE |
+| 2 | `msg_type` | `u8` |
+| 3 | `len` | `u16` LE |
+| 5 | payload | `len` bytes |
 
-| Surface | Cap |
-|---|---|
-| Raft / admin RPCs | 4 MiB |
-| Explain / Throttle / Why* envelopes | 32 KiB (stays in force even with `WireExtension::WideFrame`) |
-| WAL entry frames | Per `EntryFrameHeader.body_len` and `trailer_len`; see [concepts.md](concepts.md#1-wal-entry-frame) |
+### Routed envelope (4-byte header, `ROUTED_HDR`)
 
-### 4) Enum discriminants are stable
+Used on the `peer_tx` channel from consensus/replicator to
+`peer_router`: a 1-byte `target_replica` precedes the plain envelope.
+`target_replica = 0xFF` (`TARGET_BROADCAST`) means "send to all
+peers".
 
-One `u8` discriminant per enum. Once assigned, values never change.
-Additive variants allocate a fresh discriminant at the **tail** of
-the assignment range.
+### Routed partitioned envelope (6-byte header, `ROUTED_PARTITIONED_HDR`)
 
-Unknown enum discriminants are rejected as `WireUnknownField`, even
-inside otherwise-skippable optional or tail structures.
-Forward-compatible tails are opaque byte ranges appended after all
-known fields; they cannot contain enums or any other mandatory
-semantics. New required fields demand either a schema-version bump
-or a new message ID, never a tail extension.
+`[target_replica:u8][partition_id:u16 LE][msg_type:u8][len:u16 LE]`
+then the payload. `target_replica` is scoped to the named partition;
+`peer_router` keys its connection table by
+`(partition_id, target_replica)`.
 
-The experimental enum range `0xF0–0xFF` is reserved. Production
-builds reject messages that use it.
+### Payload cap
 
-### 5) Optional fields use `has_field` prefix
-
-Optional fields use a `u8 has_field` byte followed by the value when
-present. Receivers may skip unknown trailing bytes only when both
-peers have negotiated `WireExtension::ForwardCompat` and the
-surrounding framing (message ID, schema header, `body_len`) is
-recognised. Mandatory unknown fields — including enums — still
-trigger `WireUnknownField` even inside otherwise-skippable regions.
-
-### 6) Frame size errors
-
-| Trigger | Error |
-|---|---|
-| Frame shorter than mandatory minimum | `WireBodyTooShort` |
-| Frame exceeding surface cap | `WireBodyTooLarge` |
-| Payloads > 64 KiB | Streaming parsers enforce rolling-window buffers |
-
-### 7) Chunked lists
-
-`ChunkedListFrame` (see [concepts.md](concepts.md#10-chunkedlist-frame)).
-CRC enforcement is strict when `has_crc = 1`. `has_crc = 0` is
-permitted but integrity then depends on the transport. Deduplication
-is by `chunk_offset`. JSON mirrors sort entries lexicographically
-and include continuation tokens when truncating.
-
----
+The `len` field is a `u16`, so a single envelope carries at most
+`MAX_PAYLOAD = 0xFFFF` bytes (64 KiB − 1). Larger transfers (snapshot
+bodies, catch-up entries) are chunked at the message layer. Individual
+messages carry much smaller caps of their own — a proposal body is
+bounded by the WAL entry cap below.
 
 ## Message catalog
 
-### System log entries
+Ids are grouped by area. Layouts shown field-by-field are the encode /
+decode helpers in `modules/common/wire.rs`; messages listed without a
+layout carry payloads private to their producer and consumer. This
+catalog covers the major families rather than every id.
 
-| Code | Entry |
-|---|---|
-| `0x01` | `MembershipChange` |
-| `0x02` | `MembershipRollback` |
-| `0x03` | `DurabilityTransition` |
-| `0x04` | `FenceCommit` |
-| `0x05` | `DefineActivate` |
+### Raft RPCs (0x01–0x0E)
 
-### Messages
+| Id | Message | Payload |
+|---|---|---|
+| 0x01 | `MSG_APPEND_ENTRIES` | 49-byte header + entry body (below) |
+| 0x02 | `MSG_APPEND_ENTRIES_RESP` | 26 bytes (below) |
+| 0x03 / 0x04 | `MSG_REQUEST_VOTE` / `_RESP` | request 25 B, response 10 B (below) |
+| 0x05 / 0x06 | `MSG_PRE_VOTE` / `_RESP` | same shapes as RequestVote |
+| 0x07 / 0x08 | `MSG_HEARTBEAT` / `_RESP` | leader liveness |
+| 0x09 | `MSG_LEADER_HINT` | `[leader_id:u8 (0xFF = unknown)][term:u64 LE]` |
+| 0x0A | `MSG_TIMEOUT_NOW` | `[caller_term:u64 LE]` — leader-transfer promotion |
+| 0x0B / 0x0C | `MSG_READ_INDEX_PROBE` / `_RESP` | probe `[probe_id:u64][term:u64]`; response adds `[replica:u8]` |
+| 0x0D / 0x0E | `MSG_READ_PROBE_REQ` / `_REPLY` | internal apply ↔ raft read-confirmation seam |
 
-`DurabilityAck` — defined in
-[concepts.md](concepts.md#4-durabilityack-attestation).
+`MSG_APPEND_ENTRIES` fixed header (`AE_HDR_LEN = 49`), one entry per
+frame; an empty-entry log-matching probe sets
+`entry_term = entry_index = 0`:
 
-`PreVoteResponse`:
+| Offset | Field | Type |
+|---|---|---|
+| 0 | `term` | `u64` LE |
+| 8 | `leader_id` | `u8` |
+| 9 | `prev_log_index` | `u64` LE |
+| 17 | `prev_log_term` | `u64` LE |
+| 25 | `leader_commit` | `u64` LE |
+| 33 | `entry_term` | `u64` LE |
+| 41 | `entry_index` | `u64` LE |
+| 49 | entry body | variable |
 
-```
-PreVoteResponse {
-    term:         u64,
-    vote_granted: u8,
-    [has_high_rtt: u8,
-     high_rtt:     u8]              // tail extension; v0.1+ senders
-}
-```
+`MSG_APPEND_ENTRIES_RESP` (`AE_RESP_LEN = 26`):
+`[term:u64][last_log_index:u64][replica_byte:u8][durable_index:u64][busy:u8]`,
+where `replica_byte = self_id | (success << 7)`. `durable_index` is
+the follower's locally durable WAL index, which the leader's
+replicator forwards as a synthesised `MSG_FSYNC_ACK` so quorum
+durability covers every voter. `busy = 1` marks a failure caused by
+follower WAL backpressure, not log divergence — the leader retries
+without rolling `next_index` back. Decoders accept the legacy 17- and
+25-byte shapes with the missing fields defaulting to zero.
 
-v0.1+ senders append `has_high_rtt` and the optional `high_rtt` flag
-as a tail extension. Legacy peers send only `term` and
-`vote_granted`. Receivers treat the absence of the extension as
-`has_high_rtt = 0`. Additional tail bytes are accepted only when
-`WireExtension::ForwardCompat` has been negotiated; otherwise they
-trigger `WireUnknownField`.
+Vote request (25 bytes): `[term:u64][candidate_id:u8]
+[last_log_index:u64][last_log_term:u64]`. Vote response (10 bytes):
+`[term:u64][granted:u8][voter_id:u8]`. Pre-vote uses the same layouts
+under its own ids; there is no `high_rtt` field.
 
-A worked frame is below in
-[Worked Examples](#prevoteresponse-frames).
+### Client path (0x10–0x1B)
 
-### Envelopes
+| Id | Message | Notes |
+|---|---|---|
+| 0x10 | `MSG_CLIENT_PROPOSAL` | body is opaque; tagged form prefixes `[correlation_id:u64 LE]` (must be non-zero) on the `proposals_tagged` port |
+| 0x11 | `MSG_CLIENT_RESPONSE` | commit ack; internal v2 `[partition_id:u16][term:u64][index:u64]` |
+| 0x12 / 0x13 | `MSG_ADMIN_COMMAND` / `_RESPONSE` | response's first byte is an `ADMIN_STATUS_*` code |
+| 0x14 | `MSG_PROPOSAL_ASSIGNED` | `[correlation_id:u64][partition_id:u16][wal_index:u64]` (18 B) — binds a tagged proposal to its log index |
+| 0x15 | `MSG_CLIENT_REJECT` | structured rejection, 11 B — see [errors.md](errors.md) |
+| 0x16 | `MSG_CLIENT_READ_REQUEST` | linearizable read: `[read_id:u64 LE][body]` after the gateway's conn_id prefix |
+| 0x17 | `MSG_CLIENT_REJECT_INTERNAL` | throttle → codec rejection, 18 B — see [errors.md](errors.md) |
+| 0x18 | `MSG_CLIENT_READ_RESPONSE` | `[correlation_id:u64]` — the linearization point was reached; the state-machine query is the application's job |
+| 0x19 | `MSG_ADMIN_APPLIED` | `[command_id:u32][status:u8]` — apply confirmation to the admin component |
+| 0x1A | `MSG_ADMIN_COMMITTED` | internal consensus seam: committed admin entry minus its magic |
+| 0x1B | `MSG_CONFIG_COMMITTED` | committed config-change entry, body verbatim (magic retained) |
 
-Every envelope carries a shared header:
+### Persistence and durability (0x20–0x2F)
 
-```
-{ schema_version, generated_at, partition_id, routing_epoch, durability_mode_epoch }
-```
+| Id | Message | Notes |
+|---|---|---|
+| 0x20 | `MSG_WAL_ENTRY` | entry to append |
+| 0x21 | `MSG_FSYNC_ACK` | `[term:u64][index:u64][replica:u8]` (17 B) — emitted by the WAL on `wal.flushed`, and synthesised by the replicator from follower AE responses |
+| 0x22 | `MSG_DURABILITY_PROOF` | `[partition_id:u16][term:u64][index:u64][replica:u8]` (19 B) — cross-partition fan-in to the ack tracker |
+| 0x23 | `MSG_COMMITTED_BATCH` | commit-horizon advance |
+| 0x24 | `MSG_COMMITTED_ENTRY` | `[term:u64][index:u64][body...]` — per-entry committed stream in strict commit order; body is opaque |
+| 0x29 / 0x2A | `MSG_WAL_ENTRY_REQUEST` / `_REPLY` | random-access read-back; request `[request_id:u32][wal_index:u64]`, reply header `[request_id:u32][term:u64][index:u64][prev_term:u64]` (28 B) + body; an empty body means not found |
+| 0x2B | `MSG_APPLY_PIPELINE_RESET` | `[term:u64][index:u64]` after a snapshot install fast-forwards commit |
+| 0x2C | `MSG_WAL_COMPACT_BEFORE` | `[before_index:u64]` — drop segments below the floor |
+| 0x2D | `MSG_WAL_REPLAY_COMPLETE` | `[term:u64][high_water_index:u64]` — boot replay finished; raft resumes its index here |
+| 0x2E | `MSG_WAL_TRUNCATE_AFTER` | `[keep_through_index:u64]` — Raft §5.3 conflict repair; never crosses `commit_index` |
+| 0x2F | `MSG_WAL_REJECT` | `[expected_index:u64]` — continuity rejection, see [errors.md](errors.md) |
 
-Envelope catalog:
+### Control plane (0x30–0x33)
 
-- `RoutingEpochMismatch`
-- `ModeConflict`
-- `ThrottleEnvelope`
-- `ControlPlaneUnavailable`
-- `snapshot_full_invalidated`
-- `snapshot_delta_invalidated`
-- `Why*` payloads — `WhyNotLeader`, `WhyCreditZero`,
-  `WhySnapshotBlocked`, `WhyDiskBlocked`, `WhyQuarantined`,
-  `WhyCreditHint`
-- `OverrideLedgerEntry`
+`MSG_CP_PROOF` (0x30), `MSG_CACHE_STATE` (0x31, one `CP_*` state
+byte), `MSG_FALLBACK_SIGNAL` (0x32), `MSG_READ_PERMIT` (0x33).
 
-Lists carry `truncated_ids_count` and `continuation_token` when
-truncated.
+### Flow control (0x40–0x43)
 
-### Control-plane readiness
+`MSG_THROTTLE_CREDITS` (0x40, `[entry_credits:i32][byte_credits:i32]`),
+`MSG_THROTTLE_ENVELOPE` (0x41), `MSG_LAG_SIGNAL` (0x42), and
+`MSG_THROTTLE_REFILL` (0x43,
+`[entry_grant:i32][byte_grant:i32][entry_capacity:i32][byte_capacity:i32]`).
 
-`/readyz` returns:
+### Snapshots (0x50–0x59) and peer identity (0x5A)
 
-```
-{
-  definition_bundle_id,
-  activation_barrier_id,
-  shadow_apply_state,
-  shadow_apply_checkpoint_index,
-  warmup_ready_ratio,
-  partition_ready_ratio,
-  feature.<name>_gate_state,
-  feature.<name>_predicate_digest,
-  readiness_digest
-}
-```
+| Id | Message | Notes |
+|---|---|---|
+| 0x50–0x52 | `MSG_SNAPSHOT_CHUNK` / `_MANIFEST` / `_TRIGGER` | snapshot plumbing |
+| 0x53 | `MSG_INSTALL_SNAPSHOT` | 33-byte header `[term:u64][last_included_index:u64][last_included_term:u64][offset:u64][done:u8]` + data |
+| 0x54 | `MSG_INSTALL_SNAPSHOT_RESP` | `[term:u64][success:u8]` |
+| 0x55 | `MSG_SNAPSHOT_INSTALLED` | `[term:u64][last_included_index:u64][last_included_term:u64]` (24 B) |
+| 0x56 | `MSG_SNAPSHOT_INSTALL_REQUEST` | `[target_replica_id:u8]` (0xFF = broadcast) — follower fell below the WAL retention floor |
+| 0x57 | `MSG_APP_SNAPSHOT_CHUNK` | 28-byte header `[term:u64][last_included_index:u64][offset:u64][done:u8][reserved:u8;3]` + opaque body |
+| 0x58 / 0x59 | `MSG_APP_SNAPSHOT_REQUEST` / `_RESET` | `[term:u64][last_included_index:u64]` |
+| 0x5A | `MSG_PEER_IDENTITY` | `[conn_id:u8][replica_id:u8][verified:u8][svid_len:u8][svid...]` — TLS identity binding to `peer_router` |
 
-### Wide-integer registry
+### Key management, telemetry, and HTTP (0x60–0x76)
 
-Every node exposes `GET /.well-known/wide-int-registry`. The response
-is canonical JSON listing every field encoded as a decimal string —
-all `*_ms` values, timestamps, counters, CRC hex strings. JSON
-outputs accept numeric enums but emit enum strings.
+`MSG_DEK_EPOCH` (0x60) and `MSG_CERT_REFRESH` (0x61) cover key
+management. The telemetry family:
 
----
+- `MSG_METRICS` (0x70), `MSG_READYZ` (0x71), `MSG_WHY` (0x72).
+- `MSG_METRIC_SAMPLE` (0x73), 14 bytes:
+  `[module_id:u8][partition_id:u16][metric_id:u16][kind:u8][value:i64]`
+  with `kind` 0 = counter, 1 = gauge, 2 = histogram bucket.
+- `MSG_HTTP_REQUEST` (0x74):
+  `[conn_id:u8][method:u8][path_len:u8][path][body...]` — the method
+  byte is the first character of the HTTP verb.
+- `MSG_HTTP_RESPONSE` (0x75):
+  `[conn_id:u8][status:u16 LE][body_len:u16 LE][body]`; the HTTP
+  server module frames the wire-level response itself.
+- `MSG_VOTER_SET_UPDATE` (0x76):
+  `[current_set:u8][joint_set:u8][joint_active:u8]` bitmasks.
 
-## Handshake and negotiation
+The `GET /metrics` export payload is a self-describing blob:
+`[magic:u8 = 0xC7][version:u8 = 1][record_count:u16 LE]` followed by
+`record_count` fixed 14-byte records identical to the
+`MSG_METRIC_SAMPLE` body, so a scraper iterates records with no
+per-module parser.
 
-Peers exchange a handshake envelope during the Raft setup:
+### Routing and session registry
 
-```
-wire.catalog_version = { major: u8, minor: u8 }
-wire.max_body_len    = <negotiated>
-extensions           = <bitmask>
-```
+`MSG_PLACEMENT_UPDATE` (0x80); `MSG_SR_REQUEST` (0x90) and
+`MSG_SR_REPLY` (0x91), the replicated session-registry boundary of
+`modules/app/session_directory` — a reply is sent only after the
+command is quorum-committed and applied; `MSG_PLACEMENT_EPOCH_EVENT`
+(0xD5, `[kpg_id:u16][new_epoch:u32][reason:u8]`);
+`MSG_COMPACTION_FLOOR` (0xE1, `[kpg_id:u16][floor_revision:u64]`);
+`MSG_CLIENT_FRAME` (0xEA, `[conn_id:u8][raw client bytes]`, the
+multiplexed cleartext client lane); `MSG_CONN_CLOSED` (0xEB,
+`[conn_id:u8]`).
 
-### `WireExtension::ForwardCompat` (0x20)
+## Log-entry body magics
 
-When a node advertises this extension it includes
-`forward_parse_max_minor: u8` alongside the bitmask, typically set to
-`minor + 1`. Both sides then enforce:
+Entries replicated through the Raft log are opaque application bytes
+by default. Clustor's own control entries are distinguished by an
+8-byte magic prefix on the entry body, not by a 1-byte type code: body
+heads routinely carry dense counters (a correlation id's low byte
+cycles through all 256 values), so any short tag would be forged
+within a few hundred entries, and a forged config change could remove
+a node from its own voter set. Eight bytes put accidental collision at
+about 2⁻⁶⁴ and cost application entries nothing.
 
-```
-remote_minor ≤ local_forward_parse_max_minor
-local_minor  ≤ remote_forward_parse_max_minor
-```
+| Magic | Bytes | Body after the magic |
+|---|---|---|
+| `ADMIN_MAGIC` | `AD 4D 4E 21 9E 1F 5C A7` | `[command_id:u32 LE][op_code:u8][op_body...]` — applied at commit time on every replica |
+| `CONFIG_CHANGE_MAGIC` | `CC 46 47 21 9E 1F 5C A7` | `[op_code:u8 (1 = C_old,new, 2 = C_new)][voter_count:u8][voter_ids...]` |
+| `TIMING_MAGIC` | `54 4D 45 21 9E 1F 5C A7` | `[op:u8 (1 = TimeAdvance, 2 = TimeDrain)][time_ms:u64 LE]` — leader-only; the gateway rejects client bodies carrying this prefix |
 
-Violations close the transport before log traffic flows.
+Bodies without a recognised magic pass through unchanged.
 
-### `WireExtension::WideFrame` (0x10)
+## WAL frame contract
 
-Reserves larger frame caps (up to 32 MiB) once both peers advertise
-it. Until then senders keep RPCs ≤ 4 MiB. Even after negotiation,
-Explain / Throttle / Why* envelopes stay capped at 32 KiB.
+The on-disk segment layout is defined once in
+`modules/common/wal_frame.rs` and compiled into both the durability
+module and the `clustor_cli` `wal-frame` / `wal-scan` commands, so a
+`wal-scan` verdict on a segment image is the durable prefix a
+replica's replay would recover.
 
-### `WireExtension::WideCount` (0x11)
+Per entry:
 
-Allows `u32` element counts for fields explicitly marked "wide count
-capable", only when both peers support it. Otherwise counts remain
-`u16` with chunking.
+| Offset | Field | Type |
+|---|---|---|
+| 0 | `entry_len` | `u32` LE |
+| 4 | `crc32c` | `u32` LE |
+| 8 | payload | `entry_len` bytes |
 
-### Unknown extensions
-
-Unknown extensions require explicit negotiation. Peers reject
-opportunistic usage with `WireCatalogMismatch`.
-
----
-
-## Error codes
-
-| Range | Codes |
-|---|---|
-| `1000 – 1089` | Main wire errors: `WireBodyTooShort = 1001`, `WireBodyTooLarge = 1002`, `WireUnknownField = 1003`, `WireChunkMissing = 1004`, `WireChunkOverlap = 1005`, `WireChunkMissingCrc = 1006`, `WireChunkCrcMismatch = 1007`, `WireChunkDuplicateItem = 1008`, `WireChunkReassemblyAborted = 1009`, `WireCatalogMismatch = 1010` |
-| `1090 – 1099` | Vendor-specific extensions. Production deployments relinquish IDs if Clustor later assigns them. |
-| `1100 – 1199` | Reserved for future Clustor wire-level errors. |
-
-Higher-level rejection envelopes (`ControlPlaneUnavailable`,
-`ThrottleEnvelope`) are catalogued in
-[errors.md](errors.md#wire-rejections).
-
----
-
-## Worked examples
-
-### PreVoteResponse frames
-
-Frames serialise as `<u32 body_len little-endian> || body`.
-
-For `PreVoteResponse { term = 42, vote_granted = 1, has_high_rtt = 1,
-high_rtt = 1 }` the body is `2a00000000000000010101` (12 bytes) and
-the full frame begins:
-
-```
-0c0000002a00000000000000010101
-```
-
-Legacy peers send only `term` and `vote_granted`, so their body is
-`2a0000000000000001` (9 bytes) and the full frame begins:
-
-```
-090000002a0000000000000001
-```
-
-Receivers treat missing extension bytes as "no `has_high_rtt` field
-present". Frames that promise 12 body bytes but deliver only 9
-(e.g. `0c0000002a0000000000000001`) raise `WireBodyTooShort`.
-
-### CRC lane packing example
-
-The CRC-lane packing rule in
-[concepts.md §2 Segment Trailer](concepts.md#2-segment-trailer) is
-easier to follow with concrete bytes.
-
-Consider two entries:
-
-1. Entry A header / body bytes (hex):
-   `01000000000010000000000000000000aa`
-2. Entry B header / body bytes (hex):
-   `01000000000008000000000000000000bb`
-
-Concatenate headers and bodies to form the canonical stream:
-
-```
-01000000000010000000000000000000aa
-01000000000008000000000000000000bb
-```
-
-Splitting into 32-bit little-endian words and distributing across
-four lanes can, for illustration, use lane CRCs:
-
-```
-{ lane0 = 0x89ABCDEF,
-  lane1 = 0x01234567,
-  lane2 = 0xFEDCBA98,
-  lane3 = 0x76543210 }
-```
-
-Packed little-endian bytes therefore equal:
-
-```
-ef cd ab 89  67 45 23 01  98 ba dc fe  10 32 54 76
-```
-
-Offsets for the two entries (`0` and `0x0000000000000010`) serialised
-as contiguous little-endian `u64` values:
-
-```
-0000000000000000  1000000000000000
-```
-
-produce the same packed CRC
-`0x1032547698badcfe67452301efcdab89`.
-
-Tooling replays this vector when validating lane implementations.
-The CRC constants above are illustrative placeholders, not computed
-CRC32C outputs for the example bytes.
+The CRC (Castagnoli) covers the payload only. The payload's first 16
+bytes are the term/index prologue (`[term:u64 LE][index:u64 LE]`);
+the rest is the entry body, capped at `MAX_ENTRY_BODY = 2048` bytes —
+one coalesced proposal batch, the value every proposal-carrying buffer
+in the graph sizes against. The full payload cap is therefore
+`MAX_ENTRY_LEN = 2064`. An entry is torn when `entry_len` is zero,
+exceeds `MAX_ENTRY_LEN`, or runs past the readable region: replay
+stops at the first bad frame and everything before it is the durable
+prefix. A torn frame is never skipped.

@@ -17,7 +17,7 @@ The partitioned pair `proposals_partitioned` (in[4]) and
 behind a 5-byte `[partition_id:u16][msg_type:u8][len:u16]` envelope
 for multi-Raft graphs.
 
-Untagged producers work unchanged — `operations` bridges replicable
+Untagged producers work unchanged: `operations` bridges replicable
 admin ops onto `proposals`, for instance. Wiring the tagged port is
 opt-in; clustor's own client path takes it, since the gateway's
 codec component needs the assignment feedback to route responses.
@@ -56,7 +56,7 @@ MSG_PROPOSAL_ASSIGNED on proposal_assigned:
 process may host replicas of several partitions.
 
 One assignment event is emitted per tagged proposal. Multiple proposals
-batched into the same Raft log entry share the same `wal_index` — that is
+batched into the same Raft log entry share the same `wal_index`; that is
 the intended semantics: ack-on-durability (`durable_index >= wal_index`)
 will fire for all of them at once.
 
@@ -83,16 +83,19 @@ Helpers: `wire::encode_proposal_assigned`, `wire::decode_proposal_assigned`.
   WAL entry still exists, so the message is durable, but the proposer
   cannot bind it to a packet id. A proposer-side FIFO heuristic is a
   useful safety net against that case.
-- Leadership change resets pending correlations
-  (`become_follower` / `become_leader`). Producers should retry on a new
-  leader.
+- Role transitions reset pending correlations: both `become_follower`
+  and `become_leader` (`modules/app/consensus/raft.rs`) discard the
+  pending proposal batch and zero its correlation-id slots, so a
+  proposal caught in flight across a leadership change never produces
+  an assignment event. Producers should time out and retry against the
+  new leader.
 
 ## See also
 
-- [architecture/replication.md](architecture/replication.md) — the
+- [architecture/replication.md](../architecture/replication.md) — the
   surrounding propose / commit pipeline this protocol rides on.
-- [architecture/consumer_facade.md](architecture/consumer_facade.md)
+- [architecture/consumer_facade.md](../architecture/consumer_facade.md)
   — typed Rust helpers (`build_tagged_proposal`, `InflightTable`)
   that implement the proposer-side bookkeeping described above.
-- [architecture/wire.md](architecture/wire.md) — `MSG_CLIENT_PROPOSAL`
+- [architecture/wire.md](../architecture/wire.md) — `MSG_CLIENT_PROPOSAL`
   and `MSG_PROPOSAL_ASSIGNED` opcode catalog entries.

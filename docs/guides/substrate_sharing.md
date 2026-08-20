@@ -1,13 +1,12 @@
-# Substrate-module sharing between clustor and downstream products
+# Substrate-module sharing with downstream products
 
 `clustor/modules/app/` is the single source of truth for substrate
-modules. Quantum, Lattice (and any other downstream that builds on
-the Raft substrate) consume them by **manifest search path**, not by
-file duplication.
+modules. Downstream products that build on the Raft substrate
+consume them by **manifest search path**, not by file duplication.
 
-The substrate is a palette of seven modules — `peer_router`,
+The substrate is a palette of seven modules (`peer_router`,
 `consensus`, `durability`, `gateway`, `admission`, `control_plane`,
-`operations` — plus the standalone `session_directory` and
+`operations`) plus the standalone `session_directory` and
 `partition_router`. A downstream graph instantiates the palette and
 attaches its own modules to the ports enumerated in
 [Published attach surface](#published-attach-surface) below. Those
@@ -19,7 +18,8 @@ promise.
 
 Every YAML graph that wants substrate declares a top-level
 `module_search_paths:` key listing additional directories the fluxor
-host tool should search when resolving manifests. Quantum's configs do:
+host tool should search when resolving manifests. A consumer graph
+that sits in a sibling checkout of clustor declares:
 
 ```yaml
 target: linux
@@ -31,7 +31,7 @@ module_search_paths:
 
 The path points at `modules/app/` (not `modules/`) because the host
 tool's resolver looks for `<search-path>/<type_name>/manifest.toml`
-literally — it does not descend tier subdirectories. Clustor's
+literally; it does not descend tier subdirectories. Clustor's
 substrate modules live under `modules/app/` because the substrate
 is the consuming application of fluxor's foundation modules.
 
@@ -57,8 +57,8 @@ palette's API: shapes are stable, names are stable, and a change to
 either is a change to every consuming repo. Ports not listed here
 exist on the manifests to carry palette-internal plumbing (the
 `consensus ⇄ durability` append/flush/refetch legs, the metric
-fan-in, the `peer_router` transport legs) — a deployment wires them
-exactly as the shipped configs in [`../configs/`](../configs/) do,
+fan-in, the `peer_router` transport legs); a deployment wires them
+exactly as the graph embedded in [running.md](running.md) does,
 rather than treating them as extension points.
 
 Every name below is declared in the corresponding
@@ -70,7 +70,7 @@ table and a manifest ever disagree.
 | Direction | Ports |
 |---|---|
 | in | `net_in`, `peer_tx`, `repl_tx`, `client_resp`, `tls_identity` |
-| out | `net_out`, `cleartext`, `peer_rx`, `raft_rpc` |
+| out | `net_out`, `cleartext`, `peer_rx`, `raft_rpc`, `metrics` |
 
 The transport anchor. A downstream graph that terminates its own
 protocol attaches to `cleartext` / `client_resp`; one that adds a
@@ -118,13 +118,13 @@ module.
 
 | Direction | Ports |
 |---|---|
-| in | `requests`, `client_requests`, `proposals`, `credit_supply`, `throttle_status`, `placement`, `admin_responses`, `readyz_data`, `why_data`, `metrics_data` |
+| in | `requests`, `client_requests`, `proposals`, `credit_supply`, `placement`, `admin_responses`, `readyz_data`, `why_data`, `metrics_data` |
 | out | `responses`, `proposals_tagged`, `reads`, `rejected`, `admin_req`, `raft_rpc`, `metrics` |
 
 `requests` / `responses` are the `peer_router` side of the client
 path. `proposals` is the injection point for producers that are not
-on the wire — bench drivers and the `operations` module's
-`/propose` and admin-PROPOSE bridges — and their traffic is
+on the wire (bench drivers and the `operations` module's
+`/propose` and admin-PROPOSE bridges); their traffic is
 admitted through the same throttle as wire-side client traffic.
 An unwired `credit_supply` means unlimited, not zero.
 
@@ -141,7 +141,7 @@ to all three leave on `responses`.
 | Direction | Ports |
 |---|---|
 | in | `proof`, `input`, `lag` |
-| out | `cache_state`, `fresh_state`, `strict_fallback`, `permits`, `credits`, `envelope`, `metrics` |
+| out | `cache_state`, `fresh_state`, `strict_fallback`, `permits`, `credits`, `metrics` |
 
 `proof` and `input` are the same contract on two attach points, as
 are `cache_state` and `fresh_state`. Deployments differ in which
@@ -152,11 +152,13 @@ either name resolves.
 
 | Direction | Ports |
 |---|---|
-| out | `proof`, `tenant_records`, `capabilities`, `routing`, `epoch_events` |
+| out | `proof`, `tenant_records`, `capabilities`, `routing`, `epoch_events`, `metrics` |
 
 Pure sources; the module has no inputs. `tenant_records`,
 `capabilities` and `epoch_events` are optional — a graph without
-tenancy or session fencing leaves them unwired.
+tenancy or session fencing leaves them unwired. `metrics` carries
+only the module's per-component step-accounting samples and may
+likewise stay unwired.
 
 ### `operations`
 
@@ -194,32 +196,23 @@ two — not both over an overlapping `conn_id` range.
 
 ## Why search paths, not hardlinks
 
-A hardlink-based alternative — every substrate module exposed at
-both `clustor/modules/app/<name>/` and `quantum/modules/app/<name>/`
-with shared inodes — was considered and rejected. The failure modes
-ruled it out:
+Exposing every substrate module in each downstream tree as a
+hardlink to the clustor copy does not work. Tooling that does
+atomic-rename-on-write, which includes most editors, silently breaks
+a hardlink on the first save, leaving the two paths pointing at
+different inodes. Adding a substrate module would require remembering
+to `ln -f` it into each downstream tree, with a forgotten link
+surfacing as a missing port at `fluxor run` time. And ownership
+becomes ambiguous once a downstream tree contains files clustor
+owns: "do not modify the downstream repo" stops being checkable, and
+one cross-repo change shows as modified in two `git status` outputs.
 
-- Tooling that does atomic-rename-on-write (most editors, including
-  the agent's `Edit` tool) silently breaks the link, leaving the two
-  paths pointing at different inodes after the first save.
-- Adding a substrate module would require remembering to `ln -f`
-  it into the downstream tree — easy to forget, with the failure
-  surfacing as a missing port at `fluxor run` time.
-- "Do not modify quantum" guidance becomes ambiguous because
-  quantum's tree contains files clustor owns.
-- Cross-repo changes show as modified in two `git status` outputs
-  with no automatic linkage.
-
-The search-path approach provides everything the hardlink shape
-would have, with none of those fragilities:
-
-- Single source of truth: substrate edits land in
-  `clustor/modules/app/` and quantum picks them up at the next
-  `fluxor run`.
-- Quantum's `git status` only shows quantum-specific files.
-- The substrate / app boundary is visible at the YAML layer
-  (`module_search_paths:`), not implicit in disk layout.
-- Adding a substrate module needs zero downstream action.
+With search paths, substrate edits land only in
+`clustor/modules/app/` and each downstream picks them up at the next
+`fluxor run`; a downstream's `git status` shows only its own files;
+the substrate/app boundary is visible at the YAML layer in
+`module_search_paths:` rather than implicit in disk layout; and
+adding a substrate module needs no downstream action.
 
 ## Build chain
 
@@ -227,25 +220,26 @@ Each repo packs only what it owns:
 
 | Repo | `fluxor modules build --target bcm2712` packs |
 |------|-------------------------------------|
-| `clustor` | The seven substrate modules (with the `durability` and `operations` variant fmods), the standalone `session_directory` and `partition_router`, the two bench drivers, `example_consumer`, and the `clustor_cli` applet — full map in [architecture/modules.md](architecture/modules.md) and the canonical edge set in [`../configs/single.yaml`](../configs/single.yaml). |
-| `quantum` | The quantum-specific app modules (codecs, session processing, topic/dedup engines, retained store, audit, DR, metrics, consumer groups, transactions, tenancy). |
+| `clustor` | The seven substrate modules (with the `durability` and `operations` variant fmods), the standalone `session_directory` and `partition_router`, the two bench drivers, `example_consumer`, and the `clustor_cli` applet — full map in [architecture/modules.md](../architecture/modules.md) and the canonical edge set embedded in [running.md](running.md). |
+| downstream | That project's own app modules. |
 
-Both clustor and quantum publish `.fmod` module artefacts into the
-local OCI store (`make publish` per project; see
-[`../../standards/dependencies.md`](../../standards/dependencies.md)
-for the contract). A consumer project that depends on both via
-`fluxor.toml::[dependencies]` runs `fluxor sync` to materialise the
-digest-pinned palette into its own `target/<silicon>/modules/<name>.fmod`
-layout. At runtime fluxor's host tool composes the graph using the
-manifests it discovers via search paths and resolves each module's
-`.fmod` against that synced output directory.
+Every project publishes its `.fmod` module artefacts into the
+local OCI store (`make publish` per project). A consumer project
+that depends on them via
+`fluxor.toml::[dependencies]` runs `fluxor modules build --all`; the
+build pre-flight materialises the digest-pinned palette from
+`fluxor.lock` into the consumer's own
+`target/fluxor/<silicon>/modules/<name>.fmod` layout, so no separate
+sync step is required. At runtime fluxor's host tool composes the
+graph using the manifests it discovers via search paths and resolves
+each module's `.fmod` against that output directory.
 
-To build a fresh quantum graph from scratch:
+To build a fresh downstream graph from scratch:
 
 ```sh
 cd clustor && fluxor modules build --target bcm2712
-cd quantum && fluxor modules build --target bcm2712
-fluxor run quantum/configs/quantum-linux-minimal.yaml
+cd ../<downstream> && fluxor modules build --target bcm2712
+fluxor run <graph>.yaml
 ```
 
 The two module builds are independent. Either order
@@ -254,7 +248,7 @@ works; both have to run at least once on a clean tree.
 ## What lives where
 
 - `clustor/modules/app/<name>/` — substrate source. **Edit here.**
-- `clustor/modules/common/{wire,types,collections,replica_facade,http_admin}.rs`
+- `clustor/modules/common/{wire,types,collections,replica_facade,http_admin,log_fmt,session_registry,step_accounting,timing,wal_frame}.rs`
   — pure no_std helpers shared across substrate modules. Each
   substrate module references them via
   `#[path = "../../common/wire.rs"]` from `modules/app/<name>/mod.rs`.
@@ -266,14 +260,13 @@ works; both have to run at least once on a clean tree.
   façade over the pure files above. Downstream Rust code that wants
   to compile against clustor's helpers depends on `clustor-common`
   rather than reaching into `modules/common/`.
-- `quantum/modules/app/<name>/` — quantum-specific source.
-- `quantum/modules/common/{wire,types}.rs` — quantum-specific wire
-  format helpers (e.g. `MSG_TOPIC_PUBLISH`, MQTT dedup keys).
-  Distinct from clustor's `common/wire.rs`.
-- `<consuming-project>/target/<silicon>/modules/<name>.fmod` —
-  packed artifacts read at runtime. `fluxor sync` lands the
-  store-resolved fmods here; `fluxor modules build` lands the ones the
-  consumer owns.
+- `<downstream>/modules/app/<name>/` — that product's own source.
+- `<downstream>/modules/common/` — that product's own wire and type
+  helpers, distinct from clustor's `common/wire.rs`.
+- `<consuming-project>/target/fluxor/<silicon>/modules/<name>.fmod` —
+  packed artefacts read at runtime. The build pre-flight lands the
+  store-resolved fmods here from `fluxor.lock`; `fluxor modules
+  build` lands the ones the consumer owns.
 
 ## PIC module pitfalls
 

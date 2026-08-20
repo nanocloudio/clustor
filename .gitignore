@@ -21,6 +21,7 @@ Cargo.lock
 # .git-shadow/, never pushed to this repo's remote.
 /tests/
 /benches/
+/configs/
 /.git-shadow/
 
 # Runtime WAL state (mutated by local runs, not source)

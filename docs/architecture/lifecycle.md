@@ -1,530 +1,280 @@
 # Replica Lifecycle
 
-The state machine each replica steps through over its lifetime —
-healthy steady state, degraded modes, scrub, quarantine, snapshot
-install, membership changes, and (rarely) repair.
-
-The replication-loop algorithms themselves are in
-[replication.md](replication.md). This doc covers the states the loop
-runs inside.
+The phases a replica moves through over its lifetime: boot restore,
+WAL replay, durability modes, strict fallback, snapshots, admin
+operations, and membership. The replication-loop algorithms are in
+[replication.md](replication.md).
 
 ## Table of Contents
 
-1. [Strict fallback and the read gate](#strict-fallback-and-the-read-gate)
-2. [Leader and follower lifecycle](#leader-and-follower-lifecycle)
-3. [Durability modes and I/O writer states](#durability-modes-and-io-writer-states)
-4. [Startup scrub and quarantine](#startup-scrub-and-quarantine)
-5. [Snapshot lifecycle](#snapshot-lifecycle)
-6. [Compaction and storage hygiene](#compaction-and-storage-hygiene)
-7. [Definition bundles and activation barriers](#definition-bundles-and-activation-barriers)
-8. [ControlPlaneRaft proof publication](#controlplaneraft-proof-publication)
-9. [Membership changes and joint consensus](#membership-changes-and-joint-consensus)
+1. [Boot and WAL replay](#boot-and-wal-replay)
+2. [Durability modes](#durability-modes)
+3. [Group-fsync batching](#group-fsync-batching)
+4. [Strict fallback and the read gate](#strict-fallback-and-the-read-gate)
+5. [Leader and follower lifecycle](#leader-and-follower-lifecycle)
+6. [Admin operations](#admin-operations)
+7. [Snapshot lifecycle](#snapshot-lifecycle)
+8. [Membership changes and joint consensus](#membership-changes-and-joint-consensus)
+
+---
+
+<a id="startup-scrub-and-quarantine"></a>
+## Boot and WAL replay
+
+Boot runs in two stages: snapshot restore, then WAL replay.
+
+**Snapshot restore** (`modules/app/durability/snapshot.rs`) reads the
+pointer sidecar naming the durable local snapshot, loads and
+CRC-validates the file it names, replays the application body to the
+state machine (a reset followed by chunks), and signals
+`MSG_SNAPSHOT_INSTALLED` to consensus so raft knows the log has a
+floor. A file whose end magic or CRC does not check out is rejected
+and the node falls back to its log. Snapshot files are written in one
+sequential pass with a single trailing fsync, so a torn write never
+leaves a readable trailer.
+
+**WAL replay** (`modules/app/durability/wal.rs`) walks segment files
+forward from the persisted segment-floor sidecar (or from sequence 1
+when none exists), tolerating a bounded number of missing sequence
+numbers so compaction gaps and fresh deployments both terminate the
+scan cleanly. Within a segment it verifies each frame's CRC32C against
+the shared frame contract (`modules/common/wal_frame.rs`) and stops at
+the first torn or corrupt frame; everything before it is the durable
+prefix. The write path later rewinds onto that tail and stages a
+zero-length terminator, so stale bytes beyond it are never replayed as
+valid. Startup verification is exactly this per-frame CRC walk — there
+is no separate scrub pass, no index files to rebuild, and no
+quarantine state. A `dek_epoch: u32` is stamped into snapshot headers
+and rotated weekly by the keys component
+(`modules/app/durability/keys.rs`), but nothing encrypts yet.
+
+When replay finishes, the WAL freezes the recovered durable
+high-water, seeds the durability ledger with it (replay produces no
+fsync acks, and without the seed a recovered node's quorum tracking
+would sit at zero), and emits `MSG_WAL_REPLAY_COMPLETE` carrying the
+recovered `(term, index)`. This is the **boot handoff**: raft holds
+proposal intake closed and answers AppendEntries with `busy` until the
+signal lands, because appending at a stale persisted index hint would
+collide with the replayed index space. The signal is re-emitted on a
+bounded cadence in case the first frame is lost while the consumer
+port is still coming up. The graphs wire it on a dedicated edge
+(`durability.replay_complete → consensus.wal_replay_complete`) — the
+comment in the deployment graph records why it must never be
+multiplexed onto `wal.flushed`, which also fans out durability
+acknowledgements.
+
+Raft persists its own metadata (current term, vote, durable-index
+hint) in `RAFT<pppp>.MET` on bare-metal FAT32 or `raft/meta`
+otherwise, written before votes and term changes take effect.
+
+---
+
+<a id="durability-modes-and-io-writer-states"></a>
+## Durability modes
+
+Three modes, defined in `modules/common/types.rs` and selected by the
+consensus module's `durability_mode` parameter (enum `strict=0`,
+`group_fsync=1`, `relaxed=2`; default group_fsync):
+
+- **strict** and **group_fsync** — the commit index is clamped to the
+  quorum-durable index: an entry commits only once a quorum of
+  replicas has fsynced it. The two differ on the WAL side, not the
+  commit side (see the batching section below).
+- **relaxed** — the clamp is dropped and the quorum match index
+  commits directly. Acknowledged writes are replicated but not
+  necessarily on stable storage anywhere; a simultaneous crash of a
+  quorum can lose them. Volatile and benchmark graphs use this.
+
+The WAL's write behaviour is a separate parameter, `fsync_mode`
+(`modules/app/durability/wal.rs`): `0` fsyncs every entry before it is
+acknowledged durable; `1` enables group-fsync batching.
+
+<a id="3-monotone-epoch-enforcement"></a>
+Mode changes ride `ADMIN_OP_DURABILITY_MODE`, which is replicated
+through raft as an admin-magic proposal and applied at commit on every
+replica; the raft component records the applied mode, while the commit
+tracker's operating mode and the WAL's `fsync_mode` come from module
+parameters fixed at composition time. There is no durability-mode
+epoch, no mode-conflict RPC, and no io_uring writer-state machinery.
+Independently of the configured mode, strict fallback (below) forces
+the commit tracker's *effective* mode to strict.
+
+---
+
+## Group-fsync batching
+
+With `fsync_mode = 1`, appended entries accumulate in a pending batch
+and are flushed when any of three conditions is met: the batch reaches
+`group_max_pending` entries (default 64), the batch age reaches
+`group_window_ms` (default 2 ms; the flush timer runs even when no new
+entries arrive, so a quiescent writer drains its tail), or a
+truncation terminator has been staged. Segment rotation always flushes
+first so acknowledgements stay ordered relative to the close.
+
+On filesystem providers with the async durable-write tier, flushes are
+fence-pipelined: up to `fence_depth` fsync fences stay outstanding at
+once, each carrying the `(term, index)` high-water it covers, and
+fences are reaped strictly in order so durability acknowledgements are
+emitted in raft-log order. A failed fenced write latches a fail-stop
+flag: the acknowledgement is withheld and no further writes proceed,
+so the commit index can never advance past a non-durable entry. Each
+completed fsync delivers the covered high-water to the in-module
+durability ledger and emits `MSG_FSYNC_ACK` on the `flushed` port.
 
 ---
 
 ## Strict fallback and the read gate
 
-`strict_fallback` is a latch on every leader. It engages whenever
-either:
+`strict_fallback` is a flag, not a state machine. The admission
+module's proof cache classifies control-plane proof age into Fresh,
+Cached, Stale, and Expired; the flag is set exactly when the cache
+state is Stale or Expired (`modules/app/consensus/commit.rs`), and the
+proof cache broadcasts the same transition as `MSG_FALLBACK_SIGNAL`.
 
-- (a) the ControlPlaneRaft cache is `Stale` or `Expired`, or
-- (b) the leader lacks a ControlPlaneRaft-published
-  `DurabilityProofTupleV1` whose equality subset matches the leader's
-  last quorum-fsynced tuple (and therefore proves the current-term
-  durable watermark).
+Its effects while set:
 
-While the latch is set, the leader's read and lease capabilities are
-gated off and local I/O behaves as Strict mode. No new durability or
-`commit_visibility` transition is appended; the leader behaves *as
-though* `commit_visibility = DurableOnly` until the latch clears,
-regardless of the configured mode.
+- The commit tracker's effective durability mode becomes strict, so
+  commit is gated on quorum fsync regardless of the configured mode.
+- The read-gate component stops emitting read permits, so linearizable
+  reads time out and are rejected with `CLIENT_REJECT_FALLBACK`
+  (see [replication.md](replication.md#read-gate-predicate)).
+- Raft drops incoming client proposals, counted separately from
+  freeze-driven drops so operators can tell the two gates apart.
 
-### 1) What latched leaders do
-
-While `strict_fallback == true`, leaders:
-
-- Reject Group-Fsync enablement
-  (`DurabilityTransition{to=Group}`), leases, follower-read
-  capabilities, incremental snapshot enablement, observer admission,
-  and admin overrides that try to bypass the gate.
-- Clamp read exposure to `DurableOnly`. `CommitAllowsPreDurable` is
-  neither enabled nor continued while the latch holds.
-  `lease_gap_max` is disabled.
-- Continue accepting writes strictly (each append increments
-  `strict_fallback_pending_entries`) but block ReadIndex and lease
-  reads with
-  `ControlPlaneUnavailable{reason = NeededForReadIndex}`.
-
-Followers continue honouring whatever `DurabilityTransition` entries
-already exist in the log. The clamp to Strict is purely a
-leader-local I/O behaviour until a new transition entry commits.
-
-### 2) Cache state and the latch are coupled
-
-Once a cache transitions to `Stale` or `Expired`, clause (a) forces
-`strict_fallback = true` until ControlPlaneRaft publishes a proof
-covering the current `raft_commit_index` and the cache returns to
-`Fresh` or `Cached`. Clause (b) can keep the latch asserted
-independently even when caches are still `Fresh` or `Cached`.
-
-### 3) State tracking telemetry
-
-```
-strict_fallback_state ∈ { Healthy, LocalOnly, ProofPublished }
-strict_fallback_last_local_proof
-strict_fallback_blocking_reason
-strict_fallback_gate_blocked{operation}
-strict_fallback_decision_epoch
-```
-
-`strict_fallback_state = LocalOnly` lasting longer than
-`strict_fallback_local_only_demote_ms` forces self-demotion unless a
-Break-Glass override renews the timer. Profile defaults:
-
-| Profile | `local_only_demote_ms` |
-|---|---|
-| ConsistencyProfile / Throughput | 14,400,000 (4 h) |
-| WAN | 21,600,000 (6 h) |
-
-### 4) Demotion protocol
-
-When the demote threshold is exceeded, the leader steps down and
-waits at least `min_leader_term_ms` before campaigning again. After
-demotion the node is barred from leadership until **all** of:
-
-1. ControlPlaneRaft is back.
-2. A fresh `DurabilityProofTupleV1` is published and observed in
-   cache.
-3. A jittered backoff of
-   `strict_fallback_recampaign_backoff_ms = 60,000` elapses.
-
-The bar prevents thrash where the same leader keeps regaining term
-without clearing strict fallback.
-
-### 5) Behaviour while barred
-
-A barred node still:
-
-- Responds to inbound `PreVote` / `RequestVote` RPCs truthfully,
-  granting votes when the candidate's log is at least as up to date.
-  Responses carry `vote_annotation = StrictFallbackBarred` so
-  operators can see why the node isn't seeking leadership.
-- Processes AppendEntries from the active leader, updating
-  `match_index` and durability state normally so it rejoins quickly
-  once the bar lifts.
-- Exposes `strict_fallback_barred_until_ms` telemetry so operators
-  can correlate the enforced backoff.
-
-What it does **not** do: start local `Campaign` or `PreVote` attempts.
-
-### 6) Liveness escape hatch
-
-If no leader is observed for
-`strict_fallback_no_leader_grace_ms = 120,000`, barred nodes may
-temporarily lift the campaign suppression to restore write
-availability — while staying in strict fallback. The escape hatch
-never re-enables ReadIndex or leases, so it does not bypass the proof
-requirement. The bar reactivates as soon as a leader is elected or
-ControlPlaneRaft caches return to `Fresh`.
+The flag clears when a fresh control-plane proof returns the cache to
+Fresh or Cached. There are no named fallback sub-states, no demotion
+timers, no recampaign backoff, and no vote annotations — elections
+proceed normally while the flag is set.
 
 ---
 
 ## Leader and follower lifecycle
 
-- Leaders persist `current_term` before AppendEntries, enforce
-  `wal_committed_index ≤ raft_commit_index`, and export telemetry
-  referencing the controlling clauses (durability equality, etc).
-- Election timeouts: `[150, 300]` ms (ConsistencyProfile /
-  Throughput) or `[300, 600]` ms (WAN). Heartbeats every 50 ms.
-  PreVote always on.
-- `PreVoteResponse.high_rtt = true` widens the next election window
-  when a follower observes high RTT for three consecutive heartbeats.
-- `min_leader_term_ms = 750` provides stickiness. Step-down happens
-  on structural lag, device latency violations, or
-  ControlPlaneRaft `TransferLeader`.
-- Followers never serve ReadIndex. They serve snapshot-only reads
-  only after ControlPlaneRaft grants
-  `follower_read_snapshot_capability`. Capabilities are revoked
-  within 100 ms when guardrails fail; in-flight RPCs close with
-  `FollowerCapabilityRevoked`.
-- Observers rely on dedicated bandwidth pools and are revoked
-  whenever `strict_fallback == true` or cache freshness fails.
+Roles follow standard Raft: follower, candidate (pre-vote first, then
+a real election), leader. Election timing, vote rules, the
+current-term no-op fence, and conflict repair are described in
+[replication.md](replication.md#elections-and-pre-vote).
 
-All numeric guardrails (`observer.bandwidth_cap`,
-`membership.catchup_slack_bytes`, etc.) come from the profile bundles
-described in [concepts.md](concepts.md#profiles).
+Two flags modify a node's participation:
+
+- **Learner mode** — set when a committed configuration change removes
+  the node from the voter set. A learner never starts elections and
+  never grants votes, but keeps replicating so it can rejoin promptly
+  if re-added.
+- **Frozen** — set by `ADMIN_OP_FREEZE`. Client proposals are dropped;
+  admin-magic envelopes are exempt so the `THAW` that lifts the freeze
+  can itself commit.
+
+Followers never serve linearizable reads; the ReadIndex path answers
+only on the leader, and there is no follower-read capability grant.
 
 ---
 
-## Durability modes and I/O writer states
+## Admin operations
 
-`io_writer_mode ∈ { FixedUring, RegisteredUring, Blocking }`.
+Admin commands enter through the operations module
+(`modules/app/operations/admin.rs`): HTTP `POST /admin/<op>` is
+admitted by the rbac component and handed to the admin component as
+`[conn_id][op_code][op_body]`. A command byte-identical to its
+immediate predecessor within a 2 s window is collapsed as
+`ADMIN_STATUS_DUPLICATE`; that in-memory retransmit dedup is the only
+idempotency window, and the supported op set is double-apply-safe by
+construction.
 
-Group-Fsync is disabled whenever any voter reports `Blocking` and
-remains disabled until all voters report non-`Blocking` modes for the
-recovery window. Downgrades clamp group batch sizes and timers and
-emit incidents after `io_writer_mode.downgrade_incident_ms`.
+Supported ops and their routes:
 
-Leaders authenticate `io_writer_mode` via the same Raft heartbeat
-metadata used for flow-control telemetry. The mTLS channel plus
-replica identity and term fields provide integrity; spoofing would
-require a compromised replica (the same trust model as
-`DurabilityAck`). Because the fault model is crash-only, a single
-voter stuck in `Blocking` is enough to fence Group-Fsync. Operators
-must demote or repair such a replica.
+| Op | Route | Effect |
+|---|---|---|
+| `FREEZE` / `THAW` | Replicated (admin-magic proposal, applied at commit) | Sets / clears the proposal-drop flag on every replica |
+| `DURABILITY_MODE` | Replicated | Records the requested mode (see [Durability modes](#durability-modes)) |
+| `TRANSFER_LEADER` | Local-only envelope to consensus | Leader sends `MSG_TIMEOUT_NOW` to the target and steps down; rejected on followers |
+| `SNAPSHOT` | Local-only | Acknowledged, currently a no-op: snapshots are driven by segment rotation and the external trigger port, not by this op |
+| `ADD_VOTER` / `REMOVE_VOTER` | — | `ADMIN_STATUS_UNSUPPORTED` (see membership below) |
 
-### 1) Group-Fsync re-enablement predicate
-
-```rust
-fn can_enable_group_fsync(state) -> bool {
-    !state.strict_fallback
-        && state.controlplane.cache_state == CacheState::Fresh
-        && now() >= state.downgrade_backoff_deadline
-        && state.voters.iter().all(|v| v.io_mode != Blocking)
-        && state.device_latency_violations_in_window < 3
-        && !state.incident_flags.contains("GroupFsyncQuarantine")
-}
-```
-
-### 2) Per-partition limits
-
-- `group_fsync.max_batch_bytes ≤ 64 KiB`
-- `max_batch_ms ≤ 5 ms`
-- Inflight bytes ≤ 4 MiB per partition
-- ≤ 64 MiB per node
-- `overrun_limit = 2`
-- Exponential backoff up to 15 min
-
-Node-level incidents may clamp credits further without changing the
-predicate.
-
-### 3) Monotone epoch enforcement
-
-`durability_mode_epoch` is monotone across the cluster. A follower
-that has persisted epoch `E` rejects any AppendEntries or admin RPC
-carrying an older epoch (`E' < E`) by replying with
-`ModeConflict(durability_mode_epoch)` over RPC (or closing the Raft
-stream) and logging `DurabilityModeEpochConflict`. The stale leader
-steps down immediately and replays the transition fences once it has
-refreshed its proof cache. ControlPlaneRaft mirrors the conflict as
-an incident so operators can audit stale binaries.
-
----
-
-## Startup scrub and quarantine
-
-### Startup scrub
-
-- Authenticate AEAD blocks.
-- Validate MACs, CRC, Merkle digests.
-- Rebuild `.idx` files.
-- Verify ledger ordering.
-- Truncate unreadable tails.
-- Record `boot_record.scrub_state`.
-
-AEAD or MAC failures immediately quarantine the partition. CRC-only
-failures mark `needs_repair` with exponential backoff (up to three
-retries) before escalation.
-
-### Background scrub
-
-Samples ≥ 1% of entries per segment every 21,600,000 ms (6 h),
-ensuring every WAL byte is hashed at least once per 604,800,000 ms
-(7 days). Reports `scrub.coverage_age_days`. Repair escalation
-enters Quarantine on repeated anomalies.
-
-### Quarantine state transitions
-
-```
-Healthy   ─►  Quarantine          on integrity faults
-Quarantine ─► RepairMode          for offline work
-Quarantine ─► Decommissioned      when removed
-```
-
-While quarantined: writes and membership changes are disabled.
-Follower reads and snapshot exports depend on the quarantine reason.
-Readiness surfaces `WhyQuarantined{reason, since_ms}`.
-
-### Per-partition scope
-
-Quarantine is strictly per-partition. ControlPlaneRaft records the
-reason and timestamp, but other partitions on the same node continue
-operating unless they independently violate guardrails. Admin tooling
-does not propagate quarantine automatically — operators investigate
-neighbouring partitions separately, to avoid cascading outages.
+Application replies ride `MSG_ADMIN_APPLIED` back through the admin
+component, which answers the originating connection with
+`MSG_ADMIN_RESPONSE`.
 
 ---
 
 ## Snapshot lifecycle
 
-### Full snapshot emit triggers
+Snapshots are per-partition and manifest-plus-body
+(`modules/app/durability/snapshot.rs`).
 
-Any one of:
+**Triggers.** The WAL fires a trigger at every segment rotation; an
+external `trigger` port accepts `MSG_SNAPSHOT_TRIGGER` from admin
+tooling or coordinators; and the replicator requests a re-broadcast
+(`MSG_SNAPSHOT_INSTALL_REQUEST`) when a follower's `next_index` falls
+below the leader's WAL retention floor. Every trigger passes the
+retention-floor gate: a snapshot at index *n* implies compaction below
+*n*, so any registered consumer floor still below *n* defers the
+trigger.
 
-- Log bytes reach `snapshot.log_bytes_target = 512 MiB`.
-- Elapsed wall-clock time since the last successful full snapshot
-  exceeds `snapshot.full_emit_period_ms_operator` (if set) or the
-  profile hard bound `snapshot.full_emit_period_ms_hard_profile`.
-- Follower lag ≥ 64 MiB.
+**Capture.** With an application state machine wired, the engine
+requests a state export (`MSG_APP_SNAPSHOT_REQUEST`) and accumulates
+the body chunks strictly in order; the body's own `(term, index)` is
+authoritative, since the application may have applied past the
+trigger. A silent application is bounded by a capture timeout so a
+wedged consumer costs one rotation's snapshot, not all of them.
 
-`snapshot.full_emit_period_ms_target` (30,000 ms default) is
-advisory. Missing it by > 25% emits `delta_chain_state =
-GracefulCatchup` plus telemetry, but only operator or hard bound
-overruns set `delta_chain_state = Orphaned` (which disables
-incrementals).
+**Persist.** The snapshot file carries a magic header, `(term, index)`
+metadata, the `dek_epoch`, the body, a body CRC32C, and an end magic —
+written sequentially with one trailing fsync, so it is crash-atomic
+without a rename. Filenames are index-keyed and monotone. The manifest
+authorisation port (`durability.manifest_auth`) broadcasts the durable
+manifest to peers.
 
-Manifest emission, `content_hash` computation, and signing follow the
-canonical JSON procedure in
-[concepts.md](concepts.md#6-snapshot-manifest).
-
-### Incremental snapshot cadence
-
-Independent cadence measured from the previous delta's
-`manifest_id.emit_ts`. Targets are advisory; hard bounds gate.
-Temporary overruns produce `GracefulCatchup`. Only operator or hard
-bound overruns force a full snapshot and mark the chain orphaned
-until a compliant delta resumes the cadence.
-
-### Import procedure
-
-1. Canonicalise and verify the manifest signature plus DEK epoch.
-2. Check `version_id` bounds.
-3. Stream AEAD-authenticated chunks. Zeroise buffers and retry up to
-   three times (≤ 60 s) before quarantining.
-4. Buffer AppendEntries until `applied_index >= base_index`.
-5. Reconcile follower checkpoints and ControlPlaneRaft trust caches.
-
-The step 4 buffer is bounded per-partition by
-`snapshot.import_buffer_max_entries_profile` (default 8,192) and
-`snapshot.import_buffer_max_bytes_profile` (default 8 GiB), and
-globally by `snapshot.import_node_buffer_hard_cap_bytes_profile`
-(default `min(32 GiB, 15% RAM)` per node). Effective limit is
-`min(per-partition, remaining node budget)`. Per-partition values are
-upper bounds subject to the node cap; implementations spill to
-disk-backed staging if necessary.
-
-Buffer exhaustion emits `ThrottleEnvelope{reason = SnapshotImport}`.
-
-### Bandwidth budgets
-
-- `snapshot.max_bytes_per_sec = 128 MiB/s` per peer with 90% / 60%
-  hysteresis.
-- Node-level cap `min(0.7 × NIC capacity, 1 GiB/s)`.
-
----
-
-## Compaction and storage hygiene
-
-WAL deletion requires **all** of:
-
-- (a) At least `compaction.quorum_ack_count` replicas reporting
-  `sm_durable_index ≥ snapshot_base_index`.
-- (b) A floor `max(learner_slack_floor,
-  min(quorum_applied_index, snapshot_base_index))`.
-- (c) Manifest authorisation handshake complete.
-- (d) Learner retirement guardrails satisfied.
-- (e) Nonce reservations cleared or abandoned.
-- (f) No integrity or quarantine blocks active.
-
-Disk policy checks enforce safe write-cache modes, barriers, and
-stacked-device validation before bootstrap.
-
-The compaction floor itself is computed by
-[`compute_compaction_floor`](replication.md#compaction-floor).
-
----
-
-## Definition bundles and activation barriers
-
-ControlPlaneRaft issues two related records:
-
-```
-DefinitionBundle {
-    bundle_id,
-    version,
-    sha256,
-    definition_blob,
-    warmup_recipe,
-}
-ActivationBarrier {
-    barrier_id,
-    bundle_id,
-    readiness_threshold,
-    warmup_deadline_ms,
-    readiness_window_ms,
-    partitions[],
-}
-```
-
-Nodes stage bundles under `/state/<partition>/definitions`, verify
-digests, run shadow apply queues, and publish:
-
-```
-WarmupReadiness {
-    partition_id,
-    bundle_id,
-    shadow_apply_checkpoint_index,
-    partition_ready_ratio,
-}
-```
-
-`DefineActivate` commits only when every partition reports
-`warmup_ready_ratio ≥ readiness_threshold` within the deadline.
-Mismatches abort with `ActivationBarrierExpired`.
-
----
-
-## ControlPlaneRaft proof publication
-
-The proof consumed by read gates and strict-fallback clearance:
-
-```
-DurabilityProofTupleV1 {
-    partition_id,
-    last_durable_term,
-    last_durable_index,
-    segment_seq,
-    io_writer_mode,
-    durability_mode_epoch,
-    controlplane_signature,
-    updated_at,
-}
-```
-
-`controlplane_signature` is an Ed25519 signature produced by the
-ControlPlaneRaft proof-signing key (`ControlPlaneProofKey` in
-[security.md](security.md#key-purpose-registry)).
-
-ControlPlaneRaft enforces strict monotone ordering on `(last_durable_term,
-last_durable_index, segment_seq, durability_mode_epoch)` per
-partition. Toggling `durability_mode_epoch` therefore requires the
-same `DurabilityTransition` entry to advance `(last_durable_term,
-last_durable_index)` as well.
-
-### 1) Verification
-
-Nodes:
-
-1. Verify the signature.
-2. Compare `{last_durable_term, last_durable_index, segment_seq,
-   io_writer_mode, durability_mode_epoch}` to the last
-   `DurabilityRecord` persisted locally.
-
-`updated_at` and the signature bytes are excluded from the equality
-check. Reads are refused whenever the signed tuple and the local
-record diverge. Wherever the docs refer to the proof "matching" or
-to `controlplane.proof`, that's the subset.
-
-### 2) Conflicting proofs
-
-When two proofs are observed (e.g. after a partitioned
-ControlPlaneRaft quorum) replicas accept the one with the higher
-`(last_durable_term, last_durable_index, segment_seq,
-durability_mode_epoch)` tuple. Identical
-`(last_durable_term, last_durable_index)` with different
-`segment_seq` or `durability_mode_epoch` immediately raises
-`ControlPlaneProofConflict`. Replicas stay in strict fallback and
-require operators to reconcile ControlPlaneRaft before proceeding.
-
-### 3) Clearing strict fallback
-
-Leaders leave strict fallback only after ControlPlaneRaft durably
-appends the proof matching their local ledger. A locally verified
-tuple without the ControlPlaneRaft append is insufficient — leaders
-stay in Strict mode until they can publish a fresh proof and observe
-it replicated with the correct signature.
+**Install transfer.** Leaders stream `MSG_INSTALL_SNAPSHOT` chunks —
+a 33-byte header `[term][last_included_index][last_included_term]
+[offset][done]` followed by up to 4 KiB of data — which the follower
+accumulates strictly in order; a gap or oversize aborts the attempt
+and waits for the leader to restart it. On `done`, the follower
+durably persists the snapshot before signalling
+`MSG_SNAPSHOT_INSTALLED`; a failed persist withholds the signal so
+consensus never trusts a torn body. On receiving the signal, raft
+fast-forwards its log state to the snapshot point, resets the apply
+pipeline, and emits the WAL compaction floor
+([replication.md](replication.md#compaction)). There are no bandwidth
+budgets, size targets, or manifest signing.
 
 ---
 
 ## Membership changes and joint consensus
 
-> **Status note.** The phases below describe the design target. The
-> current substrate has the joint state machine in `consensus`'s raft
-> component (`CONFIG_CHANGE_OP_JOINT`/`_NEW`, voter-set overlay,
-> auto-`C_new` on commit) and joint-aware quorum logic in its commit
-> component — the voter-set update is delivered between them inside
-> the module, in the same step raft applies the configuration change.
-> One downstream piece is unfinished: the ledger component of
-> `durability` does not consume `MSG_VOTER_SET_UPDATE` and uses the
-> fixed-`voter_count` quorum median, so union quorum is not enforced
-> on the durability side during the joint phase.
+> **Status note.** The current substrate has the joint state machine
+> in `consensus`'s raft component (`CONFIG_CHANGE_OP_JOINT`/`_NEW`,
+> voter-set overlay, auto-`C_new` on commit) and joint-aware quorum
+> logic in its commit component — the voter-set update is delivered
+> between them inside the module, in the same step raft applies the
+> configuration change. One downstream piece is unfinished: the ledger
+> component of `durability` does not consume `MSG_VOTER_SET_UPDATE`
+> and uses the fixed-`voter_count` quorum median, so union quorum is
+> not enforced on the durability side during the joint phase.
 >
 > The admin component of `operations` accordingly returns
 > `ADMIN_STATUS_UNSUPPORTED` for `ADD_VOTER` / `REMOVE_VOTER`. The
 > safe gate stays closed until union quorum reaches the ledger.
 
-Reconfigurations walk through four phases.
+What the implemented state machine does when a configuration entry
+commits (`modules/app/consensus/raft.rs`):
 
-### 1) Preflight
+- **`CONFIG_CHANGE_OP_JOINT`** enters the joint phase: the current
+  voter set is kept and the new set is layered as a joint overlay.
+  From that step on, elections, ReadIndex probes, and the commit
+  tracker's quorum all require majorities of **both** sets (the commit
+  tracker takes the minimum of the two medians). The leader
+  automatically queues the matching `C_new` entry, which is emitted in
+  its own clean log slot on a subsequent tick.
+- **`CONFIG_CHANGE_OP_NEW`** exits the joint phase: the new set
+  becomes current and the overlay clears. A node absent from the new
+  set steps down if it was leader and enters learner mode — no
+  elections, no vote grants — and leaves learner mode again if a later
+  change re-adds it. Both ops deduplicate replayed entries.
 
-ControlPlaneRaft validates:
-
-- Placement feasibility (≤ 70% utilisation after the move).
-- Survivability prechecks (`Q` and `H` ratios).
-- Deterministic rehearsal (`placement_digest`).
-
-Failure produces a structured error. Overrides require signed
-justification recorded in the override ledger.
-
-### 2) Catch-up
-
-Joining replicas enter `Learner` state. They satisfy at least one of:
-
-- `(raft_commit_index − membership.catchup_slack_bytes)` with default
-  4 MiB, or
-- `(leader.last_log_index − membership.catchup_index_slack)` with
-  default 1024 entries,
-
-within `membership.catchup_timeout = 120,000` ms. Either guard
-suffices unless policy demands both.
-
-### 3) Joint consensus
-
-After catch-up, the leader writes:
-
-```
-MembershipChange {
-    old_members[],
-    new_members[],
-    routing_epoch,
-    placement_digest,
-}
-```
-
-and operates with the **union quorum**. Voluntary leader transfers
-are blocked while in joint config. Each `MembershipChange` carries
-the rehearsal digest so replay can prove the change was prevalidated.
-
-### 4) Finalise
-
-Once **both**:
-
-- `joint_commit_count ≥ membership.finalize_window` (default 64), and
-- structural lag is below both `lag_bytes < 64 MiB` and
-  `lag_duration < 30 s`,
-
-the leader commits the pure new configuration and mirrors it back to
-ControlPlaneRaft, which records the resulting proof so subsequent
-joins can cite the exact ledger index.
-
-### Rollback
-
-Triggered when catch-up fails, lag remains structural beyond
-`membership.rollback_grace_ms = 3000`, or survivability prechecks
-fail mid-flight. Rollback appends:
-
-```
-MembershipRollback { reason, failing_nodes[], override_ref }
-```
-
-commits it under the joint quorum, records the durability proof for
-the rollback index, and only then allows elections to proceed.
-
-### Cross-cutting
-
-Every membership transition emits `DurabilityTransition` and
-`FenceCommit` proofs if durability modes or DR fences change
-simultaneously. Replicas persist the ControlPlaneRaft ack containing
-`{routing_epoch, membership_digest, durability_mode_epoch}` before
-serving client traffic under the new membership. That way observers
-can prove which quorum composition produced the active log suffix.
+Vote responses and probe confirmations from nodes outside the active
+voter set(s) never move a tally — the guard against an ex-voter's
+ballot electing a second leader after a downsize. There is no
+preflight validation, learner catch-up protocol, finalise window, or
+rollback entry; the admin gate stays closed until the durability
+ledger is joint-aware.

@@ -24,8 +24,7 @@ mod replica_facade;
 
 The file is `#![allow(dead_code)]` and pure logic — no `unsafe`, no
 `SyscallTable` use — so it compiles under both the embedded `no_std`
-module build and the host-side `cargo test` build. Integration tests
-at `tests/facade.rs` exercise the same file unchanged.
+module build and a host-side `std` build unchanged.
 
 ## Table of Contents
 
@@ -39,7 +38,6 @@ at `tests/facade.rs` exercise the same file unchanged.
 8. [Snapshot install and export](#snapshot-install-and-export)
 9. [Read-gate inputs](#read-gate-inputs)
 10. [Invariants and out-of-scope](#invariants-and-out-of-scope)
-11. [Test surface](#test-surface)
 12. [Per-entry stream configuration](#per-entry-stream-configuration)
 
 ---
@@ -106,8 +104,9 @@ never reach `consensus`'s proposal ports.
 
 The cap is intentionally small — clustor orders identity-bearing
 metadata, never bulk content. Object bodies, EC shards, cache
-contents, and other bulk data travel out-of-band. (Cross-reference:
-Loam's BODY-OUT-OF-RAFT invariant.)
+contents, and other bulk data travel out-of-band. Loam, the
+object-store consumer downstream of this facade, states the same rule
+as its BODY-OUT-OF-RAFT invariant.
 
 Empty commands and `correlation_id == 0` are rejected. Zero is
 reserved by `consensus` as the "untagged" marker that suppresses
@@ -166,10 +165,6 @@ writes `MSG_CLIENT_PROPOSAL` to `consensus.proposals` and recovers the
 body from `consensus.committed_entries`; one that wants clustor to
 correlate on its behalf wraps a [`build_tagged_proposal`](#propose-lifecycle)
 payload and writes to `consensus.proposals_tagged` instead.
-
-`tests/facade.rs::facade_envelope_constants_track_the_substrate` holds
-the facade's constants against `wire.rs`, so renumbering a message in the
-substrate fails there rather than silently mis-framing in a consumer.
 
 ---
 
@@ -245,8 +240,9 @@ index.
 
 Backpressure on the observer ring fails open: under sustained
 back-pressure the oldest un-emitted slot is evicted, the consumer
-observes a gap, and recovery is via snapshot install
-(`SnapshotInstaller::reset_to`).
+observes a gap, and recovery is via snapshot install:
+`SnapshotInstaller::finalize` returns a `CommitAck` whose index and
+term the consumer seeds into `CommittedSubscriber::reset_to`.
 
 ### Per-entry ingest contract
 
@@ -289,8 +285,8 @@ surface.
 **A single-replica graph (`voter_count == 1`) walks the same facade
 contract as a multi-replica graph.** The commit horizon advances
 faster, but `propose → assign → commit → drain` is the same code
-path. Consumer code does not branch on cluster size.
-(Cross-reference: Loam's TOPOLOGY-INVARIANT.)
+path. Consumer code does not branch on cluster size; Loam captures
+the same guarantee as its TOPOLOGY-INVARIANT.
 
 ---
 
@@ -396,33 +392,6 @@ co-located with `admission`.
 
 ---
 
-## Test surface
-
-- **Host-side `cargo test`** covers the encode/decode and
-  state-machine layers (`tests/facade.rs` plus the inline
-  `#[cfg(test)]` module in `modules/common/replica_facade.rs`,
-  49+ tests). This is the primary regression net for per-entry
-  ordering, inflight correlation, snapshot framing, and bounded-size
-  invariants.
-- **Real fluxor module integration** is proved by
-  `modules/example_consumer/`, a minimal `no_std` module that
-  `#[path]`-includes `replica_facade.rs` and wires to
-  `consensus.committed_entries`. `fluxor modules build` rebuilds it
-  alongside every clustor module on every CI run — the gate that
-  catches `no_std` regressions in the facade or in the per-entry
-  emitter.
-- **End-to-end multi-node scenarios** — 3-replica propose with all
-  members acking, 3-replica propose with one member offline,
-  propose-fails-when-quorum-unreachable, leader-change replay,
-  follower snapshot install, oversized-command rejection, read-gate
-  index tracking — live in the Rust harness at `tests/cluster.rs`.
-  Each scenario spawns real `fluxor-linux` instances via
-  `std::process::Command` and asserts against logs, `/readyz`, and
-  `/metrics`. Long-term tooling for clustor is Rust-only — no
-  Python harness in `tests/` or `make ci`.
-
----
-
 ## Per-entry stream configuration
 
 To receive `MSG_COMMITTED_ENTRY` on the consumer side, the
@@ -434,9 +403,9 @@ deployment graph wires one edge:
   edge_class: cross_core
 ```
 
-The entry-body fanout that feeds it — appended bodies from the raft
-component into the apply component's ring — is interior to
-`consensus` and every deployment gets it by construction. The edge
+The entry-body fanout that feeds it is interior to `consensus` (see
+[Per-entry committed stream](#per-entry-committed-stream)) and every
+deployment gets it by construction. The edge
 above is optional from the consensus core's standpoint: omitting it
 does not affect quorum, durability, or read-gate behaviour, it
 simply leaves the per-entry stream with no destination. It is

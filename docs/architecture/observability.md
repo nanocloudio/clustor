@@ -1,40 +1,47 @@
 # Observability
 
-The metrics surface, the structured-explain APIs, the throttle
-envelope shape, and the artifact bundles that audit and validation
-tooling consume. Designed so deployment controllers can gate
-activations on exactly the same predicates the data plane evaluates
-— a single source of truth for "is this cluster ready?"
+Clustor exports metrics as a compact binary record stream, serves a
+small set of HTTP diagnostic endpoints, and ships host-side tooling
+that decodes the stream into JSON baselines. Everything on the node
+side is integer-only and fixed-width so the `no_std` hot path never
+formats text or touches floating point.
 
 ## Table of Contents
 
 1. [Metrics and telemetry](#metrics-and-telemetry)
-2. [Readiness](#readiness)
-3. [Throttle envelopes and explain APIs](#throttle-envelopes-and-explain-apis)
-4. [Artifact bundles and audit](#artifact-bundles-and-audit)
+2. [HTTP surface](#http-surface)
+3. [Host-side tooling](#host-side-tooling)
 
 ---
 
 ## Metrics and telemetry
 
-### Namespaces
+### Metric identity
 
-```
-clustor.raft.*
-clustor.wal.*
-clustor.snapshot.*
-clustor.flow.*
-clustor.controlplane.*
-clustor.security.*
-```
+Every sample is keyed by `(module_id, partition_id, metric_id)`.
+`module_id` is the emitting component's source id
+(`wire::SOURCE_ID_*` in `modules/common/wire.rs`), so components of a
+composite module keep distinct identities in the export.
+`partition_id` scopes a sample to a partition where that applies and
+is 0 otherwise. `metric_id` is a per-module id: scalar metrics occupy
+a small private space starting at `0x0001` (`wire::metric_ids`), and
+histogram bucket ranges sit above it so the two never collide.
 
-Every export also carries `metrics.schema_version` and
-`metrics.build_git_sha`.
+Samples travel as `MSG_METRIC_SAMPLE` frames on each module's metrics
+port into the operations module. The 14-byte body carries
+`module_id:u8`, `partition_id:u16 LE`, `metric_id:u16 LE`, `kind:u8`
+(0 counter, 1 gauge, 2 histogram bucket) and `value:i64 LE`.
 
 ### Histogram buckets
 
-Fixed across releases. Implicit `+Inf` bucket is in addition to the
-inclusive upper bounds listed:
+Bucket bounds are fixed in `wire::hist` and stored in the producer's
+native sampling unit (microseconds or milliseconds), so classification
+stays integer-only. Each histogram occupies a contiguous `metric_id`
+range starting at `HIST_BASE = 0x1000`: bucket `i` is emitted at
+`HIST_BASE + i` with `value = cumulative count` of samples at or below
+that bound. There are `bounds.len() + 1` buckets; the last is the
+implicit `+Inf` overflow bucket, so saturation of the top bound still
+registers.
 
 | Metric | Buckets (inclusive upper bounds) | Unit |
 |---|---|---|
@@ -43,36 +50,50 @@ inclusive upper bounds listed:
 | `clustor.flow.apply_batch_latency_ms` | `0.25, 0.5, 1, 2, 4, 6, 8, 10` | ms |
 | `clustor.snapshot.transfer_seconds` | `1, 2, 4, 8, 16, 32, 64, 128, 256` | s |
 
-Deployments outside profile SLOs still alert even if they saturate
-the top bucket — saturation is itself the signal.
-
-Producers classify each sample in integer units (`wire::hist::*`
-holds the bounds in µs or ms so the `no_std` hot path never touches
-floating point) and emit one `MSG_METRIC_SAMPLE` per bucket with
-`kind = METRIC_KIND_HISTOGRAM` and `value = cumulative count`. Bucket
-`i` occupies `metric_id = wire::hist::HIST_BASE + i`; there are
-`bounds.len() + 1` buckets (the last is the implicit `+Inf` overflow).
-All four specified histograms now emit, plus the kernel step-timing
-histogram:
-
 | Histogram | Producer | Timed at |
 |---|---|---|
-| `clustor.wal.fsync_latency_ms` | `durability` (wal) | every `FS_FSYNC` |
-| `clustor.raft.commit_latency_ms` | `consensus` (raft) | leader append→commit, via a per-index timestamp ring |
-| `clustor.flow.apply_batch_latency_ms` | `consensus` (apply) | per commit-apply pass that delivers ≥1 entry |
-| `clustor.snapshot.transfer_seconds` | `durability` (snapshot) | first install chunk → `done` |
-| kernel scheduler step-time | `operations` (telemetry) | scraped over the monitor ABI, exported under the telemetry component id |
+| `clustor.wal.fsync_latency_ms` | `durability` (`wal.rs`) | every `FS_FSYNC` |
+| `clustor.raft.commit_latency_ms` | `consensus` (`raft.rs`) | leader append to commit, via a per-index timestamp ring |
+| `clustor.flow.apply_batch_latency_ms` | `consensus` (`apply.rs`) | per commit-apply pass that delivers at least one entry |
+| `clustor.snapshot.transfer_seconds` | `durability` (`snapshot.rs`) | first install chunk to `done` |
+| kernel scheduler step time | `operations` (`telemetry.rs`) | scraped over the monitor ABI |
 
-### Export wire format
+### Step-time histograms
 
-The telemetry component of `operations` keeps a latest-value table
-keyed by `(module_id, partition_id, metric_id)` and serializes it into
-the `MSG_METRICS` export that the module's http component caches and
-serves verbatim at `GET /metrics`. The payload is a fixed-width binary record stream
-(`wire::METRICS_EXPORT_MAGIC`):
+Two further histogram families measure scheduler step time, each in
+its own id range so the three families never collide within a module:
+
+- **Per-module step histograms** (`STEP_PERMOD_BASE = 0x1100`). On
+  its emit tick the telemetry component scrapes each kernel scheduler
+  slot's 8-bucket step histogram over the monitor ABI and exports the
+  non-idle slots. Bucket `i` is emitted at `STEP_PERMOD_BASE + i`
+  under `module_id = SOURCE_ID_TELEMETRY` with `partition_id` set to
+  the scheduler module index. The global scheduler step histogram uses
+  the same buckets but sits at `HIST_BASE` with partition 0.
+- **Per-component step histograms** (`COMP_STEP_BASE = 0x1200`,
+  `modules/common/step_accounting.rs`). The kernel sees a composite
+  module as one scheduler entity, so each composite's dispatch table
+  brackets every `component::step` call with `dev_micros` reads and
+  records the elapsed time into a `CompStepHist` per component. Bucket
+  `i` is emitted at `COMP_STEP_BASE + i` under the component's own
+  source id. The bucket edges mirror the kernel's per-module step
+  buckets (`1, 3, 7, 15, 31, 63, 255` µs plus `+Inf`), so component
+  and module distributions compare directly. The whole 8-bucket
+  snapshot goes out in one atomic `channel_write`; a full ring drops
+  the snapshot whole, and the cumulative counts re-publish complete on
+  the next tick.
+
+### Aggregation and export
+
+The telemetry component of the operations module drains the metrics
+fan-in each step, keeps a latest-value table keyed by
+`(module_id, partition_id, metric_id)` (oldest-write eviction when
+full), and on its emit tick serialises the table into the `/metrics`
+export that the http component caches and serves verbatim. The
+payload is a fixed-width binary record stream:
 
 ```
-[0]      magic   = 0xC7
+[0]      magic   = 0xC7   (wire::METRICS_EXPORT_MAGIC)
 [1]      version = 1
 [2..4]   record_count : u16 LE
 [4..]    record_count × 14-byte records, each:
@@ -82,196 +103,78 @@ serves verbatim at `GET /metrics`. The payload is a fixed-width binary record st
 
 Each record is byte-identical to the `MSG_METRIC_SAMPLE` body, so a
 scraper iterates fixed-width records with no per-module parser. The
-aggregator appends its own self-metrics (`module_id = 0x15`:
-messages ingested, typed samples, slots used) and the scheduler
-step-timing histogram. A benchmark driver or rig scrapes `/metrics`
-at a window's start and end and diffs the records.
+header carries the magic and version byte only; there are no embedded
+schema-version or build-sha strings.
 
-### Required telemetry fields
+After the latest-value table the aggregator appends four self-metrics
+under `module_id = SOURCE_ID_TELEMETRY` (0x15): messages ingested,
+typed samples decoded, metric slots used, and `TELE_METRICS_EVICTED`,
+which counts table slots evicted because the fixed table filled. Then
+come the global scheduler step histogram and the per-module step
+histograms, and finally `TELE_RECORDS_DROPPED`, the count of records
+this scrape dropped to stay inside the byte-budgeted channel ring, so
+export truncation is observable rather than silent. The self-metrics
+and the drop counter are emitted unconditionally; the budget reserves
+space for them.
 
-Every conforming node exports the following. Tooling rejects runs
-that omit any:
+### Strict fallback and cache state
 
-```
-strict_fallback_state
-strict_fallback_blocking_read_index
-strict_fallback_pending_entries
-readgate.*
-io_writer_mode_gate_state
-lease_gate_runtime_state
-clock_guard_alarm*
-observer_capability_state
-snapshot.delta_chain_length
-snapshot.delta_emit_skew_ms
-snapshot_only_ready_ratio
-flow.pid_auto_tune_state
-flow.pid_auto_tune_adjust_total
-transport.pool_*
-feature.<name>_gate_state
-feature.<name>_predicate_digest
-controlplane.cache_state
-controlplane.cache_age_ms
-controlplane.cache_warning
-controlplane.cache_expiry_total
-strict_only_runtime_ms
-ingest_status_code
-credit_hint
-durability_status_code
-```
-
-### Incident logging
-
-Alerts feed correlated incidents under a storm guard:
-
-```
-incident_max_per_window      = max(5, ceil(active_partitions_on_node / 250))
-window                       = 600,000 ms (10 min)
-cooldown_between_duplicates  = 300,000 ms
-```
-
-Safety-critical classes are exempt from the storm guard.
+The admission module's proof cache broadcasts its state as
+`MSG_CACHE_STATE` frames. Consensus consumes them: a stale cache
+drives the commit component's strict-fallback flag, and raft exports
+that state as the gauge `RAFT_STRICT_FALLBACK_FLAG`, with the counter
+`RAFT_PROPOSALS_DROPPED_STRICT` recording proposals refused while the
+fallback held. The cache state is not exported as a metric of its
+own; the raft gauge is where it surfaces in `/metrics`.
 
 ---
 
-## Readiness
+## HTTP surface
 
-`/readyz` surfaces:
+The operations module's ingress and http components serve five
+routes (`operations/ingress.rs`, `operations/http.rs`):
 
-- Readiness ratios.
-- Definition bundle state.
-- Activation barriers.
-- Warmup readiness.
-- Fixture bundle version and age.
-- Ingest status and credit hints.
-- Feature gates.
-
-Deployment controllers gate activations on the same fields the data
-plane evaluates. The contract is symmetry: if `/readyz` says the
-cluster is ready, the data plane has already cleared every predicate.
-
----
-
-## Throttle envelopes and explain APIs
-
-### Throttle envelopes
-
-Constraints:
-
-- ≤ 32 KiB JSON.
-- ≤ 32 IDs per array.
-- IDs sorted lexicographically.
-- Continuation tokens included when truncated.
-
-Wire shape and reasons in
-[errors.md](errors.md#throttleenvelope).
-
-### Explain endpoints
-
-A family of structured-explain endpoints share the envelope schema
-header. Every endpoint carries decision trace IDs, guardrail deltas,
-and truncated-list metadata so an operator can trace a decision back
-to the predicate that produced it.
-
-| Endpoint | Surfaces |
+| Route | Behaviour |
 |---|---|
-| `WhyNotLeader` | Why this node refuses to serve writes |
-| `WhyCreditZero` | Which credit pool is empty and why |
-| `WhySnapshotBlocked` | Which guardrail is fencing snapshot emission |
-| `WhyDiskBlocked` | Disk-policy or geometry block |
-| `WhyQuarantined` | Quarantine reason and `since_ms` |
-| `WhyCreditHint` | Why the credit hint is `Recover`/`Hold`/`Shed` |
+| `GET /readyz` | One-byte body (0 or 1); status 200 when ready, 503 otherwise. Answered from a cached byte, short-circuited inside ingress. |
+| `GET /why` | Two-byte body: format version (1) followed by `timing_pause_reason` (`wire::TIMING_PAUSE_*`), stating why deterministic time production is paused on this node, 0 when producing. |
+| `GET /metrics` | The cached binary export described above. |
+| `POST /propose` | Synchronous write bridge; the response is deferred until apply acknowledges the assigned WAL index. |
+| `POST /admin/<op>` | Staged through rbac to the admin component; 202 on delivery. Recognised ops (`modules/common/http_admin.rs`): `freeze`, `thaw`, `transfer-leader`, `durability-mode`, `snapshot`. |
 
-### Admin dry-run endpoints
+Readiness is computed by the telemetry component from readiness
+sub-signals in the metric table: raft must report `RAFT_READY = 1`
+(boot replay complete, metadata loaded, consensus established) and
+every apply instance present must report `APPLY_CAUGHT_UP = 1`. A
+minimum boot delay stops the node flipping ready before its first
+full scrape, and a staleness watchdog drops `/readyz` back to 503 if
+the underlying signals stop refreshing. The diagnostic caches are
+refreshed on exactly the steps telemetry emits, so `/readyz`, `/why`
+and `/metrics` share the export cadence.
 
-Report computed guardrails (catch-up slack and timeout, predicted
-credit impact) without committing the change:
-
-- `DryRunMovePartition`
-- `DryRunSnapshot`
-- `DryRunFailover`
+There is no JSON payload on any of these routes and no Prometheus
+text endpoint; `/metrics` is binary only.
 
 ---
 
-## Artifact bundles and audit
+## Host-side tooling
 
-Specification automation regenerates machine-readable bundles from
-the source tree. Builds compare bundles byte-for-byte and block
-releases on drift.
+`tools/clustor-bench` is the off-DUT harness that consumes this
+surface. It is std-only with no external crates, so it builds on an
+offline driver host. The library decodes the binary export
+(`parse_export` mirrors the wire framing) and provides a minimal
+HTTP/1.1 client, a JSON writer, and a log-linear latency histogram
+with coordinated-omission-aware percentiles. Two binaries sit on top:
 
-### Bundle catalog
+- **`clustor-scrape`** scrapes `/metrics` at a window's start and
+  end, computes counter deltas and final gauges, and writes a JSON
+  baseline record carrying run provenance (git SHA, config hash,
+  target, label, workload parameters).
+- **`clustor-loadgen`** drives the DUT over the real client path
+  (`POST /propose` by default) at a fixed offered rate across worker
+  threads, and self-reports whether a run was DUT-attributable or
+  harness-bound.
 
-```
-wire_catalog.json
-chunked_list_schema.json
-system_log_catalog.json
-wide_int_catalog.json
-spec_fixtures.bundle.json
-consensus_core_manifest.json
-proof_artifacts.json
-term_registry.json
-metrics_buckets.json
-```
-
-Each bundle entry carries SHA-256 digests, schema versions, manifest
-hashes, and Ed25519 signatures (`ReleaseAutomationKey`,
-`CPReleaseKey` — see
-[security.md](security.md#key-purpose-registry)). The manifest maps
-section IDs to digests plus a Merkle tree root
-(`spec_hash_format = "SpecHashV1"`).
-
-### Proof provenance
-
-Releases publish `proof_bundle_schema_version`,
-`proof_bundle_sha256`, and detached signatures binding Loom and
-TLA+ archives, fixture suites, and feature manifests. Auditors
-recompute digests to validate artifacts without CI access.
-
-### Fixture catalog
-
-The clause-to-fixture map and wide-int registry feed deterministic
-`spec_fixtures.bundle.json`. Automation enforces coverage and
-rejects mismatched fixtures. Vendors may add private fixtures but
-retain canonical vectors:
-
-- `PreVoteResponse` ([wire.md](wire.md#prevoteresponse-frames))
-- `ChunkedList`
-- Lease inequality
-- Snapshot manifest ([security.md](security.md#snapshot-manifest-sample))
-- Segment MAC ([security.md](security.md#segment-mac-vector))
-- AEAD constant-time ([security.md](security.md#aead-constant-time-comparison))
-- Crash-consistency harness
-- Jepsen-like scenarios
-
-### Startup spec self-tests
-
-Rerun encoding fixtures, catalog regeneration, lease inequalities,
-incremental cadence, BLAKE3 vectors, and other checks before mounting
-partitions. Failures quarantine nodes and require operator override.
-
-### Release evidence
-
-Exposed via `/readyz`:
-
-- `bundle_version`
-- `bundle_sha256`
-- `fixture_suite_ts`
-- `fixtures.bundle_version`
-- `fixtures.bundle_age_ms`
-
-CI blocks release artifacts if the bundle timestamp vs git tag
-differs by > 86,400,000 ms (24 h).
-
-### Artifact location independence
-
-Runtime correctness does not depend on reading files from
-`/artifacts` or `/manifests`. Binaries embed the necessary catalogs
-and expose them via APIs
-(`/.well-known/wide-int-registry`, `/readyz`). Artifact files only
-serve validation, audit, or tooling workflows outside the hot path.
-
-When `/artifacts` is absent (e.g. production images that strip
-optional bundles), nodes default to skipping startup validation by
-exporting `CLUSTOR_SKIP_ARTIFACT_VALIDATION=1`. Operators who need
-the original fail-closed behaviour instead set
-`CLUSTOR_REQUIRE_ARTIFACT_VALIDATION=1`, which forces bootstrap to
-error until the artifacts are restored.
+An operator or rig therefore consumes metrics by fetching the binary
+export and diffing decoded records across a window, not by scraping a
+text exposition format.

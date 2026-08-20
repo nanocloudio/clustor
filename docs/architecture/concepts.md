@@ -1,105 +1,105 @@
 # Clustor Concepts and Data Model
 
 Clustor agrees on an ordered log, fsyncs it on a quorum, and exposes
-the result through a typed consumer facade. The terms and entities
-defined here are the vocabulary the rest of the architecture docs
-use. If a later doc refers to `wal_committed_index` or
-`DurabilityRecord` without elaboration, this is where they're
-introduced.
+the result to applications through a typed replica facade. It is built
+as a set of `no_std`, position-independent modules on the fluxor
+runtime. This page defines the vocabulary the other architecture docs
+use: the index watermarks, the configuration switches, the roles, and
+the on-disk and on-wire data entities as they exist in the code.
 
 ## Table of Contents
 
 1. [Indexes](#indexes) — the watermarks that drive replication and reads
-2. [Behaviour switches](#behaviour-switches) — modes, epochs, and routing
-3. [Profiles and roles](#profiles-and-roles)
-4. [System model](#system-model)
+2. [Behaviour switches](#behaviour-switches) — modes and tuning knobs
+3. [Roles](#roles)
+4. [System model](#system-model) — components, environment, [crash model](#crash-model)
 5. [Data entities](#data-entities)
 6. [Invariants](#invariants)
-7. [Snapshot and ledger metadata](#snapshot-and-ledger-metadata)
 
 ---
 
 ## Indexes
 
-Five watermarks. Keeping them straight is the single most useful
-mental model when reading the rest of the docs.
+An entry moves through five watermarks between proposal and
+application. Sources: `modules/app/consensus/commit.rs`,
+`modules/app/consensus/apply.rs`, `modules/app/durability/ledger.rs`,
+`modules/common/wire.rs`.
 
 | Term | Definition |
 |---|---|
-| `raft_commit_index` | The standard Raft commit index: highest log index replicated on a majority, advanced only when the leader has a current-term entry in the majority. Implied when the docs say `commit_index` bare. |
-| `local_wal_durable_index` | Replica-local. The last log index whose WAL bytes completed step (2) of the [ledger ordering rules](replication.md#ledger-ordering-and-replay) **and** whose `DurabilityRecord` completed step (4). Both halves matter — bytes on disk without the matching record don't count. |
-| `wal_committed_index` | Leader-only. The largest *m* such that (a) the leader's own `local_wal_durable_index ≥ m`, (b) at least quorum-size replicas (counting the leader) report the same, (c) the entry at *m* lives in the current term, and (d) `m ≤ raft_commit_index`. Followers never compute it. |
-| `sm_durable_index` | Product-visible state-machine durability. Non-normative for consensus, surfaced for compaction and readiness decisions. |
-| `quorum_applied_index` | Smallest `applied_index` among the most recent quorum heartbeat bundle. Forms a compaction floor. |
-| `applied_index_floor` | Follower-local: `min(applied_index, snapshot_base_index)`, persisted alongside snapshot authorisation. Follower snapshot-only reads require `local_wal_durable_index ≥ applied_index_floor`. |
+| `wal_index` | The log index the leader assigns to a proposal when it appends the entry. For tagged proposals the assignment is reported back to the proposer via `MSG_PROPOSAL_ASSIGNED` (`[correlation_id:u64][partition_id:u16][wal_index:u64]`). |
+| `durable_index` (replica-local) | The highest index whose WAL bytes have been written and fsynced on this replica. The local WAL component reports it as a `FsyncAck`; followers also stamp it into every AppendEntriesResponse so the leader can track peer durability without a separate ack stream. |
+| `wal_committed_index` (quorum-durable index) | Leader-side. The largest index durable on a quorum of voters, computed by the durability ledger from per-replica `FsyncAck` evidence and emitted as a `DurabilityProof`. Followers only ever see their own slot advance and therefore never emit a proof. |
+| `commit_index` | The Raft commit index (`committed_index` in `commit.rs`). Under strict and group_fsync it advances to the minimum of the replication quorum match and the quorum-durable index from the latest `DurabilityProof`; under relaxed it advances on replication match alone. The current-term fence applies: a prior-term entry commits only transitively, once a current-term entry commits above it. |
+| `apply_index` | The highest index the apply pipeline has handed to the state machine. Read fencing compares it against the commit horizon: a fenced read is answered only once `apply_index` has caught up to the commit index observed at submission. |
 
-The relationship that drives read safety:
+The ordering that read safety relies on:
 
 ```
-local_wal_durable_index  ≤  wal_committed_index  ≤  raft_commit_index
-        (per replica)          (leader only)           (standard Raft)
+apply_index  ≤  commit_index  ≤  quorum-durable index (strict / group_fsync)
 ```
 
-Linearizable reads require the right two to be equal. Strict equality
-is what proves "everything readable is durable".
+Under relaxed the commit index may run ahead of the quorum-durable
+index; that is the mode's explicit trade.
+
+The quorum match itself is the median of the per-voter `match_indices`
+(`quorum_index` in `modules/common/types.rs`). During a joint-consensus
+membership change the effective quorum match is the minimum of the two
+set medians, so an entry must reach a majority of both the old and the
+new voter set before it counts.
 
 ---
 
 ## Behaviour switches
 
-The flags and epochs that govern mode, routing, and feature
-availability.
+The runtime knobs, with their defaults, as declared in the modules'
+`define_params!` blocks. Sources: `modules/app/consensus/mod.rs`,
+`modules/app/durability/mod.rs`, `modules/app/admission/mod.rs`,
+`modules/common/types.rs`.
 
-| Term | Definition |
+| Switch | Definition |
 |---|---|
-| `commit_visibility` | `DurableOnly` or `CommitAllowsPreDurable`. Controls whether reads can observe entries ahead of `wal_committed_index`. See [replication.md](replication.md#commit-visibility-modes). |
-| `lease_gap_max` | Bound on `(raft_commit_index − wal_committed_index)` while leases are enabled. Set to 0 to disable leases. Equality is already required for linearizable reads, so this guard is a telemetry clamp for near-miss conditions. |
-| `lease_epoch` | Monotone identifier carried on heartbeats. Followers reject lease reads on epoch mismatch. |
-| `routing_epoch` | Placement / reconfiguration version issued by ControlPlaneRaft. |
-| `durability_mode` | Consensus mode: `Strict` or `Group-Fsync`. Toggled by `DurabilityTransition` entries; see [lifecycle.md](lifecycle.md#durability-modes-and-io-writer-states). |
-| `wal.fs_block_bytes` | WAL I/O alignment hint, taken from the filesystem (`st_blksize`) or an operator override. WAL writes and truncations align to this quantum. |
-| `wal.crypto_block_bytes` | Fixed AEAD block size, 4096 bytes. Used for nonce counters and reservations. |
-| `ControlPlaneUnavailablePriorityOrder` | Rejection precedence when mapping read/lease gate failures to `ControlPlaneUnavailable`: `{CacheExpired, CacheNotFresh, NeededForReadIndex}`. Cache-related clauses map to the first two; everything else maps to `NeededForReadIndex`. |
-| `CanonicalJson` | [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) Canonical JSON: UTF-8, deterministic object member ordering, no insignificant whitespace. All signatures and `content_hash` calculations over JSON or JSONL use this encoding after removing any explicitly excluded fields. |
+| `durability_mode` | Consensus commit gating: strict (0), group_fsync (1), relaxed (2) — `DUR_STRICT` / `DUR_GROUP_FSYNC` / `DUR_RELAXED` in `types.rs`. Default group_fsync. Strict and group_fsync gate the commit index on quorum durability; relaxed commits on replication match alone. |
+| `fsync_mode` | WAL writer behaviour in the durability module: 0 = write + fsync + ack per entry, 1 = group fsync. Group mode batches under `group_window_ms` (default 2) and `group_max_pending` (default 64). |
+| `segment_bytes` | WAL segment size limit. Default 67,108,864 (64 MiB). |
+| `partition_id` | Partition slot for multi-Raft graphs. Stamped into segment and snapshot filenames, durability proofs, and raft metadata paths. |
+| `fresh_threshold_s` / `grace_period_s` | Admission proof-cache ladder thresholds; defaults 60 and 120. See the cache states below. |
+| `dek_epoch` | Data-encryption-key epoch, owned by the durability module's keys component. Rotated locally on a weekly timer and stamped into snapshot manifests and headers. There is no AEAD encryption of WAL or snapshot bytes; the epoch is carried metadata. |
 
-Runtime nouns with stable casing — telemetry and APIs match these
-spellings exactly: `Clustor`, `Strict`, `Group-Fsync`,
-`DurabilityRecord`, `FollowerReadSnapshot`, `LeaseEnable`,
-`SnapshotDeltaEnable`, `ControlPlaneRaft`, `ConsistencyProfile`.
+Control-plane cache states (`CP_FRESH` / `CP_CACHED` / `CP_STALE` /
+`CP_EXPIRED` in `types.rs`) are derived from the age of the last
+control-plane proof. With the default thresholds the ladder is: Fresh
+below 60 s, Cached 60–90 s, Stale 90–120 s, Expired at 120 s and
+beyond. Once the cache ages into Stale or Expired, consensus and
+admission force strict fallback: the effective durability mode is
+clamped to strict regardless of the configured mode.
 
 ---
 
-## Profiles and roles
+## Roles
 
-### Profiles
+Roles describe what a replica is doing right now, not what type of
+node it is. Sources: `modules/common/types.rs`,
+`modules/app/consensus/raft.rs`.
 
-Five profile bundles tune durability batching, ack deferral, flow
-control, telemetry sampling, and feature availability. The full
-parameter set is published in `consensus_core_manifest.json` and
-surfaced through `/.well-known/wide-int-registry`.
+- **Follower** (`ROLE_FOLLOWER`) — replicates the log and stamps its
+  `durable_index` into AppendEntries responses.
+- **Candidate** (`ROLE_CANDIDATE`) — running an election; pre-vote is
+  implemented and runs first.
+- **Leader** (`ROLE_LEADER`) — appends proposals, dispatches
+  replication, computes the commit index, and emits durability proofs
+  via the ledger.
+- **Learner** — a mode, not a fourth role constant. A replica whose id
+  is outside the current voter set (typically after a
+  `CONFIG_CHANGE_OP_NEW` removed it) keeps replicating and serving
+  reads but does not start elections or grant votes. The flag clears
+  if a later configuration change re-adds the node.
 
-| Profile | Intent |
-|---|---|
-| `ConsistencyProfile` | Default. Tight election timeouts, Strict durability available. |
-| `Throughput` | Larger group-fsync batches, may opt into `CommitAllowsPreDurable`. |
-| `WAN` | Wider election timeouts and RTT thresholds for cross-region voters. |
-| `ZFS` | Tuned for `sync=always` / `logbias=throughput` semantics. |
-| `Aggregator` | Read-heavy ingest fanout role with observer fairness budgets. |
-
-### Roles
-
-Roles describe what a node is doing *right now*, not what type it is.
-A single binary moves through every role over its lifetime.
-
-- **Leader** — serves writes and ReadIndex / lease reads.
-- **Follower** — replicates the log; serves snapshot-only reads once
-  granted the capability bit.
-- **Learner** — catch-up replica during joint consensus; does not
-  vote.
-- **Observer** — read-only stream consumer; bandwidth-bounded; does
-  not participate in quorum.
-- **ControlPlaneRaft** — independent Raft cluster governing
-  placements, proofs, feature gates, and DR fences.
+The control plane is a local module in the same graph — a timer-driven
+source that emits periodic control-plane proofs, tenant records,
+capability manifests, and placement epochs
+(`modules/app/control_plane/mod.rs`). It is not a separate Raft
+cluster.
 
 ---
 
@@ -107,56 +107,41 @@ A single binary moves through every role over its lifetime.
 
 ### Components
 
-- **Data-plane nodes** host one or more Raft Partition Groups (RPGs).
-  Each RPG maintains WAL segments, durability ledgers, apply
-  pipelines, snapshot emitters and importers, flow controllers, and
-  telemetry streams.
-- **ControlPlaneRaft** is an independent Raft cluster storing routing
-  epochs, durability proofs, feature manifests, overrides, DR fences,
-  `DefinitionBundle` metadata, and readiness signals. Data-plane
-  nodes rely on its caches as the source of truth for placement and
-  durability policy.
-- **Clients** interact with leaders via Raft RPCs or Admin APIs,
-  carrying `routing_epoch` plus durability and lease epochs.
-- **Observers** receive read-only streams under dedicated bandwidth
-  quotas (`0.1 × snapshot.max_bytes_per_sec` per partition) and do
-  not participate in quorum.
+A clustor node is a fluxor graph of modules: consensus (raft, commit,
+apply components), durability (wal, ledger, snapshot, keys),
+replicator, admission (flow control plus proof cache), gateway (HTTP
+and proposal ingress), control plane, and the application state
+machine behind the replica facade in
+`modules/common/replica_facade.rs`. Multi-partition graphs stamp a
+`partition_id` into every file name and proof so partitions never
+share state.
 
 ### Environment
 
-Nodes target Linux ≥ 5.15 with `io_uring`, PHC/PTP clock discipline,
-and storage configured with explicit write barriers (XFS / ext4 with
-barriers enabled, ZFS with `sync=always` and `logbias=throughput`).
-
-WAL segments are preallocated (≥ 1 GiB) and aligned to
-`wal.fs_block_bytes`. Strict mode issues `pwrite` + `fdatasync` per
-append; Group-Fsync batches operations under profile ceilings.
+Two targets exist. On Raspberry Pi 5 bare metal the filesystem is
+FAT32 with no mkdir, so persistent files live in the volume root under
+8.3 names (for example `RAFT<pppp>.MET` and `<p><seq7>.WAL`). On the
+Linux host harness files live under `./wal/` relative to the working
+directory (`wal/p<NNNN>_seg_<NNNNNNNN>`,
+`wal/p<NNNN>_snap_<NNNNNNNN>.bin`, `raft/meta`). Strict-mode WAL
+appends issue a write plus fsync per entry; group_fsync batches writes
+inside the configured window.
 
 ### Crash model
 
-- Fail-stop nodes.
-- Power loss may occur between any two ordered steps.
-- Storage may reorder writes unless a step explicitly orders or
-  durably commits via `fdatasync` or an equivalent barrier.
-- The fault model is **crash-only, not Byzantine**. Signatures on
-  proofs and telemetry give auditability and tamper evidence; they
-  don't turn clustor into a BFT protocol. A replica that actively
+- Fail-stop nodes; power loss may occur between any two ordered
+  steps.
+- Storage may reorder writes unless an fsync (or the platform's
+  equivalent flush) orders them.
+- Recovery is CRC replay: on start the WAL is scanned frame by frame,
+  each frame's CRC32C is verified, and replay stops at the first torn
+  or invalid frame. Everything before that point is the durable
+  prefix; everything after it is discarded. Log divergence discovered
+  by AppendEntries conflict checks is repaired with the truncation
+  primitive before new entries are appended.
+- The fault model is crash-only, not Byzantine. There are no
+  signatures or MACs on log or snapshot data; a replica that actively
   lies must be removed by operators.
-
-### Operating assumptions
-
-- Minimum three voters per partition; five for the DR profile.
-- ControlPlaneRaft outages may last up to
-  `controlplane.cache_grace_ms` (default 300,000 ms). While caches
-  remain `Fresh`, nodes continue in their configured durability
-  modes. `Cached` allows existing predicates to continue with
-  telemetry warnings. Once caches age into `Stale` or `Expired`,
-  nodes clamp to Strict durability, revoke leases, pause incremental
-  snapshots, and halve credits once `strict_only_runtime_ms` exceeds
-  the profile's backpressure bound.
-- Observers and follower-read capabilities are gated on Strict
-  durability, fresh proofs, and explicit capability bits from
-  ControlPlaneRaft.
 
 ---
 
@@ -164,298 +149,133 @@ append; Group-Fsync batches operations under profile ceilings.
 
 ### 1) WAL Entry Frame
 
-```
-EntryFrameHeader { version:u8, codec:u8, flags:u16, body_len:u32, trailer_len:u32 }
-body[body_len]
-EntryFrameTrailer { crc32c:u32, [merkle_leaf_digest:32] }
-```
-
-`trailer_len` is either 4 (CRC only) or 36 (CRC + Merkle). The
-trailer's `crc32c` covers the serialised header bytes concatenated
-with the body bytes — it does **not** cover the trailer itself.
-
-Body caps:
-- ConsistencyProfile: ≤ 1 MiB
-- Throughput / WAN: ≤ 4 MiB
-
-These WAL caps are independent of RPC body caps in
-[wire.md](wire.md#encoding-rules).
-
-### 2) Segment Trailer
-
-Every segment ends with a `segment_mac_trailer` that authenticates
-the segment under HMAC-SHA256 keyed by `integrity_mac_epoch`:
+The per-entry segment layout is defined once, in
+`modules/common/wal_frame.rs`, and compiled into both the durability
+module and the `clustor_cli` `wal-frame` / `wal-scan` commands.
 
 ```
-segment_mac_trailer {
-    version:u8,
-    mac_suite_id:u8,
-    segment_seq:u64,
-    first_index:u64,
-    last_index:u64,
-    entry_count:u32,
-    entries_crc32c_lanes_bytes[16],
-    offsets_crc32c_lanes_bytes[16],
-    mac:[32]
-}
+[entry_len: u32 LE][crc32c: u32 LE][payload: entry_len bytes]
 ```
 
-The packed CRC lanes are deterministic. For each entry in physical
-WAL order, append the byte range used by that entry's CRC calculation
-(header bytes followed by body bytes) to a canonical byte stream with
-no separators or padding. Treat the stream as 32-bit little-endian
-words; pad the tail with zero bytes if needed so the length is a
-multiple of 4 (this padding exists only for the CRC-lane computation
-and is not persisted elsewhere). Distribute each word into lane
-`word_index mod 4`, compute CRC32C (Castagnoli) per lane, and emit
-four little-endian `u32` lane CRCs ordered lane0 → lane3. The packed
-`entries_crc32c_lanes_bytes` is exactly 16 bytes.
+The CRC32C (Castagnoli) covers the payload only. The payload's first
+16 bytes are the term/index prologue (`[term:u64 LE][index:u64 LE]`);
+the remainder is the entry body, capped at `MAX_ENTRY_BODY` = 2048
+bytes, giving `MAX_ENTRY_LEN` = 2064 as the largest valid `entry_len`.
+A frame whose `entry_len` is zero, exceeds the cap, or runs past the
+readable region is torn; replay stops there.
 
-`offsets_crc32c_lanes_bytes` uses the `.idx` offsets serialised as
-contiguous 64-bit little-endian values with no separators. Each
-offset is 8 bytes, so the stream is inherently word-aligned and needs
-no padding. The same lane ordering applies.
+### 2) WAL segments and naming
 
-The segment MAC covers every trailer field except `mac` itself,
-authenticating the serialised CRC-lane bytes verbatim. A worked CRC
-lane vector lives in [wire.md](wire.md#crc-lane-packing-example).
+Segments are plain append-only files rolled at `segment_bytes`
+(default 64 MiB). Naming (`encode_segment_path` in
+`modules/app/durability/wal.rs`):
 
-### 3) Durability Ledger
+- Linux host: `wal/p<NNNN>_seg_<NNNNNNNN>` — partition id as four hex
+  digits, segment sequence as eight.
+- Bare-metal FAT32 root: `<p><seq7>.WAL` — one partition nibble plus
+  seven sequence nibbles, 8.3-conforming.
 
-Append-only sidecar file beside the WAL. Each record is one of:
+There is no segment trailer, index sidecar, or MAC; segment integrity
+is entirely the per-entry CRC chain.
 
-- `DurabilityRecord { term, index, segment_seq, io_writer_mode, record_crc32c }`
-- `NonceReservationRange { segment_seq, start_block_counter, reserved_blocks }`
-- `NonceReservationAbandon { segment_seq, abandon_reason }`
-- `DurabilityTransition` — fences a Strict ↔ Group-Fsync mode change
+### 3) Raft metadata record
 
-The ledger is the durability ground truth: an entry counts as durable
-only after its WAL bytes are on disk **and** the matching
-`DurabilityRecord` has been appended and `fdatasync`ed. Ordering
-rules in
-[replication.md](replication.md#ledger-ordering-and-replay).
-
-### 4) DurabilityAck Attestation
+Consensus persists election and log-tip state via the FS contract
+(`modules/app/consensus/raft.rs`): `RAFT<pppp>.MET` on bare-metal
+FAT32, `raft/meta` (or `raft/p<NNNN>/meta` for non-zero partitions)
+on the host. The record is 28 bytes:
 
 ```
-DurabilityAck {
-    partition_id,
-    replica_id,
-    last_fsynced_index,
-    segment_seq,
-    io_writer_mode,
-}
+[current_term:u64][voted_for:i8][last_log_index:u64]
+[last_log_term:u64][current_voters:u8][joint_voters:u8][joint_active:u8]
 ```
 
-A follower emits the ack only after three preconditions:
+Persistence on the durable-ack path is rate-limited; a crash loses at
+most the configured advance window of durable-index bookkeeping, never
+term or vote.
 
-1. The WAL bytes for `last_fsynced_index` are durable.
-2. The matching `DurabilityRecord` has been appended to
-   `wal/durability.log`.
-3. `fdatasync(wal/durability.log)` has completed.
+### 4) Tagged proposal envelope
 
-Acks emitted before any of those complete are protocol violations
-and are discarded at the leader. The
-`{last_fsynced_index, segment_seq, io_writer_mode}` tuple is treated
-as peer-authenticated: mTLS plus replica identity in the crash-only
-fault model proves the follower can regenerate the quorum proof after
-a crash. `io_writer_mode` rides the ack so the leader can fence
-Group-Fsync eligibility — not because it contributes to replay-proof
-durability.
+A proposer that needs to correlate results prefixes its proposal body
+with a non-zero 8-byte correlation id: `[correlation_id:u64 LE][body]`
+(`modules/app/gateway/codec.rs`, `modules/common/replica_facade.rs`).
+The leader strips the prefix before logging — the WAL entry body is
+the untagged application payload — and answers with
+`MSG_PROPOSAL_ASSIGNED` binding the correlation id to the assigned
+`wal_index`. A zero correlation id is rejected.
 
-Leaders bind every received tuple to the current term and stream
-context. Stale tuples cannot help clear a read gate without a fresh
-ControlPlaneRaft proof.
+### 5) FsyncAck and DurabilityProof
 
-### 5) Durability Mode Epoch
+The durability evidence messages (`modules/common/wire.rs`,
+`modules/app/durability/ledger.rs`):
 
-`durability_mode_epoch` is a monotone `u32` stored in ControlPlaneRaft
-and mirrored into `DurabilityTransition` entries, envelopes, and
-telemetry. It increments every time a partition toggles
-Strict ↔ Group.
+- `FsyncAck` (17 bytes): `[term:u64][index:u64][replica:u8]`. Emitted
+  by the local WAL component when its durable point advances; on the
+  leader, per-peer acks are synthesised from the `durable_index` field
+  of each AppendEntriesResponse.
+- `DurabilityProof` (19 bytes):
+  `[partition_id:u16][term:u64][index:u64][replica:u8]`. Emitted by
+  the ledger whenever the quorum-durable index advances; it gates the
+  commit index under strict and group_fsync.
 
-Every Raft control message (AppendEntries, heartbeats, RequestVote,
-PreVote) carries the sender's current epoch. Nodes persist the epoch
-alongside `wal/durability.log`. Any message or ledger record that
-regresses the epoch is rejected — `ModeConflict` on admin RPCs, Raft
-streams closed or answered with a `ModeConflict` envelope. Leaders
-acknowledge a transition only after the epoch and the durability
-proof checkpoint are durably recorded.
+The ledger is an in-memory per-replica progress tracker, not a file.
+There is no durability sidecar log; durable ground truth is the WAL
+bytes themselves, re-proven by replay after a crash.
 
 ### 6) Snapshot Manifest
 
-Canonical JSON (per `CanonicalJson` above):
-
-```json
-{
-  "manifest_id": "...",
-  "version_id": ...,
-  "producer_version": "...",
-  "emit_version": ...,
-  "base_term": ...,
-  "base_index": ...,
-  "snapshot_kind": "Full" | "Delta",
-  "delta_parent_manifest_id": "...",
-  "delta_chain_length": ...,
-  "content_hash": "0x...",
-  "signature": "0x...",
-  "encryption": { "dek_epoch": ..., "iv_salt": "0x..." },
-  "chunks": [...],
-  "logical_markers": [...],
-  "ap_pane_digest": "0x...",
-  "dedup_shards": [...],
-  "commit_epoch_vector": [...]
-}
-```
-
-Incremental manifests set `snapshot_kind = Delta` and record parent
-information. Their `encryption{…}` uses the snapshot-specific IV
-derivation in [security.md](security.md#snapshot-chunks); WAL IV
-derivation ignores `iv_salt`.
-
-Computing `content_hash` or signing the manifest removes the
-top-level `content_hash` and `signature` fields first, then hashes or
-signs the canonical encoding of the remaining object. Every manifest
-is signed with the cluster's `SnapshotManifestKey` (see
-[security.md](security.md#key-purpose-registry)).
-
-A worked sample is in
-[security.md](security.md#snapshot-manifest-sample).
-
-### 7) Filesystem Layout
+A snapshot manifest is a 32-byte binary record
+(`build_manifest` in `modules/common/replica_facade.rs`):
 
 ```
-/state/<partition>/wal/segment-*.log
-/state/<partition>/wal/segment-*.idx
-/state/<partition>/wal/durability.log
-/state/<partition>/snapshot/<term>-<index>/manifest.json
-/state/<partition>/snapshot/chunks/
-/state/<partition>/definitions/<bundle_id>.blob
-/state/<partition>/metadata.json
-/state/<partition>/boot_record.json
+[magic:u32 = 0x534E4150 "SNAP"][partition_id:u16][reserved:u16]
+[term:u64][base_index:u64][dek_epoch:u32][reserved:u32]
 ```
 
-Tenant- or product-specific files MAY be added under
-`/state/<partition>/…` so long as the layout above stays intact.
+Snapshot content travels as `MSG_SNAPSHOT_CHUNK` frames with an
+8-byte `[seq:u32][len:u32]` prefix, followed by the manifest as the
+completion record. The durability module persists the snapshot to
+`wal/p<NNNN>_snap_<NNNNNNNN>.bin` with a CRC-validated file layout and
+a pointer sidecar naming the current durable snapshot, which makes the
+install crash-atomic without an FS rename
+(`modules/app/durability/snapshot.rs`). Manifests are not signed and
+not JSON.
 
-### 8) ControlPlaneRaft Objects
+### 7) Timing entries
 
-ControlPlaneRaft stores: partition manifests, durability ledger
-entries, `QuarantineCleared` records, `DefinitionBundles`,
-`ActivationBarriers`, `WarmupReadiness` entries, override ledger
-items, feature manifest rows, DR fences, key epochs, RBAC manifests.
-
-### 9) Throttle Envelope Payload
-
-JSON envelope carrying: reason, retry hints, backlog, credit levels,
-durability metadata, decision trace ID, credit hint, ingest and
-durability status codes, sorted-and-truncated ID lists with
-continuation tokens. Wire shape in
-[wire.md](wire.md#message-catalog).
-
-### 10) ChunkedList Frame
-
-```
-ChunkedListFrame {
-    total_count:u32,
-    chunk_offset:u32,
-    chunk_len:u16,
-    chunk_flags:u8,
-    items[],
-    [chunk_crc32c:u32 when has_crc=1]
-}
-```
-
-Constraints: `chunk_len ≤ 1024`, serialised payload ≤ 64 KiB,
-reassembly cap 8 MiB, `total_count ≤ 1,000,000`.
+Deterministic replicated timing rides the ordinary log. A proposal
+whose payload begins with the 8-byte `TIMING_MAGIC`
+(`modules/common/wire.rs`) is a timing command — deadline
+registration and related operations — applied deterministically at
+apply time by the state in `modules/common/timing.rs`. The producer is
+leader-fenced so only one node injects timing entries per term.
 
 ---
 
 ## Invariants
 
-The properties that hold across every replica in every run. Anything
-violating these is a protocol bug, not a tuning issue.
+Properties that hold on every replica in every run; a violation is a
+protocol bug, not a tuning issue.
 
-### 1) Raft safety
-
-Log matching, leader completeness, and monotone `raft_commit_index`
-hold for every replica. `raft_commit_index` follows the Raft
-current-term rule: only entries from the current term may become
-committed in the current term.
-
-`wal_committed_index ≤ raft_commit_index` always. Equality is
-required whenever `commit_visibility = DurableOnly`.
-
-### 2) Durability before ACK
-
-Client ACKs occur only after:
-- the leader has persisted,
-- a quorum has sent `DurabilityAck` evidence,
-- the ledger record has been appended and `fdatasync`ed, and
-- `wal_committed_index` has advanced.
-
-`DurabilityTransition` entries fence every Strict ↔ Group change.
-No batch may span a fence.
-
-### 3) Linearizable read prerequisites
-
-All of the following must hold:
-
-- `strict_fallback == false`
-- `commit_visibility == DurableOnly`
-- Cache freshness — state ∈ `{Fresh, Cached}`
-- Proof equality on the `DurabilityProofTupleV1` subset
-  `{last_durable_term, last_durable_index, segment_seq,
-   io_writer_mode, durability_mode_epoch}` matching the leader's
-  last quorum-fsynced tuple
-- `wal_committed_index == raft_commit_index`
-
-The reference predicate is in
-[replication.md](replication.md#read-gate-predicate).
-
-### 4) Snapshot integrity
-
-Full and incremental snapshots use signed manifests,
-AEAD-authenticated chunks, digest verification before apply, and
-profile-bound cadence controls. Targets are advisory; hard bounds
-gate.
-
-### 5) Nonce uniqueness
-
-`(segment_seq, block_counter)` pairs are globally unique.
-Reservations are contiguous, bounded by
-`nonce.reservation_max_blocks_profile`, proactively flushed
-(writers persist after ≤ 5 ms of inactivity and whenever windows
-fill), and durably recorded before any ciphertext uses the counters.
-Reservations are explicitly abandoned before compaction.
-
-### 6) Startup scrub
-
-Nodes authenticate AEAD tags in constant time, zeroise buffers on
-failure, verify MACs / CRC / Merkle, and check ledger ordering before
-taking action. No plaintext influences state before authentication
-completes.
-
-### 7) Quarantine
-
-AEAD or MAC failures, repeated fatal apply outcomes, nonce reuse
-suspicion, integrity policy violations, or admin pause force
-Quarantine. Exit requires snapshot or WAL rebuild plus a
-ControlPlaneRaft acknowledgement.
-
----
-
-## Snapshot and ledger metadata
-
-Snapshot authorisation walks through four steps in order:
-
-1. `fsync` the manifest.
-2. Re-list (`stat` + checksum).
-3. Emit
-   `SnapshotAuthorizationRecord { manifest_id, base_index, auth_seq, manifest_hash }`.
-4. Emit `CompactionAuthAck { manifest_id, auth_seq }` with hash
-   chaining.
-
-`boot_record.json` captures the scrub outcome, durability watermark,
-WAL geometry, `io_writer_mode`, and spec self-test metadata for
-audit. The same data is surfaced via `/readyz`.
+1. **Raft safety.** Log matching, leader completeness, and a monotone
+   commit index hold. The current-term fence in `commit.rs` enforces
+   the standard rule: the commit index may not advance by counting
+   replicas while the quorum sits below the current term's first
+   entry.
+2. **Durability before commit (strict / group_fsync).** The commit
+   index never exceeds the quorum-durable index proven by the latest
+   `DurabilityProof`. Client-visible acknowledgement of a proposal
+   therefore implies quorum fsync in these modes.
+3. **Replay recovers exactly the durable prefix.** `wal-scan` over a
+   segment image and a replica's replay agree by construction — both
+   compile `wal_frame.rs` — and both stop at the first torn frame.
+4. **Strict fallback on stale control-plane proofs.** Once the proof
+   cache ages into Stale or Expired, the effective durability mode is
+   strict regardless of configuration, until fresh proofs arrive.
+5. **Read fencing.** A fenced read is answered only after
+   `apply_index` reaches the commit horizon captured at submission,
+   so a client never reads state older than a write it has been
+   acknowledged for.
+6. **Partition isolation.** Every persistent file name and every
+   durability proof carries the `partition_id`; partitions sharing a
+   node share no state.

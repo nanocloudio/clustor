@@ -1,141 +1,93 @@
 # Error Handling
 
-The structured rejections clustor surfaces when a write, read, or
-admin call cannot be honoured. Wire-level encoding errors live in
-[wire.md](wire.md#error-codes); this doc covers the higher-level
-envelopes a client or operator actually observes.
+The structured rejections a client or operator actually observes:
+wire-level client rejects, admin status codes, the WAL's continuity
+rejection, and the HTTP status behaviour of the operations module.
+Byte layouts and message ids are defined in
+[wire.md](wire.md#message-catalog); this document explains when each
+rejection occurs. Sources: `modules/common/wire.rs`,
+`modules/app/gateway/`, `modules/app/consensus/apply.rs`,
+`modules/app/operations/`.
 
-Every envelope carries the shared schema header from
-[wire.md](wire.md#envelopes):
-`{schema_version, generated_at, partition_id, routing_epoch,
-durability_mode_epoch}`.
+## Client rejections (`MSG_CLIENT_REJECT`)
 
-## Table of Contents
+A request denied before it can be replicated is answered with an
+11-byte `MSG_CLIENT_REJECT` payload:
 
-1. [Wire rejections](#wire-rejections)
-2. [Gate failures](#gate-failures)
-3. [Quarantine reasons](#quarantine-reasons)
+| Offset | Field | Type |
+|---|---|---|
+| 0 | `conn_id` | `u8` |
+| 1 | `status` | `u8` |
+| 2 | `reserved` | `u8` — carries `leader_id` when `status` is NOT_LEADER, otherwise 0 |
+| 3 | `retry_after_ms` | `u16` LE |
+| 5 | `entry_credits` | `i16` LE |
+| 7 | `byte_credits` | `i32` LE |
 
----
+Between the gateway's throttle and its codec the same 10-byte body
+rides an internal envelope (`MSG_CLIENT_REJECT_INTERNAL`) keyed by an
+8-byte correlation id instead of the conn_id.
 
-## Wire rejections
+| Status | Value | When it occurs |
+|---|---|---|
+| `CLIENT_REJECT_THROTTLED` | 0x01 | The gateway's throttle could not admit the proposal: credits are exhausted, or raft's intake channel was full and nothing was written. The client should retry. |
+| `CLIENT_REJECT_NOT_LEADER` | 0x02 | The gateway's codec knows the leader and it is not the local node. The `reserved` byte carries the believed `leader_id` so the client can redirect. Applies to both writes and reads. |
+| `CLIENT_REJECT_STALE_EPOCH` | 0x03 | The local node has seen a newer placement epoch than the request implies. The client refreshes placement and retries. |
+| `CLIENT_REJECT_FALLBACK` | 0x04 | A linearizable read failed in the consensus apply pipeline: the ReadIndex probe was unconfirmed (not leader, or the probe timed out), the read aged past its 5 s queue timeout, or it was evicted from the bounded read queue. |
+| `CLIENT_REJECT_READ_UNSUPPORTED` | 0x05 | A read arrived but the graph has no read path wired to consensus, so a structured reject replaces a silent drop. |
+| `CLIENT_REJECT_TOO_LARGE` | 0x06 | The record's payload exceeds the largest proposal the log can carry (`MAX_ENTRY_BODY`, see [wire.md](wire.md#wal-frame-contract)). Rejected at the gateway surface before any bytes are consumed downstream — proposing a truncated prefix would commit a corrupted entry while acking the full write. |
 
-### `RoutingEpochMismatch`
+`retry_after_ms` is only populated by the throttle: 5 ms when entry
+credits remain (the raft channel was momentarily full), 50 ms when
+credits are exhausted. Throttle rejects also carry the current
+(clamped) entry and byte credit balances; every other status leaves
+all three fields at zero.
 
-Stale or missing routing epoch on writes or admin calls. The payload
-includes the observed and expected `routing_epoch`, plus lease and
-durability epochs. Clients refresh placement and retry.
+## Admin status codes (`MSG_ADMIN_RESPONSE` / `MSG_ADMIN_APPLIED`)
 
-### `ModeConflict`
+The first payload byte of an admin response is one of:
 
-Stale durability mode epoch when toggling Strict ↔ Group, or when an
-inbound Raft control message carries an older `durability_mode_epoch`
-than the receiver has persisted. See
-[lifecycle.md](lifecycle.md#3-monotone-epoch-enforcement) for the
-monotone-epoch rules.
+| Status | Value | When it occurs |
+|---|---|---|
+| `ADMIN_STATUS_OK` | 0x00 | The op applied: freeze, thaw, transfer-leader, durability-mode, snapshot. |
+| `ADMIN_STATUS_DUPLICATE` | 0x01 | Idempotency collapse of a rapid retransmit — a command byte-identical to its immediate predecessor within the in-flight window. |
+| `ADMIN_STATUS_UNSUPPORTED` | 0x80 | Membership ops (add / remove voter): joint consensus is deliberately gated until union-quorum enforcement lands. |
+| `ADMIN_STATUS_REJECTED` | 0x81 | The command is too large to stage in the admin envelope buffer. |
+| `ADMIN_STATUS_NOT_LEADER` | 0x82 | Transfer-leader issued on a node that is not the leader. |
 
-### `ControlPlaneUnavailable`
+## WAL continuity rejection (`MSG_WAL_REJECT`)
 
-Read-gate or lease-gate failure, mapped through the priority order
-in [concepts.md](concepts.md#behaviour-switches):
+Emitted by the durability module to consensus when the WAL is handed
+an entry whose index is not `wal_current_index + 1` — raft's log has
+diverged from what the WAL actually holds. The 8-byte payload is the
+index the WAL will accept next. A successful channel write only means
+the frame entered the WAL's input channel; this message is raft's only
+signal that a counted entry was never persisted. Raft resyncs its tip
+down to `expected_index − 1` and replays from there
+(the `RAFT_WAL_RESYNCS` counter counts the repairs).
 
-```
-reason ∈ { CacheExpired, CacheNotFresh, NeededForReadIndex }
-```
+## HTTP status behaviour
 
-| Reason | Mapped from |
-|---|---|
-| `CacheExpired` | Cache aged into `Expired` |
-| `CacheNotFresh` | Cache aged into `Stale` |
-| `NeededForReadIndex` | Strict-fallback latch or proof-equality failure |
+The operations module serves `GET /readyz`, `GET /why`,
+`GET /metrics`, `POST /propose`, and `POST /admin/<op>` through its
+ingress and http components.
 
-The envelope carries retry metadata, surfaces as HTTP 503 / gRPC
-`UNAVAILABLE`, and includes `Retry-After ≥ 250 ms`. Clients falling
-back to snapshot-only reads do so via an explicit `SnapshotOnly`
-flag — `ControlPlaneUnavailable` itself does not authorise that
-fallback.
-
-### `snapshot_full_invalidated` / `snapshot_delta_invalidated`
-
-Emitted when the trust cache for this snapshot is invalid, the
-schema has bumped, the emit version changed, the DEK epoch rolled
-over, or a delta chain violation was detected.
-
-### `ThrottleEnvelope`
-
-```
-reason ∈ {
-    ApplyBudget,
-    WALDevice,
-    FollowerLag,
-    DiskSoft,
-    DiskHard,
-    TenantQuota,
-    FrameAlignment,
-    SnapshotImport,
-}
-```
-
-Carries backlog metrics, current credits, observed durations,
-`credit_hint ∈ {Recover, Hold, Shed}`, and ingest plus durability
-status codes.
-
-### Other rejection families
-
-These share the schema header and the list-truncation conventions:
-
-- `FollowerCapabilityRevoked`
-- `SnapshotChunkAuthFailure`
-- `SnapshotDeltaRetired`
-- `NonceReservationGapWarning`
-- `OverrideStrictOnlyBackpressure`
-- `WhyCreditZero`
-- `WhyNotLeader`
-- `WhySnapshotBlocked`
-- `WhyQuarantined`
-
----
-
-## Gate failures
-
-### Read gate
-
-Read-gate predicate failures emit `ControlPlaneUnavailable` with
-prioritised reasons. The predicate itself is in
-[replication.md](replication.md#read-gate-predicate).
-
-### Group-Fsync gate
-
-Group-Fsync gating returns one of:
-
-- `ModeConflict(strict_fallback)` over RPC
-- `GroupFsyncQuarantine` as a telemetry incident (the identifier
-  omits the hyphen even though the feature name is "Group-Fsync")
-
-### Lease gate
-
-Lease revocation produces:
-
-- `LeaseGapExceeded`
-- `clock_guard_alarm`
-- `LeaseRevokedDueToStrictFallback`
-
-### Snapshot import and authorisation
-
-- `SnapshotDeterminismViolation`
-- `SnapshotChunkAuthFailure`
-- `SnapshotImportNodePressure`
-
----
-
-## Quarantine reasons
-
-Quarantine entry reasons are typed so policy can branch:
-
-```
-reason ∈ { Integrity, Administrative, ApplyFault }
-```
-
-The reason controls whether snapshot exports and follower reads stay
-enabled while quarantined. See
-[lifecycle.md](lifecycle.md#startup-scrub-and-quarantine).
+- `/readyz` answers with a one-byte body directly from ingress: 200
+  when the readiness byte is non-zero, 503 otherwise.
+- A malformed request line is answered 400 `bad request`; an unknown
+  `/admin/<op>` name is answered 400 `unknown admin op`; any other
+  unknown path is 404 `not found`.
+- A body whose advertised `Content-Length` exceeds the per-connection
+  cap is answered 413 and the connection is closed; a header block
+  that overruns the receive buffer is answered 431 and closed — never
+  truncated.
+- `POST /propose` (the synchronous write bridge) answers 200
+  `committed` once apply acknowledges the assigned WAL index, and 503
+  with a reason body otherwise: `propose queue unavailable` (the
+  proposal channel refused the frame), `proposal rejected` (a throttle
+  reject came back for the correlation), `proposal timeout` or
+  `commit timeout` (the 10 s in-flight backstops expired).
+- `POST /admin/<op>` answers 202 `accepted` when the command was
+  authorised and delivered to the admin component (the op's real
+  status still answers on the module's `responses` port), 403
+  `forbidden` when authorisation fails, and 503
+  `admin body too large` when the body cannot be staged.

@@ -4,8 +4,8 @@ The exact set of signals a replicated-state-machine consumer relies
 on for durability, replication, and reconstruction. Anything not
 enumerated here is a **capability leak** — a hidden assumption that
 would break the moment the substrate is swapped for a different
-implementation (a single-node WAL, a managed-Raft service, a test
-harness mock).
+implementation (a single-node WAL, a managed-Raft service, a
+stand-in mock).
 
 This document is the normative contract. Clustor is the canonical
 provider today; the typed Rust helpers a consumer compiles against
@@ -68,7 +68,8 @@ outstanding proposal.
 **Used by.** Ops whose protocol-level ACK is gated on durability.
 **Substrate guarantees.** Same as `proposals` for the `[body]`
 part, plus a `proposal_assigned` echo (§3) and an eventual
-`quorum_durable` notice (§5) keyed by `correlation_id`.
+`quorum_durable` notice (§5) keyed by the `(partition_id,
+wal_index)` tuple the echo carries.
 
 ### 3. `proposal_assigned` (early-ack echo)
 
@@ -99,9 +100,10 @@ mutations on the consumer side.
 - Delivered in commit order; an entry is never re-delivered on
   the leader unless the apply reset (§7) precedes it.
 - `entry_body` is byte-identical to the body the proposer
-  submitted (or `[correlation_id][body]` for tagged proposals
-  — consumers strip the correlation prefix using the same wire
-  layout they encoded with).
+  submitted. For tagged proposals the substrate strips the 8-byte
+  correlation prefix before the entry is logged, so committed
+  bodies never carry it (`MSG_COMMITTED_ENTRY` in `wire.rs`
+  documents the post-strip layout).
 
 ### 5. `quorum_durable` (durability notifier)
 
@@ -142,26 +144,28 @@ and any newly-placed replica that needs to skip log replay.
 
 ### 7. Apply reset
 
-**Direction.** Substrate → consumer.
-**Shape.** The apply-reset envelope (opcode `0x2B` in
-[`../../modules/common/wire.rs`](../../modules/common/wire.rs)) with
-body `[term:u64 LE][index:u64 LE]` — same body shape as
-`MSG_COMMITTED_BATCH`, distinct opcode.
+**Direction.** Substrate → consumer, carried by the snapshot
+install path rather than a wire message.
+**Shape.** `SnapshotInstaller::finalize` returns a `CommitAck`
+`(term, index)` for the installed snapshot; the consumer seeds its
+committed-entry cursor with
+`CommittedSubscriber::reset_to(index, term)`. The
+`MSG_APPLY_PIPELINE_RESET` opcode (`0x2B`) in `wire.rs` is interior
+to `consensus`: the rewind is a seam from `raft` to the apply
+component (the "E6 RESET seam" in `consensus/raft.rs`), and nothing
+emits it on an external port.
 **Used by.** Every apply-derived arena in the consumer.
-**Substrate guarantees.** Emitted when the substrate's notion of
-"next apply index" has rewound — snapshot install, leader-
-driven log truncation, or any other event that invalidates
-already-applied state. After this signal, every consumer module
-must:
+**Substrate guarantees.** The substrate's notion of "next apply
+index" rewinds only through snapshot install. After finalising an
+install, every consumer module must:
 
 1. Discard all apply-derived state with `apply_index > reset_index`.
-2. Re-emit state from the new snapshot if one is being installed.
+2. Re-create state from the installed snapshot.
 3. Resume consuming `committed_entries` starting at `reset_index + 1`.
 
-This is **not** a "best effort" advisory. A consumer that doesn't
-honour the reset can diverge from the substrate's view of
-replicated state and will produce subtly wrong acks and fanouts
-after the next leader change.
+A consumer that skips the reset diverges from the substrate's view
+of replicated state and produces wrong acks and fanouts after the
+next leader change.
 
 ## What is NOT in the surface
 
@@ -186,15 +190,15 @@ diagnostics, never for replicated state.
   modules. Routing state itself is replicated through the
   committed-entry stream like any other apply-derived state.
 
-The test: if removing a signal changes which response a client
+The criterion: if removing a signal changes which response a client
 sees, it belongs in the seven primitives above. If it changes
 *when* a response is sent or *how fast* a request is admitted, it
 is an operational signal and does not belong here.
 
 ## Single-node stand-in
 
-A "no replication" stand-in substrate (for embedded use, dev
-rigs, or test harnesses) implements the seven primitives as
+A "no replication" stand-in substrate (for embedded use or dev
+rigs) implements the seven primitives as
 follows:
 
 | Primitive | Stand-in behaviour |
@@ -208,9 +212,8 @@ follows:
 | Apply reset | Fired on cold start after snapshot install. |
 
 A consumer binary that runs against a 3-replica clustor cluster
-runs against this stand-in unchanged — only the YAML wiring
-differs. That is the substitutability contract this surface
-exists to defend.
+runs against this stand-in unchanged; only the YAML wiring
+differs.
 
 ## Versioning
 
@@ -223,18 +226,19 @@ path. The surface version is independent of:
 - Any consumer's internal payload version byte (a consumer that
   versions its `entry_body` opaquely is invisible to the surface).
 
-A provider advertises which surface version it implements; a
-consumer manifest declares which surface version it requires. The
-`fluxor` build resolver fails fast when these disagree, the same
-way it fails on an ABI mismatch (see
-[`../../fluxor.toml`](../../fluxor.toml) `[required]` block).
+No manifest carries a surface version today. The provider's
+`capabilities = ["replication.state_machine"]` declaration is
+vocabulary only — it names the role, it does not negotiate a
+version (see [modules.md](modules.md)). The
+[`../../fluxor.toml`](../../fluxor.toml) `[required]` block is a
+different mechanism: it pins the wire ABI and catches
+envelope-shape skew, not surface-semantics skew. Until a resolver
+consumes surface versions, changes to this surface are policed by
+review against this document.
 
 ## Consumer pointers
 
-Every consumer module that consumes a primitive carries a
-`// see docs/architecture/substrate_capability_surface.md §N`
-comment at the use site, so a reader chasing one signal's contract
-lands here directly. The mapping for in-tree consumers:
+The mapping for in-tree consumers:
 
 | Primitive | Where it's consumed in clustor |
 |---|---|
@@ -262,5 +266,5 @@ layer.
   read gate, compaction).
 - [wire.md](wire.md) — opcode catalog and byte layouts for every
   `MSG_*` referenced here.
-- [../proposal_correlation.md](../proposal_correlation.md) — the
+- [../proposal_correlation.md](../guides/proposal_correlation.md) — the
   protocol that binds primitives 2 and 3 together.
