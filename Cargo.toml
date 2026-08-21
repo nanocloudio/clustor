@@ -247,6 +247,23 @@ path = "tests/volatile_cluster.rs"
 name = "wal_scan"
 path = "tests/wal_scan.rs"
 
+# Host-side coverage for the correlated Raft <-> WAL truncation
+# handshake. Mounts `modules/app/consensus/raft.rs` and
+# `modules/app/durability/wal.rs` in one crate, wired to each other
+# through shared mock channel handles; no fluxor-linux / .fmod
+# prereqs, always runs.
+[[test]]
+name = "wal_truncate"
+path = "tests/wal_truncate.rs"
+
+# Host-side unit coverage for the snapshot pointer's two-slot,
+# CRC-protected layout. Pulls `modules/app/durability/snapshot.rs`
+# in via `#[path]` against a mock SyscallTable (in-memory FS +
+# byte-FIFO channels); no fluxor-linux / .fmod prereqs, always runs.
+[[test]]
+name = "snap_pointer"
+path = "tests/snap_pointer.rs"
+
 # Host-side unit coverage for raft's write-then-adopt metadata
 # persistence discipline. Pulls `modules/app/consensus/raft.rs` in via
 # `#[path]` against a mock SyscallTable (in-memory FS with fault
@@ -255,6 +272,26 @@ path = "tests/wal_scan.rs"
 [[test]]
 name = "raft_meta"
 path = "tests/raft_meta.rs"
+
+# Host-side unit coverage for name-durable publication of WAL segments
+# and snapshot artefacts, and for fixed-segment admission when
+# preallocation is unavailable. Pulls raft.rs + wal.rs + snapshot.rs in
+# via `#[path]` against a mock SyscallTable whose directory entries are
+# volatile until fenced; no fluxor-linux / .fmod prereqs, always runs.
+[[test]]
+name = "name_fence"
+path = "tests/name_fence.rs"
+
+# Deterministic, seeded end-to-end Raft fault matrix. Mounts the whole
+# consensus composite (raft, replicator, commit, apply) and durability
+# composite (wal, ledger, snapshot) for several nodes in one crate,
+# wired through a seeded router and a mock SyscallTable that injects
+# faults at each pipeline boundary; no fluxor-linux / .fmod prereqs,
+# always runs. Serialise with `--test-threads=1`: the mock kernel is
+# process-global.
+[[test]]
+name = "raft_fault_matrix"
+path = "tests/raft_fault_matrix.rs"
 
 # Criterion benches. Each uses `harness = false` so criterion's own
 # main runs instead of the default libtest harness. Run with

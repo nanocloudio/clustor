@@ -6,8 +6,8 @@
 //!
 //!   - [`raft`]       — the Raft state machine: elections (with
 //!     pre-vote), proposal batching, follower log matching + §5.3
-//!     conflict repair, admin/config apply, `RAFT<pppp>.MET`
-//!     metadata persistence.
+//!     conflict repair, admin/config apply, two-slot CRC metadata
+//!     persistence (`RAFT<pppp>.M<slot>` / `raft/meta<slot>`).
 //!   - [`replicator`] — AppendEntries pipelining to followers, ack
 //!     processing, WAL read-back catch-up, snapshot chunk transfer.
 //!   - [`commit`]     — quorum match/durability fusion → the commit
@@ -86,6 +86,8 @@ mod types;
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
+#[path = "../../common/collections.rs"]
+mod collections;
 #[path = "../../common/wal_frame.rs"]
 mod wal_frame;
 #[path = "../../common/log_fmt.rs"]
@@ -165,6 +167,17 @@ define_params! {
     // the FS contract (`root_path` selects the layout).
     12, persist_meta, u8, 1, enum { none=0, fs=1 }
         => |s, d, len| { s.raft.persist_meta = p_u8(d, len, 0, 1); };
+
+    // Name-publication posture for the election-metadata slots, mirroring
+    // the durability module's param of the same name. Default 1 = strict:
+    // a provider that cannot fence a name persists nothing, so vote grants
+    // and election starts stay withheld rather than resting on a slot the
+    // next boot may not find. 0 = auto: fence each slot's directory entry
+    // through `fs::FSYNC_NAME` where the provider advertises
+    // `caps::FSYNC_NAME`, and report the disposition in `RAFT_NAME_FENCE`
+    // where it does not — an observation posture, not a durability one.
+    13, name_fence, u8, 1
+        => |s, d, len| { s.raft.name_fence = p_u8(d, len, 0, 1); };
 }
 
 #[repr(C)]

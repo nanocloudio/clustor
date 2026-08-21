@@ -21,6 +21,7 @@ use super::{dev_log, dev_millis, wire, wire_channels};
 
 const FS_OPEN: u32 = 0x0900;
 const FS_READ: u32 = 0x0901;
+const FS_SEEK: u32 = 0x0902;
 const FS_WRITE: u32 = 0x0906;
 const FS_FSYNC: u32 = 0x0905;
 const FS_CLOSE: u32 = 0x0903;
@@ -37,6 +38,20 @@ const FS_UNLINK: u32 = 0x090A;
 /// (`modules/sdk/contracts/storage/fs.rs::{CAPS, caps::UNLINK}`).
 const FS_CAPS: u32 = 0x09FF;
 const FS_CAP_UNLINK: u32 = 1 << 5;
+/// Durable publication of a parent-directory entry
+/// (`modules/sdk/contracts/storage/fs.rs::{FSYNC_NAME, caps::FSYNC_NAME}`).
+/// A snapshot artefact and its pointer slots are recovery roots: their
+/// bytes being durable is worthless if the name that finds them is not.
+const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_CAP_FSYNC_NAME: u32 = 1 << 11;
+
+/// `name_fence` postures — see `durability/mod.rs` param 15.
+const NAME_FENCE_STRICT: u8 = 1;
+
+/// `name_fence_probe` / `SNAP_NAME_FENCE` dispositions.
+const NAME_FENCE_UNPROBED: u8 = 0;
+const NAME_FENCE_PRESENT: u8 = 1;
+const NAME_FENCE_ABSENT: u8 = 2;
 /// FS E_AGAIN: the provider exists but is still initialising (fat32
 /// reading the BPB/GPT/root on a cold boot). Distinct from ENODEV/ENOSYS
 /// ("no provider"): an E_AGAIN persist failure must NOT be treated as the
@@ -76,6 +91,47 @@ const FS_E_NOSYS: i32 = -38;
 const STEP_BURST: i32 = 2;
 
 const SNAP_PATH_MAX: usize = 64;
+
+/// Number of snapshot-pointer slots. Each slot is a SEPARATE FILE, so
+/// the two records never share a read-modify-write unit: a publish
+/// rewrites one file's data cluster and a torn sector there damages
+/// that slot alone. Two records inside one file would share the unit
+/// and tear together.
+///
+/// That covers the records, not the namespace. On FAT32 both directory
+/// entries may sit in one directory sector, so the step that first
+/// creates the second slot can share a failure unit with the first
+/// entry. Each name is minted once, when its file grows from empty,
+/// and fenced then; afterwards a publish rewrites the same 32 bytes in
+/// place, leaving the size and cluster chain unchanged and the
+/// directory sector untouched. The creation window is the only one in
+/// which both names can be lost together, and a node in it has no
+/// adopted generation to lose.
+const SNAP_PTR_SLOTS: usize = 2;
+/// Pointer candidates BOOT_LOAD may try: both slots plus the flat
+/// record.
+const SNAP_PTR_CANDIDATES: usize = SNAP_PTR_SLOTS + 1;
+
+/// Pointer slot magic and format id.
+const MAGIC_SNAP_PTR: u32 = 0x5254_5053; // "SPTR" little-endian as bytes
+const SNAP_PTR_FORMAT_ID: u16 = 1;
+
+/// Pointer slot size.
+///
+/// Layout (32 bytes):
+///   `[magic:u32][format:u16][pad:u16][generation:u64][index:u64]
+///    [reserved:4][crc32c:u32]`
+///
+/// The CRC covers bytes `0..28`. `pad` and `reserved` are written zero
+/// and covered by the CRC, so a decoder finding them non-zero under a
+/// known `format` id refuses the record; a future field claims them
+/// behind a new format id rather than by reinterpreting a zero.
+const SNAP_PTR_SIZE: usize = 32;
+const SNAP_PTR_CRC_OFF: usize = 28;
+/// Flat pointer: a bare 8-byte index with no magic, generation or
+/// CRC. Tried last at boot, so a store holding this shape still
+/// resolves its snapshot.
+const SNAP_PTR_FLAT_SIZE: usize = 8;
 
 const MAGIC_SNAP: u32 = 0x534E_4150; // "SNAP" little-endian as bytes
 
@@ -181,8 +237,24 @@ pub struct Snapshot {
     /// silently missing. `mod.rs` holds `wal::step` until this reports
     /// done.
     boot_phase: u8,
-    /// Snapshot index named by the pointer sidecar (BOOT_PTR → BOOT_LOAD).
+    /// Snapshot index named by the pointer slot currently being tried
+    /// (BOOT_PTR → BOOT_LOAD).
     boot_ptr_index: u64,
+    /// Candidate snapshot indices collected at BOOT_PTR, ordered by
+    /// pointer generation (newest first, the flat pointer last). BOOT_LOAD
+    /// walks them in order: a pointer is only believed once the snapshot
+    /// artefact it names is present and passes its own CRC, so a pointer that
+    /// survived a crash its snapshot did not never becomes the recovery root.
+    boot_ptr_candidates: [u64; SNAP_PTR_CANDIDATES],
+    /// Number of populated entries in `boot_ptr_candidates`.
+    boot_ptr_count: u8,
+    /// Next candidate BOOT_LOAD will try.
+    boot_ptr_next: u8,
+    /// Pointer slot (0/1) holding the highest valid generation. The next
+    /// publish targets the other slot.
+    snap_ptr_slot: u8,
+    /// Generation of the record in `snap_ptr_slot`.
+    snap_ptr_generation: u64,
 
     pub partition_id: u16,
     /// Param `root_path`: 1 = 8.3 snapshot names at the FS root (bare-metal
@@ -192,6 +264,15 @@ pub struct Snapshot {
     /// 0 = unprobed, 1 = supported, 2 = unsupported. See
     /// `fs_unlink_supported`.
     fs_unlink_probe: u8,
+    /// FS `caps::FSYNC_NAME` probe cache: `NAME_FENCE_UNPROBED`,
+    /// `NAME_FENCE_PRESENT`, `NAME_FENCE_ABSENT`.
+    name_fence_probe: u8,
+    /// Param `name_fence` (0 = auto, 1 = strict), fanned in from the
+    /// composite so segments, snapshots and pointer slots share one
+    /// posture.
+    pub name_fence: u8,
+    /// Counter behind `SNAP_NAME_UNFENCED`.
+    name_unfenced: u32,
 
     // State
     pub dek_epoch: u32,
@@ -294,9 +375,17 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.wal_high_water = (0, 0);
     s.boot_phase = BOOT_PTR;
     s.boot_ptr_index = 0;
+    s.boot_ptr_candidates = [0; SNAP_PTR_CANDIDATES];
+    s.boot_ptr_count = 0;
+    s.boot_ptr_next = 0;
+    s.snap_ptr_slot = 0;
+    s.snap_ptr_generation = 0;
     s.partition_id = 0;
     s.root_path = 0;
     s.fs_unlink_probe = 0;
+    s.name_fence_probe = NAME_FENCE_UNPROBED;
+    s.name_fence = 0;
+    s.name_unfenced = 0;
     s.dek_epoch = 0;
     s.snapshots_taken = 0;
     s.chunks_imported = 0;
@@ -581,7 +670,14 @@ unsafe fn emit_metrics(s: &mut Snapshot, sys: &SyscallTable) {
     let mid = wire::SOURCE_ID_SNAPSHOT;
     let pid = s.partition_id;
     let kc = wire::METRIC_KIND_COUNTER;
-    let scalars: [(u16, i64); 7] = [
+    // The name-fence disposition is a state, not a count.
+    emit_sample(
+        s, sys, mid, pid,
+        wire::metric_ids::SNAP_NAME_FENCE,
+        wire::METRIC_KIND_GAUGE,
+        i64::from(s.name_fence_probe),
+    );
+    let scalars: [(u16, i64); 8] = [
         (wire::metric_ids::SNAP_SNAPSHOTS_TAKEN, i64::from(s.snapshots_taken)),
         (wire::metric_ids::SNAP_CHUNKS_IMPORTED, i64::from(s.chunks_imported)),
         (wire::metric_ids::SNAP_TRIGGERS_DEFERRED, i64::from(s.triggers_deferred)),
@@ -589,6 +685,7 @@ unsafe fn emit_metrics(s: &mut Snapshot, sys: &SyscallTable) {
         (wire::metric_ids::SNAP_INSTALL_FAILURES, i64::from(s.install_failures)),
         (wire::metric_ids::SNAP_APP_BODIES_RECEIVED, i64::from(s.app_bodies_received)),
         (wire::metric_ids::SNAP_APP_CAPTURES_TIMED_OUT, i64::from(s.app_captures_timed_out)),
+        (wire::metric_ids::SNAP_NAME_UNFENCED, i64::from(s.name_unfenced)),
     ];
     for &(metric_id, value) in scalars.iter() {
         emit_sample(s, sys, mid, pid, metric_id, kc, value);
@@ -1066,11 +1163,88 @@ unsafe fn emit_install_body(
     }
 }
 
+/// Path of pointer slot `slot`. The two slots are distinct files so a
+/// failure in one cannot reach the other.
+///   root mode: `<p>SNAPPT<slot>.SNP` (8.3-legal: 8-char stem)
+///   dir mode:  `wal/p<NNNN>_snapptr<slot>.bin`
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Snapshot`.
+unsafe fn build_snap_ptr_slot_path(s: &mut Snapshot, slot: u8) -> usize {
+    let len = build_snap_pointer_path(s);
+    let digit = b'0' + (slot & 1);
+    if s.root_path != 0 {
+        // "<p>SNAPPTR.SNP" → "<p>SNAPPT<slot>.SNP": replace the 'R', so
+        // the stem stays 8 characters.
+        s.path_buf[7] = digit;
+        return len;
+    }
+    // "..._snapptr.bin" → "..._snapptr<slot>.bin": insert before ".bin".
+    let dot = len - 4;
+    let mut i = len;
+    while i > dot {
+        s.path_buf[i] = s.path_buf[i - 1];
+        i -= 1;
+    }
+    s.path_buf[dot] = digit;
+    len + 1
+}
+
+/// Encode a pointer slot record and seal it with its CRC.
+fn encode_snap_ptr(buf: &mut [u8; SNAP_PTR_SIZE], generation: u64, index: Index) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    buf[0..4].copy_from_slice(&MAGIC_SNAP_PTR.to_le_bytes());
+    buf[4..6].copy_from_slice(&SNAP_PTR_FORMAT_ID.to_le_bytes());
+    buf[8..16].copy_from_slice(&generation.to_le_bytes());
+    buf[16..24].copy_from_slice(&index.to_le_bytes());
+    let mut c = Crc32c::new();
+    c.update(&buf[..SNAP_PTR_CRC_OFF]);
+    buf[SNAP_PTR_CRC_OFF..SNAP_PTR_SIZE].copy_from_slice(&c.finalize().to_le_bytes());
+}
+
+/// Decode a pointer slot into `(generation, index)`. `None` for anything
+/// whose magic, format id, or CRC does not check out — a torn write, an
+/// unwritten slot, and a foreign file are all refused alike.
+fn decode_snap_ptr(buf: &[u8]) -> Option<(u64, Index)> {
+    if buf.len() < SNAP_PTR_SIZE {
+        return None;
+    }
+    if u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) != MAGIC_SNAP_PTR {
+        return None;
+    }
+    if u16::from_le_bytes([buf[4], buf[5]]) != SNAP_PTR_FORMAT_ID {
+        return None;
+    }
+    let mut c = Crc32c::new();
+    c.update(&buf[..SNAP_PTR_CRC_OFF]);
+    let want = u32::from_le_bytes([
+        buf[SNAP_PTR_CRC_OFF],
+        buf[SNAP_PTR_CRC_OFF + 1],
+        buf[SNAP_PTR_CRC_OFF + 2],
+        buf[SNAP_PTR_CRC_OFF + 3],
+    ]);
+    if c.finalize() != want {
+        return None;
+    }
+    Some((
+        u64::from_le_bytes([
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        ]),
+        u64::from_le_bytes([
+            buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+        ]),
+    ))
+}
+
 /// Fixed-name pointer sidecar naming the current durable local
-/// snapshot's index (8 bytes, u64 LE). `OPEN_CREATE` is O_RDWR|O_CREAT
-/// positioned at zero, so each persist overwrites the whole file in
-/// place. Boot follows it to the snapshot file; without it the
-/// index-named file is unfindable (the FS surface has no listing).
+/// snapshot's index. Boot follows it to the snapshot file; without it
+/// the index-named file is unfindable (the FS surface has no listing).
+/// This builds the base name; `build_snap_ptr_slot_path` derives the
+/// per-slot names from it, and the base name itself carries the flat
+/// record.
 ///
 /// # Safety
 ///
@@ -1108,16 +1282,140 @@ unsafe fn build_snap_pointer_path(s: &mut Snapshot) -> usize {
 /// a snapshot whose pointer never landed is unfindable at boot, and
 /// letting raft compact against it would strand the state below it.
 unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable, index: Index) -> bool {
-    let plen = build_snap_pointer_path(s);
+    // Target the INACTIVE slot: the record boot would follow today is
+    // never the one being overwritten, so no failure between here and
+    // the fsync can leave the node without a usable pointer.
+    let slot = 1 - (s.snap_ptr_slot & 1);
+    let generation = s.snap_ptr_generation.wrapping_add(1);
+    let plen = build_snap_ptr_slot_path(s, slot);
     let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
     if fd < 0 {
         return fd == FS_E_NODEV || fd == FS_E_NOSYS;
     }
-    let mut val = index.to_le_bytes();
-    let w = (sys.provider_call)(fd, FS_WRITE, val.as_mut_ptr(), 8);
+    let mut buf = [0u8; SNAP_PTR_SIZE];
+    encode_snap_ptr(&mut buf, generation, index);
+    let w = (sys.provider_call)(fd, FS_WRITE, buf.as_mut_ptr(), SNAP_PTR_SIZE);
     let f = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+    if w != SNAP_PTR_SIZE as i32 || f != 0 {
+        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        return false;
+    }
+    // Read the slot back and re-validate before adopting the new
+    // generation. The read is served through the descriptor that just
+    // wrote, so it proves the provider holds the bytes it accepted —
+    // a short or mis-encoded write is caught here; the fsync above is
+    // what carries them to media.
+    let seek = 0i32.to_le_bytes();
+    let mut check = [0u8; SNAP_PTR_SIZE];
+    let ok = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) >= 0
+        && (sys.provider_call)(fd, FS_READ, check.as_mut_ptr(), SNAP_PTR_SIZE)
+            == SNAP_PTR_SIZE as i32
+        && decode_snap_ptr(&check) == Some((generation, index));
     (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    w == 8 && f == 0
+    if !ok {
+        return false;
+    }
+    // The slot file is self-describing (magic + generation + CRC), so
+    // it is created once and thereafter overwritten in place: the name
+    // fence matters on that first creation, when a crash could
+    // otherwise leave boot with no slot to read at all. `path_buf`
+    // still holds this slot's path.
+    if !publish_name(s, sys, plen) {
+        return false;
+    }
+    s.snap_ptr_slot = slot;
+    s.snap_ptr_generation = generation;
+    true
+}
+
+/// Collect the pointer candidates at boot: both slots ordered by
+/// generation (newest first), then the flat record. Returns `true`
+/// when the FS provider is still initialising and the caller must
+/// retry on a later step.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Snapshot` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn collect_snap_ptr_candidates(s: &mut Snapshot, sys: &SyscallTable) -> bool {
+    let mut found: [(u64, Index); SNAP_PTR_SLOTS] = [(0, 0); SNAP_PTR_SLOTS];
+    let mut count = 0usize;
+    for slot in 0..SNAP_PTR_SLOTS as u8 {
+        let plen = build_snap_ptr_slot_path(s, slot);
+        let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+        if fd == FS_E_AGAIN {
+            return true;
+        }
+        if fd < 0 {
+            continue;
+        }
+        let mut buf = [0u8; SNAP_PTR_SIZE];
+        let n = (sys.provider_call)(fd, FS_READ, buf.as_mut_ptr(), SNAP_PTR_SIZE);
+        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        if n != SNAP_PTR_SIZE as i32 {
+            continue;
+        }
+        if let Some((generation, index)) = decode_snap_ptr(&buf) {
+            found[count] = (generation, index);
+            count += 1;
+            if generation > s.snap_ptr_generation {
+                s.snap_ptr_generation = generation;
+                s.snap_ptr_slot = slot;
+            }
+        }
+    }
+    // Newest generation first (at most two entries).
+    if count == SNAP_PTR_SLOTS && found[1].0 > found[0].0 {
+        found.swap(0, 1);
+    }
+    s.boot_ptr_count = 0;
+    s.boot_ptr_next = 0;
+    for entry in found.iter().take(count) {
+        s.boot_ptr_candidates[s.boot_ptr_count as usize] = entry.1;
+        s.boot_ptr_count += 1;
+    }
+
+    // The single unchecksummed record, as the last resort.
+    let plen = build_snap_pointer_path(s);
+    let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+    if fd == FS_E_AGAIN {
+        return s.boot_ptr_count == 0;
+    }
+    if fd >= 0 {
+        let mut val = [0u8; SNAP_PTR_FLAT_SIZE];
+        let n = (sys.provider_call)(fd, FS_READ, val.as_mut_ptr(), SNAP_PTR_FLAT_SIZE);
+        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        if n == SNAP_PTR_FLAT_SIZE as i32 {
+            let index = u64::from_le_bytes(val);
+            let dup = s
+                .boot_ptr_candidates
+                .iter()
+                .take(s.boot_ptr_count as usize)
+                .any(|c| *c == index);
+            if !dup {
+                s.boot_ptr_candidates[s.boot_ptr_count as usize] = index;
+                s.boot_ptr_count += 1;
+            }
+        } else {
+            dev_log(sys, 3, b"[snap] boot ptr torn".as_ptr(), 20);
+        }
+    }
+    false
+}
+
+/// Advance to the next pointer candidate, or finish the boot restore
+/// when every candidate has been refused. A pointer is believed only
+/// once the snapshot it names has been opened and validated, so nothing
+/// downstream — retirement, compaction, the install signal — can rely on
+/// a root that is not actually on disk.
+fn next_boot_candidate(s: &mut Snapshot) {
+    s.boot_ptr_next += 1;
+    if s.boot_ptr_next < s.boot_ptr_count {
+        s.boot_ptr_index = s.boot_ptr_candidates[s.boot_ptr_next as usize];
+    } else {
+        s.boot_ptr_index = 0;
+        s.boot_phase = BOOT_DONE;
+    }
 }
 
 /// Drive the boot restore one bounded slice per step. Returns true
@@ -1138,26 +1436,16 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable, index: Inde
 pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     match s.boot_phase {
         BOOT_PTR => {
-            let plen = build_snap_pointer_path(s);
-            let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
-            if fd == FS_E_AGAIN {
+            if collect_snap_ptr_candidates(s, sys) {
                 return false; // provider initialising — retry next step
             }
-            if fd < 0 {
+            if s.boot_ptr_count == 0 {
                 // No pointer: fresh deployment, in-memory graph, or a
                 // pre-pointer layout. Nothing to restore.
                 s.boot_phase = BOOT_DONE;
                 return false;
             }
-            let mut val = [0u8; 8];
-            let n = (sys.provider_call)(fd, FS_READ, val.as_mut_ptr(), 8);
-            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-            if n != 8 {
-                dev_log(sys, 3, b"[snap] boot ptr torn".as_ptr(), 20);
-                s.boot_phase = BOOT_DONE;
-                return false;
-            }
-            s.boot_ptr_index = u64::from_le_bytes(val);
+            s.boot_ptr_index = s.boot_ptr_candidates[0];
             s.boot_phase = BOOT_LOAD;
             false
         }
@@ -1168,12 +1456,15 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                 return false;
             }
             if fd < 0 {
-                // Pointer names a file that is gone: restore nothing.
-                // The wal replays whatever it still holds; state below
-                // the vanished snapshot is LOST and the log says so
-                // rather than guessing.
+                // Pointer names a file that is gone. Fall through to the
+                // next candidate: an older pointer whose snapshot IS
+                // present is a valid recovery root, and only when every
+                // candidate fails is there nothing to restore. The wal
+                // then replays whatever it still holds; state below the
+                // vanished snapshot is LOST and the log says so rather
+                // than guessing.
                 dev_log(sys, 3, b"[snap] boot missing".as_ptr(), 19);
-                s.boot_phase = BOOT_DONE;
+                next_boot_candidate(s);
                 return false;
             }
             let mut hdr = [0u8; SNAP_HDR_LEN];
@@ -1212,11 +1503,12 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             }
             (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
             if !ok {
-                // Fail CLOSED on a torn/corrupt snapshot: restore
-                // nothing. Replaying a bad body is silent corruption.
+                // Fail CLOSED on a torn/corrupt snapshot: never replay a
+                // bad body, and never let a pointer to one become the
+                // recovery root. Try the next candidate instead.
                 dev_log(sys, 3, b"[snap] boot corrupt".as_ptr(), 19);
                 s.body_len = 0;
-                s.boot_phase = BOOT_DONE;
+                next_boot_candidate(s);
                 return false;
             }
             s.last_snapshot_term =
@@ -1447,15 +1739,56 @@ fn retention_floor_allows(s: &Snapshot, index: u64) -> bool {
 /// (same shape as `wal::fs_unlink_supported`). A failed CAPS call stays
 /// unprobed and retries later rather than caching a transient error.
 unsafe fn fs_unlink_supported(s: &mut Snapshot, sys: &SyscallTable) -> bool {
-    if s.fs_unlink_probe == 0 {
-        let mut caps = [0u8; 4];
-        let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
-        if rc == 4 {
-            let bits = u32::from_le_bytes(caps);
-            s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
-        }
-    }
+    ensure_fs_caps(s, sys);
     s.fs_unlink_probe == 1
+}
+
+/// One-shot FS capability probe, caching the `UNLINK` and `FSYNC_NAME`
+/// dispositions together. A failed CAPS call leaves both unprobed and
+/// retries later rather than caching a transient error as "unsupported".
+unsafe fn ensure_fs_caps(s: &mut Snapshot, sys: &SyscallTable) {
+    if s.fs_unlink_probe != 0 {
+        return;
+    }
+    let mut caps = [0u8; 4];
+    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+    if rc == 4 {
+        let bits = u32::from_le_bytes(caps);
+        s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
+        s.name_fence_probe = if bits & FS_CAP_FSYNC_NAME != 0 {
+            NAME_FENCE_PRESENT
+        } else {
+            NAME_FENCE_ABSENT
+        };
+    }
+}
+
+/// Publish the parent-directory entry for the path currently staged in
+/// `path_buf` — the fence that makes a snapshot artefact, a pointer
+/// slot, or a retirement survive a power cut. Same posture rules as the
+/// WAL's `publish_name`: strict refuses what the provider cannot fence,
+/// auto meters it.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Snapshot` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn publish_name(s: &mut Snapshot, sys: &SyscallTable, plen: usize) -> bool {
+    ensure_fs_caps(s, sys);
+    if s.name_fence_probe != NAME_FENCE_PRESENT {
+        if s.name_fence == NAME_FENCE_STRICT {
+            dev_log(sys, 1, b"[snap] no name fence".as_ptr(), 20);
+            return false;
+        }
+        s.name_unfenced = s.name_unfenced.saturating_add(1);
+        return true;
+    }
+    let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, s.path_buf.as_mut_ptr(), plen);
+    if rc == 0 {
+        return true;
+    }
+    dev_log(sys, 1, b"[snap] name fence FAIL".as_ptr(), 22);
+    false
 }
 
 /// Retire the previous snapshot file after a NEWER one is durable, so the
@@ -1474,7 +1807,12 @@ unsafe fn unlink_prev_snapshot(
     if !fs_unlink_supported(s, sys) { return; }
     let plen = build_snapshot_path(s, prev_index);
     if plen == 0 { return; }
-    if (sys.provider_call)(-1, FS_UNLINK, s.path_buf.as_mut_ptr(), plen) == 0 {
+    if (sys.provider_call)(-1, FS_UNLINK, s.path_buf.as_mut_ptr(), plen) == 0
+        && publish_name(s, sys, plen)
+    {
+        // Retirement is complete only once the REMOVAL of the name is
+        // durable: an unlink left in a volatile directory cache
+        // resurrects the retired snapshot after a power cut.
         dev_log(sys, 3, b"[snap] retired".as_ptr(), 14);
     }
 }
@@ -1549,6 +1887,14 @@ unsafe fn write_snapshot_durable(
         ok = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) == 0;
     }
     (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    if ok {
+        // The artefact is self-describing (magic + CRC + END_MAGIC), so
+        // it is published under its final name rather than renamed into
+        // place. That name is only durable once its parent-directory
+        // entry is fenced; until then the pointer about to be written
+        // would name a file the next boot cannot open.
+        ok = publish_name(s, sys, plen);
+    }
 
     if ok {
         s.snap_bytes_written = s.snap_bytes_written.saturating_add(body_len as u64);

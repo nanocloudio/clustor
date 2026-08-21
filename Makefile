@@ -2,8 +2,8 @@
 # ci / publish / clean, plus the two project targets that earn their
 # names under standards/make.md §1: `bench` (canonicalizes the
 # criterion flags the CI-fast run uses) and `e2e` (composes the
-# sequential, thread-bounded cluster/chaos/partition/wal harness
-# runs). Anything else is the `fluxor` CLI directly
+# sequential, thread-bounded host-core and cluster harness runs).
+# Anything else is the `fluxor` CLI directly
 # (`fluxor modules build`, `fluxor run`, `fluxor update`, `fluxor sync`,
 # `fluxor build --check …`) — a make target that merely renames one CLI
 # command is bloat, not convenience.
@@ -79,17 +79,20 @@ e2e:
 	# they cannot skip. They ride this target because it is the only
 	# gate `fluxor ci` reaches for anything under tests/ (phase 4 needs
 	# a tests/harness sub-workspace, which this project does not have).
-	cargo test --test raft_meta --test wal_scan
+	cargo test --test raft_meta --test wal_scan --test wal_truncate \
+	  --test snap_pointer --test name_fence
+	# The fault matrix mounts several nodes' composites in one crate
+	# against a process-global mock kernel: one test at a time.
+	cargo test --test raft_fault_matrix -- --test-threads=1
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test wal_replay -- --test-threads=$(E2E_THREADS)
 	# wal_group_fsync's 4 tests all launch single-node clusters through
 	# `Cluster::launch`, which wipes and recreates one hardcoded, shared
 	# `<workspace>/wal/` directory per launch (the WAL module resolves
 	# `wal/p...` relative to the spawned process's cwd, with no per-node
 	# override). Concurrent launches within this binary race on that one
-	# directory — confirmed by direct reproduction: 3/3 clean at
-	# --test-threads=1, 3/3 deterministic cross-contamination at
-	# --test-threads=2. Force single-threaded until the harness gives
-	# each node its own WAL directory.
+	# directory and cross-contaminate deterministically, so it runs
+	# single-threaded until the harness gives each node its own WAL
+	# directory.
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test wal_group_fsync -- --test-threads=1
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test partition -- --test-threads=$(E2E_THREADS)
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test chaos -- --test-threads=$(E2E_THREADS)

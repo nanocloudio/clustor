@@ -194,10 +194,43 @@ const FS_WRITE_ASYNC: u32 = 0x090F;
 const FS_FSYNC_SUBMIT: u32 = 0x0910;
 const FS_FSYNC_POLL: u32 = 0x0911;
 const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
+/// Durable publication of a parent-directory entry
+/// (`modules/sdk/contracts/storage/fs.rs::{FSYNC_NAME, caps::FSYNC_NAME}`).
+/// `FS_FSYNC` covers a segment's bytes through its descriptor; it does
+/// NOT make the name that finds the segment survive a power cut. Both
+/// fences are required before a segment file counts as durable.
+const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_CAP_FSYNC_NAME: u32 = 1 << 11;
 /// FS capability-discovery opcode + the `UNLINK` bit
 /// (`modules/sdk/contracts/storage/fs.rs::{CAPS, caps::UNLINK}`).
 const FS_CAPS: u32 = 0x09FF;
 const FS_CAP_UNLINK: u32 = 1 << 5;
+/// FS ENOSYS: the provider implements no such opcode. Distinct from an
+/// allocation or device failure, which must never be reinterpreted as
+/// "this backend does not offer the feature".
+const FS_E_NOSYS: i32 = -38;
+/// FS ENOENT: the named file is not there. The read-only opener
+/// (`FS_OPEN`) answers this for a name that does not exist, which is how
+/// an absent segment is told apart from a provider that is refusing.
+const FS_E_NOENT: i32 = -2;
+
+/// `name_fence` postures. `AUTO` publishes names through
+/// `FS_FSYNC_NAME` when the provider advertises `caps::FSYNC_NAME` and
+/// meters every unfenced publication when it does not. `STRICT` refuses
+/// to publish a name the provider cannot fence, so a segment is never
+/// admitted on a backend that cannot prove the name reaches media.
+const NAME_FENCE_AUTO: u8 = 0;
+const NAME_FENCE_STRICT: u8 = 1;
+
+/// `name_fence_probe` / `WAL_NAME_FENCE` dispositions.
+const NAME_FENCE_UNPROBED: u8 = 0;
+const NAME_FENCE_PRESENT: u8 = 1;
+const NAME_FENCE_ABSENT: u8 = 2;
+
+/// `WAL_SEGMENT_MODE` values — see the metric's own documentation.
+const SEGMENT_MODE_DYNAMIC: i64 = 0;
+const SEGMENT_MODE_FIXED: i64 = 1;
+const SEGMENT_MODE_FALLBACK: i64 = 2;
 
 /// FS E_AGAIN: the FS provider is present but still initialising (e.g. fat32
 /// reading the BPB/GPT/root on a pi5 cold boot). Distinct from a hard error
@@ -358,6 +391,45 @@ pub struct Wal {
     /// Count of `MSG_WAL_TRUNCATE_AFTER` requests applied (Raft conflict
     /// repair discarded a divergent suffix). Diagnostic / regression signal.
     truncations: u32,
+    /// Count of truncation requests refused because the new tail could
+    /// not be made durable. Nothing was published for these: the
+    /// high-water is unchanged and the requester keeps its old tip.
+    truncate_failures: u32,
+    /// A truncation ack the output channel could not take yet. The ack
+    /// is what releases the requester's held tip, so it is parked and
+    /// retried rather than dropped.
+    trunc_ack_pending: bool,
+    trunc_ack_index: Index,
+    trunc_ack_req: u32,
+    trunc_ack_durable: bool,
+    /// A truncation is mid-retirement: the discarded segment range is
+    /// being made inert `COMPACT_UNLINKS_PER_STEP` at a time, and the
+    /// write state it will publish is parked in the other `retire_*`
+    /// fields. While this is set nothing opens a segment, stages a
+    /// record, or reads another control frame — the WAL's descriptor
+    /// and segment sequence are not valid to write through yet.
+    retire_active: bool,
+    /// Next segment sequence to retire, and the last of the range
+    /// (inclusive). `retire_from > retire_through` means the range is
+    /// inert and the truncation may publish.
+    retire_from: u32,
+    retire_through: u32,
+    /// At least one segment of the range is already inert, so the
+    /// request is no longer a clean repeat of an untouched log.
+    retire_partial: bool,
+    /// Write state the truncation publishes once the range is inert:
+    /// descriptor, sequence, cursor, and physical extent.
+    retire_fd: i32,
+    retire_seq: u32,
+    retire_cursor: u32,
+    retire_high_water: u32,
+    /// The whole log is discarded: the published sequence is a FRESH
+    /// file and the compaction floor follows it.
+    retire_fresh: bool,
+    /// The request this retirement answers.
+    retire_keep_index: Index,
+    retire_keep_term: Term,
+    retire_req: u32,
     last_metrics_ms: u64,
     /// `clustor.wal.fsync_latency_ms` cumulative bucket counts
     /// (RFC §4.1). One slot per `wire::hist::FSYNC_LATENCY_US` bound
@@ -412,8 +484,42 @@ pub struct Wal {
     /// 0 = unprobed, 1 = supported, 2 = unsupported. See
     /// `fs_unlink_supported`.
     fs_unlink_probe: u8,
+    /// FS `caps::FSYNC_NAME` probe cache: `NAME_FENCE_UNPROBED`,
+    /// `NAME_FENCE_PRESENT`, `NAME_FENCE_ABSENT`. Shares the one-shot
+    /// CAPS read with `fs_unlink_probe`.
+    name_fence_probe: u8,
+    /// `NAME_FENCE_AUTO` or `NAME_FENCE_STRICT` (config param 15).
+    pub name_fence: u8,
+    /// Counter behind `WAL_NAME_UNFENCED`: segment names minted or
+    /// retired on a provider with no `caps::FSYNC_NAME`.
+    name_unfenced: u32,
+    /// One-shot guard for the `write_errors` step in
+    /// `ensure_segment_open`'s name-fence refusal path. The open is
+    /// re-attempted every step while the descriptor is refused, so the
+    /// counter records the TRANSITION into refusal — a per-step
+    /// increment would bury the per-entry durable-write failures it
+    /// exists to surface.
+    name_fence_refused: bool,
+    /// One-shot guards for the two name-fence diagnostics. Both
+    /// conditions recur on every publication attempt and both are
+    /// already exported as gauges (`WAL_NAME_FENCE`,
+    /// `WAL_NAME_UNFENCED`), so the log records the transition only.
+    name_fence_absent_logged: bool,
+    name_fence_fail_logged: bool,
     pub fixed_segment: u8,
     fixed_segment_active: bool,
+    /// Set once `PREALLOCATE` has answered `ENOSYS` for this provider:
+    /// fixed segments were requested, the backend has no such opcode,
+    /// and every segment is a normal dynamically grown file. Reported
+    /// as `SEGMENT_MODE_FALLBACK` so protected operation and
+    /// compatibility operation are distinguishable from outside.
+    preallocate_unsupported: bool,
+    /// The errno of the most recent `PREALLOCATE` refusal that was NOT
+    /// `ENOSYS` (allocation or device failure), or 0. Reported as
+    /// `WAL_PREALLOCATE_ERRNO`.
+    preallocate_errno: i32,
+    /// Counter behind `WAL_PREALLOCATE_FAILURES`.
+    preallocate_failures: u32,
     pub preallocate_settle_ms: u16,
     preallocate_ready_at_ms: u64,
     batch_start_ms: u64,
@@ -582,6 +688,23 @@ pub unsafe fn init(s: &mut Wal) {
     s.encoding = 0;
     s.entry_ring_max_index = 0;
     s.entry_ring_min_index = 0;
+    s.truncate_failures = 0;
+    s.trunc_ack_pending = false;
+    s.trunc_ack_index = 0;
+    s.trunc_ack_req = 0;
+    s.trunc_ack_durable = false;
+    s.retire_active = false;
+    s.retire_from = 0;
+    s.retire_through = 0;
+    s.retire_partial = false;
+    s.retire_fd = -1;
+    s.retire_seq = 0;
+    s.retire_cursor = 0;
+    s.retire_high_water = 0;
+    s.retire_fresh = false;
+    s.retire_keep_index = 0;
+    s.retire_keep_term = 0;
+    s.retire_req = 0;
     s.replay_complete_pending = true;
     s.replay_emit_attempts = 0;
     s.last_replay_emit_ms = 0;
@@ -591,6 +714,19 @@ pub unsafe fn init(s: &mut Wal) {
     s.root_path = 0;
     s.skip_replay = 0;
     s.fixed_segment = 0;
+    s.preallocate_unsupported = false;
+    s.preallocate_errno = 0;
+    s.preallocate_failures = 0;
+    // One CAPS read fills `fs_unlink_probe`, `name_fence_probe` and
+    // `fs_async` together, so the two dispositions must start unprobed
+    // in step (`ensure_fs_caps` gates on `fs_unlink_probe`).
+    s.fs_unlink_probe = 0;
+    s.name_fence_probe = NAME_FENCE_UNPROBED;
+    s.name_fence = NAME_FENCE_AUTO;
+    s.name_unfenced = 0;
+    s.name_fence_refused = false;
+    s.name_fence_absent_logged = false;
+    s.name_fence_fail_logged = false;
     s.preallocate_settle_ms = 0;
     s.fence_depth = 1;
     s.fence_failed = false;
@@ -702,9 +838,16 @@ pub fn arm(s: &mut Wal) {
 /// Step the WAL. Return codes follow the kernel step ABI (0=Continue,
 /// 2=Burst); the composite propagates Burst. Per-step bounds: replay
 /// is one FS open OR one frame; normal mode is the byte-granted input
-/// pump (≤8 records), ≤4 control frames, ≤8 gap-refetch serves, plus
-/// at most one cold segment open (which in dir mode may add a one-shot
-/// `FS_MKDIR` and a single retried open before it concludes anything).
+/// pump (≤8 records), ≤4 control frames — at most one of which
+/// truncates, since a truncation leaving an ack or a segment range
+/// outstanding ends the drain — ≤8 gap-refetch serves, plus at most
+/// one cold segment open (which in dir mode may add a one-shot
+/// `FS_MKDIR` and a single retried open before it concludes
+/// anything). Physical segment removal, whether from compaction or
+/// from a truncation's retirement, is paced at
+/// `COMPACT_UNLINKS_PER_STEP` files per step; a step that removed any
+/// returns Burst, since each removal is a synchronous unlink plus a
+/// directory fence.
 ///
 /// # Safety
 ///
@@ -716,6 +859,19 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     if s.phase == PHASE_REPLAY {
         // Replay existing WAL segments before accepting new entries.
         return step_replay(s, sys);
+    }
+
+    // A truncation mid-retirement owns the write state: its descriptor
+    // and segment sequence are parked in the `retire_*` fields and
+    // `s.fd` is withheld, so opening a segment here would create a fresh
+    // file at a sequence the retirement is about to remove and append to
+    // it at a cursor that belongs to another file. Drive the retirement
+    // and nothing else until the discarded range is inert.
+    if s.retire_active {
+        let worked = continue_retirement(s, sys);
+        flush_truncate_ack(s, sys);
+        emit_metrics(s, sys);
+        return if worked { STEP_BURST } else { 0 };
     }
 
     // FS-readiness gate. While the segment isn't open, (re)try the open
@@ -776,7 +932,7 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     //    conflict-repair truncation) BEFORE appending. A truncate must
     //    land before any same-step append, else the fresh entry would be
     //    written above the divergent tail and then rewound away.
-    drain_compact_before(s, sys);
+    let retired = drain_compact_before(s, sys);
 
     // 2. Persist complete records up to the live transaction budget. A
     // classed input derives its grant from the graph and current pacer
@@ -826,7 +982,10 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     // 4. Emit metrics periodically
     emit_metrics(s, sys);
 
-    0 // Continue
+    // Physical segment removal is synchronous provider work (unlink +
+    // directory fence per file), well above a steady-state step even at
+    // the paced budget. Burst classifies that interval correctly.
+    if retired { STEP_BURST } else { 0 }
 }
 
 /// Emit the one-shot MSG_WAL_REPLAY_COMPLETE to consensus, carrying the
@@ -1565,12 +1724,16 @@ unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) {
-    if s.in_compact_before < 0 { return; }
+unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) -> bool {
+    // An ack the output channel could not take is retried before
+    // anything else: the requester holds its old tip until it arrives,
+    // so a dropped ack is a wedge, not a lost notification.
+    flush_truncate_ack(s, sys);
+    if s.in_compact_before < 0 { return false; }
 
     // Continue any unlink work a previous compaction left pending
     // (paced COMPACT_UNLINKS_PER_STEP per step).
-    continue_compaction(s, sys);
+    let mut retired = continue_compaction(s, sys);
 
     // A truncate/compaction changes the file cursor and segment topology. Do
     // not let it overtake records that are already accepted into the current
@@ -1584,7 +1747,7 @@ unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) {
         && (s.has_batch || s.fence_pending || s.fence_ring_count > 0)
     {
         flush_batch(s, sys);
-        if s.has_batch || s.fence_pending || s.fence_ring_count > 0 { return; }
+        if s.has_batch || s.fence_pending || s.fence_ring_count > 0 { return retired; }
     }
 
     for _ in 0..4 {
@@ -1599,10 +1762,24 @@ unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) {
         ]);
         match msg_type {
             wire::MSG_WAL_COMPACT_BEFORE => compact_before(s, sys, index),
-            wire::MSG_WAL_TRUNCATE_AFTER => truncate_after(s, sys, index),
+            wire::MSG_WAL_TRUNCATE_AFTER => {
+                let req_id = match wire::decode_wal_truncate_after(&s.msg_buf[..plen as usize]) {
+                    Some((_, id)) => id,
+                    None => continue,
+                };
+                if truncate_after(s, sys, index, req_id) { retired = true; }
+                // One truncation may leave state the next one in this
+                // drain would destroy: an ack the channel could not take
+                // yet (the park slot holds exactly one answer) or a
+                // segment range still being retired (whose write state
+                // is parked, not published). End the drain and let the
+                // next step resume — the frames stay queued.
+                if s.trunc_ack_pending || s.retire_active { break; }
+            }
             _ => continue,
         }
     }
+    retired
 }
 
 /// Discard every entry strictly after `keep_through_index` (Raft §5.3
@@ -1618,9 +1795,20 @@ unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Wal` and supply a
 /// `&SyscallTable` whose function pointers reach live kernel routines per
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn truncate_after(s: &mut Wal, sys: &SyscallTable, keep_through_index: u64) {
-    // Nothing to do if we hold nothing past the keep point.
-    if s.current_index <= keep_through_index { return; }
+unsafe fn truncate_after(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    keep_through_index: u64,
+    req_id: u32,
+) -> bool {
+    // Already at or below the keep point. Either there was never
+    // anything to discard, or this repeats a truncation that already
+    // completed and whose ack was lost. Both are success — re-ack, or
+    // the requester holds its old tip forever.
+    if s.current_index <= keep_through_index {
+        send_truncate_ack(s, sys, keep_through_index, req_id, true);
+        return false;
+    }
 
     // Locate the keep point. `keep == 0` discards the whole log (no frame
     // to rewind to). Otherwise the offset ring must still hold the keep
@@ -1642,11 +1830,54 @@ unsafe fn truncate_after(s: &mut Wal, sys: &SyscallTable, keep_through_index: u6
                 s.fence_failed = true;
                 s.write_errors = s.write_errors.saturating_add(1);
                 dev_log(sys, 1, b"[wal] FATAL truncate unlocatable".as_ptr(), 31);
-                return;
+                send_truncate_ack(s, sys, keep_through_index, req_id, false);
+                return false;
             }
         }
     }
 
+    // ── Persist the new tail BEFORE publishing it ───────────────
+    // The high-water, the offset rings and the scan cursor stay as the
+    // requester last saw them until the new tail is on stable storage.
+    // Within the current segment that is one terminator plus its fsync,
+    // so a failure is a clean repeat. Across segments it also means
+    // every discarded segment file is inert; that range is paced across
+    // steps, and the descriptor, sequence and cursor the truncation
+    // will publish are parked in the `retire_*` fields until it is, so
+    // nothing observes a half-retired log as the live one.
+    if keep_through_index == 0 || keep_seg != s.segment_seq {
+        // The discarded suffix spans segment files beyond the current
+        // one — a rewind of the current segment alone would leave the
+        // suffix on disk for replay to resurrect.
+        return begin_cross_segment_truncate(
+            s, sys, keep_seg, new_cursor, keep_through_index, new_term, req_id,
+        );
+    }
+    if !truncate_current_segment(s, sys, new_cursor) {
+        s.truncate_failures = s.truncate_failures.saturating_add(1);
+        dev_log(sys, 1, b"[wal] truncate not durable".as_ptr(), 26);
+        send_truncate_ack(s, sys, keep_through_index, req_id, false);
+        return false;
+    }
+    publish_truncation(s, sys, keep_through_index, new_term, req_id);
+    false
+}
+
+/// Publish a truncation whose new tail is durable: drop the discarded
+/// suffix from the in-memory rings, move the high-water back to the keep
+/// point, repoint the scan cursor, and ack.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn publish_truncation(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    keep_through_index: u64,
+    new_term: Term,
+    req_id: u32,
+) {
     // Drop in-memory ring slots above the keep point so lookups and
     // entry-request serves no longer surface the discarded suffix. The
     // per-index walk is clamped to one ring revolution: past that, slots
@@ -1708,54 +1939,142 @@ unsafe fn truncate_after(s: &mut Wal, sys: &SyscallTable, keep_through_index: u6
         }
     }
 
-    if keep_through_index == 0 || keep_seg != s.segment_seq {
-        // The discarded suffix spans segment files beyond the current
-        // one — a rewind of the current segment alone would leave the
-        // suffix on disk for replay to resurrect.
-        truncate_cross_segment(s, sys, keep_seg, new_cursor);
-        dev_log(sys, 3, b"[wal] truncate".as_ptr(), 14);
-        return;
-    }
-
-    // Keep point lives in the current segment: mark the stale region and
-    // rewind. The trailing-terminator logic in process_entries keeps
-    // replay honest until appends overwrite past it.
-    if s.cursor > s.seg_high_water {
-        s.seg_high_water = s.cursor;
-    }
-    s.cursor = new_cursor;
-
-    // Persist the new tail: seek to the cursor, write a zero-length frame
-    // terminator (4 bytes of 0 = entry_len 0, which replay treats as
-    // end-of-segment), and fsync so the truncation survives a crash.
-    if s.fd >= 0 {
-        let seek = (new_cursor as i32).to_le_bytes();
-        (sys.provider_call)(s.fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
-        let zero = [0u8; 4];
-        let w = (sys.provider_call)(s.fd, FS_WRITE, zero.as_ptr() as *mut u8, 4);
-        if w == 4 {
-            fsync_segment(s, sys);
-            // Re-seek to the cursor so the next append overwrites the
-            // terminator we just wrote.
-            (sys.provider_call)(s.fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
-        }
-    }
     dev_log(sys, 3, b"[wal] truncate".as_ptr(), 14);
+    send_truncate_ack(s, sys, keep_through_index, req_id, true);
 }
 
-/// Cross-segment truncation: the keep point lives in an older segment
-/// (`keep_seg`), or the whole log is discarded (`keep_seg == 0`). The
-/// terminator must land in the keep segment itself and every segment
-/// file above it must be made replay-inert, else a crash after this
-/// conflict repair resurrects the discarded suffix at replay. The
-/// suffix is raft's uncommitted tail (≤ the in-flight window), so the
-/// loops here are bounded by that, not by the log size.
+/// Persist the new tail inside the CURRENT segment: seek to the keep
+/// point, write a zero-length frame terminator (4 bytes of 0, which
+/// replay treats as end-of-segment), and fsync. Returns whether the
+/// truncation is on stable storage; the file cursor moves only on
+/// success, so a failed attempt is a clean repeat.
+///
+/// The in-memory retention posture (`no_fs`) has no on-disk suffix that
+/// replay could resurrect: there is nothing to persist and nothing to
+/// fail. A missing descriptor in any other posture is the opposite — a
+/// disk segment whose suffix is untouched — so it refuses.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn truncate_cross_segment(s: &mut Wal, sys: &SyscallTable, keep_seg: u32, new_cursor: u32) {
+unsafe fn truncate_current_segment(s: &mut Wal, sys: &SyscallTable, new_cursor: u32) -> bool {
+    if s.no_fs {
+        if s.cursor > s.seg_high_water {
+            s.seg_high_water = s.cursor;
+        }
+        s.cursor = new_cursor;
+        return true;
+    }
+    if s.fd < 0 {
+        // A disk segment with no descriptor: the open failed, is still
+        // settling, or the descriptor is parked by a retirement. The
+        // suffix is untouched on media either way.
+        s.write_errors = s.write_errors.saturating_add(1);
+        return false;
+    }
+    let seek = (new_cursor as i32).to_le_bytes();
+    if (sys.provider_call)(s.fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) < 0 {
+        s.write_errors = s.write_errors.saturating_add(1);
+        return false;
+    }
+    let zero = [0u8; 4];
+    if (sys.provider_call)(s.fd, FS_WRITE, zero.as_ptr() as *mut u8, 4) != 4 {
+        s.write_errors = s.write_errors.saturating_add(1);
+        return false;
+    }
+    if fsync_segment(s, sys) != 0 {
+        s.write_errors = s.write_errors.saturating_add(1);
+        return false;
+    }
+    // Re-seek to the cursor so the next append overwrites the
+    // terminator we just wrote.
+    (sys.provider_call)(s.fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+    if s.cursor > s.seg_high_water {
+        s.seg_high_water = s.cursor;
+    }
+    s.cursor = new_cursor;
+    true
+}
+
+/// Answer a truncation request. The ack is the ONLY thing that lets the
+/// requester rewind its tip, so a channel that cannot take it right now
+/// parks the answer for `flush_truncate_ack` rather than dropping it.
+/// There is one park slot, so a caller that leaves an answer parked must
+/// not process another truncation until it is delivered.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn send_truncate_ack(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    keep_through_index: u64,
+    req_id: u32,
+    durable: bool,
+) {
+    s.trunc_ack_pending = true;
+    s.trunc_ack_index = keep_through_index;
+    s.trunc_ack_req = req_id;
+    s.trunc_ack_durable = durable;
+    flush_truncate_ack(s, sys);
+}
+
+/// Deliver a parked truncation ack if the output channel can take it.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn flush_truncate_ack(s: &mut Wal, sys: &SyscallTable) {
+    if !s.trunc_ack_pending { return; }
+    if s.out_flushed < 0 {
+        // No path back to the requester: it never entered the pending
+        // state on this graph (truncation is opt-in via wiring), so
+        // there is nobody to answer.
+        s.trunc_ack_pending = false;
+        return;
+    }
+    let poll = (sys.channel_poll)(s.out_flushed, POLL_OUT);
+    if poll <= 0 || (poll as u32 & POLL_OUT) == 0 { return; }
+    let mut buf = [0u8; wire::WAL_TRUNCATE_ACK_LEN];
+    wire::encode_wal_truncate_ack(
+        &mut buf,
+        s.trunc_ack_index,
+        s.trunc_ack_req,
+        s.trunc_ack_durable,
+    );
+    if wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_WAL_TRUNCATE_ACK, &buf) > 0 {
+        s.trunc_ack_pending = false;
+    }
+}
+
+/// Begin a cross-segment truncation: the keep point lives in an older
+/// segment (`keep_seg`), or the whole log is discarded (`keep_seg ==
+/// 0`). The terminator lands in the keep segment itself, and every
+/// segment file above it must be made replay-inert, else a crash after
+/// this conflict repair resurrects the discarded suffix at replay.
+///
+/// Retirement of that range is paced by `continue_retirement`, so this
+/// returns with the write state parked rather than published: `s.fd`
+/// stays withheld and `s.segment_seq`/`s.cursor` keep addressing the
+/// pre-truncation segment, which nothing may write through while
+/// `retire_active` holds. Returns whether any segment was retired here.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn begin_cross_segment_truncate(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    keep_seg: u32,
+    new_cursor: u32,
+    keep_through_index: u64,
+    new_term: Term,
+    req_id: u32,
+) -> bool {
     if s.fd >= 0 {
         (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
         s.fd = -1;
@@ -1763,70 +2082,143 @@ unsafe fn truncate_cross_segment(s: &mut Wal, sys: &SyscallTable, keep_seg: u32,
     let old_seq = s.segment_seq;
 
     if keep_seg == 0 {
-        // Whole-log discard: invalidate every segment and continue in a
-        // FRESH file at the next seq — never reuse a stale file in place.
-        let mut seq = s.oldest_segment_seq;
-        while seq <= old_seq {
-            invalidate_segment(s, sys, seq);
-            seq = seq.saturating_add(1);
+        // Whole-log discard: every segment is retired and appends
+        // continue in a FRESH file at the next seq — never a stale file
+        // reused in place.
+        s.retire_fd = -1;
+        s.retire_seq = old_seq.saturating_add(1);
+        s.retire_cursor = 0;
+        s.retire_high_water = 0;
+        s.retire_fresh = true;
+        s.retire_from = s.oldest_segment_seq;
+        s.retire_through = old_seq;
+    } else {
+        // Re-open the keep segment for writing, learn its physical
+        // extent (the stale-suffix high-water), and persist the
+        // terminator at the new tail before anything is deleted.
+        let mut path = [0u8; WAL_PATH_MAX];
+        let plen = encode_segment_path(s.partition_id, keep_seg, s.root_path != 0, &mut path);
+        let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+        if fd < 0 {
+            // Can't place the terminator — the discarded suffix would
+            // replay as valid after a crash. Fail-stop (see
+            // `fence_failed`).
+            s.fence_failed = true;
+            s.write_errors = s.write_errors.saturating_add(1);
+            dev_log(sys, 1, b"[wal] FATAL truncate reopen".as_ptr(), 27);
+            s.truncate_failures = s.truncate_failures.saturating_add(1);
+            dev_log(sys, 1, b"[wal] truncate not durable".as_ptr(), 26);
+            send_truncate_ack(s, sys, keep_through_index, req_id, false);
+            return false;
         }
-        s.segment_seq = old_seq.saturating_add(1);
+        let mut stat_buf = [0u8; 8];
+        let stat_rc = (sys.provider_call)(fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
+        let size = if stat_rc < 0 { 0 } else {
+            u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
+        };
+        let seek = (new_cursor as i32).to_le_bytes();
+        let sr = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+        let zero = [0u8; 4];
+        let w = (sys.provider_call)(fd, FS_WRITE, zero.as_ptr() as *mut u8, 4);
+        let fr = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+        if sr < 0 || w != 4 || fr != 0 || !publish_name(s, sys, &mut path, plen) {
+            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.fence_failed = true;
+            s.write_errors = s.write_errors.saturating_add(1);
+            dev_log(sys, 1, b"[wal] FATAL truncate term write".as_ptr(), 30);
+            s.truncate_failures = s.truncate_failures.saturating_add(1);
+            dev_log(sys, 1, b"[wal] truncate not durable".as_ptr(), 26);
+            send_truncate_ack(s, sys, keep_through_index, req_id, false);
+            return false;
+        }
+        // Next append overwrites the terminator we just wrote.
+        (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+        s.retire_fd = fd;
+        s.retire_seq = keep_seg;
+        s.retire_cursor = new_cursor;
+        s.retire_high_water = size.max(new_cursor);
+        s.retire_fresh = false;
+        s.retire_from = keep_seg.saturating_add(1);
+        s.retire_through = old_seq;
+    }
+
+    s.retire_active = true;
+    s.retire_partial = false;
+    s.retire_keep_index = keep_through_index;
+    s.retire_keep_term = new_term;
+    s.retire_req = req_id;
+    continue_retirement(s, sys)
+}
+
+/// Paced physical side of a truncation's segment retirement, mirroring
+/// `continue_compaction`: at most `COMPACT_UNLINKS_PER_STEP` files per
+/// step, each an UNLINK plus a directory fence (or the open/terminate/
+/// fence fallback), because an uncapped range is unbounded synchronous
+/// provider work in one step.
+///
+/// The write state parked by `begin_cross_segment_truncate` is handed
+/// back — and the truncation published and acked — only once the whole
+/// range is inert: a segment that survives replays the very suffix the
+/// truncation removed.
+///
+/// A segment that cannot be retired ends the attempt if nothing in the
+/// range has gone yet: the log is untouched, so the request is refused
+/// and a retry is a clean repeat. Once part of the range is inert a
+/// clean repeat no longer exists — the retirement stays armed and
+/// retries that segment every step, and `fence_failed` fail-stops new
+/// appends because the on-disk log now has a hole above the keep point
+/// that only a completed retirement or a restart resolves.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn continue_retirement(s: &mut Wal, sys: &SyscallTable) -> bool {
+    if !s.retire_active { return false; }
+    let mut retired = 0usize;
+    while s.retire_from <= s.retire_through && retired < COMPACT_UNLINKS_PER_STEP {
+        if !invalidate_segment(s, sys, s.retire_from) {
+            if s.retire_partial {
+                s.fence_failed = true;
+                return retired > 0;
+            }
+            // Nothing retired: hand the pre-truncation state back
+            // untouched and refuse.
+            if s.retire_fd >= 0 {
+                (sys.provider_call)(s.retire_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                s.retire_fd = -1;
+            }
+            s.retire_active = false;
+            s.truncate_failures = s.truncate_failures.saturating_add(1);
+            dev_log(sys, 1, b"[wal] truncate not durable".as_ptr(), 26);
+            send_truncate_ack(s, sys, s.retire_keep_index, s.retire_req, false);
+            return false;
+        }
+        s.retire_partial = true;
+        s.retire_from = s.retire_from.saturating_add(1);
+        retired += 1;
+    }
+    if s.retire_from <= s.retire_through {
+        return retired > 0; // more of the range next step
+    }
+
+    // The range is inert: adopt the parked write state and publish.
+    s.fd = s.retire_fd;
+    s.segment_seq = s.retire_seq;
+    s.cursor = s.retire_cursor;
+    s.seg_high_water = s.retire_high_water;
+    if s.retire_fresh {
         // Every prior segment is gone: the floor must follow the fresh
         // seq, or compaction and the below-floor scan keep addressing
         // files that no longer exist.
         s.oldest_segment_seq = s.segment_seq;
-        if s.scan_active { s.scan_seg = s.oldest_segment_seq; }
-        s.cursor = 0;
-        s.seg_high_water = 0;
         s.fixed_segment_active = false;
-        return;
     }
-
-    // Re-open the keep segment for writing, learn its physical extent
-    // (the stale-suffix high-water), and persist the terminator at the
-    // new tail before anything is deleted.
-    let mut path = [0u8; WAL_PATH_MAX];
-    let plen = encode_segment_path(s.partition_id, keep_seg, s.root_path != 0, &mut path);
-    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
-    if fd < 0 {
-        // Can't place the terminator — the discarded suffix would replay
-        // as valid after a crash. Fail-stop (see `fence_failed`).
-        s.fence_failed = true;
-        s.write_errors = s.write_errors.saturating_add(1);
-        dev_log(sys, 1, b"[wal] FATAL truncate reopen".as_ptr(), 27);
-        return;
-    }
-    let mut stat_buf = [0u8; 8];
-    let stat_rc = (sys.provider_call)(fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
-    let size = if stat_rc < 0 { 0 } else {
-        u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
-    };
-    let seek = (new_cursor as i32).to_le_bytes();
-    let sr = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
-    let zero = [0u8; 4];
-    let w = (sys.provider_call)(fd, FS_WRITE, zero.as_ptr() as *mut u8, 4);
-    let fr = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
-    if sr < 0 || w != 4 || fr != 0 {
-        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        s.fence_failed = true;
-        s.write_errors = s.write_errors.saturating_add(1);
-        dev_log(sys, 1, b"[wal] FATAL truncate term write".as_ptr(), 30);
-        return;
-    }
-    // Next append overwrites the terminator we just wrote.
-    (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
-
-    // Only now delete/neutralise the fully-discarded segments above.
-    let mut seq = keep_seg.saturating_add(1);
-    while seq <= old_seq {
-        invalidate_segment(s, sys, seq);
-        seq = seq.saturating_add(1);
-    }
-
-    s.fd = fd;
-    s.segment_seq = keep_seg;
-    s.cursor = new_cursor;
-    s.seg_high_water = size.max(new_cursor);
+    s.retire_fd = -1;
+    s.retire_active = false;
+    s.retire_partial = false;
+    publish_truncation(s, sys, s.retire_keep_index, s.retire_keep_term, s.retire_req);
+    retired > 0
 }
 
 /// Make a discarded segment file replay-inert: unlink it where the
@@ -1834,19 +2226,52 @@ unsafe fn truncate_cross_segment(s: &mut Wal, sys: &SyscallTable, keep_seg: u32,
 /// first frame header with a zero-length terminator so replay stops at
 /// offset 0 even though the file still exists.
 ///
+/// Retirement is only complete once the REMOVAL of the name is itself
+/// durable: an unlink whose directory entry stays in a volatile cache
+/// resurrects the segment after a power cut, and the discarded suffix
+/// replays as valid. So the unlink is followed by the same name fence
+/// that publishes a creation, and a segment whose removal cannot be
+/// fenced falls through to the terminator path rather than being
+/// reported retired.
+///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) {
+unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> bool {
     let mut path = [0u8; WAL_PATH_MAX];
     let plen = encode_segment_path(s.partition_id, seq, s.root_path != 0, &mut path);
+    let mut unlinked = false;
     if fs_unlink_supported(s, sys) {
         let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
-        if rc == 0 { return; }
+        if rc == 0 {
+            if publish_name(s, sys, &mut path, plen) {
+                return true;
+            }
+            // Gone from the live namespace, but the removal is not
+            // fenced: the name can come back. Mint it again below so
+            // what comes back is inert.
+            unlinked = true;
+        }
+    }
+    // A name that is not there is already inert — unless this call is
+    // what removed it. Probe with the read-only opener, which answers
+    // ENOENT rather than minting the file, so that a refusal from the
+    // write tier below can be read as what it is: a failing FS, not an
+    // absent segment. Retirement answers a durability question, and a
+    // dying provider must not be able to report every segment retired.
+    let probe = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+    if probe >= 0 {
+        (sys.provider_call)(probe, FS_CLOSE, core::ptr::null_mut(), 0);
+    } else if probe == FS_E_NOENT && !unlinked {
+        return true;
     }
     let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
-    if fd < 0 { return; } // never existed (or FS gone) — nothing to neutralise
+    if fd < 0 {
+        s.write_errors = s.write_errors.saturating_add(1);
+        dev_log(sys, 3, b"[wal] invalidate FAIL".as_ptr(), 21);
+        return false;
+    }
     let seek = 0i32.to_le_bytes();
     let sr = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
     let zero = [0u8; 4];
@@ -1856,7 +2281,16 @@ unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) {
     if sr < 0 || w != 4 || fr != 0 {
         s.write_errors = s.write_errors.saturating_add(1);
         dev_log(sys, 3, b"[wal] invalidate FAIL".as_ptr(), 21);
+        return false;
     }
+    // The open-create may have minted this name (unlink succeeded, its
+    // fence did not; or the file was already gone). Publishing it costs
+    // one directory fence and makes the inert file itself durable.
+    if !publish_name(s, sys, &mut path, plen) {
+        s.write_errors = s.write_errors.saturating_add(1);
+        return false;
+    }
+    true
 }
 
 /// # Safety
@@ -1938,21 +2372,29 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
 ///    cap, or on a per-file error, the floor still advances and the file
 ///    is merely orphaned.
 ///
+/// Each removal is fenced like every other, so the REMOVAL of the name
+/// is durable and not merely queued in a directory cache. A refused
+/// fence orphans the file rather than failing the trim: the persisted
+/// floor already keeps replay above a name that comes back.
+///
+/// Returns whether any segment was unlinked, so the caller can classify
+/// the step's elapsed time.
+///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) {
-    if s.compact_pending_to == 0 { return; }
+unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) -> bool {
+    if s.compact_pending_to == 0 { return false; }
     if s.oldest_segment_seq > s.compact_pending_to
         || s.oldest_segment_seq >= s.segment_seq
     {
         s.compact_pending_to = 0;
-        return;
+        return false;
     }
     let new_oldest = s.compact_pending_to.saturating_add(1).min(s.segment_seq);
     if !persist_segment_floor(s, sys, new_oldest) {
-        return; // retry next step; nothing deleted until the floor is durable
+        return false; // retry next step; nothing deleted until the floor is durable
     }
     let mut unlinks = 0usize;
     while s.oldest_segment_seq <= s.compact_pending_to
@@ -1964,7 +2406,11 @@ unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) {
             let plen = encode_segment_path(s.partition_id, s.oldest_segment_seq, s.root_path != 0, &mut path);
             let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
             if rc == 0 {
-                dev_log(sys, 3, b"[wal] compacted".as_ptr(), 15);
+                if publish_name(s, sys, &mut path, plen) {
+                    dev_log(sys, 3, b"[wal] compacted".as_ptr(), 15);
+                } else {
+                    dev_log(sys, 3, b"[wal] compact name unfenced".as_ptr(), 27);
+                }
             } else {
                 // ENOENT is expected after skip_replay orphaned a prior
                 // run's numbering, or when an operator GC'd out-of-band.
@@ -1985,6 +2431,7 @@ unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) {
     if s.scan_seg < s.oldest_segment_seq {
         s.scan_seg = s.oldest_segment_seq;
     }
+    unlinks > 0
 }
 
 /// Lazily probe the FS provider's capability bitmap for `UNLINK` support.
@@ -1998,11 +2445,12 @@ unsafe fn fs_unlink_supported(s: &mut Wal, sys: &SyscallTable) -> bool {
 }
 
 /// One-shot FS capability probe. Reads the provider's CAPS bitmap once
-/// and caches both the `UNLINK` disposition (`fs_unlink_probe`) and
-/// whether the async durable-write tier is available (`fs_async`). A
-/// failed CAPS call (provider still initialising) leaves everything
-/// unprobed and retries next call. Called at the top of `flush_batch`
-/// so `fs_async` is set before the first durable write is issued.
+/// and caches the `UNLINK` disposition (`fs_unlink_probe`), the
+/// name-publication disposition (`name_fence_probe`), and whether the
+/// async durable-write tier is available (`fs_async`). A failed CAPS
+/// call (provider still initialising) leaves everything unprobed and
+/// retries next call. Called at the top of `flush_batch` so `fs_async`
+/// is set before the first durable write is issued.
 unsafe fn ensure_fs_caps(s: &mut Wal, sys: &SyscallTable) {
     if s.fs_unlink_probe != 0 {
         return;
@@ -2013,7 +2461,63 @@ unsafe fn ensure_fs_caps(s: &mut Wal, sys: &SyscallTable) {
         let bits = u32::from_le_bytes(caps);
         s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
         s.fs_async = bits & FS_CAP_FSYNC_ASYNC != 0;
+        s.name_fence_probe = if bits & FS_CAP_FSYNC_NAME != 0 {
+            NAME_FENCE_PRESENT
+        } else {
+            NAME_FENCE_ABSENT
+        };
     }
+}
+
+/// Publish the parent-directory entry for `path` — the fence that makes
+/// a segment file discoverable after a power cut. `FS_FSYNC` on the
+/// descriptor covers the bytes only.
+///
+/// Returns `true` when the name may be treated as durable. A provider
+/// without `caps::FSYNC_NAME` cannot prove that, so:
+///
+///   - `NAME_FENCE_STRICT` returns `false` — the caller refuses the
+///     publication rather than certifying a name it cannot fence.
+///   - `NAME_FENCE_AUTO` returns `true` and counts the publication in
+///     `WAL_NAME_UNFENCED`, so the weaker posture is visible rather
+///     than assumed.
+///
+/// A provider that advertises the capability and then fails the call is
+/// always a durability failure, in both postures.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn publish_name(s: &mut Wal, sys: &SyscallTable, path: &mut [u8], plen: usize) -> bool {
+    ensure_fs_caps(s, sys);
+    if s.name_fence_probe != NAME_FENCE_PRESENT {
+        if s.name_fence == NAME_FENCE_STRICT {
+            // A backend that has no such opcode has none on any later
+            // attempt either, and every refused publication retries. The
+            // disposition is exported as `WAL_NAME_FENCE`, so the log
+            // records the standing condition once, informationally.
+            if !s.name_fence_absent_logged {
+                s.name_fence_absent_logged = true;
+                dev_log(sys, 2, b"[wal] no name fence".as_ptr(), 19);
+            }
+            return false;
+        }
+        s.name_unfenced = s.name_unfenced.saturating_add(1);
+        return true;
+    }
+    let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, path.as_mut_ptr(), plen);
+    if rc == 0 {
+        return true;
+    }
+    // The provider advertised the capability and then refused the call:
+    // a genuine durability failure, in both postures. Loud once — it
+    // recurs on every publication while the device is in this state.
+    if !s.name_fence_fail_logged {
+        s.name_fence_fail_logged = true;
+        dev_log(sys, 1, b"[wal] name fence FAIL".as_ptr(), 21);
+    }
+    false
 }
 
 // ── Replay phase ────────────────────────────────────────────
@@ -2425,7 +2929,7 @@ unsafe fn persist_segment_floor(s: &mut Wal, sys: &SyscallTable, new_oldest: u32
     let w = (sys.provider_call)(fd, FS_WRITE, val.as_ptr() as *mut u8, 4);
     let fr = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
     (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    if w == 4 && fr == 0 {
+    if w == 4 && fr == 0 && publish_name(s, sys, &mut path, plen) {
         s.floor_persisted = new_oldest;
         true
     } else {
@@ -3104,9 +3608,11 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
 /// still uses `FS_OPEN` so it can detect "no more segments" via
 /// ENODEV; the write side needs the create tier.
 ///
-/// A persistent `fd < 0` means the FS is initialising (E_AGAIN) or
-/// broken (hard error, after the one-shot `wal/` self-heal): the
-/// caller's readiness gate holds entry intake either way.
+/// A persistent `fd < 0` means the FS is initialising (E_AGAIN), the
+/// path is broken (hard error, after the one-shot `wal/` self-heal), or
+/// the descriptor was refused after opening because a guarantee the
+/// graph asked for could not be had (fixed capacity, or a fenced name).
+/// The caller's readiness gate holds entry intake in every case.
 ///
 /// # Safety
 ///
@@ -3122,39 +3628,20 @@ unsafe fn ensure_segment_open(s: &mut Wal, sys: &SyscallTable) {
         return;
     }
     build_segment_path(s, s.segment_seq);
-    s.fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), s.path_len as usize);
-    if s.fd >= 0 && s.fixed_segment != 0 {
-        // Reserve four bytes beyond the configured record limit for the live
-        // tail terminator. PREALLOCATE persists physical capacity + fixed file
-        // size and leaves the descriptor at offset zero.
-        let capacity = s.segment_limit.saturating_add(4);
-        let cap = capacity.to_le_bytes();
-        let prc = (sys.provider_call)(
-            s.fd, FS_PREALLOCATE, cap.as_ptr() as *mut u8, cap.len(),
-        );
-        if prc == 0 {
-            // Establish a durable empty-log terminator before admission. A
-            // crash after preallocation but before the first client append
-            // must replay zero entries, never stale preallocated data.
-            let zero = [0u8; 4];
-            let w = (sys.provider_call)(s.fd, FS_WRITE, zero.as_ptr() as *mut u8, zero.len());
-            let seek = 0i32.to_le_bytes();
-            let sr = (sys.provider_call)(s.fd, FS_SEEK, seek.as_ptr() as *mut u8, seek.len());
-            let fr = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
-            if w == 4 && sr == 0 && fr == 0 {
-                s.fixed_segment_active = true;
-                s.preallocate_ready_at_ms = dev_millis(sys)
-                    .saturating_add(s.preallocate_settle_ms as u64);
-            } else {
-                (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
-                s.fd = -1;
-                s.write_errors = s.write_errors.saturating_add(1);
-                dev_log(sys, 3, b"[wal] prealloc init FAIL".as_ptr(), 24);
-                return;
-            }
-        }
-        // ENOSYS/unsupported is an intentional compatibility fallback: this
-        // descriptor remains a normal EOF-sized append file.
+    let mut outcome = open_segment_attempt(s, sys);
+    // The provider maps every open failure to one errno, so a missing
+    // `wal/` parent (nothing creates it outside the test harness) is
+    // indistinguishable from a dead disk — self-heal the parent once and
+    // retry. The retry re-enters the SAME attempt, so the preallocation
+    // tier and the name fence gate a self-healed descriptor exactly as
+    // they gate a first-try one.
+    if matches!(outcome, OpenOutcome::OpenFailed) && s.root_path == 0 && !s.mkdir_attempted {
+        s.mkdir_attempted = true;
+        let mut dir = [0u8; 4];
+        dir[..3].copy_from_slice(b"wal");
+        let _ = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), 3);
+        dev_log(sys, 3, b"[wal] mkdir wal".as_ptr(), 15);
+        outcome = open_segment_attempt(s, sys);
     }
     if s.fd >= 0 && !s.fixed_segment_active {
         // A pre-existing file at this seq (skip_replay orphan, reuse on a
@@ -3184,25 +3671,6 @@ unsafe fn ensure_segment_open(s: &mut Wal, sys: &SyscallTable) {
         q += fmt_u32_raw(p.add(q), (s.fd as i64).unsigned_abs() as u32);
         dev_log(sys, 3, p, q);
     }
-    if s.fd >= 0 || s.fd == FS_E_AGAIN {
-        // Disk-backed, or the provider is initialising (retry next step).
-        return;
-    }
-    // Hard error. The provider maps every open failure to one errno, so
-    // a missing `wal/` parent (nothing creates it outside the test
-    // harness) is indistinguishable from a dead disk — self-heal the
-    // parent once and retry before concluding anything.
-    if s.root_path == 0 && !s.mkdir_attempted {
-        s.mkdir_attempted = true;
-        let mut dir = [0u8; 4];
-        dir[..3].copy_from_slice(b"wal");
-        let _ = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), 3);
-        dev_log(sys, 3, b"[wal] mkdir wal".as_ptr(), 15);
-        s.fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), s.path_len as usize);
-        if s.fd >= 0 || s.fd == FS_E_AGAIN {
-            return; // healed, or the provider is still settling
-        }
-    }
     // Hard failure in a DISK build: fail closed, loudly. `fd` stays -1,
     // appends stash with `write_errors` and are never acked, raft
     // backpressures, and the open retries every step — the graph holds
@@ -3212,11 +3680,143 @@ unsafe fn ensure_segment_open(s: &mut Wal, sys: &SyscallTable) {
     // Count the TRANSITION into hard failure, not every retry: the
     // open is re-attempted each step while the path stays broken, and
     // a per-step increment would bury the per-entry durable-write
-    // failures this counter exists to surface.
-    if !s.no_fs_logged {
+    // failures this counter exists to surface. A descriptor refused
+    // AFTER opening was already counted at its refusal site.
+    if matches!(outcome, OpenOutcome::OpenFailed) && !s.no_fs_logged {
         s.no_fs_logged = true;
         s.write_errors = s.write_errors.saturating_add(1);
         dev_log(sys, 1, b"[wal] open fail".as_ptr(), 15);
+    }
+}
+
+/// How one segment-open attempt ended. The distinction the caller needs
+/// is whether the PATH failed (a missing parent is worth one self-heal)
+/// or the descriptor was refused after opening, where the path is fine
+/// and the guarantee is not.
+enum OpenOutcome {
+    /// `s.fd` holds an admitted descriptor.
+    Admitted,
+    /// The provider is still initialising; the whole open retries.
+    Settling,
+    /// The open itself failed.
+    OpenFailed,
+    /// Opened, then refused: preallocation or the name fence. Already
+    /// counted and logged at the refusal site.
+    Refused,
+}
+
+/// One attempt at opening `path_buf` as the live segment, through the
+/// full admission path: create, reserve fixed capacity where that is
+/// configured, and fence the name. `s.fd` holds the outcome — a
+/// descriptor, `FS_E_AGAIN` while the provider settles, or -1.
+///
+/// The name fence is the single admission point: the bytes of a fresh
+/// segment are reachable by no durable name until its parent-directory
+/// entry is published, so a descriptor that cannot be fenced under the
+/// strict posture is never handed back, however it was opened.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn open_segment_attempt(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
+    s.fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), s.path_len as usize);
+    if s.fd == FS_E_AGAIN { return OpenOutcome::Settling; }
+    if s.fd < 0 { return OpenOutcome::OpenFailed; }
+    if s.fixed_segment != 0 {
+        // Reserve four bytes beyond the configured record limit for the live
+        // tail terminator. PREALLOCATE persists physical capacity + fixed file
+        // size and leaves the descriptor at offset zero.
+        let capacity = s.segment_limit.saturating_add(4);
+        let cap = capacity.to_le_bytes();
+        let prc = (sys.provider_call)(
+            s.fd, FS_PREALLOCATE, cap.as_ptr() as *mut u8, cap.len(),
+        );
+        if prc == 0 {
+            // Establish a durable empty-log terminator before admission. A
+            // crash after preallocation but before the first client append
+            // must replay zero entries, never stale preallocated data.
+            let zero = [0u8; 4];
+            let w = (sys.provider_call)(s.fd, FS_WRITE, zero.as_ptr() as *mut u8, zero.len());
+            let seek = 0i32.to_le_bytes();
+            let sr = (sys.provider_call)(s.fd, FS_SEEK, seek.as_ptr() as *mut u8, seek.len());
+            let fr = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
+            if w == 4 && sr == 0 && fr == 0 {
+                s.fixed_segment_active = true;
+                s.preallocate_ready_at_ms = dev_millis(sys)
+                    .saturating_add(s.preallocate_settle_ms as u64);
+            } else {
+                (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                s.fd = -1;
+                s.write_errors = s.write_errors.saturating_add(1);
+                dev_log(sys, 3, b"[wal] prealloc init FAIL".as_ptr(), 24);
+                return OpenOutcome::Refused;
+            }
+        } else if prc == FS_E_NOSYS {
+            // The backend has no such opcode. Fixed segments are a
+            // protection this provider cannot offer, so the descriptor
+            // remains a normal EOF-sized append file — a compatibility
+            // mode, reported as SEGMENT_MODE_FALLBACK so it is never
+            // mistaken for protected operation. ENOSYS alone selects
+            // this: the open above already bound a provider, so any
+            // other error is that provider or its device failing, and
+            // downgrading the durability mode on a fault would answer a
+            // broken store by quietly asking less of it.
+            if !s.preallocate_unsupported {
+                s.preallocate_unsupported = true;
+                dev_log(sys, 3, b"[wal] prealloc unsupported".as_ptr(), 26);
+            }
+        } else if prc == FS_E_AGAIN {
+            // Provider still initialising. Drop the descriptor and retry
+            // the whole open next step: admitting the segment now would
+            // fix the mode before the backend could answer.
+            (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.fd = FS_E_AGAIN;
+            return OpenOutcome::Settling;
+        } else {
+            // ENOSPC, EIO, ENODEV, or any other refusal from a provider
+            // that DOES implement the opcode — the open above proves one
+            // is bound. A full disk or a failing device is a failure of
+            // this segment, not a licence to write it in a different
+            // mode: refuse admission and surface the errno.
+            (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.fd = -1;
+            s.preallocate_errno = prc;
+            s.preallocate_failures = s.preallocate_failures.saturating_add(1);
+            s.write_errors = s.write_errors.saturating_add(1);
+            dev_log(sys, 1, b"[wal] prealloc FAIL".as_ptr(), 19);
+            return OpenOutcome::Refused;
+        }
+    }
+    let mut path = [0u8; WAL_PATH_MAX];
+    let plen = s.path_len as usize;
+    path[..plen].copy_from_slice(&s.path_buf[..plen]);
+    if !publish_name(s, sys, &mut path, plen) {
+        (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.fd = -1;
+        s.fixed_segment_active = false;
+        // The open is retried every step while the fence refuses, so
+        // count the transition into refusal, not each attempt.
+        if !s.name_fence_refused {
+            s.name_fence_refused = true;
+            s.write_errors = s.write_errors.saturating_add(1);
+        }
+        return OpenOutcome::Refused;
+    }
+    OpenOutcome::Admitted
+}
+
+/// Which segment mode this WAL actually achieved, as reported by
+/// `WAL_SEGMENT_MODE`. Protected fixed-capacity operation and the
+/// compatibility fallback are distinct values, so an operator can tell
+/// a node that has the protection from one that merely asked for it.
+fn segment_mode(s: &Wal) -> i64 {
+    if s.fixed_segment == 0 {
+        SEGMENT_MODE_DYNAMIC
+    } else if s.preallocate_unsupported {
+        SEGMENT_MODE_FALLBACK
+    } else {
+        SEGMENT_MODE_FIXED
     }
 }
 
@@ -3361,7 +3961,7 @@ unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
     let kc = wire::METRIC_KIND_COUNTER;
     let kg = wire::METRIC_KIND_GAUGE;
     let kh = wire::METRIC_KIND_HISTOGRAM;
-    let scalars: [(u16, u8, i64); 21] = [
+    let scalars: [(u16, u8, i64); 27] = [
         (wire::metric_ids::WAL_ENTRIES_WRITTEN, kc, i64::from(s.entries_written)),
         (wire::metric_ids::WAL_WRITE_ERRORS, kc, i64::from(s.write_errors)),
         (wire::metric_ids::WAL_CHECKSUM_FAILURES, kc, i64::from(s.checksum_failures)),
@@ -3385,6 +3985,12 @@ unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
         (wire::metric_ids::WAL_CURRENT_INDEX, kg, s.current_index as i64),
         (wire::metric_ids::WAL_FAULT_EXPECTED, kg, s.fault_expected as i64),
         (wire::metric_ids::WAL_FAULT_GOT, kg, s.fault_got as i64),
+        (wire::metric_ids::WAL_TRUNCATE_FAILURES, kc, s.truncate_failures as i64),
+        (wire::metric_ids::WAL_SEGMENT_MODE, kg, segment_mode(s)),
+        (wire::metric_ids::WAL_PREALLOCATE_FAILURES, kc, i64::from(s.preallocate_failures)),
+        (wire::metric_ids::WAL_PREALLOCATE_ERRNO, kg, i64::from(s.preallocate_errno)),
+        (wire::metric_ids::WAL_NAME_FENCE, kg, i64::from(s.name_fence_probe)),
+        (wire::metric_ids::WAL_NAME_UNFENCED, kc, i64::from(s.name_unfenced)),
     ];
     for &(metric_id, kind, value) in scalars.iter() {
         emit_sample(s, sys, mid, pid, metric_id, kind, value);

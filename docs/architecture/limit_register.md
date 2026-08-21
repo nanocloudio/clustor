@@ -1,7 +1,6 @@
 # Limit register
 
-The list of clustor's *deliberate* hard ceilings, following the same
-discipline as fluxor's `docs/architecture/limit_register.md`: a policy
+The list of clustor's *deliberate* hard ceilings: a policy
 ceiling found in source but absent here is a bug. Every checkable
 row's `Symbol` must exist in its `Source` file as a `const` whose
 value matches `Value`; a ceiling changed in source without updating

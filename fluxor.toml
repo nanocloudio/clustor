@@ -1,14 +1,12 @@
-# Clustor project config consumed by the `fluxor` CLI. See
-# ~/Development/nanocloudio/standards/{ci,fluxor-modules,tests,lints,dependencies}.md
-# for the schema each table belongs to.
+# Clustor project config consumed by the `fluxor` CLI.
 
-# Project identity (standards/dependencies.md §2.1). Required for
-# `fluxor publish`; downstream projects reference clustor by this name.
+# Project identity. Required for `fluxor publish`; downstream
+# projects reference clustor by this name.
 [project]
 name    = "clustor"
 version = "0.0.1"
 
-# Cross-project dependencies (standards/dependencies.md §2.2).
+# Cross-project dependencies.
 # Resolves to fluxor's published source crates and fmod palette via
 # the local registry. PIC modules in `modules/app/*/mod.rs` consume
 # the materialised SDK source at
@@ -78,5 +76,4 @@ vars = { SELF_ID = "0", LISTEN_PORT = "9090", PEER0_PORT = "9090", PEER1_PORT = 
 # `fluxor ci` explicitly rather than as a downstream link error.
 # Bump only when fluxor's `modules/sdk/wire.rs::ABI_VERSION`
 # changes (module headers / channel hints / contract ids break).
-# See standards/fluxor-modules.md §5 and standards/dependencies.md.
 fluxor = { abi = 1 }

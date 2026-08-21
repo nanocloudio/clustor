@@ -144,11 +144,12 @@ under its own ids; there is no `high_rtt` field.
 | 0x22 | `MSG_DURABILITY_PROOF` | `[partition_id:u16][term:u64][index:u64][replica:u8]` (19 B) — cross-partition fan-in to the ack tracker |
 | 0x23 | `MSG_COMMITTED_BATCH` | commit-horizon advance |
 | 0x24 | `MSG_COMMITTED_ENTRY` | `[term:u64][index:u64][body...]` — per-entry committed stream in strict commit order; body is opaque |
+| 0x25 | `MSG_WAL_TRUNCATE_ACK` | `[keep_through_index:u64][request_id:u32][durable:u8]` (13 B) — the WAL's answer to a truncation request; `durable = 0` means the suffix is still on disk and the tip must not be rewound |
 | 0x29 / 0x2A | `MSG_WAL_ENTRY_REQUEST` / `_REPLY` | random-access read-back; request `[request_id:u32][wal_index:u64]`, reply header `[request_id:u32][term:u64][index:u64][prev_term:u64]` (28 B) + body; an empty body means not found |
 | 0x2B | `MSG_APPLY_PIPELINE_RESET` | `[term:u64][index:u64]` after a snapshot install fast-forwards commit |
 | 0x2C | `MSG_WAL_COMPACT_BEFORE` | `[before_index:u64]` — drop segments below the floor |
 | 0x2D | `MSG_WAL_REPLAY_COMPLETE` | `[term:u64][high_water_index:u64]` — boot replay finished; raft resumes its index here |
-| 0x2E | `MSG_WAL_TRUNCATE_AFTER` | `[keep_through_index:u64]` — Raft §5.3 conflict repair; never crosses `commit_index` |
+| 0x2E | `MSG_WAL_TRUNCATE_AFTER` | `[keep_through_index:u64][request_id:u32]` (12 B) — Raft §5.3 conflict repair; never crosses `commit_index`. The request id correlates the `MSG_WAL_TRUNCATE_ACK` that releases the tip |
 | 0x2F | `MSG_WAL_REJECT` | `[expected_index:u64]` — continuity rejection, see [errors.md](errors.md) |
 
 ### Control plane (0x30–0x33)

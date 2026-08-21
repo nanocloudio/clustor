@@ -81,12 +81,24 @@ the frame in strict order:
 2. **Gap** (`prev_log_index > last_log_index`) — NACK; the response
    carries the follower's real `last_log_index` so the leader backs
    `next_index` up in one step instead of decrementing.
-3. **Term conflict at `prev_log_index`** — truncate the local log back
-   to `prev_log_index − 1` and NACK. Truncation is forwarded to the
-   WAL as `MSG_WAL_TRUNCATE_AFTER`; the WAL rewinds its write cursor to
-   the end of the kept entry's frame and writes a zero-length
-   terminator so replay never resurrects the discarded suffix
-   (`modules/app/durability/wal.rs`).
+3. **Term conflict at `prev_log_index`** — request a truncation back to
+   `prev_log_index − 1` and NACK. The request goes to the WAL as
+   `MSG_WAL_TRUNCATE_AFTER`, carrying a correlation id. The WAL rewinds
+   its write cursor to the end of the kept entry's frame, writes a
+   zero-length terminator so replay never resurrects the discarded
+   suffix, fsyncs, retires every segment file above the keep point, and
+   only then publishes its own high-water and answers
+   `MSG_WAL_TRUNCATE_ACK` (`modules/app/durability/wal.rs`).
+
+   The follower keeps its old tip until that ack arrives. While the
+   truncation is outstanding it answers every AppendEntries `busy`,
+   proposes nothing, and stands for no election: until the WAL has
+   actually made room, a replacement suffix appended here would sit
+   above a suffix the WAL can still replay at the same indices. A
+   request the control channel could not take is re-sent every step, so
+   backpressure delays the truncation without cancelling it, and a WAL
+   answer of "not durable" leaves the previous tip in force and retries.
+   Failure and retry are idempotent on both sides.
 4. **Retransmit** of an index already held with a matching term —
    acknowledged at that index without re-appending.
 5. **Clean append** — contiguity is enforced (`entry_index` must be

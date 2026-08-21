@@ -62,6 +62,7 @@ The runtime knobs, with their defaults, as declared in the modules'
 | `durability_mode` | Consensus commit gating: strict (0), group_fsync (1), relaxed (2) — `DUR_STRICT` / `DUR_GROUP_FSYNC` / `DUR_RELAXED` in `types.rs`. Default group_fsync. Strict and group_fsync gate the commit index on quorum durability; relaxed commits on replication match alone. |
 | `fsync_mode` | WAL writer behaviour in the durability module: 0 = write + fsync + ack per entry, 1 = group fsync. Group mode batches under `group_window_ms` (default 2) and `group_max_pending` (default 64). |
 | `segment_bytes` | WAL segment size limit. Default 67,108,864 (64 MiB). |
+| `name_fence` | Name-publication posture, declared identically on the consensus and durability modules. Default strict (1): a filesystem that cannot fence a name publishes nothing, so segments are not admitted, snapshots are not published and vote grants stay withheld. Auto (0): publish every artefact name through the filesystem's directory fence where it offers one, and report the disposition where it does not. |
 | `partition_id` | Partition slot for multi-Raft graphs. Stamped into segment and snapshot filenames, durability proofs, and raft metadata paths. |
 | `fresh_threshold_s` / `grace_period_s` | Admission proof-cache ladder thresholds; defaults 60 and 120. See the cache states below. |
 | `dek_epoch` | Data-encryption-key epoch, owned by the durability module's keys component. Rotated locally on a weekly timer and stamped into snapshot manifests and headers. There is no AEAD encryption of WAL or snapshot bytes; the epoch is carried metadata. |
@@ -120,10 +121,10 @@ share state.
 
 Two targets exist. On Raspberry Pi 5 bare metal the filesystem is
 FAT32 with no mkdir, so persistent files live in the volume root under
-8.3 names (for example `RAFT<pppp>.MET` and `<p><seq7>.WAL`). On the
+8.3 names (for example `RAFT<pppp>.M0` and `<p><seq7>.WAL`). On the
 Linux host harness files live under `./wal/` relative to the working
 directory (`wal/p<NNNN>_seg_<NNNNNNNN>`,
-`wal/p<NNNN>_snap_<NNNNNNNN>.bin`, `raft/meta`). Strict-mode WAL
+`wal/p<NNNN>_snap_<NNNNNNNN>.bin`, `raft/meta0`). Strict-mode WAL
 appends issue a write plus fsync per entry; group_fsync batches writes
 inside the configured window.
 
@@ -133,12 +134,22 @@ inside the configured window.
   steps.
 - Storage may reorder writes unless an fsync (or the platform's
   equivalent flush) orders them.
+- A file's bytes and the directory entry naming it are two separate
+  durability facts. An fsync through a descriptor covers the bytes
+  only, so every segment, snapshot, pointer slot and metadata slot is
+  published with a second fence over its parent-directory entry, and
+  every retirement fences the removal the same way. Until both fences
+  have completed, nothing about that artefact is claimed durable. A
+  filesystem that cannot publish a name is refused by default; the
+  `name_fence` parameter is what relaxes that into the weaker
+  reported-rather-than-assumed mode.
 - Recovery is CRC replay: on start the WAL is scanned frame by frame,
   each frame's CRC32C is verified, and replay stops at the first torn
   or invalid frame. Everything before that point is the durable
   prefix; everything after it is discarded. Log divergence discovered
   by AppendEntries conflict checks is repaired with the truncation
-  primitive before new entries are appended.
+  primitive before new entries are appended; the replacement suffix is
+  admitted only after the WAL acknowledges that truncation as durable.
 - The fault model is crash-only, not Byzantine. There are no
   signatures or MACs on log or snapshot data; a replica that actively
   lies must be removed by operators.
@@ -181,14 +192,39 @@ is entirely the per-entry CRC chain.
 ### 3) Raft metadata record
 
 Consensus persists election and log-tip state via the FS contract
-(`modules/app/consensus/raft.rs`): `RAFT<pppp>.MET` on bare-metal
-FAT32, `raft/meta` (or `raft/p<NNNN>/meta` for non-zero partitions)
-on the host. The record is 28 bytes:
+(`modules/app/consensus/raft.rs`) as two slot records in separate
+files: `RAFT<pppp>.M<slot>` on bare-metal FAT32, `raft/meta<slot>` (or
+`raft/p<NNNN>/meta<slot>` for non-zero partitions) on the host. Each
+record is 64 bytes:
 
 ```
-[current_term:u64][voted_for:i8][last_log_index:u64]
-[last_log_term:u64][current_voters:u8][joint_voters:u8][joint_active:u8]
+[magic:u32][format:u16][pad:u16][generation:u64][current_term:u64]
+[voted_for:i8][current_voters:u8][joint_voters:u8][joint_active:u8]
+[durable_index:u64][durable_term:u64][reserved:16][crc32c:u32]
 ```
+
+The CRC covers bytes 0..60. `pad` and `reserved` are written zero and
+covered by the CRC, so a decoder that finds them non-zero under a known
+format id rejects the record; a future field claims them behind a new
+`format` id rather than by reinterpreting a zero. A persist writes the
+inactive slot,
+fsyncs, re-reads and validates it, and only then adopts the new
+generation; boot takes the highest generation that validates. Separate
+files, not separate offsets in one file: two records sharing a 512-byte
+read-modify-write sector are one failure unit, not redundancy.
+
+`durable_index` is the WAL's durable watermark and `durable_term` is
+the term of the entry AT that index, taken from the WAL's own fsync
+ack. It is deliberately not `last_log_term`, which describes the
+volatile tip and can name a newer term than anything on disk — a record
+pairing the two would over-state how up to date the recovered log is,
+and that claim decides elections.
+
+A store holding the flat record — a single unchecksummed 28-byte
+record written in place — still boots: it is read once, when neither
+slot validates, and yields term and vote rather than nothing. Its
+index and term describe different entries, so both are carried
+forward unchecked and the WAL replay high-water supersedes them.
 
 Persistence on the durable-ack path is rate-limited; a crash loses at
 most the configured advance window of durable-index bookkeeping, never
@@ -235,11 +271,24 @@ A snapshot manifest is a 32-byte binary record
 Snapshot content travels as `MSG_SNAPSHOT_CHUNK` frames with an
 8-byte `[seq:u32][len:u32]` prefix, followed by the manifest as the
 completion record. The durability module persists the snapshot to
-`wal/p<NNNN>_snap_<NNNNNNNN>.bin` with a CRC-validated file layout and
-a pointer sidecar naming the current durable snapshot, which makes the
-install crash-atomic without an FS rename
+`wal/p<NNNN>_snap_<NNNNNNNN>.bin` with a CRC-validated file layout,
+which makes the install crash-atomic without an FS rename
 (`modules/app/durability/snapshot.rs`). Manifests are not signed and
 not JSON.
+
+The snapshot a node recovers from is named by two pointer slots in
+separate files (`<p>SNAPPT<slot>.SNP` on FAT32,
+`wal/p<NNNN>_snapptr<slot>.bin` otherwise). Each slot is 32 bytes:
+
+```
+[magic:u32 = 0x52545053 "SPTR"][format:u16][pad:u16][generation:u64]
+[index:u64][reserved:u32][crc32c:u32]
+```
+
+The CRC covers bytes 0..28. Publication follows the same discipline as
+the metadata slots: write the inactive slot, fsync, re-read, validate,
+then adopt. Boot tries the slots highest-generation first and believes
+a pointer only once the snapshot it names opens and validates.
 
 ### 7) Timing entries
 

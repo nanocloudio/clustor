@@ -528,7 +528,7 @@ pub const MSG_WAL_COMPACT_BEFORE: u8 = 0x2C;
 /// carrying the EXACT on-disk high-water it reconstructed. Payload
 /// (16 bytes): `[term:u64 LE][high_water_index:u64 LE]` (encoded via
 /// `encode_term_index`). On a crash-recovery boot raft loads only a
-/// THROTTLED durable hint from `RAFT0000.MET` (`META_PERSIST_STRIDE`),
+/// THROTTLED durable hint from its metadata slots (`META_PERSIST_STRIDE`),
 /// which lags the WAL's true replayed high-water; resuming at the stale
 /// hint makes new post-recovery appends collide with the replayed index
 /// space. raft HOLDS proposal intake until this signal arrives, then
@@ -541,14 +541,95 @@ pub const MSG_WAL_REPLAY_COMPLETE: u8 = 0x2D;
 /// consensus → WAL log-suffix truncation (Raft §5.3 conflict repair).
 /// Emitted by a follower when an AppendEntries reveals a divergent suffix:
 /// every entry strictly AFTER `keep_through_index` must be discarded before
-/// the leader's entries can be appended. Payload (8 bytes):
-/// `[keep_through_index:u64 LE]`. The WAL drops in-memory offset-map slots
-/// above the floor, seeks the live segment to the end of `keep_through_index`,
-/// writes a zero-length terminator frame so replay stops there, and fsyncs.
+/// the leader's entries can be appended. Payload (12 bytes):
+/// `[keep_through_index:u64 LE][request_id:u32 LE]`. The WAL seeks the live
+/// segment to the end of `keep_through_index`, writes a zero-length
+/// terminator frame so replay stops there, fsyncs, retires every discarded
+/// segment above the keep point, and only THEN publishes its own high-water
+/// and answers `MSG_WAL_TRUNCATE_ACK`.
+///
+/// The request is a REQUEST, not a fact: raft keeps its old tip and refuses
+/// conflicting AppendEntries until the correlated ack arrives. A repeat of
+/// the same `(keep_through_index, request_id)` is idempotent.
+///
 /// SAFETY: raft never emits this for `keep_through_index < commit_index` —
 /// committed entries are immutable, so truncation can only ever touch the
 /// uncommitted tail. Shares the `wal.compact_before` control channel.
 pub const MSG_WAL_TRUNCATE_AFTER: u8 = 0x2E;
+/// Length of the `MSG_WAL_TRUNCATE_AFTER` payload.
+pub const WAL_TRUNCATE_AFTER_LEN: usize = 12;
+
+/// WAL → consensus truncation outcome, correlated by `request_id`.
+/// Payload (13 bytes): `[keep_through_index:u64 LE][request_id:u32 LE]
+/// [durable:u8]`.
+///
+/// `durable = 1` means every part of the truncation reached stable storage:
+/// the retained prefix, the terminator frame, the required fsync, and any
+/// segment retirement. Only then may raft rewind its tip and accept
+/// replacement entries. `durable = 0` means nothing was published — the WAL's
+/// own high-water is unchanged and a retry is a clean repeat.
+///
+/// Rides the `wal.flushed` channel alongside `MSG_FSYNC_ACK`.
+pub const MSG_WAL_TRUNCATE_ACK: u8 = 0x25;
+/// Length of the `MSG_WAL_TRUNCATE_ACK` payload.
+pub const WAL_TRUNCATE_ACK_LEN: usize = 13;
+
+/// Encode the `MSG_WAL_TRUNCATE_AFTER` payload.
+#[inline]
+pub fn encode_wal_truncate_after(
+    buf: &mut [u8; WAL_TRUNCATE_AFTER_LEN],
+    keep_through_index: u64,
+    request_id: u32,
+) {
+    buf[0..8].copy_from_slice(&keep_through_index.to_le_bytes());
+    buf[8..12].copy_from_slice(&request_id.to_le_bytes());
+}
+
+/// Decode the `MSG_WAL_TRUNCATE_AFTER` payload. A shorter payload
+/// carries no request id and decodes as id 0.
+#[inline]
+pub fn decode_wal_truncate_after(buf: &[u8]) -> Option<(u64, u32)> {
+    if buf.len() < 8 {
+        return None;
+    }
+    let index = u64::from_le_bytes([
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+    ]);
+    let request_id = if buf.len() >= WAL_TRUNCATE_AFTER_LEN {
+        u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
+    } else {
+        0
+    };
+    Some((index, request_id))
+}
+
+/// Encode the `MSG_WAL_TRUNCATE_ACK` payload.
+#[inline]
+pub fn encode_wal_truncate_ack(
+    buf: &mut [u8; WAL_TRUNCATE_ACK_LEN],
+    keep_through_index: u64,
+    request_id: u32,
+    durable: bool,
+) {
+    buf[0..8].copy_from_slice(&keep_through_index.to_le_bytes());
+    buf[8..12].copy_from_slice(&request_id.to_le_bytes());
+    buf[12] = durable as u8;
+}
+
+/// Decode the `MSG_WAL_TRUNCATE_ACK` payload.
+#[inline]
+pub fn decode_wal_truncate_ack(buf: &[u8]) -> Option<(u64, u32, bool)> {
+    if buf.len() < WAL_TRUNCATE_ACK_LEN {
+        return None;
+    }
+    Some((
+        u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]),
+        u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+        buf[12] != 0,
+    ))
+}
 
 /// `durability` → `consensus` continuity rejection. Emitted when the WAL is
 /// handed an entry whose index is not `wal_current_index + 1`, i.e. raft's log
@@ -1034,16 +1115,19 @@ pub mod metric_ids {
     /// Gauge: the WAL replay high-water raft last RESUMED at via
     /// MSG_WAL_REPLAY_COMPLETE (0 if none received). Diagnostic.
     pub const RAFT_REPLAY_HW: u16 = 0x000F;
-    /// Gauge: log index raft loaded from RAFT0000.MET at boot (0 = fresh).
+    /// Gauge: log index raft loaded from its metadata slots at boot
+    /// (0 = fresh).
     pub const RAFT_META_HINT: u16 = 0x0010;
     /// Counter: Raft §5.3 conflict-repair truncations driven (divergent
     /// suffix discarded). Steady-state replication should hold this at 0;
     /// non-zero marks log divergence + repair (e.g. post-failover).
     pub const RAFT_LOG_TRUNCATIONS: u16 = 0x0011;
-    /// Gauge (readiness sub-signal): 1 once boot replay is complete, metadata
-    /// is loaded, and consensus is established (we are leader, or we know the
-    /// leader). Consumed by operations to drive a real `/readyz` instead of
-    /// a fixed boot timer. 0 until all three hold.
+    /// Gauge (readiness sub-signal): 1 once boot replay is complete,
+    /// metadata is loaded, no truncation is outstanding (a node holding
+    /// one refuses every AppendEntries, so it is not carrying
+    /// replication), and consensus is established (we are leader, or we
+    /// know the leader). Consumed by operations to drive a real
+    /// `/readyz` instead of a fixed boot timer. 0 until all four hold.
     pub const RAFT_READY: u16 = 0x0012;
     /// Counter: WAL continuity rejections repaired — times raft rolled its
     /// tip back to the index the WAL actually holds (`MSG_WAL_REJECT`).
@@ -1068,6 +1152,27 @@ pub mod metric_ids {
     /// so the node follows and serves but cannot move elections.
     /// Transient FS-initialising outcomes are not counted.
     pub const RAFT_META_WRITE_ERRORS: u16 = 0x0016;
+    /// Counter: AppendEntries held (`busy`) because a conflict-repair
+    /// truncation was still unacknowledged by the WAL. Non-zero means
+    /// log repair is waiting on durability, which is the fail-closed
+    /// behaviour; sustained growth means the WAL cannot complete the
+    /// truncation and this node is stuck out of the repair path.
+    pub const RAFT_TRUNCATE_HOLDS: u16 = 0x0017;
+    /// Counter: truncation requests the WAL refused as not durable.
+    /// Steady state 0. Non-zero means the new log tail could not be
+    /// persisted; the old tip is retained and the request is re-sent.
+    pub const RAFT_TRUNCATE_NACKS: u16 = 0x0018;
+    /// Gauge: the provider's name-publication disposition for the
+    /// election-metadata slots. `0` = not probed, `1` =
+    /// `caps::FSYNC_NAME` advertised and each slot's name is fenced
+    /// when it is created, `2` = absent.
+    pub const RAFT_NAME_FENCE: u16 = 0x0019;
+    /// Counter: metadata slot names published without a name fence
+    /// because the provider does not advertise `caps::FSYNC_NAME`. In
+    /// the strict posture this is always 0 — the publication is
+    /// refused instead, so a non-zero value is the auto posture
+    /// reporting what it could not fence.
+    pub const RAFT_NAME_UNFENCED: u16 = 0x001A;
 
     // wal (module_id = 0x02)
     pub const WAL_ENTRIES_WRITTEN: u16 = 0x0001;
@@ -1127,6 +1232,38 @@ pub mod metric_ids {
     /// break. The pair IS the diagnosis.
     pub const WAL_FAULT_EXPECTED: u16 = 0x0014;
     pub const WAL_FAULT_GOT: u16 = 0x0015;
+    /// Counter: truncation requests refused because the new tail could
+    /// not be made durable. Nothing was published for these: the
+    /// high-water is unchanged and the requester keeps its old tip.
+    pub const WAL_TRUNCATE_FAILURES: u16 = 0x0016;
+    /// Gauge: how the current segment file is being written.
+    /// `0` = dynamically grown because fixed segments were not
+    /// requested, `1` = protected fixed-capacity operation
+    /// (`PREALLOCATE` active), `2` = compatibility fallback — fixed
+    /// segments were requested but the provider has no `PREALLOCATE`,
+    /// so the segment grows dynamically. `2` is the only value where
+    /// the configured mode and the achieved mode differ.
+    pub const WAL_SEGMENT_MODE: u16 = 0x0017;
+    /// Counter: segment admissions refused because `PREALLOCATE`
+    /// reported an allocation or device failure rather than a missing
+    /// opcode. A full disk or a failing device never becomes a
+    /// different segment mode; the segment stays unopened and entries
+    /// go un-acked.
+    pub const WAL_PREALLOCATE_FAILURES: u16 = 0x0018;
+    /// Gauge: the errno of the most recent `PREALLOCATE` refusal
+    /// (negative), or `0` when preallocation has never been refused.
+    /// Pairs with `WAL_SEGMENT_MODE` to say WHY a node is not in
+    /// protected fixed-segment operation.
+    pub const WAL_PREALLOCATE_ERRNO: u16 = 0x0019;
+    /// Gauge: the provider's name-publication disposition. `0` = not
+    /// probed yet, `1` = `caps::FSYNC_NAME` advertised and every
+    /// segment name is fenced, `2` = absent.
+    pub const WAL_NAME_FENCE: u16 = 0x001A;
+    /// Counter: segment names created or retired without a name fence
+    /// because the provider does not advertise `caps::FSYNC_NAME`. In
+    /// the strict posture this is always 0 — the publication is
+    /// refused instead.
+    pub const WAL_NAME_UNFENCED: u16 = 0x001B;
 
     // replicator (module_id = 0x03)
     pub const REPL_RPCS_SENT: u16 = 0x0001;
@@ -1169,6 +1306,15 @@ pub mod metric_ids {
     /// app refused (capacity denial) or is wedged; either way the WAL
     /// cannot compact until a capture completes.
     pub const SNAP_APP_CAPTURES_TIMED_OUT: u16 = 0x0007;
+    /// Gauge: the provider's name-publication disposition for snapshot
+    /// artefacts and pointer slots. `0` = not probed, `1` =
+    /// `caps::FSYNC_NAME` advertised, `2` = absent.
+    pub const SNAP_NAME_FENCE: u16 = 0x0008;
+    /// Counter: snapshot names published or retired without a name
+    /// fence. Non-zero means a recovery root's discoverability rests
+    /// on the provider's own flushing policy; the strict posture
+    /// refuses the publication instead and leaves this at 0.
+    pub const SNAP_NAME_UNFENCED: u16 = 0x0009;
 
     // consensus — apply component (source_id = 0x06)
     pub const APPLY_ENTRIES_APPLIED: u16 = 0x0001;

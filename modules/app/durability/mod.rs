@@ -33,8 +33,13 @@
 //!   2. `wal`      — replay or the write path. Durable high-water and
 //!      rotation triggers land in monotone latches. Bound
 //!      (`wal::step`): replay is one FS open OR one frame; normal
-//!      mode ≤8 input records + ≤4 control frames + ≤8 gap-refetch
-//!      serves.
+//!      mode ≤8 input records + ≤4 control frames (at most one of
+//!      them a truncation) + ≤8 gap-refetch serves + at most one cold
+//!      segment open. Physical segment removal, from compaction or a
+//!      truncation's retirement alike, is paced at
+//!      `COMPACT_UNLINKS_PER_STEP` per step; a step that removed any
+//!      returns Burst, each removal being an unlink plus a directory
+//!      fence.
 //!   3. latch drain — the ledger receives the local durable advance;
 //!      the snapshot component receives the rotation trigger. O(1)
 //!      composition-layer code.
@@ -158,6 +163,17 @@ define_params! {
 
     14, voter_count, u8, 1
         => |s, d, len| { s.voter_count = p_u8(d, len, 0, 1); };
+
+    // Name-publication posture for WAL segments, snapshot artefacts and
+    // pointer slots. Default 1 = strict: a provider that cannot fence a
+    // name is refused, so no artefact is ever created under a name whose
+    // durability is unproven. 0 = auto: fence every name through
+    // `fs::FSYNC_NAME` where the provider advertises `caps::FSYNC_NAME`,
+    // and meter the publications it cannot fence (`WAL_NAME_UNFENCED` /
+    // `SNAP_NAME_UNFENCED`) — an observation posture, not a durability
+    // one.
+    15, name_fence, u8, 1
+        => |s, d, len| { s.name_fence = p_u8(d, len, 0, 1); };
 }
 
 #[repr(C)]
@@ -168,6 +184,7 @@ struct ModuleState {
     self_id: u8,
     voter_count: u8,
     root_path: u8,
+    name_fence: u8,
 
     wal: wal::Wal,
     #[cfg(not(feature = "volatile"))]
@@ -224,6 +241,7 @@ pub extern "C" fn module_new(
         s.self_id = 0;
         s.voter_count = 1;
         s.root_path = 0;
+        s.name_fence = 0;
 
         wal::init(&mut s.wal);
         #[cfg(not(feature = "volatile"))]
@@ -275,8 +293,10 @@ pub extern "C" fn module_new(
         s.wal.partition_id = s.partition_id;
         s.wal.self_id = s.self_id;
         s.wal.root_path = s.root_path;
+        s.wal.name_fence = s.name_fence;
         s.snapshot.partition_id = s.partition_id;
         s.snapshot.root_path = s.root_path;
+        s.snapshot.name_fence = s.name_fence;
         #[cfg(not(feature = "volatile"))]
         {
             s.ledger.self_id = s.self_id;

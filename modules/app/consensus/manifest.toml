@@ -9,7 +9,7 @@ hardware_targets = ["bcm2712"]
 #
 # Components: raft (elections with pre-vote, proposal batching,
 # follower log matching + §5.3 conflict repair, admin/config apply,
-# RAFT<pppp>.MET metadata persistence), replicator (AppendEntries
+# two-slot CRC metadata persistence), replicator (AppendEntries
 # pipelining, ack processing, WAL read-back catch-up, snapshot chunk
 # transfer), commit (quorum match/durability fusion → commit horizon),
 # apply (ordered dedup delivery of committed entries + the
@@ -34,8 +34,9 @@ permissions = []
 capabilities = ["replication.state_machine"]
 
 # raft persists term + voted_for + durable-index metadata via the FS
-# contract (root-level RAFT<pppp>.MET when root_path = 1, raft/meta
-# otherwise — the raft/ parent is self-healed at first persist).
+# contract, as two CRC-protected generational slots (root-level
+# RAFT<pppp>.M<slot> when root_path = 1, raft/meta<slot> otherwise —
+# the raft/ parent is self-healed at first persist).
 # Persist failures are counted (meta_write_errors) and withhold vote
 # grants and election starts. The `persist_meta: 0` posture disables
 # metadata persistence deliberately (volatile graphs); the declaration
@@ -94,10 +95,19 @@ name = "snapshot_installed"
 direction = "input"
 content_type = "OctetStream"
 
-# Local MSG_FSYNC_ACK frames from `wal.flushed`. Followers stamp the
-# resulting `local_wal_durable_index` into every AppendEntriesResponse
-# so the leader's durability ledger can compute quorum-fsync
-# durability across replicas (spec §10.4.1).
+# The WAL's local acknowledgement stream from `wal.flushed`:
+# MSG_FSYNC_ACK, MSG_WAL_TRUNCATE_ACK and MSG_WAL_REJECT. Followers
+# stamp the resulting `local_wal_durable_index` into every
+# AppendEntriesResponse so the leader's durability ledger can compute
+# quorum-fsync durability across replicas (spec §10.4.1).
+#
+# All three MUST stay on this one edge. They are consumed in FIFO
+# order, which is what makes a truncation's durable-watermark clamp
+# sound: every fsync ack for an entry the truncation discards was
+# written ahead of the truncate ack and is therefore already applied
+# when the clamp runs. Split across separate edges, a late fsync ack
+# would raise the watermark back above the new tail and the node would
+# again advertise durability for entries it no longer holds.
 [[ports]]
 name = "wal_flushed"
 direction = "input"
@@ -106,7 +116,7 @@ content_type = "OctetStream"
 # Boot-time replay-complete signal from `wal.replay_complete`
 # (MSG_WAL_REPLAY_COMPLETE `[term:u64][high_water:u64]`). On a
 # crash-recovery boot raft loads only a THROTTLED durable hint from
-# RAFT0000.MET; resuming at it makes new post-recovery appends collide
+# its metadata slots; resuming at it makes new post-recovery appends collide
 # with the replayed index space. raft holds proposal intake until this
 # arrives, then resumes `last_log_index` at the WAL's exact on-disk
 # high-water and re-seeds the apply horizon. A DEDICATED edge — must
@@ -321,7 +331,7 @@ rate_class_max = "transaction"
 
 [observability]
 # Exactly what the code emits as typed MSG_METRIC_SAMPLE, per
-# component: raft (22 — `ready` is emitted FIRST so it is the last
+# component: raft (26 — `ready` is emitted FIRST so it is the last
 # casualty under metric-channel backpressure), replicator (6),
 # commit (2), apply (6). Partition-stamped for multi-Raft graphs.
 metrics = [
@@ -333,7 +343,8 @@ metrics = [
   "flushes_deferred", "uncommitted_inflight",
   "awaiting_replay", "replay_hw", "meta_hint", "log_truncations",
   "wal_resyncs", "wal_unacked_holds", "ae_noncontiguous",
-  "meta_write_errors",
+  "meta_write_errors", "name_fence", "name_unfenced",
+  "truncate_holds", "truncate_nacks",
   # replicator
   "rpcs_sent", "acks_received", "nacks_received", "catchup_sent",
   "inflight_depth", "backpressure",

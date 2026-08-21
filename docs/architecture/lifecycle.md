@@ -24,12 +24,21 @@ operations, and membership. The replication-loop algorithms are in
 Boot runs in two stages: snapshot restore, then WAL replay.
 
 **Snapshot restore** (`modules/app/durability/snapshot.rs`) reads the
-pointer sidecar naming the durable local snapshot, loads and
-CRC-validates the file it names, replays the application body to the
-state machine (a reset followed by chunks), and signals
-`MSG_SNAPSHOT_INSTALLED` to consensus so raft knows the log has a
-floor. A file whose end magic or CRC does not check out is rejected
-and the node falls back to its log. Snapshot files are written in one
+two CRC-protected pointer slots naming the durable local snapshot
+(`<p>SNAPPT<slot>.SNP` on FAT32, `wal/p<NNNN>_snapptr<slot>.bin`
+otherwise, plus the flat 8-byte record as a last resort), loads and
+CRC-validates the file the highest valid
+pointer names, replays the application body to the state machine (a
+reset followed by chunks), and signals `MSG_SNAPSHOT_INSTALLED` to
+consensus so raft knows the log has a floor. A pointer is believed only
+once the snapshot it names has been opened and validated: a file whose
+end magic or CRC does not check out, or that is absent altogether, is
+refused and the next-highest pointer is tried, so retirement and
+compaction never run against a recovery root that is not on disk.
+When no candidate survives, the node falls back to its log. Each
+publish writes the inactive slot, fsyncs, re-reads and validates it,
+and only then adopts the new generation; the slots are separate files
+so one torn sector cannot damage both. Snapshot files are written in one
 sequential pass with a single trailing fsync, so a torn write never
 leaves a readable trailer.
 
@@ -63,13 +72,22 @@ comment in the deployment graph records why it must never be
 multiplexed onto `wal.flushed`, which also fans out durability
 acknowledgements.
 
-Raft persists its own metadata (current term, vote, durable-index
-hint) as one 28-byte record: `RAFT<pppp>.MET` on bare-metal FAT32,
-`raft/meta` otherwise (the `raft/` parent is created at first persist
-if absent). The persist gates the actions that must never outlive a
-crash unrecorded: a vote is granted, and an election started, only
-after the prospective `(term, vote)` record is on stable storage.
-Write first, adopt in memory second, so there is no rollback path. A
+Raft persists its own metadata (current term, vote, durable index and
+its term) as two CRC-protected slot records in separate files:
+`RAFT<pppp>.M0` / `RAFT<pppp>.M1` on bare-metal FAT32, `raft/meta0` /
+`raft/meta1` otherwise (the `raft/` parent is created at first persist
+if absent). Each persist writes the slot that is NOT currently
+authoritative, fsyncs it, reads it back, and only then adopts its
+generation, so a torn or lost write damages a record nothing was
+relying on. Boot selects the highest generation whose magic, format id
+and CRC all check out, falling back to the flat 28-byte record (one
+unchecksummed record written in place) when neither slot validates.
+The two slots live in separate files deliberately: the provider's
+read-modify-write unit is per-file, so one torn sector reaches one
+slot. The persist gates the actions that must never outlive a crash
+unrecorded: a vote is granted, and an election started, only after the
+prospective `(term, vote)` record is on stable storage. Write first,
+adopt in memory second, so there is no rollback path. A
 same-term step-down changes neither field and writes nothing. The one
 deliberate exception is adopting a *higher observed term*, which takes
 effect in memory even if its persist fails, because refusing to

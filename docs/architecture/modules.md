@@ -76,7 +76,7 @@ explicitly until a fluxor validator/resolver consumes the name.
 
 | Component | Responsibility |
 |---|---|
-| `raft` | Elections with pre-vote, proposal batching, follower log matching and §5.3 conflict repair, admin/config apply, `RAFT<pppp>.MET` metadata persistence. |
+| `raft` | Elections with pre-vote, proposal batching, follower log matching and §5.3 conflict repair, admin/config apply, two-slot CRC metadata persistence (`RAFT<pppp>.M<slot>`). |
 | `replicator` | AppendEntries pipelining to followers, ack processing, WAL read-back catch-up, snapshot chunk transfer. |
 | `commit` | Fuses quorum match indices with durability acks into the commit horizon, gated on durability mode (strict / group_fsync / relaxed). |
 | `apply` | Ordered, deduplicated delivery of committed entries plus the linearizable-read queue. |
@@ -96,7 +96,7 @@ feedback, the same shape a channel edge has.
 |---|---|
 | Inputs | `rpc`, `proposals`, `admin_proposals`, `proposals_tagged`, `proposals_partitioned`, `proposals_partitioned_tagged`, `snapshot_installed`, `wal_flushed`, `wal_replay_complete`, `ack`, `snapshot_rx`, `durable`, `cp_state`, `read_permits`, `read`, `entry_reply` |
 | Outputs | `rpc_out`, `net_out`, `log_append`, `metrics`, `proposal_assigned`, `leader_state`, `admin_applied`, `wal_compact`, `lag_signal`, `snapshot_import`, `snapshot_request`, `cross_durability_ack`, `retention_floor`, `committed_entries`, `applied`, `entry_request` |
-| Params | `self_id`, `voter_count`, `election_timeout_ms`, `heartbeat_interval_ms`, `proposal_batch_max`, `proposal_batch_timeout_ms`, `partition_id`, `root_path`, `peer_count`, `pipeline_depth`, `durability_mode`, `persist_meta` |
+| Params | `self_id`, `voter_count`, `election_timeout_ms`, `heartbeat_interval_ms`, `proposal_batch_max`, `proposal_batch_timeout_ms`, `partition_id`, `root_path`, `peer_count`, `pipeline_depth`, `durability_mode`, `persist_meta`, `name_fence` |
 
 Two inputs and one output are shared handles with an in-module
 demux, because fluxor caps a module at 16 ports per direction:
@@ -110,9 +110,10 @@ demux, because fluxor caps a module at 16 ports per direction:
   component's catch-up read-back.
 
 `consensus` requires an `fs` write contract: `raft` persists term,
-`voted_for` and the durable-index hint to `RAFT<pppp>.MET` (a
-root-level 8.3 name when `root_path = 1`, `raft/meta` otherwise, and
-the `raft/` parent is created at first persist). A persist failure
+`voted_for` and the durable index/term pair to two CRC-protected slot
+files, `RAFT<pppp>.M<slot>` (root-level 8.3 names when
+`root_path = 1`) or `raft/meta<slot>` otherwise, with the `raft/`
+parent created at first persist. A persist failure
 is counted (`meta_write_errors`), logged once, and withholds vote
 grants and election starts until the store recovers. Setting
 `persist_meta = none` disables metadata persistence deliberately:
@@ -143,7 +144,7 @@ themselves rather than behind channel capacity.
 |---|---|
 | Inputs | `entries`, `entry_request`, `compact_before`, `ack`, `import_chunks`, `trigger`, `install_request`, `retention_floor`, `app_snapshot_body` |
 | Outputs | `flushed`, `replay_complete`, `entry_reply`, `compaction_signal`, `metrics`, `quorum_durable`, `export_chunks`, `manifest_auth`, `installed_local`, `app_snapshot_ctl`, `cert_refresh` |
-| Params | `encoding`, `segment_bytes`, `partition_id`, `self_id`, `fsync_mode`, `group_window_ms`, `group_max_pending`, `root_path`, `skip_replay`, `fixed_segment`, `preallocate_settle_ms`, `fence_depth`, `voter_count` |
+| Params | `encoding`, `segment_bytes`, `partition_id`, `self_id`, `fsync_mode`, `group_window_ms`, `group_max_pending`, `root_path`, `skip_replay`, `fixed_segment`, `preallocate_settle_ms`, `fence_depth`, `voter_count`, `name_fence` |
 | Variants | `disk` (default), `volatile` |
 
 `disk` is the durable composition: FS-backed segments and

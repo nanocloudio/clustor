@@ -179,5 +179,18 @@ direction = "output"
 content_type = "OctetStream"
 
 [observability]
-metrics = ["entries_written", "bytes_written", "segment_seq", "pending_depth", "write_errors", "checksum_failures", "truncations", "input_budget_bytes", "pump_records", "continuity_errors", "durable_index", "quorum_transitions", "snapshots_taken", "chunks_imported", "triggers_deferred", "install_failures", "app_bodies_received", "app_captures_timed_out"]
+metrics = [
+  # wal — the snapshot component shares `bytes_written`,
+  # `name_fence` and `name_unfenced` under its own source id.
+  "entries_written", "bytes_written", "segment_seq", "pending_depth",
+  "write_errors", "checksum_failures", "truncations", "truncate_failures",
+  "continuity_errors", "input_budget_bytes", "pump_records", "stashed_holds",
+  "steps", "current_index", "open_rc", "replayed",
+  "replay_hw", "replay_fsize", "entryreq_served", "entryreq_notfound",
+  "fault_expected", "fault_got", "segment_mode", "preallocate_failures",
+  "preallocate_errno", "name_fence", "name_unfenced",
+  # snapshot
+  "snapshots_taken", "chunks_imported", "triggers_deferred", "install_failures",
+  "app_bodies_received", "app_captures_timed_out"
+]
 histograms = ["fsync_latency_ms", "transfer_seconds"]
