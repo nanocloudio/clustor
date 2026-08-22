@@ -245,9 +245,16 @@ pub unsafe fn step(s: &mut Commit, sys: &SyscallTable) {
 /// make install-based catch-up lossless; operators drop dead voters via
 /// membership change.
 ///
-/// Emitted only on change; dropped under backpressure (the next change
-/// or step re-emits — the gate degrades toward NOT compacting, which is
-/// always safe). Wire shape (10 bytes, shared with lattice):
+/// Emitted only on change, and the change latch moves only once the
+/// write has actually landed. Latching it on an attempt would be a
+/// silent loss with no repair: this function returns early while
+/// `floor == last_floor_emitted`, so a floor recorded as emitted but
+/// never written is never re-offered, and the WAL retains those segments
+/// until some LATER floor value happens to come along. The direction is
+/// safe either way — the gate degrades toward NOT compacting — but an
+/// idle cluster has no later value, and "safe" there means retaining
+/// forever. Wire shape (10 bytes, declared by
+/// `wire::MSG_COMPACTION_FLOOR`):
 /// `[kpg_id:u16 LE][floor_revision:u64 LE]`.
 unsafe fn emit_retention_floor(s: &mut Commit, sys: &SyscallTable) {
     if s.out_retention_floor < 0 { return; }
@@ -271,13 +278,18 @@ unsafe fn emit_retention_floor(s: &mut Commit, sys: &SyscallTable) {
     }
     if !any || floor == Index::MAX { return; }
     if floor == s.last_floor_emitted { return; }
-    let poll = (sys.channel_poll)(s.out_retention_floor, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
     let mut buf = [0u8; 10];
     buf[0..2].copy_from_slice(&s.partition_id.to_le_bytes());
     buf[2..10].copy_from_slice(&floor.to_le_bytes());
-    wire_channels::channel_write_msg(sys, s.out_retention_floor, wire::MSG_COMPACTION_FLOOR, &buf);
-    s.last_floor_emitted = floor;
+    // No poll pre-check: it reports >=1 byte free, not room for this
+    // frame. The all-or-nothing write's return value is the only answer,
+    // and the latch moves only on a confirmed one.
+    let n = wire_channels::channel_write_msg(
+        sys, s.out_retention_floor, wire::MSG_COMPACTION_FLOOR, &buf,
+    );
+    if n > 0 {
+        s.last_floor_emitted = floor;
+    }
 }
 
 /// Emit commit-index gauge + commit-advance counter as typed samples

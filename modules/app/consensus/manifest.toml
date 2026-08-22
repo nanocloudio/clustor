@@ -290,8 +290,13 @@ content_type = "OctetStream"
 # Per-entry committed stream consumed by downstream replicated apps
 # (loam, lattice, example_consumer, ...). Envelope:
 # MSG_COMMITTED_ENTRY `[term:u64][index:u64][body...]`. Strict
-# commit-index order, fail-open on backpressure (consumer recovers
-# via snapshot install). See docs/architecture/consumer_facade.md.
+# commit-index order, and LOSSLESS under backpressure: a refused write
+# retains the entry in the apply buffer and freezes `apply_index` behind
+# it until this port takes it, rather than dropping it and leaving the
+# consumer a gap it can detect but not repair. A consumer that stops
+# draining therefore stalls the producer's apply cursor and shows up as
+# `caught_up = 0` plus a climbing `delivery_stalls`.
+# See docs/architecture/consumer_facade.md.
 [[ports]]
 name = "committed_entries"
 direction = "output"
@@ -333,7 +338,7 @@ rate_class_max = "transaction"
 # Exactly what the code emits as typed MSG_METRIC_SAMPLE, per
 # component: raft (26 — `ready` is emitted FIRST so it is the last
 # casualty under metric-channel backpressure), replicator (6),
-# commit (2), apply (6). Partition-stamped for multi-Raft graphs.
+# commit (2), apply (7). Partition-stamped for multi-Raft graphs.
 metrics = [
   # raft
   "ready", "last_log_index", "commit_index", "role", "current_term",
@@ -352,6 +357,6 @@ metrics = [
   "commit_index", "commit_advances",
   # apply
   "entries_applied", "queue_depth", "refetched", "caught_up",
-  "entries_evicted", "reads_evicted",
+  "entries_evicted", "reads_evicted", "delivery_stalls",
 ]
 histograms = ["commit_latency_ms", "apply_batch_latency_ms"]

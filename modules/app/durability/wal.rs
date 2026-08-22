@@ -2837,8 +2837,9 @@ unsafe fn build_segment_path(s: &mut Wal, seq: u32) {
 /// The `wal/` parent is self-healed at first open (`FS_MKDIR`, once
 /// per boot) when absent, so a fresh working directory needs no
 /// manual `mkdir`. An operator who wants the segments elsewhere
-/// pre-creates a symlink (e.g. `ln -s /var/lib/quantum/wal wal`);
-/// the single-directory layout serves any partition count. See
+/// pre-creates a symlink in the working directory (`ln -s
+/// <somewhere> wal`); the single-directory layout serves any
+/// partition count. See
 /// `modules/app/durability/manifest.toml` for the wider deployment note.
 fn encode_segment_path(partition_id: u16, seq: u32, root: bool, out: &mut [u8]) -> usize {
     let cap = out.len();

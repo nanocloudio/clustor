@@ -99,14 +99,13 @@ const SNAP_PATH_MAX: usize = 64;
 /// and tear together.
 ///
 /// That covers the records, not the namespace. On FAT32 both directory
-/// entries may sit in one directory sector, so the step that first
-/// creates the second slot can share a failure unit with the first
-/// entry. Each name is minted once, when its file grows from empty,
-/// and fenced then; afterwards a publish rewrites the same 32 bytes in
-/// place, leaving the size and cluster chain unchanged and the
-/// directory sector untouched. The creation window is the only one in
-/// which both names can be lost together, and a node in it has no
-/// adopted generation to lose.
+/// entries may sit in one directory sector, so creating the second slot
+/// mutates a sector the first entry already occupies.
+/// `materialize_snap_ptr_slots` therefore creates and sizes BOTH files
+/// and fences BOTH names before any non-neutral generation is adopted,
+/// so that mutation happens while there is nothing to lose. Afterwards
+/// a publish rewrites the same 32 bytes in place, leaving the size and
+/// cluster chain unchanged and the directory sector untouched.
 const SNAP_PTR_SLOTS: usize = 2;
 /// Pointer candidates BOOT_LOAD may try: both slots plus the flat
 /// record.
@@ -166,10 +165,9 @@ const MAX_CHUNK_BODY: usize = 4 * 1024;
 /// wedged app only costs one rotation's snapshot.
 const APP_CAPTURE_TIMEOUT_TICKS: u32 = 2000;
 
-/// Per-kpg retention-floor table capacity. Downstream consumers
-/// (lattice's `compaction_coordinator` and the substrate-side
-/// surfaces it aggregates) emit one `MSG_COMPACTION_FLOOR` per
-/// active kpg they care about. 32 slots covers any realistic
+/// Per-kpg retention-floor table capacity. A downstream consumer emits
+/// one `MSG_COMPACTION_FLOOR` per active kpg it cares about, however it
+/// arrives at that floor. 32 slots covers any realistic
 /// per-partition kpg count; on overflow the engine fails closed
 /// (see `retention_floor_overflow`) — evicting a slot would silently
 /// widen the compaction window past a live floor, and fail-open would
@@ -252,6 +250,10 @@ pub struct Snapshot {
     boot_ptr_next: u8,
     /// Pointer slot (0/1) holding the highest valid generation. The next
     /// publish targets the other slot.
+    /// Both pointer slot files exist at full size with their names
+    /// fenced, so every later publish is a pure in-place data
+    /// overwrite. See `materialize_snap_ptr_slots`.
+    snap_ptr_slots_materialized: bool,
     snap_ptr_slot: u8,
     /// Generation of the record in `snap_ptr_slot`.
     snap_ptr_generation: u64,
@@ -378,6 +380,7 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.boot_ptr_candidates = [0; SNAP_PTR_CANDIDATES];
     s.boot_ptr_count = 0;
     s.boot_ptr_next = 0;
+    s.snap_ptr_slots_materialized = false;
     s.snap_ptr_slot = 0;
     s.snap_ptr_generation = 0;
     s.partition_id = 0;
@@ -1277,11 +1280,82 @@ unsafe fn build_snap_pointer_path(s: &mut Snapshot) -> usize {
     i
 }
 
+/// Bring BOTH pointer slot files into existence, at full size, with
+/// both names fenced — before any non-neutral generation is adopted.
+///
+/// Two files make the RECORDS independent; they do not make the NAMES
+/// independent. On FAT32 a directory entry is 32 bytes inside a
+/// 512-byte directory sector, and two entries in one directory
+/// routinely share one, so minting the second name mutates a sector the
+/// first name already occupies. Creating each slot at its first publish
+/// puts that mutation after generation 1 is adopted and is the only
+/// pointer the node has — the worst possible moment. Doing it here puts
+/// it where nothing has been adopted yet, and from the first adopted
+/// generation onward every publish overwrites `SNAP_PTR_SIZE` bytes in
+/// a file that already has its size and its cluster chain, leaving the
+/// directory untouched.
+///
+/// An existing slot is read first and left alone if it is already full
+/// size: a node upgrading into this scheme must not have its recovered
+/// pointer zeroed. A fresh slot gets all zeroes, which `decode_snap_ptr`
+/// rejects, so it is "nothing yet" rather than a competing record.
+///
+/// Returns false only on a real FS failure; a device with no FS at all
+/// is handled by the caller's `FS_E_NODEV` / `FS_E_NOSYS` path.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Snapshot` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn materialize_snap_ptr_slots(s: &mut Snapshot, sys: &SyscallTable) -> bool {
+    if s.snap_ptr_slots_materialized {
+        return true;
+    }
+    for slot in 0..SNAP_PTR_SLOTS as u8 {
+        let plen = build_snap_ptr_slot_path(s, slot);
+        let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
+        if fd < 0 {
+            return fd == FS_E_NODEV || fd == FS_E_NOSYS;
+        }
+        // A short read is the test for "not yet sized": a file created
+        // a moment ago reads 0, one written by a previous boot reads
+        // SNAP_PTR_SIZE and keeps whatever record it holds.
+        let seek = 0i32.to_le_bytes();
+        let mut probe = [0u8; SNAP_PTR_SIZE];
+        let sized = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) >= 0
+            && (sys.provider_call)(fd, FS_READ, probe.as_mut_ptr(), SNAP_PTR_SIZE)
+                == SNAP_PTR_SIZE as i32;
+        if !sized {
+            let mut neutral = [0u8; SNAP_PTR_SIZE];
+            let ok = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) >= 0
+                && (sys.provider_call)(fd, FS_WRITE, neutral.as_mut_ptr(), SNAP_PTR_SIZE)
+                    == SNAP_PTR_SIZE as i32
+                && (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) == 0;
+            if !ok {
+                (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                return false;
+            }
+        }
+        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        // `path_buf` still holds this slot's path.
+        if !publish_name(s, sys, plen) {
+            return false;
+        }
+    }
+    s.snap_ptr_slots_materialized = true;
+    true
+}
+
 /// Persist the pointer sidecar for `index`. Returns durable-or-no-fs
 /// like the other persists; the caller gates the install signal on it —
 /// a snapshot whose pointer never landed is unfindable at boot, and
 /// letting raft compact against it would strand the state below it.
 unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable, index: Index) -> bool {
+    // Both names and both sizes are settled before anything is adopted,
+    // so no publish below ever mutates the directory.
+    if !materialize_snap_ptr_slots(s, sys) {
+        return false;
+    }
     // Target the INACTIVE slot: the record boot would follow today is
     // never the one being overwritten, so no failure between here and
     // the fsync can leave the node without a usable pointer.
@@ -1315,14 +1389,10 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable, index: Inde
     if !ok {
         return false;
     }
-    // The slot file is self-describing (magic + generation + CRC), so
-    // it is created once and thereafter overwritten in place: the name
-    // fence matters on that first creation, when a crash could
-    // otherwise leave boot with no slot to read at all. `path_buf`
-    // still holds this slot's path.
-    if !publish_name(s, sys, plen) {
-        return false;
-    }
+    // The name was fenced at materialisation, before anything was
+    // adopted, and this publish changed neither the size nor the
+    // cluster chain — so the directory entry is exactly as it was and
+    // needs no second fence.
     s.snap_ptr_slot = slot;
     s.snap_ptr_generation = generation;
     true
@@ -1538,10 +1608,6 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                 s.boot_phase = BOOT_DONE;
                 return true;
             }
-            let poll = (sys.channel_poll)(s.out_installed, 0x02);
-            if poll <= 0 || (poll as u32 & 0x02) == 0 {
-                return false; // channel full — retry next step
-            }
             let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
             wire::encode_snapshot_installed(
                 &mut buf,
@@ -1549,7 +1615,17 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                 s.last_snapshot_index,
                 s.last_snapshot_term,
             );
-            wire_channels::channel_write_msg(sys, s.out_installed, wire::MSG_SNAPSHOT_INSTALLED, &buf);
+            // The phase advances only on a CONFIRMED write. A poll saying
+            // ">=1 byte free" is not room for this frame, and BOOT_DONE is
+            // a one-way door: nothing re-sends this. A node whose base
+            // term/index never reached raft comes up believing its log
+            // starts at 0 while its state is at the snapshot index.
+            let n = wire_channels::channel_write_msg(
+                sys, s.out_installed, wire::MSG_SNAPSHOT_INSTALLED, &buf,
+            );
+            if n <= 0 {
+                return false; // channel full or frame too large — retry next step
+            }
             s.boot_phase = BOOT_DONE;
             true
         }
@@ -1628,8 +1704,8 @@ unsafe fn build_snapshot_path(s: &mut Snapshot, index: Index) -> usize {
 /// defers it to tick N+1.
 ///
 /// Wire shape (10 bytes): `[kpg_id:u16 LE][floor_revision:u64 LE]`.
-/// See `modules/common/wire.rs::MSG_COMPACTION_FLOOR` for the
-/// byte-compatible declaration shared with lattice.
+/// `modules/common/wire.rs::MSG_COMPACTION_FLOOR` is the declaration;
+/// a consumer that emits floors conforms to it.
 ///
 /// Public so the composite dispatch can drain floors BEFORE handing
 /// over a latched rotation trigger: a floor declared in tick N must

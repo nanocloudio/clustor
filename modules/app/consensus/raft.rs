@@ -217,15 +217,21 @@ enum PersistOutcome {
 /// and fail together — one failure unit wearing two names, not
 /// redundancy.
 ///
-/// The guarantee covers the records, not the namespace that finds
-/// them. On FAT32 the two directory entries may occupy one directory
-/// sector, so the step that first creates the second slot can share a
-/// failure unit with the first entry. Both names are minted once, at
-/// the first persist of each slot, and fenced then; from that point
-/// every persist writes only file data and the pair is independent.
-/// A power cut inside that initial creation is the one window where
-/// losing both names together is possible, and it lands on a node with
-/// no adopted generation to lose.
+/// The records are only half of it: the namespace that finds them has
+/// its own failure unit. On FAT32 a directory entry is 32 bytes inside
+/// a 512-byte directory sector, and two entries in one directory
+/// routinely share one — so minting the second name mutates a sector
+/// the first name already occupies.
+///
+/// `materialize_meta_slots` therefore creates BOTH files, sizes both,
+/// and fences both names before any non-neutral generation is adopted.
+/// That is what makes the pair independent from the first adopted
+/// generation onward: every later persist seeks to 0 and overwrites
+/// fixed-size data in a file that already has its size and its cluster
+/// chain, so no publication ever touches the directory again. Doing it
+/// lazily instead would put the second name's creation AFTER the first
+/// generation was adopted and durable, which is precisely when there is
+/// something to lose.
 const META_SLOTS: usize = 2;
 
 /// Slot record magic and format id.
@@ -413,6 +419,23 @@ pub struct Raft {
     /// short write, or a hard error). It is re-emitted every step until
     /// it lands: a dropped emit must never silently permit the rewind.
     truncate_emit_pending: bool,
+    /// A `MSG_WAL_COMPACT_BEFORE` the control channel has not taken yet
+    /// (`0` = none). Edge-triggered — it is raised once, by a snapshot
+    /// install or a local snapshot, and nothing raises it again until
+    /// the NEXT snapshot. A dropped one therefore leaves the WAL holding
+    /// every retired segment until then, so it is retried each step
+    /// instead. Highest index wins: the floor is monotone, so a later
+    /// signal supersedes an earlier one that has not landed.
+    compact_before_pending: u64,
+    /// A committed admin op whose `MSG_ADMIN_APPLIED` status the channel
+    /// has not taken yet. The op is already applied by the time the ack
+    /// is written, so this is not re-applied — it is re-ANNOUNCED, and
+    /// `drain_admin_committed` refuses to pop the next admin record
+    /// while it is set, which is what keeps the seam's own retention
+    /// from being undone by a lost status.
+    admin_ack_pending: bool,
+    admin_ack_id: u32,
+    admin_ack_status: u8,
     /// The pending request reached the WAL's control channel at least
     /// once. Until it has, the WAL cannot have begun retiring anything
     /// for it and the hold may be released; once it has, only a
@@ -504,6 +527,11 @@ pub struct Raft {
     /// overwritten in place thereafter, so the fence is paid on the
     /// creation that mints the name, not on every persist.
     meta_name_published: [bool; META_SLOTS],
+    /// Both slot files exist at full size with their names fenced, so
+    /// every later persist is a pure in-place data overwrite. See
+    /// `materialize_meta_slots` for why this must be true before the
+    /// first generation is adopted.
+    meta_slots_materialized: bool,
     /// Error-side backoff: steps remaining during which the throttled
     /// durable-hint persist is skipped after a hard failure. The
     /// vote/election persist sites always attempt regardless.
@@ -718,6 +746,10 @@ pub fn init(s: &mut Raft) {
     s.truncate_req_seq = 0;
     s.truncate_deadline_ms = 0;
     s.truncate_emit_pending = false;
+    s.compact_before_pending = 0;
+    s.admin_ack_pending = false;
+    s.admin_ack_id = 0;
+    s.admin_ack_status = 0;
     s.truncate_delivered = false;
     s.truncate_nacks = 0;
     s.truncate_holds = 0;
@@ -742,6 +774,7 @@ pub fn init(s: &mut Raft) {
     // the capability rather than publishing a name it cannot fence.
     s.name_fence = NAME_FENCE_STRICT;
     s.meta_name_published = [false; META_SLOTS];
+    s.meta_slots_materialized = false;
     s.meta_backoff_steps = 0;
     s.holdoff_until_ms = 0;
     s.holdoff_over_logged = true;
@@ -1056,6 +1089,10 @@ pub unsafe fn step(
             emit_wal_truncate_after(s, sys);
         }
     }
+    // Re-offer a compact-before the control channel refused. Nothing
+    // else will raise it again before the next snapshot, so this is its
+    // only route back.
+    flush_wal_compact_before(s, sys);
 
     // 4. Role-specific logic
     match s.role {
@@ -1091,19 +1128,30 @@ pub unsafe fn step(
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// The change latch moves only on a confirmed write. This is emitted
+/// ONLY when `(leader_id, term)` differs from the last one latched, so a
+/// hint recorded as sent but never written is never re-offered — every
+/// consumer of `MSG_LEADER_HINT` would keep routing to the previous
+/// leader for the whole of this term, and nothing would correct it until
+/// the next leadership change.
 unsafe fn emit_leader_hint(s: &mut Raft, sys: &SyscallTable) {
     if s.out_leader_state < 0 { return; }
     if s.leader_id == s.last_hint_leader_id && s.current_term == s.last_hint_term {
         return;
     }
-    let poll = (sys.channel_poll)(s.out_leader_state, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
     let mut buf = [0u8; 9];
     buf[0] = if s.leader_id < 0 { 0xFFu8 } else { s.leader_id as u8 };
     buf[1..9].copy_from_slice(&s.current_term.to_le_bytes());
-    wire_channels::channel_write_msg(sys, s.out_leader_state, wire::MSG_LEADER_HINT, &buf);
-    s.last_hint_leader_id = s.leader_id;
-    s.last_hint_term = s.current_term;
+    // No poll pre-check: it reports >=1 byte free, not room for this
+    // frame. A refused write leaves the latch alone, so the next step
+    // re-offers the same hint.
+    let n = wire_channels::channel_write_msg(
+        sys, s.out_leader_state, wire::MSG_LEADER_HINT, &buf,
+    );
+    if n > 0 {
+        s.last_hint_leader_id = s.leader_id;
+        s.last_hint_term = s.current_term;
+    }
 }
 
 // ── RPC processing (all roles) ──────────────────────────────
@@ -1401,6 +1449,15 @@ unsafe fn handle_timeout_now(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u
         s.msg_buf[4], s.msg_buf[5], s.msg_buf[6], s.msg_buf[7],
     ]);
     if caller_term < s.current_term { return; }
+    // A transfer cannot make an unrecovered tip safe to campaign on.
+    // Refused here as well as in `start_election` so the deadline is
+    // never pulled into the past on this node's behalf: leaving it
+    // where it is means the ordinary timeout applies once the WAL has
+    // answered, instead of an election firing the moment it does.
+    if replay_hold(s) {
+        dev_log(sys, 2, b"[raft] timeout_now held".as_ptr(), 23);
+        return;
+    }
     dev_log(sys, 3, b"[raft] timeout_now".as_ptr(), 18);
     // Force-start an election by advancing the deadline into the past
     // and clearing votes. The normal candidate path will pick up.
@@ -1497,12 +1554,31 @@ unsafe fn emit_apply_reset(s: &mut Raft, _sys: &SyscallTable, term: u64, index: 
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn emit_wal_compact_before(s: &Raft, sys: &SyscallTable, before_index: u64) {
+unsafe fn emit_wal_compact_before(s: &mut Raft, sys: &SyscallTable, before_index: u64) {
     if s.out_wal_compact < 0 { return; }
-    let poll = (sys.channel_poll)(s.out_wal_compact, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
-    let buf = before_index.to_le_bytes();
-    wire_channels::channel_write_msg(sys, s.out_wal_compact, wire::MSG_WAL_COMPACT_BEFORE, &buf);
+    if before_index > s.compact_before_pending {
+        s.compact_before_pending = before_index;
+    }
+    flush_wal_compact_before(s, sys);
+}
+
+/// Re-offer the outstanding compact-before signal. Called every step so
+/// a refused one is not lost until the next snapshot happens to raise
+/// another.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn flush_wal_compact_before(s: &mut Raft, sys: &SyscallTable) {
+    if s.compact_before_pending == 0 || s.out_wal_compact < 0 { return; }
+    let buf = s.compact_before_pending.to_le_bytes();
+    let n = wire_channels::channel_write_msg(
+        sys, s.out_wal_compact, wire::MSG_WAL_COMPACT_BEFORE, &buf,
+    );
+    if n > 0 {
+        s.compact_before_pending = 0;
+    }
 }
 
 /// Ask the WAL to discard every entry strictly after `truncate_keep`
@@ -1913,6 +1989,13 @@ unsafe fn drain_wal_replay_complete(s: &mut Raft, sys: &SyscallTable) {
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_admin_committed(s: &mut Raft, sys: &SyscallTable, admin_in: &mut SeamRing<4096>) {
     for _ in 0..4 {
+        // An unannounced result blocks the drain. The ring holds the
+        // records behind it, so nothing is lost by waiting, whereas
+        // popping past would overwrite the pending status with the next
+        // one and leave the first command with no outcome at all.
+        if !flush_admin_applied(s, sys) {
+            return;
+        }
         let (msg_type, plen) = match admin_in.pop(&mut s.msg_buf) {
             Some(v) => v,
             None => break,
@@ -2114,12 +2197,37 @@ unsafe fn apply_admin_op(
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_admin_applied(s: &mut Raft, sys: &SyscallTable, command_id: u32, status: u8) {
     if s.out_admin_applied < 0 { return; }
-    let poll = (sys.channel_poll)(s.out_admin_applied, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    s.admin_ack_pending = true;
+    s.admin_ack_id = command_id;
+    s.admin_ack_status = status;
+    let _ = flush_admin_applied(s, sys);
+}
+
+/// Re-offer the outstanding admin status, reporting whether nothing is
+/// owed. The op it names has already been applied, so this announces a
+/// result rather than causing one; losing it would leave an operator's
+/// command with no outcome at all while its effect stood.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn flush_admin_applied(s: &mut Raft, sys: &SyscallTable) -> bool {
+    if !s.admin_ack_pending { return true; }
+    if s.out_admin_applied < 0 {
+        s.admin_ack_pending = false;
+        return true;
+    }
     let mut buf = [0u8; 5];
-    buf[0..4].copy_from_slice(&command_id.to_le_bytes());
-    buf[4] = status;
-    wire_channels::channel_write_msg(sys, s.out_admin_applied, wire::MSG_ADMIN_APPLIED, &buf);
+    buf[0..4].copy_from_slice(&s.admin_ack_id.to_le_bytes());
+    buf[4] = s.admin_ack_status;
+    let n = wire_channels::channel_write_msg(
+        sys, s.out_admin_applied, wire::MSG_ADMIN_APPLIED, &buf,
+    );
+    if n > 0 {
+        s.admin_ack_pending = false;
+    }
+    !s.admin_ack_pending
 }
 
 /// # Safety
@@ -2156,6 +2264,36 @@ unsafe fn emit_timeout_now_if_pending(s: &mut Raft, sys: &SyscallTable) {
     // for the target to start its election first.
     s.role = ROLE_FOLLOWER;
     s.leader_id = target as i8;
+}
+
+/// True while this node does not yet know where its own log ends.
+///
+/// Between boot and the WAL's `replay_complete`, `last_log_index` /
+/// `last_log_term` hold the PERSISTED HINT, which is a lower bound and
+/// nothing more: the hint is written on a throttle and records the
+/// durable watermark, so the WAL can hold committed entries well above
+/// it. Every ballot in Raft is decided by comparing logs, and a
+/// comparison made against an understated tip is not conservative — it
+/// is wrong in the unsafe direction:
+///
+/// - GRANTING on it elects a candidate whose log is genuinely shorter
+///   than ours, and the entries between the hint and our real tip —
+///   committed entries — are then overwritten. That is a Leader
+///   Completeness violation, the one Raft property with no recovery.
+/// - CAMPAIGNING on it advertises a tip below our own, so we can win an
+///   election we should have lost, with the same outcome.
+///
+/// Term observation and heartbeat handling stay open, because neither
+/// depends on the tip: a higher term must be adopted whenever it is
+/// heard, and `handle_append_entries` already answers `busy` so the
+/// leader simply retries. What closes is every path whose correctness
+/// rests on the log comparison.
+///
+/// The hold is only as long as the WAL takes to hand over its
+/// high-water — milliseconds — and is armed only where the recovery
+/// edge is wired (see `s.awaiting_replay`).
+fn replay_hold(s: &Raft) -> bool {
+    s.awaiting_replay
 }
 
 /// # Safety
@@ -2195,6 +2333,20 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
         || (last_term == s.last_log_term && last_index >= s.last_log_index);
 
     let mut granted = term_ok && vote_ok && log_ok && !s.learner_mode;
+
+    // Log comparison is only as good as our knowledge of our own log.
+    // See `replay_hold`: until the WAL reports its high-water, `log_ok`
+    // was computed against a lower bound, so a candidate that is
+    // genuinely behind us can look ahead of us. Refuse both real votes
+    // and PRE-votes — a pre-vote granted on the same bad comparison is
+    // what tells the candidate its real election will succeed.
+    //
+    // The response still goes out, carrying our term: a candidate
+    // learning it is behind is useful, and a silent drop would only
+    // stall the election it is entitled to lose.
+    if replay_hold(s) {
+        granted = false;
+    }
 
     // Volatile posture mitigations for real votes: no grants inside the
     // boot hold-off window (this node may have voted in an election
@@ -3534,6 +3686,12 @@ unsafe fn load_flat_metadata(s: &mut Raft, sys: &SyscallTable, root: bool) -> Fl
 /// log, fd invalidation (so the next attempt reopens), and the
 /// error-side backoff consulted by the throttled durable-hint save.
 ///
+/// Invalidating the fd also re-arms `materialize_meta_slots`, which
+/// owns the only open path: the next attempt runs it again, reopens
+/// what was closed, finds the file already at full size and leaves its
+/// record untouched. Leaving the flag set would strand the persist on a
+/// closed descriptor for good.
+///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
@@ -3544,6 +3702,7 @@ unsafe fn mark_meta_failure(s: &mut Raft, sys: &SyscallTable, slot: u8) -> Persi
         (sys.provider_call)(s.meta_fds[idx], FS_CLOSE, core::ptr::null_mut(), 0);
         s.meta_fds[idx] = -1;
     }
+    s.meta_slots_materialized = false;
     s.meta_write_errors = s.meta_write_errors.saturating_add(1);
     s.meta_backoff_steps = 200;
     if !s.meta_fail_logged {
@@ -3667,6 +3826,117 @@ unsafe fn publish_meta_name(
     false
 }
 
+/// Bring BOTH slot files into existence, at full size, with both names
+/// fenced — before any non-neutral generation is adopted.
+///
+/// ## Why this is not the same as creating each slot when it is first
+/// written
+///
+/// Two files make the RECORDS independent: a persist rewrites one
+/// file's data and a torn sector there reaches that slot alone. It does
+/// not make the NAMES independent. On FAT32 a directory entry is 32
+/// bytes inside a 512-byte directory sector, and two entries in one
+/// directory routinely share a sector — so adding the second name is a
+/// mutation of a sector the first name already lives in.
+///
+/// Creating lazily puts that mutation in the worst possible place. Slot
+/// A is created and adopted at the first persist; slot B's name is
+/// minted at the SECOND persist — by which time generation 1 is
+/// adopted, durable, and the only thing recovery has. A node
+/// interrupted there can lose both names together and come back with no
+/// metadata at all, having previously reported a vote as durable.
+///
+/// Doing it here moves the whole namespace mutation to a point where
+/// there is provably nothing to lose: no generation has been adopted,
+/// so an interruption costs a node that had not yet voted. From the
+/// first adopted generation onward the directory is never touched
+/// again — each persist seeks to 0 and overwrites `META_SLOT_SIZE`
+/// bytes in a file that already has that size and that cluster chain.
+///
+/// The neutral record written into a fresh slot is all zeroes: the
+/// magic check in `decode_meta_slot` rejects it, so a slot in this
+/// state is "nothing yet" to recovery rather than a competing record.
+/// An existing slot is READ first and left alone if it is already full
+/// size — an upgrading node must not have its recovered state zeroed.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOutcome {
+    if s.meta_slots_materialized {
+        return PersistOutcome::Persisted;
+    }
+    for slot in 0..META_SLOTS as u8 {
+        let idx = slot as usize;
+        // Same refusal as the persist path, for the same reason: under
+        // the strict posture a name that cannot be fenced is never
+        // minted, and the refusal comes before any FS work.
+        if !s.meta_name_published[idx] && !name_fence_permits_create(s, sys) {
+            return mark_meta_failure(s, sys, slot);
+        }
+        if s.meta_fds[idx] < 0 {
+            let (mut path, plen) =
+                build_meta_slot_path(s.partition_id, s.meta_root_path != 0, slot);
+            let mut opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+            if opened == FS_E_AGAIN {
+                return PersistOutcome::Transient; // provider initialising
+            }
+            if opened < 0 && s.meta_root_path == 0 && !s.meta_mkdir_attempted {
+                s.meta_mkdir_attempted = true;
+                meta_mkdir_parents(s, sys);
+                opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+                if opened == FS_E_AGAIN {
+                    return PersistOutcome::Transient;
+                }
+            }
+            if opened < 0 {
+                return mark_meta_failure(s, sys, slot);
+            }
+            s.meta_fds[idx] = opened;
+        }
+        let fd = s.meta_fds[idx];
+
+        // Size it, but only if it is not already sized. A short read is
+        // the test: a file this node created a moment ago reads 0, one
+        // written by a previous boot reads META_SLOT_SIZE and keeps
+        // whatever record it holds.
+        let zero = 0i32.to_le_bytes();
+        if (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4) < 0 {
+            return mark_meta_failure(s, sys, slot);
+        }
+        let mut probe = [0u8; META_SLOT_SIZE];
+        let have = (sys.provider_call)(fd, FS_READ, probe.as_mut_ptr(), META_SLOT_SIZE);
+        if have != META_SLOT_SIZE as i32 {
+            if (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4) < 0 {
+                return mark_meta_failure(s, sys, slot);
+            }
+            let mut neutral = [0u8; META_SLOT_SIZE];
+            if (sys.provider_call)(fd, FS_WRITE, neutral.as_mut_ptr(), META_SLOT_SIZE)
+                != META_SLOT_SIZE as i32
+            {
+                return mark_meta_failure(s, sys, slot);
+            }
+            if (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) < 0 {
+                return mark_meta_failure(s, sys, slot);
+            }
+        }
+
+        // Fence the name now — the point of the exercise is that the
+        // directory is settled before anything depends on it.
+        if !s.meta_name_published[idx] {
+            let (mut path, plen) =
+                build_meta_slot_path(s.partition_id, s.meta_root_path != 0, slot);
+            if !publish_meta_name(s, sys, &mut path, plen) {
+                return mark_meta_failure(s, sys, slot);
+            }
+            s.meta_name_published[idx] = true;
+        }
+    }
+    s.meta_slots_materialized = true;
+    PersistOutcome::Persisted
+}
+
 /// Persist the Raft metadata record with an EXPLICIT `(term, voted_for)`
 /// pair — the write-then-adopt primitive. Voting-relevant callers
 /// persist the prospective record first and mutate in-memory state only
@@ -3696,41 +3966,20 @@ unsafe fn persist_meta_record(
         return PersistOutcome::Persisted;
     }
     s.meta_fs_step = true;
+    // Both names and both file sizes are settled before the first
+    // adopted generation, so from here on the directory is never
+    // touched again — see `materialize_meta_slots`. The fds it opened
+    // are cached, so each persist is just seek+write+fsync with no cold
+    // dir-scan re-open.
+    match materialize_meta_slots(s, sys) {
+        PersistOutcome::Persisted => {}
+        other => return other,
+    }
     // Target the INACTIVE slot. The active slot — the one recovery
     // would choose today — is never touched, so a failure anywhere
     // between here and the fsync leaves it whole and readable.
     let slot = 1 - (s.meta_slot & 1);
     let idx = slot as usize;
-    // Under the strict posture a slot whose name cannot be fenced is
-    // never created, and the refusal comes before any FS work: writing
-    // first would leave a fsynced record whose generation and vote this
-    // node goes on to refuse, and the next boot would recover it.
-    if !s.meta_name_published[idx] && !name_fence_permits_create(s, sys) {
-        return mark_meta_failure(s, sys, slot);
-    }
-    // Open-create ONCE per slot (both path modes) and cache the fd so
-    // each persist is just seek+write+fsync — no cold dir-scan re-open.
-    // The dir-mode parent (`raft/`) is self-healed once per boot:
-    // nothing else creates it outside the test harness.
-    if s.meta_fds[idx] < 0 {
-        let (mut path, plen) = build_meta_slot_path(s.partition_id, s.meta_root_path != 0, slot);
-        let mut opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
-        if opened == FS_E_AGAIN {
-            return PersistOutcome::Transient; // provider initialising — retry later
-        }
-        if opened < 0 && s.meta_root_path == 0 && !s.meta_mkdir_attempted {
-            s.meta_mkdir_attempted = true;
-            meta_mkdir_parents(s, sys);
-            opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
-            if opened == FS_E_AGAIN {
-                return PersistOutcome::Transient;
-            }
-        }
-        if opened < 0 {
-            return mark_meta_failure(s, sys, slot);
-        }
-        s.meta_fds[idx] = opened;
-    }
     let fd = s.meta_fds[idx];
 
     // Seek to start (overwrite)
@@ -3783,15 +4032,12 @@ unsafe fn persist_meta_record(
         return mark_meta_failure(s, sys, slot);
     }
 
-    // Fence the name once per slot per boot: the bytes are durable, but
-    // until the directory entry naming them is, the next boot may not
-    // find this slot at all.
+    // The name was fenced at materialisation, before anything was
+    // adopted. Kept as a guard rather than deleted: if a future change
+    // ever reaches this point with an unpublished name, the record must
+    // not be adopted under a directory entry that may not survive.
     if !s.meta_name_published[idx] {
-        let (mut path, plen) = build_meta_slot_path(s.partition_id, s.meta_root_path != 0, slot);
-        if !publish_meta_name(s, sys, &mut path, plen) {
-            return mark_meta_failure(s, sys, slot);
-        }
-        s.meta_name_published[idx] = true;
+        return mark_meta_failure(s, sys, slot);
     }
 
     // Adopt: from here recovery chooses this slot.
@@ -3880,6 +4126,14 @@ fn step_down_same_term(s: &mut Raft) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    // Unreachable while `start_election` holds — candidacy cannot begin
+    // during replay — and checked anyway, because this is the step that
+    // makes an understated log authoritative for the whole cluster. A
+    // future path to office that forgets the hold fails closed here
+    // instead of taking office on a tip this node has not recovered.
+    if replay_hold(s) {
+        return;
+    }
     s.role = ROLE_LEADER;
     s.leader_id = s.self_id as i8;
     s.votes_granted.clear();
@@ -3925,6 +4179,20 @@ unsafe fn start_election(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: b
     // the cluster's. Applies to pre-votes too — a pre-vote won on that
     // tip converts straight into the real election.
     if s.truncate_pending {
+        s.election_deadline_ms = now + s.election_timeout_ms as u64;
+        return;
+    }
+    // No candidacy on a tip we have not yet recovered. See
+    // `replay_hold`: the vote request would advertise the persisted
+    // hint, which is at or below our real tip, and an election won on
+    // an understated log is how this node's own committed tail gets
+    // overwritten by the leader it just elected.
+    //
+    // Gated here rather than only at the timeout site so it also covers
+    // the pre-vote→real conversion, the single-node fast path below,
+    // and a TimeoutNow-driven start. The deadline re-arms; the WAL
+    // answers in milliseconds and the next timeout proceeds normally.
+    if replay_hold(s) {
         s.election_deadline_ms = now + s.election_timeout_ms as u64;
         return;
     }

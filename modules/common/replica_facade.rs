@@ -703,12 +703,18 @@ impl CommittedSubscriber {
     ///   returns [`CommitOrderError::NonMonotonicIndex`] — the
     ///   consumer's deterministic handler MUST NOT see the same entry
     ///   twice.
-    /// - `index == cursor + 1` (no gaps). The consensus observer
-    ///   ring is bounded and evicts oldest entries under sustained
-    ///   backpressure; if the consumer falls behind it may observe a
-    ///   gap. Gaps return [`CommitOrderError::GapInPerEntryStream`]
-    ///   and the consumer MUST recover via snapshot install
-    ///   ([`SnapshotInstaller`]).
+    /// - `index == cursor + 1` (no gaps). Gaps return
+    ///   [`CommitOrderError::GapInPerEntryStream`] and the consumer
+    ///   MUST recover via snapshot install ([`SnapshotInstaller`]).
+    ///
+    ///   Falling behind is NOT one of the ways to reach this error.
+    ///   `consensus.committed_entries` is lossless under backpressure:
+    ///   a refused write retains the entry and holds the producer's
+    ///   `apply_index` behind it, so a slow consumer stalls its
+    ///   producer instead of being skipped past. The check stands as a
+    ///   defence against a consumer rebound to a different producer,
+    ///   or against a regression in that contract — it should never
+    ///   fire because of load.
     ///
     /// On success the cursor advances to `index` and `last_term` to
     /// the entry's term. The returned [`CommittedEntry`] borrows from

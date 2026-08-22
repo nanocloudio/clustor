@@ -238,9 +238,28 @@ non-load-bearing). The apply component buffers up to
 `committed_entries` once the commit horizon advances past their
 index.
 
-Backpressure on the observer ring fails open: under sustained
-back-pressure the oldest un-emitted slot is evicted, the consumer
-observes a gap, and recovery is via snapshot install:
+Backpressure on `committed_entries` does NOT fail open. A write the
+port refuses leaves the entry in its buffer slot with its
+partial-delivery state intact, and `apply_index` stays behind it until
+the port takes it; the next step re-offers exactly what is still
+outstanding. This is deliberate: `apply_index` advancing past an
+undelivered entry is what makes it unrecoverable, since the apply
+component only ever re-reads `apply_index + 1` from the WAL. A consumer
+that stops draining therefore stalls its producer's apply cursor rather
+than being skipped past — visible as `apply.caught_up = 0`, a climbing
+`apply.delivery_stalls`, and a failing `/readyz` on that node.
+
+The lossiness that remains is all upstream of the cursor and is
+repaired automatically: raft's body ring may drop a fan-out under
+overdrive, and a full pending buffer refuses new entries, but in both
+cases the entry is still durable in the WAL and is re-read through
+`entry_request` before `apply_index` moves. `apply.refetched` counts
+those recoveries.
+
+Gap handling in the facade therefore remains as a defensive check
+rather than an expected path. If a consumer does observe
+`GapInPerEntryStream` — for instance after being rebound to a
+different producer — recovery is via snapshot install:
 `SnapshotInstaller::finalize` returns a `CommitAck` whose index and
 term the consumer seeds into `CommittedSubscriber::reset_to`.
 

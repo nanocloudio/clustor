@@ -21,10 +21,10 @@
 //! future. `reason` (one of):
 //!   0 = bootstrap, 1 = admin (reserved), 2 = rebalance (reserved).
 //!
-//! Distinct from quantum's `MSG_EPOCH_EVENT (0xD4)` global-epoch
-//! slot; the kpg-keyed contract is `MSG_PLACEMENT_EPOCH_EVENT
-//! (0xD5)`, declared byte-compatibly in both clustor and lattice
-//! `modules/common/wire.rs`.
+//! The kpg-keyed contract is `MSG_PLACEMENT_EPOCH_EVENT (0xD5)`,
+//! declared in `modules/common/wire.rs`. It is deliberately NOT 0xD4:
+//! that id carries a global-epoch transition, a different shape, and
+//! the two must not be conflated by a consumer that sees both.
 
 use super::abi::SyscallTable;
 use super::{wire, wire_channels};

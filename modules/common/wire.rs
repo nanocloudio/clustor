@@ -203,9 +203,9 @@ pub const ADMIN_OP_PROPOSE: u8 = 0x08;
 /// Sizing: entry TYPE is inferred from the head of a body that is
 /// otherwise opaque application data, so the magic must be wide enough
 /// that no real payload collides into it. Application bodies routinely
-/// lead with dense counters (lattice's KV payload starts with a
-/// `corr_id` whose low byte cycles through all 256 values), so any
-/// short tag is forged within a few hundred entries — and a forged
+/// lead with dense counters — a correlation id whose low byte cycles
+/// through all 256 values is an ordinary way to start a record — so any
+/// short tag is forged within a few hundred entries, and a forged
 /// config change can apply a C_new that removes the node from its own
 /// voter set. Eight bytes put accidental collision at ~2^-64 and cost
 /// application entries nothing: only clustor's own admin/config
@@ -1030,19 +1030,18 @@ pub const MSG_HTTP_RESPONSE: u8 = 0x75;
 /// write in this length-delimited envelope so records from different
 /// conn_ids never coalesce on the byte-FIFO channel (a raw write per
 /// record loses the per-record boundary and the next conn_id byte is
-/// misread as stream data, silently dropping that connection). Consumers
-/// (gateway, quantum's protocol_router) demarcate with
-/// `channel_read_msg`. The msg_type value matches quantum's
-/// `wire::MSG_CLIENT_FRAME` so the envelope is identical on both sides.
+/// misread as stream data, silently dropping that connection).
+/// Consumers demarcate with `channel_read_msg`. The id is fixed here
+/// and a protocol stack in front of this router conforms to it;
+/// changing it silently breaks every one of them, so it does not move.
 pub const MSG_CLIENT_FRAME: u8 = 0xEA;
 
 /// Transport-level connection-closed notice on the cleartext lane.
 /// Payload `[conn_id:u8]`. peer_router emits it when a CLIENT socket
-/// closes so downstream consumers (quantum's protocol_router → codecs →
-/// session state) can release per-connection state deterministically
-/// rather than leaking it until a timeout. Value matches quantum's
-/// `wire::MSG_CONN_CLOSED` so the envelope is identical on both sides.
-/// Consumers that don't care ignore the msg_type (gateway).
+/// closes so a downstream consumer can release per-connection state
+/// deterministically rather than leaking it until a timeout. The id is
+/// fixed here; a consumer that does not care ignores the msg_type (the
+/// gateway does).
 pub const MSG_CONN_CLOSED: u8 = 0xEB;
 
 /// Metric kinds for `MSG_METRIC_SAMPLE`.
@@ -1335,6 +1334,14 @@ pub mod metric_ids {
     pub const APPLY_ENTRIES_EVICTED: u16 = 0x0006;
     /// Counter: refetch read-back slots evicted before consumption.
     pub const APPLY_READS_EVICTED: u16 = 0x0007;
+    /// Counter: apply passes that ended holding a committed entry one of
+    /// its destinations refused (client ack, admin seam, or the
+    /// per-entry stream). NOT a loss count — the entry keeps its buffer
+    /// slot and is re-offered on the next step, and `apply_index` is
+    /// deliberately frozen behind it. A value climbing steadily means a
+    /// consumer has stopped draining; `APPLY_CAUGHT_UP` will read 0 for
+    /// the same reason.
+    pub const APPLY_DELIVERY_STALLS: u16 = 0x0008;
 
     // the http component (module_id = 0x18)
     pub const HTTP_CORRELATIONS_INFLIGHT: u16 = 0x0001;
@@ -1589,18 +1596,18 @@ pub const MSG_SR_REPLY: u8 = 0x91;
 // Routing
 pub const MSG_PLACEMENT_UPDATE: u8 = 0x80;
 
-/// `control_plane` → downstream session-bearing modules
-/// (lattice's `watch_registry`, `lease_manager`, `kv_state_worker`,
-/// future quantum equivalents): a kpg's placement has changed and
-/// any session bound to that kpg should advance its session_epoch
-/// atomically so stale frames in flight get fenced.
+/// `control_plane` → any downstream session-bearing consumer: a kpg's
+/// placement has changed, and a session bound to that kpg should
+/// advance its `session_epoch` atomically so stale frames in flight
+/// get fenced.
 ///
 /// Payload (7 bytes): `[kpg_id:u16 LE][new_epoch:u32 LE][reason:u8]`.
 ///
-/// Byte-compatible with lattice's `modules/common/wire.rs::MSG_PLACEMENT_EPOCH_EVENT`.
-/// Distinct from quantum's `MSG_EPOCH_EVENT` (0xD4), which carries a
-/// global-epoch transition shape — 0xD5 is reserved here for the
-/// kpg-keyed Lattice contract.
+/// This declaration is the contract. A consumer that mirrors the
+/// constant mirrors THIS one; the substrate does not track who has and
+/// does not change the shape to suit any of them. 0xD5 is the kpg-keyed
+/// form specifically — a global-epoch transition is a different message
+/// with a different shape and must not be given this id.
 ///
 /// `reason` field — values shipped today:
 ///   0 = bootstrap (initial placement-router epoch on launch)
@@ -1608,18 +1615,20 @@ pub const MSG_PLACEMENT_UPDATE: u8 = 0x80;
 ///   2 = rebalance (substrate-driven, reserved)
 pub const MSG_PLACEMENT_EPOCH_EVENT: u8 = 0xD5;
 
-/// `compaction_coordinator` (downstream substrate consumer, e.g.
-/// lattice) → `durability`: aggregated per-kpg retention floor.
-/// `durability` must not advance compaction past `floor_revision`
-/// for that `kpg_id` — otherwise a watcher whose `start_revision` is
-/// below the new floor cannot be satisfied by replay-after-rebind.
+/// Downstream consumer → `durability`: the aggregated per-kpg retention
+/// floor. `durability` must not advance compaction past
+/// `floor_revision` for that `kpg_id` — otherwise a watcher whose
+/// `start_revision` is below the new floor cannot be satisfied by
+/// replay-after-rebind.
 ///
 /// Payload (10 bytes): `[kpg_id:u16 LE][floor_revision:u64 LE]`.
 ///
-/// Byte-compatible with lattice's `modules/common/wire.rs::MSG_COMPACTION_FLOOR`.
-/// The per-source `MSG_RETENTION_FLOOR` (0xE0, lattice-only) is
-/// aggregated by lattice's `compaction_coordinator` before reaching
-/// clustor; the substrate sees only the aggregated form.
+/// The substrate accepts ONE floor per kpg and takes it as final. How a
+/// consumer arrives at that number — how many watchers or readers it
+/// polled, whether it aggregates several of its own per-source floors
+/// first — is the consumer's business and deliberately invisible here:
+/// this port would mean the same thing with a different consumer on the
+/// other end of it.
 pub const MSG_COMPACTION_FLOOR: u8 = 0xE1;
 
 /// Envelope header size (1 byte type + 2 bytes length).
@@ -2099,10 +2108,11 @@ pub fn decode_throttle_refill(buf: &[u8]) -> Option<(i32, i32, i32, i32)> {
 
 // ── FNV-1a 64-bit hash ──────────────────────────────────────────────────────
 //
-// Used by `partition_router` for routing-key → partition_id mapping. Same
-// algorithm as `quantum/modules/common/wire.rs::fnv1a_64` so a hash
-// computed at the broker boundary (e.g. of an MQTT topic string) stays
-// stable through clustor.
+// Used by `partition_router` for routing-key → partition_id mapping.
+// Stock FNV-1a with the standard 64-bit offset basis and prime, chosen
+// because it is unambiguous: a protocol stack that hashes a routing key
+// at its own boundary (an MQTT topic string, say) gets the same
+// partition without either side publishing a private variant.
 
 const FNV1A_64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV1A_64_PRIME: u64 = 0x0000_0100_0000_01b3;

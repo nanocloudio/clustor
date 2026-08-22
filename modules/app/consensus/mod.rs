@@ -128,9 +128,10 @@ define_params! {
     // Group commit: pack up to N client proposals into ONE raft log entry =
     // ONE WAL fsync. Default 1 — one proposal per log index, which every
     // consumer handles. Raising it REQUIRES the committed-entry consumer to
-    // split the entry body back into its N self-delimiting proposals
-    // (lattice does this in lattice_apply_bridge; clustor-native configs
-    // whose responses route by unique wal_index must leave it at 1).
+    // split the entry body back into its N self-delimiting proposals — a
+    // capability of the consumer, which the substrate cannot detect, so
+    // the default stays at the value every consumer handles. Any config
+    // whose responses route by unique wal_index must leave it at 1.
     5, proposal_batch_max, u16, 1
         => |s, d, len| { s.raft.proposal_batch_max = p_u16(d, len, 0, 256); };
 

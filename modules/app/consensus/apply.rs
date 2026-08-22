@@ -69,12 +69,19 @@ const PENDING_BODY_CAP: usize = wal_frame::MAX_ENTRY_BODY;
 
 /// Number of pending entries buffered awaiting commit. Sized to absorb
 /// the typical in-flight window between WAL persist and quorum commit.
-/// When the buffer is full and a new entry arrives, the oldest
-/// un-emitted slot is evicted — observers fail open. The eviction is
-/// safe because consumers MUST tolerate gaps and recover from the
-/// monotonic index in the per-entry stream.
+///
+/// The buffer fails CLOSED: when every slot is occupied, `store_pending`
+/// refuses the new entry rather than evicting one. That direction is the
+/// safe one because a refused entry is still durable in the WAL and the
+/// next-needed index is re-read through `request_missing_entry`, whereas
+/// an evicted slot ahead of `apply_index` would be a hole nothing asks
+/// for again. It is also why this buffer doubles as the retention store
+/// for [`emit_committed_entry`]: an entry a destination has not yet
+/// taken keeps its slot, so back-pressure travels up the pipeline
+/// instead of turning into a lost commit.
+///
 /// Sized above raft's uncommitted-inflight window (MAX_UNCOMMITTED_INFLIGHT
-/// = 48) so a full in-flight backlog never forces an eviction under
+/// = 48) so a full in-flight backlog never forces a refusal under
 /// sustained load.
 const PENDING_ENTRY_SLOTS: usize = 64;
 
@@ -109,6 +116,24 @@ const ENTRY_REFETCH_RETRY_MS: u64 = 50;
 /// so nothing else changes.
 const ENTRY_REQUEST_ID_BIT: u32 = 0x8000_0000;
 
+/// Destinations a committed entry owes before it counts as applied, as
+/// bits in [`PendingEntry::delivered`].
+///
+/// Delivery is tracked per destination, not per entry, for one reason:
+/// the retry that a refused write forces must not re-run the writes that
+/// already landed. Without these bits an entry whose client ack
+/// succeeded and whose observer write was refused would ack twice, and
+/// an admin body would be applied twice by raft.
+///
+/// A destination that is unwired, or that this entry does not concern
+/// (the admin seam, for a body carrying no admin/config magic), is
+/// marked delivered at the point the entry is classified: there is
+/// nobody to owe it to.
+const DELIVERED_ACK: u8 = 1 << 0;
+const DELIVERED_ADMIN: u8 = 1 << 1;
+const DELIVERED_STREAM: u8 = 1 << 2;
+const DELIVERED_ALL: u8 = DELIVERED_ACK | DELIVERED_ADMIN | DELIVERED_STREAM;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PendingEntry {
@@ -116,6 +141,11 @@ struct PendingEntry {
     index: Index,
     term: Term,
     body_len: u16,
+    /// `DELIVERED_*` bits already satisfied for this entry. Reset
+    /// whenever the slot takes a different entry — including the
+    /// same-index replacement a follower truncate-then-append performs,
+    /// where the index is unchanged but the body is not.
+    delivered: u8,
     body: [u8; PENDING_BODY_CAP],
 }
 
@@ -125,6 +155,7 @@ impl PendingEntry {
             index: 0,
             term: 0,
             body_len: 0,
+            delivered: 0,
             body: [0u8; PENDING_BODY_CAP],
         }
     }
@@ -189,7 +220,13 @@ pub struct Apply {
     /// E9: committed admin/config bodies → raft (was
     /// `admin_committed`; unwired in every config before — making it
     /// live is the deliberate RFC WS-4 semantic activation).
-    /// Drop-on-full preserved.
+    ///
+    /// A full ring refuses the push, and that refusal RETAINS the entry
+    /// rather than dropping it: a committed config change raft never
+    /// sees is a voter set that disagrees with the log this node claims
+    /// to have applied, and nothing re-derives it. Raft drains this seam
+    /// at the top of every dispatch, so the retry lands on the next
+    /// step.
     pub admin_out: SeamRing<4096>,
 
     pub partition_id: u16,
@@ -214,6 +251,15 @@ pub struct Apply {
     entries_applied: u32,
     entries_buffered: u32,
     entries_evicted: u32,
+    /// Counter: passes that ended holding a committed entry a
+    /// destination refused. NOT a loss count — the entry keeps its slot
+    /// and is re-offered next step. A value that climbs steadily means a
+    /// consumer is not draining, and `apply_index` is deliberately
+    /// frozen behind it; `APPLY_CAUGHT_UP` goes to 0 with it, so the
+    /// node reports itself unready rather than diverging quietly.
+    delivery_stalls: u32,
+    /// `dev_millis` of the last stall warning, for log throttling.
+    last_stall_log_ms: u64,
 
     // ── Metrics ───────────────────────────────────────────────
     last_metrics_ms: u64,
@@ -263,6 +309,8 @@ pub fn init(s: &mut Apply) {
     s.entries_applied = 0;
     s.entries_buffered = 0;
     s.entries_evicted = 0;
+    s.delivery_stalls = 0;
+    s.last_stall_log_ms = 0;
     s.last_metrics_ms = 0;
     s.apply_batch_buckets = [0u32; wire::hist::APPLY_BATCH_US.len() + 1];
     for slot in s.pending.iter_mut() {
@@ -432,6 +480,8 @@ unsafe fn emit_metrics(s: &mut Apply, sys: &SyscallTable, now: u64) {
     // Drop/eviction counters (observability closeout).
     emit_sample(s, sys, mid, pid, wire::metric_ids::APPLY_ENTRIES_EVICTED, wire::METRIC_KIND_COUNTER, i64::from(s.entries_evicted));
     emit_sample(s, sys, mid, pid, wire::metric_ids::APPLY_READS_EVICTED, wire::METRIC_KIND_COUNTER, i64::from(s.reads_evicted));
+    // Backpressure, not loss: passes that ended holding a retained entry.
+    emit_sample(s, sys, mid, pid, wire::metric_ids::APPLY_DELIVERY_STALLS, wire::METRIC_KIND_COUNTER, i64::from(s.delivery_stalls));
     // Cumulative bucket counts per the wire contract (wire::hist): emit the
     // running prefix sum so bucket i = count of samples <= bound[i].
     let base = wire::hist::HIST_BASE;
@@ -544,6 +594,11 @@ unsafe fn store_pending(
         if !slot.is_empty() && slot.index == index {
             slot.term = term;
             slot.body_len = body_len as u16;
+            // A different entry now occupies this index, so whatever the
+            // previous occupant had already delivered says nothing about
+            // this one. Partial delivery of a body that has since been
+            // truncated away is not progress to preserve.
+            slot.delivered = 0;
             if body_len > 0 {
                 slot.body[..body_len].copy_from_slice(&s.msg_buf[16..16 + body_len]);
             }
@@ -556,6 +611,7 @@ unsafe fn store_pending(
             slot.index = index;
             slot.term = term;
             slot.body_len = body_len as u16;
+            slot.delivered = 0;
             if body_len > 0 {
                 slot.body[..body_len].copy_from_slice(&s.msg_buf[16..16 + body_len]);
             }
@@ -569,6 +625,32 @@ unsafe fn store_pending(
     // for the entry again after committed entries free capacity.
     s.entries_evicted = s.entries_evicted.saturating_add(1);
     false
+}
+
+/// Minimum spacing between delivery-stall warnings. A stall re-offers
+/// its entry every step, so an unthrottled line would be one per step
+/// for as long as a consumer is wedged.
+const STALL_LOG_INTERVAL_MS: u64 = 1_000;
+
+/// Record that this pass ended holding an entry a destination refused.
+///
+/// Counted rather than dropped, and said out loud on a throttle: apply
+/// is now deliberately not advancing, and the operator needs to be able
+/// to tell that from a quiet cluster. `APPLY_CAUGHT_UP` reports the same
+/// condition to `/readyz`; this is the line that names the cause.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Apply` and supply a valid
+/// `&SyscallTable` per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+unsafe fn note_delivery_stall(s: &mut Apply, sys: &SyscallTable) {
+    s.delivery_stalls = s.delivery_stalls.saturating_add(1);
+    let now = dev_millis(sys);
+    if now.wrapping_sub(s.last_stall_log_ms) < STALL_LOG_INTERVAL_MS {
+        return;
+    }
+    s.last_stall_log_ms = now;
+    dev_log(sys, 2, b"[apply] delivery stalled".as_ptr(), 24);
 }
 
 /// Apply buffered entries in strict ascending order up to the commit
@@ -586,14 +668,12 @@ unsafe fn store_pending(
 /// `&SyscallTable` per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_pending_entries(s: &mut Apply, sys: &SyscallTable) {
     loop {
-        // A committed entry is not retired until its per-index apply
-        // acknowledgement can be published. This makes grouped commit
-        // advances lossless for synchronous clients: every proposal gets an
-        // ack, not only the highest index in a committed batch.
-        if s.out_applied >= 0 {
-            let poll = (sys.channel_poll)(s.out_applied, 0x02);
-            if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
-        }
+        // No pre-poll of `out_applied` here. `emit_committed_entry`
+        // tracks acceptance per destination, so an entry whose ack
+        // already landed and whose stream write is still outstanding
+        // must not be held back by the ack channel's fill level — and a
+        // poll that reports ≥1 byte free never licensed the write
+        // anyway.
         let mut victim: Option<usize> = None;
         let mut victim_index: Index = Index::MAX;
         for (i, slot) in s.pending.iter().enumerate() {
@@ -624,7 +704,14 @@ unsafe fn drain_pending_entries(s: &mut Apply, sys: &SyscallTable) {
                     break;
                 }
                 if !emit_committed_entry(s, sys, slot_idx) {
-                    break; // ack channel saturated — retry next step
+                    // A destination refused. The entry keeps its slot
+                    // and its partial-delivery state, `apply_index`
+                    // stays where it is, and the next step re-offers
+                    // exactly what is still outstanding. Stopping here
+                    // rather than moving to the next index is also what
+                    // preserves strict apply order.
+                    note_delivery_stall(s, sys);
+                    break;
                 }
             }
         }
@@ -710,14 +797,45 @@ pub unsafe fn on_entry_reply(s: &mut Apply, _sys: &SyscallTable, msg: &[u8], ple
     }
 }
 
-/// Emit one committed entry: client ack, admin/config fanout, observer
-/// stream, then retire the slot.
+/// Offer one committed entry to every destination it owes — client ack,
+/// admin/config fanout, per-entry stream — and retire the slot only once
+/// all of them have taken it.
 ///
-/// Returns false — leaving the slot intact and `apply_index` unmoved —
-/// when the per-index client ack could not be written. The caller's poll
-/// only guarantees ≥1 byte free, not a whole frame, so retiring the slot
-/// on a failed write would break the "every proposal gets an ack"
-/// contract under `out_applied` saturation.
+/// Returns false, leaving the slot intact and `apply_index` unmoved,
+/// while any destination is still refusing. Each destination clears
+/// independently via [`PendingEntry::delivered`], so the retry re-offers
+/// only what is still outstanding and no destination sees the entry
+/// twice.
+///
+/// ## Why nothing here may be dropped
+///
+/// This function is the only place a committed entry leaves the apply
+/// pipeline. What is not delivered here is not delivered at all: the
+/// slot is the last copy, `drain_pending_entries` only ever asks the WAL
+/// for `apply_index + 1`, and advancing `apply_index` past an entry is
+/// what makes it unaskable-for. Every earlier loss in this pipeline —
+/// the lossy body-ring fan-out, a `store_pending` refusal — is survivable
+/// precisely because it happens BEFORE the cursor moves, and is repaired
+/// by `request_missing_entry`. A loss here has no such repair.
+///
+/// So each destination is treated as correctness-bearing:
+///
+/// - the **client ack** is the proposal's only completion signal;
+/// - the **admin seam** carries committed config changes, and one raft
+///   never sees is a voter set that disagrees with the applied log;
+/// - the **per-entry stream** is what every consumer builds replicated
+///   state from (see this module's header), and `replica_facade`'s
+///   `GapInPerEntryStream` detects such a hole without being able to
+///   repair it.
+///
+/// A destination that is unwired is owed nothing and is marked delivered
+/// at once, so an observer-less graph applies at full speed.
+///
+/// The cost of this is that a consumer which stops draining stalls
+/// apply rather than being quietly skipped past. That is the intended
+/// direction: `APPLY_CAUGHT_UP` drops to 0, `/readyz` fails, and the
+/// node stops claiming to be a replica of a log it is no longer
+/// applying.
 ///
 /// # Safety
 ///
@@ -725,21 +843,26 @@ pub unsafe fn on_entry_reply(s: &mut Apply, _sys: &SyscallTable, msg: &[u8], ple
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_committed_entry(s: &mut Apply, sys: &SyscallTable, slot_idx: usize) -> bool {
-    let slot = s.pending[slot_idx];
-    let body_len = slot.body_len as usize;
+    // Small fields only — the body stays in its slot rather than being
+    // copied through a PENDING_BODY_CAP-sized stack temporary on every
+    // applied entry.
+    let term = s.pending[slot_idx].term;
+    let index = s.pending[slot_idx].index;
+    let body_len = s.pending[slot_idx].body_len as usize;
 
-    // Client ack FIRST, with everything else gated on its confirmed
-    // write, so the retry next step cannot double-deliver the
-    // admin/observer fanouts below.
-    if s.out_applied >= 0 {
-        let mut resp = [0u8; 18];
-        resp[0..2].copy_from_slice(&s.partition_id.to_le_bytes());
-        wire::encode_term_index(&mut resp[2..18], slot.term, slot.index);
-        let w = wire_channels::channel_write_msg(
-            sys, s.out_applied, wire::MSG_CLIENT_RESPONSE, &resp,
-        );
-        if w <= 0 {
-            return false;
+    if s.pending[slot_idx].delivered & DELIVERED_ACK == 0 {
+        if s.out_applied < 0 {
+            s.pending[slot_idx].delivered |= DELIVERED_ACK;
+        } else {
+            let mut resp = [0u8; 18];
+            resp[0..2].copy_from_slice(&s.partition_id.to_le_bytes());
+            wire::encode_term_index(&mut resp[2..18], term, index);
+            let w = wire_channels::channel_write_msg(
+                sys, s.out_applied, wire::MSG_CLIENT_RESPONSE, &resp,
+            );
+            if w > 0 {
+                s.pending[slot_idx].delivered |= DELIVERED_ACK;
+            }
         }
     }
 
@@ -749,45 +872,65 @@ unsafe fn emit_committed_entry(s: &mut Apply, sys: &SyscallTable, slot_idx: usiz
     // collide into them — see `wire::ADMIN_MAGIC`.
     // Both fan out on the admin seam ring back to raft (E9);
     // the distinct msg_type tells the engine which path applies.
-    // Drop-on-full: a full ring drops the frame whole.
-    if body_len >= 8 {
-        let head = &slot.body[..body_len];
-        if wire::has_admin_magic(head) && body_len >= 13 {
-            let _ = s.admin_out.push(
-                wire::MSG_ADMIN_COMMITTED,
-                &slot.body[8..body_len],
-            );
-        } else if wire::has_config_change_magic(head) && body_len >= 10 {
-            // Re-emit the body verbatim — the magic stays so
-            // raft can validate with `decode_config_change`.
-            let _ = s.admin_out.push(
-                wire::MSG_CONFIG_COMMITTED,
-                &slot.body[..body_len],
-            );
+    if s.pending[slot_idx].delivered & DELIVERED_ADMIN == 0 {
+        // `None` = this entry is not an admin or config change, so the
+        // seam is owed nothing by it.
+        let owed: Option<(u8, usize)> = if body_len >= 8 {
+            let head = &s.pending[slot_idx].body[..body_len];
+            if wire::has_admin_magic(head) && body_len >= 13 {
+                Some((wire::MSG_ADMIN_COMMITTED, 8))
+            } else if wire::has_config_change_magic(head) && body_len >= 10 {
+                // Re-emit the body verbatim — the magic stays so
+                // raft can validate with `decode_config_change`.
+                Some((wire::MSG_CONFIG_COMMITTED, 0))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match owed {
+            None => s.pending[slot_idx].delivered |= DELIVERED_ADMIN,
+            Some((msg_type, from)) => {
+                let (pending, admin_out) = (&s.pending[slot_idx], &mut s.admin_out);
+                if admin_out.push(msg_type, &pending.body[from..body_len]) {
+                    s.pending[slot_idx].delivered |= DELIVERED_ADMIN;
+                }
+            }
         }
     }
 
-    if s.out_committed_entries >= 0 {
-        let poll = (sys.channel_poll)(s.out_committed_entries, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
+    if s.pending[slot_idx].delivered & DELIVERED_STREAM == 0 {
+        if s.out_committed_entries < 0 {
+            s.pending[slot_idx].delivered |= DELIVERED_STREAM;
+        } else {
             // Reuse msg_buf as the scratch envelope: 16-byte header + body.
-            wire::encode_term_index(&mut s.msg_buf, slot.term, slot.index);
+            wire::encode_term_index(&mut s.msg_buf, term, index);
             if body_len > 0 {
-                s.msg_buf[16..16 + body_len].copy_from_slice(&slot.body[..body_len]);
+                let (pending, msg_buf) = (&s.pending[slot_idx], &mut s.msg_buf);
+                msg_buf[16..16 + body_len].copy_from_slice(&pending.body[..body_len]);
             }
-            wire_channels::channel_write_msg(
+            // No `channel_poll` pre-check: it reports ≥1 byte free, not
+            // room for this frame, so it can neither authorise nor
+            // forbid the write. `channel_write_msg` is all-or-nothing
+            // and its return value is the only true answer.
+            let w = wire_channels::channel_write_msg(
                 sys,
                 s.out_committed_entries,
                 wire::MSG_COMMITTED_ENTRY,
                 &s.msg_buf[..16 + body_len],
             );
+            if w > 0 {
+                s.pending[slot_idx].delivered |= DELIVERED_STREAM;
+            }
         }
-        // If the channel is full, drop on the floor — fail-open. The
-        // entry remains durable in the WAL and the consumer can refetch
-        // via a snapshot install when it recovers.
     }
 
-    s.apply_index = slot.index;
+    if s.pending[slot_idx].delivered != DELIVERED_ALL {
+        return false;
+    }
+
+    s.apply_index = index;
     s.entries_applied += 1;
     // Apply signal — the only external proof a committed entry
     // actually reached the state machine, distinct from `[wal] entry

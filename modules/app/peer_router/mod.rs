@@ -1697,8 +1697,9 @@ fn peer_dest(s: &ModuleState, peer_msg_type: u8) -> i32 {
         // receives the leader's PROBE, leader receives the follower's
         // RESP — consensus handles both on its rpc input. Omitting
         // these silently killed multi-node linearizable reads (every
-        // probe timed out → LIN-BOUND reject); dormant until lattice
-        // wired the read fence.
+        // probe timed out → LIN-BOUND reject). Unexercised until some
+        // consumer wires the read fence, which is exactly why the
+        // omission survived so long.
         | wire::MSG_READ_INDEX_PROBE
         | wire::MSG_READ_INDEX_PROBE_RESP
         | wire::MSG_TIMEOUT_NOW => s.raft_rpc,
