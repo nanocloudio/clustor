@@ -475,19 +475,6 @@ pub fn encode_client_reject_wire(
     buf[1..1 + CLIENT_REJECT_BODY_LEN].copy_from_slice(&body);
 }
 
-// Legacy aliases (kept so the previous in-tree call sites compile while the
-// throttle/codec switch lands. New code should call the explicit variants.)
-pub const CLIENT_REJECT_LEN: usize = CLIENT_REJECT_BODY_LEN;
-#[inline]
-pub fn encode_client_reject(
-    buf: &mut [u8; CLIENT_REJECT_BODY_LEN],
-    status: u8,
-    retry_after_ms: u16,
-    entry_credits: i16,
-    byte_credits: i32,
-) {
-    encode_client_reject_body(buf, status, 0, retry_after_ms, entry_credits, byte_credits);
-}
 /// Emitted by consensus on its `proposal_assigned` output port for every
 /// tagged proposal once the leader has assigned it a log index. Lets the
 /// proposer (e.g. quantum/session_processor) bind a per-message correlation
@@ -1006,24 +993,12 @@ pub const MSG_WHY: u8 = 0x72;
 /// `value` is signed so counter resets, signed credits, and gauges
 /// taking on negative values all use the same slot.
 pub const MSG_METRIC_SAMPLE: u8 = 0x73;
-/// Inbound HTTP request frame for the diagnostic adapter (RFC §4.4).
-/// Payload (variable):
-///   `[conn_id:u8][method:u8 (G=0x47, P=0x50, ...)][path_len:u8][path bytes][body...]`
-/// The method byte is the first character of the HTTP verb so the
-/// adapter can dispatch without parsing the whole verb.
-pub const MSG_HTTP_REQUEST: u8 = 0x74;
-/// Outbound HTTP response frame from the adapter back to the HTTP
-/// server module. Payload (variable):
-///   `[conn_id:u8][status:u16 LE][body_len:u16 LE][body bytes]`
-/// `Content-Type` is implied by status: 200 → text/plain, 4xx/5xx →
-/// text/plain with a short error string. The HTTP server module
-/// frames the wire-level HTTP response itself.
-pub const MSG_HTTP_RESPONSE: u8 = 0x75;
-// 0x79 (was MSG_HTTP_READY_SNAPSHOT) retired: the http → ingress
-// readiness hand-off is an interior seam (`ingress::deliver_ready`),
-// not a wire edge — seams carry no opcode and no stability promise
-// (standards fluxor-modules.md §8). Do not reuse 0x79 until the
-// sibling repos confirm no reader remains.
+// 0x74, 0x75 and 0x79 are retired and reserved. HTTP framing is not
+// clustor's: the `operations` request/response ports carry wave's own
+// `HttpRequest` / `HttpResponse` envelopes, and readiness reaches the
+// http component as an interior seam — seams carry no opcode and no
+// stability promise (standards fluxor-modules.md §8). Do not reuse
+// these ids until the sibling repos confirm no reader remains.
 
 /// Multiplexed client record on the cleartext path. Payload is
 /// `[conn_id:u8][raw client bytes]`. peer_router wraps every cleartext
@@ -1076,7 +1051,7 @@ pub const SOURCE_ID_NVME_BENCH: u8 = 0x16;
 pub const SOURCE_ID_CONSENSUS_BENCH: u8 = 0x17;
 pub const SOURCE_ID_HTTP: u8 = 0x18;
 pub const SOURCE_ID_TIMING: u8 = 0x19;
-pub const SOURCE_ID_INGRESS: u8 = 0x1A;
+// 0x1A is retired and reserved — do not reassign.
 
 /// Per-module metric ids. Each module owns a small private space
 /// (0x00..0xFF). Documented next to the module's metric emission.
@@ -1357,6 +1332,8 @@ pub mod metric_ids {
     pub const HTTP_COMMITTED: u16 = 0x000B;
     pub const HTTP_REQUESTS: u16 = 0x000C;
     pub const HTTP_REQUESTS_404: u16 = 0x000D;
+    pub const HTTP_RESPONSES_DROPPED: u16 = 0x000E;
+    pub const HTTP_ADMIN_DROPPED: u16 = 0x000F;
 
     // the gateway's throttle (module_id = 0x0A)
     pub const THROTTLE_ADMITTED: u16 = 0x0001;

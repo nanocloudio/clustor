@@ -69,17 +69,21 @@ down to `expected_index − 1` and replays from there
 
 The operations module serves `GET /readyz`, `GET /why`,
 `GET /metrics`, `POST /propose`, and `POST /admin/<op>` through its
-ingress and http components.
+http component, behind wave's `http` module on the diagnostic
+listener.
 
-- `/readyz` answers with a one-byte body directly from ingress: 200
-  when the readiness byte is non-zero, 503 otherwise.
-- A malformed request line is answered 400 `bad request`; an unknown
+- `/readyz` answers with a one-byte body from the cached readiness
+  byte: 200 when non-zero, 503 otherwise.
+- Malformed HTTP is answered by wave at the wire; an unknown
   `/admin/<op>` name is answered 400 `unknown admin op`; any other
   unknown path is 404 `not found`.
-- A body whose advertised `Content-Length` exceeds the per-connection
-  cap is answered 413 and the connection is closed; a header block
-  that overruns the receive buffer is answered 431 and closed — never
-  truncated.
+- A forwarded body over `MAX_EXT_BODY` (1 KiB), or a body wave has
+  split across envelopes, is answered 413 `body too large` — never
+  truncated. Requests too large for wave's own wire buffers never
+  reach this module; wave answers those itself.
+- `GET /metrics` streams across several envelopes and only one
+  export streams at a time; a concurrent scrape is answered 503
+  `metrics busy` until the slot frees.
 - `POST /propose` (the synchronous write bridge) answers 200
   `committed` once apply acknowledges the assigned WAL index, and 503
   with a reason body otherwise: `propose queue unavailable` (the

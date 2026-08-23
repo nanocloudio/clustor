@@ -252,8 +252,7 @@ HTTP diagnostic surface.
 | `rbac` | Evaluates RBAC roles (Operator / TenantAdmin / Observer / BreakGlass) by SPIFFE-SVID prefix match against `admin_svid_prefix` / `observer_svid_prefix` — an admin match grants Operator plus BreakGlass; writes the audit stream on `audit_events`. |
 | `admin` | Idempotency-keyed admin envelope. Routes `FREEZE` / `THAW` / `TRANSFER_LEADER` / `DURABILITY_MODE` / `SNAPSHOT` to `consensus` and replies `ADMIN_STATUS_OK` / `ADMIN_STATUS_DUPLICATE`. `ADD_VOTER` / `REMOVE_VOTER` return `ADMIN_STATUS_UNSUPPORTED`; the joint-consensus path is documented in [lifecycle.md](lifecycle.md#membership-changes-and-joint-consensus). |
 | `telemetry` | Metrics fan-in with fixed histogram buckets, incident correlation under a storm guard, feature-gate state, and the `/readyz` / `/why` / `/metrics` payloads. |
-| `http` | Maps parsed requests to op codes and frames replies; serves `/readyz`, `/why`, `/metrics`, `POST /admin/<op>` and `POST /propose`. |
-| `ingress` | HTTP/1.1 listener and parser on a dedicated `linux_net` port — by convention `LISTEN_PORT + 10000`. See [../net_http.md](../guides/net_http.md). |
+| `http` | Owns what each request means: serves `/readyz`, `/why`, `/metrics`, `POST /admin/<op>` and `POST /propose` over wave `HttpRequest`/`HttpResponse` envelopes. HTTP mechanics live in wave's `http` module on a dedicated listener — by convention `LISTEN_PORT + 10000`. See [../net_http.md](../guides/net_http.md). |
 
 Every admin command is admitted through `rbac` and there is no
 path around it. Wire commands arriving on `admin_req` are
@@ -267,36 +266,32 @@ commands that passed, carrying the same `MSG_ADMIN_COMMAND` bytes
 the `admin` component received. The tee is best-effort — dropped
 on backpressure — and is never in the path of that delivery.
 
-Dispatch order is `telemetry → rbac → admin → http → ingress`,
-with the http and ingress caches refreshed from telemetry's fresh
-payloads on each emit tick. A parsed request delivers into `http`
-in the same step `ingress` parses it, and an authorized command
-delivers into `admin` in the same step `rbac` admits it.
+Dispatch order is `telemetry → rbac → admin → http`, with the
+http caches refreshed from telemetry's fresh payloads on each emit
+tick. An authorized command delivers into `admin` in the same step
+`rbac` admits it.
 
 | | |
 |---|---|
-| Inputs | `admin_req`, `identity`, `admin_applied`, `admin_requests`, `ingest`, `net_in`†, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request`† |
-| Outputs | `responses`, `denied`, `audit_events`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `net_out`†, `proposal`†, `authorized`, `response`† |
-| Params | `admin_svid_prefix`, `observer_svid_prefix`, `default_role`, `emit_interval_ms`, `listen_port` |
+| Inputs | `admin_req`, `identity`, `admin_applied`, `admin_requests`, `ingest`, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request`† |
+| Outputs | `responses`, `denied`, `audit_events`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `authorized`, `response`† |
+| Params | `admin_svid_prefix`, `observer_svid_prefix`, `default_role`, `emit_interval_ms` |
 | Variants | `diag` (default), `headless` |
 
 † Present in the `diag` variant only.
 
-`request` / `response` serve a consumer that terminates HTTP on
-its own shared client port rather than this module's dedicated
-listener: `MSG_HTTP_REQUEST` `[conn_id][method][path_len][path]
-[body]` in, `MSG_HTTP_RESPONSE` `[conn_id][status:u16]
-[body_len:u16][body]` out, feeding the same request handling the
-listener does. A `conn_id` bitmap records which source each live
-request came from so a reply always egresses the way its request
-arrived; the two sources share one `conn_id` namespace, so a graph
-wires the listener or these ports, not both over overlapping ids.
+`request` / `response` carry wave's `HttpRequest`/`HttpResponse`
+envelopes from the `http` module's `HANDLER_APP` fan-out; both graph
+edges run in mailbox mode (`buffer_group`). Replies are correlated
+on the echoed `(conn_id, stream_id)` pair, so a deferred `/propose`
+answer can never land on a client that merely inherited a recycled
+conn id.
 
 `diag` carries the full HTTP diagnostic surface. `headless`
-compiles the `http` and `ingress` components out and omits their
-ports entirely; readiness and metrics still publish on `readyz`,
-`why` and `export`, so a deployment that must not expose HTTP
-selects the variant rather than trusting a config flag.
+compiles the `http` component out and omits its ports entirely;
+readiness and metrics still publish on `readyz`, `why` and
+`export`, so a deployment that must not expose HTTP selects the
+variant rather than trusting a config flag.
 `operations` declares the `monitor` capability so `telemetry` can
 pull the kernel-scope step-time histogram over the monitor
 syscall; without it, bare-metal EL0 enforcement denies the call

@@ -164,8 +164,8 @@ likewise stay unwired.
 
 | Direction | Ports |
 |---|---|
-| in | `admin_req`, `admin_requests`, `identity`, `admin_applied`, `ingest`, `net_in`†, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request`† |
-| out | `responses`, `denied`, `audit_events`, `authorized`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `net_out`†, `proposal`†, `response`† |
+| in | `admin_req`, `admin_requests`, `identity`, `admin_applied`, `ingest`, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request`† |
+| out | `responses`, `denied`, `audit_events`, `authorized`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `response`† |
 
 † `diag` variant only. The `headless` variant omits the HTTP ports
 entirely; readiness and metrics still publish on `readyz`, `why`
@@ -184,15 +184,14 @@ best-effort and never gates or delays that delivery.
 `ingest` is the metric fan-in every other palette module's
 `metrics` output feeds.
 
-`request` / `response` serve HTTP for a consumer that terminates it
-on its own shared client port instead of this module's dedicated
-listener (`net_in` / `net_out`). `request` carries
-`MSG_HTTP_REQUEST` `[conn_id][method][path_len][path][body]`,
-`response` carries `MSG_HTTP_RESPONSE`
-`[conn_id][status:u16][body_len:u16][body]`, and both feed the same
-request handling the listener does. A reply always goes back the
-way its request came, so a graph wires either the listener or these
-two — not both over an overlapping `conn_id` range.
+`request` / `response` are the HTTP seam. This module owns what a
+request means, never the mechanics: wave's `http` module (`app`
+variant) terminates the wire and hands each matched request over as
+an `HttpRequest` envelope, and replies leave as `HttpResponse`
+envelopes. Both graph edges run in mailbox mode (a distinct non-zero
+`buffer_group` each), so one write is one whole envelope; replies
+are correlated on the echoed `(conn_id, stream_id)` pair. See
+[net_http.md](net_http.md).
 
 ## Why search paths, not hardlinks
 

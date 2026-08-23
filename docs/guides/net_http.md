@@ -8,60 +8,78 @@ formula with no separate allocator.
 
 ## Topology
 
+HTTP mechanics and HTTP meaning live in different modules. Wave's
+`http` module (`app` variant) terminates the wire — parsing, framing,
+connection state, bounded bodies — and forwards each matched request
+to `operations` as an `HttpRequest` envelope on its `HANDLER_APP`
+fan-out. `operations`' `http` component owns what the request means:
+the diagnostic paths, admin admission, and the `/propose` bridge.
+Neither module knows the other's internals; the seam is the two
+envelope ports.
+
 The listener rides the target's network module: `linux_net` on the
 Linux host target, the `ip` module (over the target's NIC driver) on
-bare metal. The wiring is the same pair of edges either way:
-`operations.net_out → <net>.net_in` and back (the "HTTP diagnostic
-surface" group in the graph embedded in [running.md](running.md)
-for the host, and the equivalent `ip` edges on bare metal).
-
-One network-module instance serves both anchors: `peer_router` and
-`operations` each bind their own listen port on it via `CMD_BIND`.
-Accept events on the shared `net_in` broadcast carry the accepting
-local port, and `ingress` claims only connections accepted on its
-own listen port — without that filter it would answer 404s on the
-wire protocol's connections.
+bare metal. One network-module instance serves both anchors:
+`peer_router` and `http` each bind their own listen port on it via
+`CMD_BIND`. Accept events on the shared `net_in` broadcast carry the
+accepting local port, and each anchor claims only connections
+accepted on its own listen port.
 
 ```
-                              ┌───────── operations ─────────┐
-curl ──tcp──▶ net module ──▶  │ ingress ──request──▶ http    │
-                              │                        │     │
-      curl ◀── net module ◀── │ ingress ◀──response────┘     │
-                              └──────────────────────────────┘
+curl ──tcp──▶ net module ──▶ http (wave) ──req_out───▶ operations.request
+curl ◀──tcp── net module ◀── http (wave) ◀──resp_in─── operations.response
 ```
 
-HTTP framing is clustor's, not a fluxor foundation primitive. On the
-listener path above, the request/response exchange between the
-`ingress` and `http` components is carried in-module. The same
-message shapes also exist as graph ports: the `diag` variant of
-`operations` publishes `request` (accepting `MSG_HTTP_REQUEST`, msg
-type `0x74`) and `response` (emitting `MSG_HTTP_RESPONSE`, `0x75`),
-so a consumer that terminates HTTP on its own shared client port can
-feed the same `http::on_request` handling and receive replies over
-the graph. Foundation modules stay app-agnostic either way.
+The graph carries four edges (the "HTTP diagnostic surface" group in
+every diag config under `configs/`):
 
-The HTTP components ship only in the `diag` variant. A deployment
-that must not expose an HTTP surface selects `variant: headless` on
-`operations`, which compiles them out and omits the HTTP ports
-(`net_in`, `net_out`, `request`, `response`, `proposal`,
-`proposal_assigned`, `applied`, `proposal_rejected`) from the
-module's port set; readiness and metrics still publish on `readyz`,
-`why` and `export`.
+- `<net>.net_out` → `http.net_in` and `http.net_out` → `<net>.net_in`
+- `http.req_out` → `operations.request` and
+  `operations.response` → `http.resp_in`, each with a distinct
+  non-zero `buffer_group` — mailbox mode, one write = one whole
+  envelope. Omitting the group does not fail loudly; it delivers
+  fragmented envelopes.
+
+The wave module block is uniform across the configs:
+
+```yaml
+- name: http
+  variant: app
+  port: 19090
+  host_tcp: 1        # linux_net downstream only; omit on bare metal
+  routes:
+    - path: "/"
+      app: true      # catch-all: operations owns the 404
+```
+
+Responses are correlated by `(conn_id, stream_id)` — wave stamps a
+per-request generation into `stream_id` and `operations` echoes it,
+so a reply deferred through Raft (`/propose`) can never land on a
+client that merely inherited a recycled conn id.
+
+The `http` component ships only in the `diag` variant of
+`operations`. A deployment that must not expose an HTTP surface
+selects `variant: headless`, which compiles it out and omits the
+HTTP ports (`request`, `response`, `proposal`, `proposal_assigned`,
+`applied`, `proposal_rejected`) from the module's port set; readiness
+and metrics still publish on `readyz`, `why` and `export`. Such a
+graph carries no wave modules at all.
 
 ## Endpoints and method handling
 
 The endpoint surface is the GET diagnostics `/readyz`, `/why` and
 `/metrics`, plus `POST /admin/<op>` and `POST /propose`. Routing in
-`http::on_request` is method-gated only for the two POST paths (the
-verb's first byte must be `P`); the diagnostic paths match on path
-alone, so a POST to `/metrics` is answered like a GET. Unknown paths
-answer 404. No route ever answers 405 — the status appears in the
-response formatter's reason table but nothing sends it.
+`http::on_request` is method-gated only for the two POST paths
+(wave's method byte must be `METHOD_POST`); the diagnostic paths
+match on path alone, so a POST to `/metrics` is answered like a GET.
+Unknown paths answer 404.
 
-`GET /readyz` is short-circuited entirely inside `ingress` from the
-readiness byte delivered each telemetry emit tick; the high-rate
-probe path never enters the request pipeline and is intentionally
-unlogged.
+`/metrics` exceeds one wave send buffer, so `operations` streams it:
+the first envelope carries `MORE_BODY`, a `Content-Length` header and
+the first slice; continuation envelopes carry the rest as the
+`response` port drains. One export streams at a time — a concurrent
+`/metrics` answers 503 until the slot frees, and the cached export is
+not refreshed mid-stream so the declared length stays true.
 
 `POST /admin/<op>` is admitted through the `rbac` component like
 every other admin command. HTTP carries no peer identity, so it
@@ -91,9 +109,7 @@ throttle rejects it; `proposal timeout` or `commit timeout` when a
 slot waits longer than `HTTP_PROPOSAL_TIMEOUT_MS` (10 s) for
 assignment or apply.
 
-The bridge needs four graph edges (the "HTTP /propose bridge" group
-in the graph embedded in [running.md](running.md), plus the apply
-feedback):
+The bridge needs four graph edges (beyond the surface's own four):
 
 - `operations.proposal` → `gateway.proposals`
 - `consensus.proposal_assigned` → `operations.proposal_assigned`
@@ -103,35 +119,25 @@ feedback):
 A graph without these edges fails closed: every `POST /propose`
 answers `503 propose queue unavailable`.
 
-## Parser limits
+## Limits
 
-`ingress` is a minimal sequential HTTP/1.1 keep-alive server with 32
-connection slots (`modules/app/operations/ingress.rs`). What it
-actually enforces:
+The wire-side limits are wave's (see wave's
+`modules/foundation/http/README.md` and its per-target sizing):
+connection slots, receive/send buffers, keep-alive, and the 30 s
+application timeout that answers 504 when `operations` never
+replies. On the meaning side, `operations` enforces its own bounds:
+request paths over 64 bytes answer 404, and bodies over the 1 KiB
+admin envelope — or streamed request bodies, which nothing here
+accepts — answer 413.
 
-- Body length comes from `Content-Length` alone; a missing or
-  malformed header means a zero-length body. Transfer encodings are
-  not inspected — there is no chunked support and no explicit
-  rejection of it.
-- Each connection has a 2 KiB receive buffer (`RX_BUF`). A header
-  block that fills the buffer without terminating answers `431` and
-  the connection is closed.
-- Request bodies are capped at 1024 bytes (`MAX_BODY`). A request
-  advertising a larger `Content-Length` answers `413` and the
-  connection is closed — never truncated, whose excess bytes would
-  reparse as a smuggled pipelined request.
-- Connections are persistent by default, per HTTP/1.1. A client's
-  explicit `Connection: close` is honoured; every other response
-  carries `Connection: keep-alive`. The `clustor-bench` load client
-  depends on keep-alive. Pipelining is not supported: one request may
-  be in flight per connection, and inbound bytes that arrive while a
-  response is pending are dropped.
-- Header bytes are not validated as ASCII, and there are no
-  timeouts: no request deadline, no socket read/write timeout, no 408
-  path. An idle or stalled connection holds its slot until the client
-  or the transport closes it.
+`operations` pulls a request only when its `response` port can take
+the answer, so a saturated reply path stalls the pull rather than
+losing the reply, and wave applies the backpressure. The
+`responses_dropped` counter records a reply the port refused anyway;
+it should stay at zero, and a rising count means the `response` edge
+is undersized.
 
-The parser is sized for the control-plane and diagnostic endpoints
+The surface is sized for the control-plane and diagnostic endpoints
 and assumes trusted clients inside the cluster perimeter.
 
 ## Stderr signals
@@ -141,11 +147,12 @@ Signals the surface emits on stderr:
 | Signal | Meaning |
 |---|---|
 | `[linux_net] listening on port 19090` | the network module bound the HTTP listen port (host target; the `ip` module logs the bare-metal equivalent) |
-| `[ingress] init listen_port=19090` | listener brought up |
-| `[ingress] accepted conn_id=N` | client connected |
-| `[ingress] request M /path body=N conn_id=K` | request parsed and handed to `http`; `M` is the single method byte (`G`/`P`). Never emitted for `/readyz` |
-| `[ingress] closed conn_id=N` | connection torn down |
+| `[http] bound, waiting for connections` | wave's bind acknowledgement reached the module |
 | `[http] admin op=N conn_id=M` | admin request authorised and routed to the admin component |
+
+Per-request logging is intentionally absent on both sides: logging
+every health-check hit would violate the per-packet severity
+discipline (standards/observability.md §2).
 
 ## See also
 

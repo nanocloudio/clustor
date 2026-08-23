@@ -156,16 +156,13 @@ pub extern "C" fn module_new(
         // Port handles. Indices follow the manifest declaration order.
         s.surface.in_requests = in_chan; // in[0] requests
         s.surface.in_admin_resp = dev_channel_port(sys, 0, 1);
-        s.surface.in_readyz = dev_channel_port(sys, 0, 2);
-        s.surface.in_why = dev_channel_port(sys, 0, 3);
-        s.surface.in_metrics = dev_channel_port(sys, 0, 4);
-        s.codec.in_applied = dev_channel_port(sys, 0, 5);
-        s.codec.in_placement = dev_channel_port(sys, 0, 6);
-        s.codec.in_proposal_assigned = dev_channel_port(sys, 0, 7);
-        s.codec.in_leader_state = dev_channel_port(sys, 0, 8);
-        s.throttle.in_credits = dev_channel_port(sys, 0, 9);
-        s.throttle.in_proposals = dev_channel_port(sys, 0, 10);
-        s.codec.in_client_requests = dev_channel_port(sys, 0, 11);
+        s.codec.in_applied = dev_channel_port(sys, 0, 2);
+        s.codec.in_placement = dev_channel_port(sys, 0, 3);
+        s.codec.in_proposal_assigned = dev_channel_port(sys, 0, 4);
+        s.codec.in_leader_state = dev_channel_port(sys, 0, 5);
+        s.throttle.in_credits = dev_channel_port(sys, 0, 6);
+        s.throttle.in_proposals = dev_channel_port(sys, 0, 7);
+        s.codec.in_client_requests = dev_channel_port(sys, 0, 8);
         s.surface.out_raft_rpc = out_chan; // out[0] raft_rpc
         s.surface.out_responses = dev_channel_port(sys, 1, 1);
         s.surface.out_admin_req = dev_channel_port(sys, 1, 2);

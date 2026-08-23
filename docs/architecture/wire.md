@@ -177,7 +177,7 @@ byte), `MSG_FALLBACK_SIGNAL` (0x32), `MSG_READ_PERMIT` (0x33).
 | 0x58 / 0x59 | `MSG_APP_SNAPSHOT_REQUEST` / `_RESET` | `[term:u64][last_included_index:u64]` |
 | 0x5A | `MSG_PEER_IDENTITY` | `[conn_id:u8][replica_id:u8][verified:u8][svid_len:u8][svid...]` — TLS identity binding to `peer_router` |
 
-### Key management, telemetry, and HTTP (0x60–0x76)
+### Key management, telemetry, and membership (0x60–0x76)
 
 `MSG_DEK_EPOCH` (0x60) and `MSG_CERT_REFRESH` (0x61) cover key
 management. The telemetry family:
@@ -186,12 +186,10 @@ management. The telemetry family:
 - `MSG_METRIC_SAMPLE` (0x73), 14 bytes:
   `[module_id:u8][partition_id:u16][metric_id:u16][kind:u8][value:i64]`
   with `kind` 0 = counter, 1 = gauge, 2 = histogram bucket.
-- `MSG_HTTP_REQUEST` (0x74):
-  `[conn_id:u8][method:u8][path_len:u8][path][body...]` — the method
-  byte is the first character of the HTTP verb.
-- `MSG_HTTP_RESPONSE` (0x75):
-  `[conn_id:u8][status:u16 LE][body_len:u16 LE][body]`; the HTTP
-  server module frames the wire-level response itself.
+- 0x74, 0x75 and 0x79 are retired and reserved. HTTP framing is
+  wave's, not clustor's: the `operations` `request` / `response` ports
+  carry wave's `HttpRequest` / `HttpResponse` envelopes, described in
+  [../guides/net_http.md](../guides/net_http.md).
 - `MSG_VOTER_SET_UPDATE` (0x76):
   `[current_set:u8][joint_set:u8][joint_active:u8]` bitmasks.
 

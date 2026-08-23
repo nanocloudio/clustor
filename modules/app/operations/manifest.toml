@@ -9,8 +9,11 @@ hardware_targets = ["bcm2712"]
 # (standards fluxor-modules.md §8).
 #
 # Components: rbac, admin, telemetry, and — behind the `http`
-# feature — http (request handling) + ingress (HTTP/1.1 listener on a
-# dedicated linux_net port, by convention LISTEN_PORT + 10000).
+# feature — http (request handling). HTTP mechanics live outside the
+# module: wave's `http` module (`app` variant) terminates the wire
+# and exchanges `HttpRequest`/`HttpResponse` envelopes with this one
+# over `request`/`response`. This module owns what a request MEANS —
+# paths, admission, the /propose bridge — and none of the framing.
 #
 # Every admin command is admitted through rbac: wire commands on
 # `admin_req` (evaluated against identity bindings), HTTP
@@ -21,7 +24,7 @@ hardware_targets = ["bcm2712"]
 # Variants:
 #   diag (default, feature http) — full HTTP diagnostic surface:
 #     /readyz, /why, /metrics, POST /admin/<op>, POST /propose.
-#   headless — no HTTP components, HTTP ports absent; readiness and
+#   headless — no http component, HTTP ports absent; readiness and
 #     metrics still publish on readyz/why/export.
 
 # Pulls the kernel-scope step-time histogram over the monitor syscall
@@ -37,7 +40,7 @@ name = "headless"
 # marker satisfies the variant-is-a-feature-set rule without gating
 # any code of its own.
 features = ["headless"]
-omit_ports = ["net_in", "proposal_assigned", "applied", "proposal_rejected", "request", "net_out", "proposal", "response"]
+omit_ports = ["proposal_assigned", "applied", "proposal_rejected", "request", "proposal", "response"]
 
 [[variant]]
 name = "diag"
@@ -72,16 +75,6 @@ direction = "input"
 content_type = "OctetStream"
 
 [[ports]]
-name = "net_in"
-direction = "input"
-content_type = "OctetStream"
-# linux_net/ip net_out is NetProto, whose generic default (audio) is
-# calibrated for embedded slow NICs, not host HTTP admin loopback
-# traffic. Declare this edge's true shape once here instead of
-# relying on every consuming config to override per edge.
-rate_class_default = "transaction"
-
-[[ports]]
 name = "proposal_assigned"
 direction = "input"
 content_type = "OctetStream"
@@ -99,18 +92,16 @@ content_type = "OctetStream"
 [[ports]]
 name = "request"
 direction = "input"
-content_type = "OctetStream"
-buffer_size = 8192
-# Envelope (3) + `[conn_id][method][path_len][path:64][body:1024]` = 1094;
-# matches the reader's 1091-byte payload buffer (MAX_EXT_REQUEST) —
-# a larger declared cap would let producers send frames the reader
-# silently discards.
-max_record = 1094
+content_type = "HttpRequest"
+buffer_size = 16384
+# One wave `req_out` envelope — the producer's own `max_record`; the
+# reader's frame buffer (MAX_EXT_REQUEST) matches it exactly.
+max_record = 8192
 rate_class_max = "transaction"
-# HTTP requests parsed by a consumer that serves HTTP over its own
-# shared client port instead of this module's dedicated listener
-# (`net_in`). Feeds the same request handling the listener does; the
-# reply leaves on `response` rather than the listener's wire path.
+# Wave `HttpRequest` envelopes from the `http` module's HANDLER_APP
+# fan-out. The graph edge needs a non-zero `buffer_group` (mailbox
+# mode) so one write is one whole envelope; replies leave on
+# `response`.
 
 # ── outputs ──────────────────────────────────────────────────
 
@@ -166,21 +157,6 @@ direction = "output"
 content_type = "OctetStream"
 
 [[ports]]
-name = "net_out"
-direction = "output"
-content_type = "OctetStream"
-buffer_size = 8192
-# The largest NCMD_SEND this module frames: net header (3) + conn_id
-# (2) + HTTP response head (128) + the bounded 7600-byte body. Mirrors
-# `ingress::TX_BUF`, which the code derives from the same four terms.
-max_record = 7733
-rate_class_max = "transaction"
-# See net_in above: this edge's consumer (linux_net.net_in / ip.net_in)
-# is NetProto, whose generic default (audio) would otherwise exceed
-# the rate_class_max cap above.
-rate_class_default = "transaction"
-
-[[ports]]
 name = "proposal"
 direction = "output"
 content_type = "OctetStream"
@@ -206,15 +182,17 @@ rate_class_max = "transaction"
 [[ports]]
 name = "response"
 direction = "output"
-content_type = "OctetStream"
-buffer_size = 8192
-# Envelope (3) + `[conn_id][status:u16][body_len:u16]` (5) + the
-# bounded 7600-byte response body (`http::METRICS_CACHE` =
-# `telemetry::SAFE_EXPORT_MAX` 7400 + 200 slack — the code derives it,
-# this literal just mirrors it).
-max_record = 7608
+content_type = "HttpResponse"
+buffer_size = 16384
+# Envelope head (12) + content type + a Content-Length header line +
+# one body slice (`http::RESP_SLICE` = 3072, sized under wave's
+# per-connection send buffer). Larger bodies — `/metrics` — stream
+# across several envelopes via MORE_BODY.
+max_record = 3200
 rate_class_max = "transaction"
-# Replies to requests that arrived on `request`. See that port.
+# Wave `HttpResponse` envelopes answering `request` traffic. Same
+# mailbox-mode requirement as `request`; the two edges take distinct
+# `buffer_group` values.
 
 [observability]
 # The /propose bridge's request + proposal-correlation health, plus
@@ -222,4 +200,4 @@ rate_class_max = "transaction"
 # telemetry component id inside the export it serves). Every name here
 # has an emit site in http.rs / telemetry.rs — the list claims exactly
 # what the module ships.
-metrics = ["requests", "requests_404", "correlations_inflight", "indices_inflight", "inflight_high_water", "proposal_timeouts", "commit_timeouts", "assignments_unmatched", "assignments_no_slot", "applies_unmatched", "rejections", "queue_unavailable", "committed"]
+metrics = ["requests", "requests_404", "correlations_inflight", "indices_inflight", "inflight_high_water", "proposal_timeouts", "commit_timeouts", "assignments_unmatched", "assignments_no_slot", "applies_unmatched", "rejections", "queue_unavailable", "committed", "responses_dropped", "admin_dropped"]

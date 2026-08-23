@@ -167,7 +167,7 @@ pub unsafe fn init(t: &mut Telemetry, sys: &SyscallTable) {
 }
 
 /// True on exactly the steps the export tick emitted — the dispatch
-/// table refreshes the http/ingress caches on these steps.
+/// table refreshes the http caches on these steps.
 pub fn emitted(t: &Telemetry) -> bool {
     t.emitted
 }

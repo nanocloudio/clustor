@@ -1,21 +1,24 @@
 //! Operations — admin admission, workflows, telemetry aggregation and
 //! the HTTP diagnostic surface.
 //!
-//! One graph module composed of five components (standards
+//! One graph module composed of four components (standards
 //! `fluxor-modules.md` §8):
 //!
 //!   - [`rbac`]      — role-based admission for admin commands.
 //!   - [`admin`]     — idempotency-keyed admin workflows → raft.
 //!   - [`telemetry`] — metrics fan-in, readiness, /metrics export.
 //!   - [`http`]      — diagnostic + write-bridge request handling
-//!                     (`http` feature).
-//!   - [`ingress`]   — HTTP/1.1 listener on a dedicated `linux_net`
-//!                     port (`http` feature).
+//!                     (`http` feature). HTTP mechanics live outside
+//!                     the module: wave's `http` module (`app`
+//!                     variant) parses the wire and delivers
+//!                     `HttpRequest` envelopes on `request`; replies
+//!                     leave as `HttpResponse` envelopes on
+//!                     `response`.
 //!
 //! Every admin command — wire or HTTP — is admitted through the rbac
 //! component; there is no path around it. The `headless` variant
-//! carries no HTTP surface at all: the `http`/`ingress` components
-//! are compiled out and their ports are absent from the manifest.
+//! carries no HTTP surface at all: the `http` component is compiled
+//! out and its ports are absent from the manifest.
 //!
 //! ## Dispatch table
 //!
@@ -23,26 +26,25 @@
 //! owned HERE and nowhere else. Components never call each other:
 //! each returns message-shaped records (requests, verdicts, staged
 //! responses) and the routing between them — request → http,
-//! admin envelope → rbac → admin, response → ingress ring — happens
-//! in `module_step`'s loops (standards fluxor-modules.md §8):
+//! admin envelope → rbac → admin — happens in `module_step`'s loops
+//! (standards fluxor-modules.md §8):
 //!
 //!   1. `telemetry` — drain ingest, recompute readiness, emit tick.
 //!      (Heaviest single step on the emit tick: one global + up to 32
 //!      per-module histogram scrapes, export ≤ 7400 B.)
-//!   2. on an emit tick: refresh the http caches and the ingress
-//!      readiness byte from telemetry's snapshot values.
+//!   2. on an emit tick: refresh the http caches from telemetry's
+//!      snapshot values.
 //!   3. `rbac`  — identity bindings, then the wire admin-command
 //!      loop (≤4): each authorized envelope delivers into `admin`
 //!      same-step, here.
 //!   4. `admin` — apply acknowledgements, direct-inject commands.
-//!   5. `http`  — proposal feedback loops (assignments, ≤8
-//!      rejections, ≤16 applies, one expiry — each pull gated on
-//!      ingress ring space), self-telemetry into `telemetry`.
-//!   6. `http` `request` loop (≤8) — externally-parsed HTTP
-//!      requests, handled on the same terms as listener traffic;
-//!      their replies egress on `response`.
-//!   7. `ingress` — bind, net-event loop (≤16; parsed requests
-//!      route through `http` same-step), response ring → wire.
+//!   5. `http`  — proposal feedback loops (assignments, the
+//!      `/metrics` stream, ≤8 rejections, ≤16 applies, one expiry —
+//!      each pull gated on `response` writability), self-telemetry
+//!      into `telemetry`.
+//!   6. `http` `request` loop (≤8) — wave `HttpRequest` envelopes,
+//!      each pull likewise gated on `response` writability; replies
+//!      egress on `response`.
 //!
 //! Per-component step bounds are documented on each component's
 //! `step`; the sum stays well inside the runtime step guard.
@@ -89,12 +91,10 @@ mod telemetry;
 
 #[cfg(feature = "http")]
 mod http;
-#[cfg(feature = "http")]
-mod ingress;
 
 /// Step-return code classifying this step as bursty work for the
-/// scheduler (same contract as wal's STEP_BURST): set when the HTTP
-/// path advanced a request or response.
+/// scheduler (same contract as wal's STEP_BURST): set when the http
+/// component advanced a request, reply or stream slice.
 const STEP_BURST: i32 = 2;
 
 define_params! {
@@ -119,34 +119,25 @@ define_params! {
 
     4, emit_interval_ms, u16, 1000
         => |s, d, len| { s.telemetry.emit_interval_ms = p_u16(d, len, 0, 1000) as u64; };
-
-    5, listen_port, u16, 9090
-        => |s, d, len| { s.listen_port = p_u16(d, len, 0, 9090); };
 }
 
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    /// HTTP listener port (param `listen_port`). Held here so the
-    /// param table is variant-independent; copied into the ingress
-    /// component when the HTTP surface is present.
-    listen_port: u16,
 
     rbac: rbac::Rbac,
     admin: admin::Admin,
     telemetry: telemetry::Telemetry,
     #[cfg(feature = "http")]
     http: http::Http,
-    #[cfg(feature = "http")]
-    ingress: ingress::Ingress,
 
     /// Per-component step-time histograms (§8 rule 8), owned by the
-    /// dispatch table: [telemetry, rbac, admin, http, ingress]. The
-    /// headless variant leaves the http/ingress entries idle. Each
-    /// dispatch section is charged to its driving component; routing
-    /// chains bill the section owner. Delivered message-shaped to the
-    /// in-module telemetry component on a 1 s tick.
-    comp_step: [step_accounting::CompStepHist; 5],
+    /// dispatch table: [telemetry, rbac, admin, http]. The headless
+    /// variant leaves the http entry idle. Each dispatch section is
+    /// charged to its driving component; routing chains bill the
+    /// section owner. Delivered message-shaped to the in-module
+    /// telemetry component on a 1 s tick.
+    comp_step: [step_accounting::CompStepHist; 4],
     comp_step_last_ms: u64,
 }
 
@@ -188,15 +179,12 @@ pub extern "C" fn module_new(
         let s = &mut *(state as *mut ModuleState);
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
-        s.listen_port = 9090;
 
         rbac::init(&mut s.rbac);
         admin::init(&mut s.admin);
         telemetry::init(&mut s.telemetry, sys);
         #[cfg(feature = "http")]
         http::init(&mut s.http);
-        #[cfg(feature = "http")]
-        ingress::init(&mut s.ingress);
 
         // Port handles. Indices follow the manifest declaration order;
         // the headless variant omits the HTTP ports and leaves their
@@ -215,41 +203,30 @@ pub extern "C" fn module_new(
         s.telemetry.out_readyz = dev_channel_port(sys, 1, 5);
         s.telemetry.out_why = dev_channel_port(sys, 1, 6);
         s.telemetry.out_export = dev_channel_port(sys, 1, 7);
-        s.rbac.out_authorized = dev_channel_port(sys, 1, 10);
+        s.rbac.out_authorized = dev_channel_port(sys, 1, 9);
         #[cfg(feature = "http")]
         {
-            s.ingress.in_net = dev_channel_port(sys, 0, 5);
-            s.http.in_proposal_assigned = dev_channel_port(sys, 0, 6);
-            s.http.in_applied = dev_channel_port(sys, 0, 7);
-            s.http.in_proposal_rejected = dev_channel_port(sys, 0, 8);
-            s.http.in_request = dev_channel_port(sys, 0, 9);
-            s.ingress.out_net = dev_channel_port(sys, 1, 8);
-            s.http.out_proposal = dev_channel_port(sys, 1, 9);
-            s.http.out_response = dev_channel_port(sys, 1, 11);
+            s.http.in_proposal_assigned = dev_channel_port(sys, 0, 5);
+            s.http.in_applied = dev_channel_port(sys, 0, 6);
+            s.http.in_proposal_rejected = dev_channel_port(sys, 0, 7);
+            s.http.in_request = dev_channel_port(sys, 0, 8);
+            s.http.out_proposal = dev_channel_port(sys, 1, 8);
+            s.http.out_response = dev_channel_port(sys, 1, 10);
         }
 
-        s.comp_step = [step_accounting::CompStepHist::new(); 5];
+        s.comp_step = [step_accounting::CompStepHist::new(); 4];
         s.comp_step_last_ms = 0;
 
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
         }
-        #[cfg(feature = "http")]
-        {
-            s.ingress.listen_port = s.listen_port;
-        }
 
         dev_log(sys, 3, b"[rbac] init".as_ptr(), 11);
         dev_log(sys, 3, b"[admin] init".as_ptr(), 12);
         dev_log(sys, 3, b"[tele] init".as_ptr(), 11);
         #[cfg(feature = "http")]
-        {
-            dev_log(sys, 3, b"[http] init".as_ptr(), 11);
-            let mut buf = [0u8; 48];
-            let n = ingress::format_init(&mut buf, s.ingress.listen_port);
-            dev_log(sys, 3, buf.as_ptr(), n);
-        }
+        dev_log(sys, 3, b"[http] init".as_ptr(), 11);
         0
     }
 }
@@ -278,7 +255,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let (ready, export) = telemetry::snapshot(&s.telemetry);
             let timing_pause = telemetry::timing_pause_reason(&s.telemetry);
             http::cache_export(&mut s.http, ready, timing_pause, export);
-            ingress::deliver_ready(&mut s.ingress, ready as u8);
         }
 
         let t1 = dev_micros(sys);
@@ -308,34 +284,30 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         #[cfg(feature = "http")]
         {
             // http: own drains, then the response-producing feedback
-            // loops — each pull gated on ring space, so a response is
-            // staged only when the ingress ring can take it.
-            let mut t0 = dev_micros(sys);
+            // loops — each pull gated on `response` writability, so
+            // feedback is consumed only with somewhere to answer.
+            let t0 = dev_micros(sys);
             http::step(&mut s.http, sys);
             for _ in 0..8 {
-                if !ingress::response_writable(&s.ingress) {
+                if !http::response_writable(&s.http, sys) {
                     break;
                 }
                 match http::next_rejection(&mut s.http, sys) {
                     http::Feedback::Empty => break,
                     http::Feedback::Handled => {}
-                    http::Feedback::Respond(q) => queue_http_response(s, sys, q),
                 }
             }
             for _ in 0..16 {
-                if !ingress::response_writable(&s.ingress) {
+                if !http::response_writable(&s.http, sys) {
                     break;
                 }
                 match http::next_applied(&mut s.http, sys) {
                     http::Feedback::Empty => break,
                     http::Feedback::Handled => {}
-                    http::Feedback::Respond(q) => queue_http_response(s, sys, q),
                 }
             }
-            if ingress::response_writable(&s.ingress) {
-                if let http::Feedback::Respond(q) = http::expire_step(&mut s.http, sys, now) {
-                    queue_http_response(s, sys, q);
-                }
+            if http::response_writable(&s.http, sys) {
+                http::expire_step(&mut s.http, sys, now);
             }
             if let Some(samples) = http::take_metrics(&mut s.http, now) {
                 for &(metric_id, kind, value) in samples.iter() {
@@ -351,9 +323,21 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
 
-            // Externally-parsed requests off the `request` port.
+            // Requests off the `request` port (wave HttpRequest
+            // envelopes). Gated on `response` writability like the
+            // feedback loops — a request is never consumed without
+            // somewhere to answer, so wave applies the backpressure
+            // instead of the reply being dropped.
+            //
+            // Stale reply state needs no connection-boundary purge
+            // here: wave's per-request `stream_id` generation keeps a
+            // late answer from matching a recycled conn id, and the
+            // 10 s proposal timeout frees the slots.
             let mut ext = http::ExtReq::new();
             for _ in 0..8 {
+                if !http::response_writable(&s.http, sys) {
+                    break;
+                }
                 match http::next_external_request(&mut s.http, sys, &mut ext) {
                     http::ExtPulled::Empty => break,
                     http::ExtPulled::Skipped => {}
@@ -362,6 +346,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         sys,
                         now,
                         ext.conn_id,
+                        ext.stream_id,
                         ext.method,
                         ext.path_len as usize,
                         ext.body_len as usize,
@@ -371,35 +356,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
 
-            let t1 = dev_micros(sys);
-            s.comp_step[3].record(t1.wrapping_sub(t0));
-            t0 = t1;
-
-            // ingress: bind, net-event loop, response ring → wire.
-            ingress::begin_step(&mut s.ingress, sys);
-            let mut req = ingress::ParsedReq::new();
-            for _ in 0..16 {
-                match ingress::next_event(&mut s.ingress, sys, &mut req) {
-                    ingress::Pull::Empty => break,
-                    ingress::Pull::Handled => {}
-                    // Connection lifecycle edge: deferred per-conn
-                    // reply state must not survive into a reused id.
-                    ingress::Pull::ConnBoundary(cid) => http::purge_conn(&mut s.http, cid),
-                    ingress::Pull::Request => route_http_request(
-                        s,
-                        sys,
-                        now,
-                        req.conn_id,
-                        req.method,
-                        req.path_len as usize,
-                        req.body_len as usize,
-                        &req.path,
-                        &req.body,
-                    ),
-                }
-            }
-            ingress::finish_step(&mut s.ingress, sys);
-            s.comp_step[4].record(dev_micros(sys).wrapping_sub(t0));
+            s.comp_step[3].record(dev_micros(sys).wrapping_sub(t0));
         }
 
         // Per-component step accounting (§8 rule 8): hand each
@@ -407,14 +364,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // in-module telemetry component every second.
         if now.wrapping_sub(s.comp_step_last_ms) >= 1000 {
             s.comp_step_last_ms = now;
-            const COMP_IDS: [u8; 5] = [
+            const COMP_IDS: [u8; 4] = [
                 wire::SOURCE_ID_TELEMETRY,
                 wire::SOURCE_ID_RBAC,
                 wire::SOURCE_ID_ADMIN,
                 wire::SOURCE_ID_HTTP,
-                wire::SOURCE_ID_INGRESS,
             ];
-            let present: usize = if cfg!(feature = "http") { 5 } else { 3 };
+            let present: usize = if cfg!(feature = "http") { 4 } else { 3 };
             for c in 0..present {
                 let cum = s.comp_step[c].cumulative();
                 for (i, &v) in cum.iter().enumerate() {
@@ -432,7 +388,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         #[cfg(feature = "http")]
-        if ingress::took_work(&s.ingress) {
+        if http::take_worked(&mut s.http) {
             return STEP_BURST;
         }
 
@@ -465,24 +421,10 @@ unsafe fn route_admin(
     authorized
 }
 
-/// Queue one http-staged response on the ingress response ring. The
-/// body lives in the http component's staging slot; the two borrows
-/// are disjoint fields of the module state.
-///
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut ModuleState` and a valid
-/// `&SyscallTable` per the module ABI.
-#[cfg(feature = "http")]
-unsafe fn queue_http_response(s: &mut ModuleState, sys: &SyscallTable, q: http::Queued) {
-    let ModuleState { http, ingress, .. } = s;
-    ingress::queue_response(ingress, sys, q.conn_id, q.status, http::staged_body(http, q.len));
-}
-
-/// Route one parsed HTTP request (listener or `request`-port) through
-/// `http::on_request`, then walk its outcome: queue the listener
-/// response, or run the admin envelope through [`route_admin`] and
-/// complete the reply via `http::finish_admin`.
+/// Route one parsed HTTP request through `http::on_request`, then
+/// walk its outcome: replies egress inside the call, and admin
+/// envelopes run through [`route_admin`] before `http::finish_admin`
+/// completes the reply.
 ///
 /// # Safety
 ///
@@ -494,25 +436,30 @@ unsafe fn route_http_request(
     s: &mut ModuleState,
     sys: &SyscallTable,
     now: u64,
-    conn_id: u8,
+    conn_id: u16,
+    stream_id: u16,
     method: u8,
     path_len: usize,
     body_len: usize,
     path: &[u8],
     body: &[u8],
 ) {
-    match http::on_request(&mut s.http, sys, conn_id, method, &path[..path_len], &body[..body_len])
-    {
+    match http::on_request(
+        &mut s.http,
+        sys,
+        conn_id,
+        stream_id,
+        method,
+        &path[..path_len],
+        &body[..body_len],
+    ) {
         http::ReqOut::Done => {}
-        http::ReqOut::Queue(q) => queue_http_response(s, sys, q),
         http::ReqOut::Admin { op_code, len } => {
             let mut env = [0u8; 1024];
             let src = http::admin_env(&s.http, len);
             env[..src.len()].copy_from_slice(src);
             let authorized = route_admin(s, sys, now, rbac::Origin::Http, len as usize, &env);
-            if let Some(q) = http::finish_admin(&mut s.http, sys, conn_id, op_code, authorized) {
-                queue_http_response(s, sys, q);
-            }
+            http::finish_admin(&mut s.http, sys, conn_id, stream_id, op_code, authorized);
         }
     }
 }

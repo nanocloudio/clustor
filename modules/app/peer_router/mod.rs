@@ -816,13 +816,13 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                 // payload: [conn_id: u16 LE][local_port: u16 LE]
                 //
                 // We share `net_in` (linux_net / ip `net_out`) with the
-                // other anchors on this node — the operations ingress binds its
-                // own diagnostic port on the same provider. The provider
+                // other anchors on this node — wave's `http` module binds
+                // the diagnostic port on the same provider. The provider
                 // tees every MSG_ACCEPTED to all anchors and stamps the
                 // accepting listener's port so each anchor claims only
                 // the conns its own CMD_BIND accepted (see fluxor
                 // `ip::net_send_accepted` / `linux_net` providers). Without
-                // this filter peer_router would alloc a slot for an
+                // this filter peer_router would alloc a slot for a
                 // diagnostic HTTP connection and forward its raw HTTP
                 // bytes to the gateway as a bogus client proposal.
                 let local_port = if payload_len >= 4 {

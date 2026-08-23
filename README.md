@@ -121,7 +121,7 @@ fluxor mailbox channels.
 | `gateway`       | surface, codec, throttle | Client framing, proposal tagging, admission |
 | `admission`     | proof_cache, read_gate, flow | Proof cache, read gating, PID flow control |
 | `control_plane` | cp, placement | Control-plane proof and placement feed |
-| `operations`    | rbac, admin, telemetry, http, ingress | Admin commands, metrics, diagnostic HTTP |
+| `operations`    | rbac, admin, telemetry, http | Admin commands, metrics, diagnostic HTTP |
 
 The full wiring is the graph embedded in
 [`docs/guides/running.md`](docs/guides/running.md);

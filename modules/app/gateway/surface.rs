@@ -36,9 +36,6 @@ pub enum Inbound {
 pub struct Surface {
     pub in_requests: i32,        // in: cleartext MSG_CLIENT_FRAME from peer_router
     pub in_admin_resp: i32,      // in: AdminResponse from operations
-    pub in_readyz: i32,          // in: readyz from operations
-    pub in_why: i32,             // in: why from operations
-    pub in_metrics: i32,         // in: export from operations
     pub out_raft_rpc: i32,       // out: Raft RPC to consensus
     pub out_admin_req: i32,      // out: admin requests to operations
     pub out_responses: i32,      // out: responses back to peer_router
@@ -66,9 +63,6 @@ pub struct Surface {
 pub unsafe fn init(su: &mut Surface) {
     su.in_requests = -1;
     su.in_admin_resp = -1;
-    su.in_readyz = -1;
-    su.in_why = -1;
-    su.in_metrics = -1;
     su.out_raft_rpc = -1;
     su.out_admin_req = -1;
     su.out_responses = -1;
@@ -254,14 +248,6 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
 pub unsafe fn finish_step(su: &mut Surface, sys: &SyscallTable) {
     let _ = flush_retry(su, sys);
     forward_admin_responses(su, sys);
-
-    // Drain telemetry/status inputs (these produce diagnostic
-    // responses on /readyz, /why, /metrics endpoints — for now
-    // drain to prevent backpressure; wire-side diagnostic framing
-    // is future work)
-    drain_input(sys, su.in_readyz, &mut su.msg_buf);
-    drain_input(sys, su.in_why, &mut su.msg_buf);
-    drain_input(sys, su.in_metrics, &mut su.msg_buf);
 }
 
 /// Send one codec-resolved [`codec::Outbound`] to peer_router.
@@ -384,7 +370,7 @@ unsafe fn flush_retry(su: &mut Surface, sys: &SyscallTable) -> bool {
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn ready_to_send(su: &mut Surface, sys: &SyscallTable) -> bool {
     if su.out_responses < 0 {
-        // Unwired responses port: drain-and-drop, as before.
+        // Unwired responses port: nothing to flush, nothing to gate.
         return true;
     }
     if !flush_retry(su, sys) {
@@ -427,21 +413,5 @@ unsafe fn forward_admin_responses(su: &mut Surface, sys: &SyscallTable) {
         }
         local[..pl].copy_from_slice(&su.msg_buf[..pl]);
         send_response(su, sys, msg_type, &local[..pl]);
-    }
-}
-
-unsafe fn drain_input(sys: &SyscallTable, chan: i32, buf: &mut [u8]) {
-    if chan < 0 {
-        return;
-    }
-    for _ in 0..4 {
-        let poll = (sys.channel_poll)(chan, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
-            break;
-        }
-        let n = (sys.channel_read)(chan, buf.as_mut_ptr(), 2048);
-        if n <= 0 {
-            break;
-        }
     }
 }

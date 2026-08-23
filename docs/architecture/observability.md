@@ -131,12 +131,13 @@ own; the raft gauge is where it surfaces in `/metrics`.
 
 ## HTTP surface
 
-The operations module's ingress and http components serve five
-routes (`operations/ingress.rs`, `operations/http.rs`):
+The operations module's http component serves five routes
+(`operations/http.rs`), behind wave's `http` module on the dedicated
+diagnostic listener (see [../guides/net_http.md](../guides/net_http.md)):
 
 | Route | Behaviour |
 |---|---|
-| `GET /readyz` | One-byte body (0 or 1); status 200 when ready, 503 otherwise. Answered from a cached byte, short-circuited inside ingress. |
+| `GET /readyz` | One-byte body (0 or 1); status 200 when ready, 503 otherwise. Answered from a cached byte. |
 | `GET /why` | Two-byte body: format version (1) followed by `timing_pause_reason` (`wire::TIMING_PAUSE_*`), stating why deterministic time production is paused on this node, 0 when producing. |
 | `GET /metrics` | The cached binary export described above. |
 | `POST /propose` | Synchronous write bridge; the response is deferred until apply acknowledges the assigned WAL index. |

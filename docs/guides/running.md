@@ -83,8 +83,15 @@ modules:
   - name: control_plane
   - name: admission
   - name: operations
-    params:
-      listen_port: __HTTP_PORT__
+  # wave http (`app` variant): terminates the diagnostic listener and
+  # exchanges HttpRequest/HttpResponse envelopes with operations.
+  - name: http
+    variant: app
+    port: __HTTP_PORT__
+    host_tcp: 1
+    routes:
+      - path: "/"
+        app: true
 wiring:
   # ── linux_net ↔ peer_router (no TLS) ─────────────────────
   - from: linux_net.net_out
@@ -210,18 +217,20 @@ wiring:
     to: operations.ingest
   - from: gateway.metrics
     to: operations.ingest
-  - from: operations.readyz
-    to: gateway.readyz_data
-  - from: operations.why
-    to: gateway.why_data
-  - from: operations.export
-    to: gateway.metrics_data
 
   # ── HTTP diagnostic surface ──────────────────────────────────
   - from: linux_net.net_out
-    to: operations.net_in
-  - from: operations.net_out
+    to: http.net_in
+  - from: http.net_out
     to: linux_net.net_in
+  # Mailbox mode (`buffer_group`) is REQUIRED on both envelope
+  # edges: one write = one whole envelope; distinct groups.
+  - from: http.req_out
+    to: operations.request
+    buffer_group: 1
+  - from: operations.response
+    to: http.resp_in
+    buffer_group: 2
 EOF
 ```
 
@@ -288,8 +297,15 @@ modules:
   - name: control_plane
   - name: admission
   - name: operations
-    params:
-      listen_port: __HTTP_PORT__
+  # wave http (`app` variant): terminates the diagnostic listener and
+  # exchanges HttpRequest/HttpResponse envelopes with operations.
+  - name: http
+    variant: app
+    port: __HTTP_PORT__
+    host_tcp: 1
+    routes:
+      - path: "/"
+        app: true
 wiring:
   # ── Transport: linux_net ↔ peer_router ─────────────────────
   - from: linux_net.net_out
@@ -425,18 +441,20 @@ wiring:
     to: operations.ingest
   - from: gateway.metrics
     to: operations.ingest
-  - from: operations.readyz
-    to: gateway.readyz_data
-  - from: operations.why
-    to: gateway.why_data
-  - from: operations.export
-    to: gateway.metrics_data
 
   # ── HTTP diagnostic surface ──────────────────────────────────
   - from: linux_net.net_out
-    to: operations.net_in
-  - from: operations.net_out
+    to: http.net_in
+  - from: http.net_out
     to: linux_net.net_in
+  # Mailbox mode (`buffer_group`) is REQUIRED on both envelope
+  # edges: one write = one whole envelope; distinct groups.
+  - from: http.req_out
+    to: operations.request
+    buffer_group: 1
+  - from: operations.response
+    to: http.resp_in
+    buffer_group: 2
 EOF
 ```
 
