@@ -235,6 +235,9 @@ const NSOCK_STREAM: u8 = net_proto::SOCK_TYPE_STREAM;
 const ID_MAGIC: u16 = 0xC1A0;
 const ID_MSG_LEN: usize = 3;
 
+/// Longest key fingerprint `MSG_PEER_IDENTITY` can carry (SHA-256).
+const PEER_FP_MAX: usize = 32;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Conn {
@@ -244,13 +247,20 @@ struct Conn {
     active: bool,
     outbound: bool,   // we initiated
     identified: bool, // identity handshake complete
-    /// True once `MSG_PEER_IDENTITY` from the TLS layer pinned this
-    /// connection's `replica_id`. Plaintext-handshake bindings are
-    /// only honoured when this is false; once a TLS-verified identity
-    /// arrives, contradicting plaintext claims are rejected and the
-    /// connection is marked unidentifiable (replica_id = -1). See
-    /// RFC §5.1.
+    /// True once `MSG_PEER_IDENTITY` from the TLS layer reported an
+    /// established peer credential on this connection: the chain
+    /// reached a configured anchor and the peer proved possession of
+    /// the key. It does NOT say which replica the peer is — the
+    /// transport has no notion of a replica id, and the field that
+    /// used to claim otherwise is gone (see `wire::MSG_PEER_IDENTITY`).
+    /// What it buys is `peer_fp`: a plaintext claim of a replica id is
+    /// refused when another connection already holds that id under a
+    /// different key.
     tls_verified: bool,
+    /// The peer's key fingerprint from `MSG_PEER_IDENTITY`, valid only
+    /// while `tls_verified`.
+    peer_fp: [u8; PEER_FP_MAX],
+    peer_fp_len: u8,
     /// Pre-identify fragment: bytes of a connection's opening data
     /// that arrived in a chunk shorter than the 3-byte handshake
     /// magic. Buffered here (never dropped) until enough bytes exist
@@ -278,6 +288,8 @@ impl Conn {
             outbound: false,
             identified: false,
             tls_verified: false,
+            peer_fp: [0; PEER_FP_MAX],
+            peer_fp_len: 0,
             frag_len: 0,
             frag: [0; ID_MSG_LEN],
             identity_pending: false,
@@ -572,15 +584,17 @@ unsafe fn drain_tls_identity(s: &mut ModuleState, sys: &SyscallTable) {
             continue;
         }
         let pl = plen as usize;
-        let (conn_id, replica_id, verified, _svid_off) =
-            match wire::decode_peer_identity(&s.buf[..pl]) {
-                Some(v) => v,
-                None => continue,
-            };
-        // Find the matching connection slot.
-        // NOTE: MSG_PEER_IDENTITY (clustor-internal wire format) still
-        // carries a u8 conn id; the transport's u16 ids above 255
-        // cannot be matched by the TLS layer until that format widens.
+        let Some(id) = wire::decode_peer_identity(&s.buf[..pl]) else {
+            continue;
+        };
+        // Copy the fingerprint out of the shared scratch buffer before
+        // taking a `&mut` borrow of the connection table.
+        let fp_len = id.fingerprint_len.min(PEER_FP_MAX);
+        let mut fp = [0u8; PEER_FP_MAX];
+        fp[..fp_len].copy_from_slice(&s.buf[id.fingerprint_at..id.fingerprint_at + fp_len]);
+        let established = id.is_established();
+        let conn_id = id.conn_id();
+
         let mut slot_idx: Option<usize> = None;
         for (i, c) in s.conns.iter().enumerate() {
             if c.active && c.conn_id == conn_id as u16 {
@@ -590,24 +604,47 @@ unsafe fn drain_tls_identity(s: &mut ModuleState, sys: &SyscallTable) {
         }
         let Some(i) = slot_idx else { continue };
         let c = &mut s.conns[i];
-        if replica_id == 0xFF {
-            // TLS layer revoked identity (e.g. mid-session
-            // re-handshake mismatch). Strip the binding.
+        if !established || fp_len == 0 {
+            // The peer offered no usable credential, or one that
+            // failed a check the profile required. Strip whatever the
+            // in-band handshake may have bound: a connection that
+            // cannot be authenticated must not route as a Raft peer.
             c.replica_id = -1;
             c.identified = false;
             c.tls_verified = false;
-            dev_log(sys, 2, b"[pr] tls revoked".as_ptr(), 16);
+            c.peer_fp_len = 0;
+            dev_log(sys, 2, b"[pr] tls unverified".as_ptr(), 19);
             continue;
         }
-        if (replica_id as usize) >= MAX_NODES {
-            dev_log(sys, 2, b"[pr] tls bad rid".as_ptr(), 16);
-            continue;
-        }
-        c.replica_id = replica_id as i8;
-        c.identified = true;
-        c.tls_verified = verified;
-        dev_log(sys, 3, b"[pr] tls bound".as_ptr(), 14);
+        c.tls_verified = true;
+        c.peer_fp = fp;
+        c.peer_fp_len = fp_len as u8;
+        dev_log(sys, 3, b"[pr] tls keyed".as_ptr(), 14);
     }
+}
+
+/// Whether some OTHER active connection already holds `replica_id`
+/// under a key fingerprint different from `fp`.
+///
+/// This is what replaced the transport naming the replica. Two peers
+/// cannot both be replica 3 while presenting different keys, so the
+/// second claim is refused rather than allowed to displace the first
+/// — which is how a peer that authenticated as *somebody* is stopped
+/// from routing as *anybody*.
+fn replica_held_by_other_key(s: &ModuleState, slot: usize, replica_id: u8, fp: &[u8]) -> bool {
+    for (i, c) in s.conns.iter().enumerate() {
+        if i == slot || !c.active || !c.tls_verified || c.peer_fp_len == 0 {
+            continue;
+        }
+        if c.replica_id != replica_id as i8 {
+            continue;
+        }
+        let held = &c.peer_fp[..c.peer_fp_len as usize];
+        if held != fp {
+            return true;
+        }
+    }
+    false
 }
 
 // ── Bind ────────────────────────────────────────────────────
@@ -1200,23 +1237,24 @@ unsafe fn handle_identity(
 
     let peer_id = hdr[2];
 
-    // RFC §5.1: a TLS-verified binding takes precedence over the
-    // plaintext handshake. If the in-band claim contradicts a
-    // previously TLS-pinned identity, drop the binding and mark the
-    // connection unidentifiable so subsequent traffic can't route as
-    // a Raft peer.
+    // RFC §5.1: the in-band claim names the replica; the TLS layer
+    // says which key made it. The transport cannot name a replica
+    // itself — it has no idea what one is — so the check is that the
+    // claim is consistent across keys rather than that it matches a
+    // transport-supplied id.
     if s.conns[slot].tls_verified {
-        if s.conns[slot].replica_id != peer_id as i8 {
-            dev_log(&*s.syscalls, 2, b"[pr] tls/plain mismatch".as_ptr(), 23);
+        let fp_len = s.conns[slot].peer_fp_len as usize;
+        let mut fp = [0u8; PEER_FP_MAX];
+        fp[..fp_len].copy_from_slice(&s.conns[slot].peer_fp[..fp_len]);
+        if replica_held_by_other_key(s, slot, peer_id, &fp[..fp_len]) {
+            dev_log(&*s.syscalls, 2, b"[pr] replica key clash".as_ptr(), 22);
             s.conns[slot].replica_id = -1;
             s.conns[slot].identified = false;
             return false;
         }
-        // Match — keep the existing (TLS-verified) binding.
-    } else {
-        s.conns[slot].replica_id = peer_id as i8;
-        s.conns[slot].identified = true;
     }
+    s.conns[slot].replica_id = peer_id as i8;
+    s.conns[slot].identified = true;
     s.peer_addrs[peer_id as usize].connected = true;
     {
         let mut m = *b"[pr] conn up p=?";

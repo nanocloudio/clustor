@@ -300,29 +300,41 @@ unsafe fn drain_identity(r: &mut Rbac, sys: &SyscallTable) {
             continue;
         }
         let pl = plen as usize;
-        let (conn_id, replica_id, verified, svid_off) =
-            match wire::decode_peer_identity(&r.msg_buf[..pl]) {
-                Some(v) => v,
-                None => continue,
-            };
-        // `replica_id == 0xFF` is the transport's explicit revoke
-        // (`wire::MSG_PEER_IDENTITY`: "clears any previously bound
-        // identity") — connection torn down or TLS re-handshake
-        // mismatch. The binding dies here; a later client reusing
-        // the conn_id evaluates as `default_role` until its own
-        // handshake binds an identity.
-        if replica_id == 0xFF {
+        let Some(id) = wire::decode_peer_identity(&r.msg_buf[..pl]) else {
+            continue;
+        };
+        let conn_id = id.conn_id();
+        // A record that establishes nothing is a revoke: the peer
+        // offered no usable credential, or one that failed a check
+        // its profile required. The binding dies here; a later client
+        // reusing the conn_id evaluates as `default_role` until its
+        // own handshake binds an identity.
+        if !id.is_established() {
             clear_binding(r, conn_id);
             continue;
         }
-        // Copy the SVID out of the shared scratch buffer first so the
+        // Roles are granted by NAME, so a role is granted only when
+        // the name was actually verified. `has_principal` is false
+        // unless the chain reached an anchor AND the SAN matched the
+        // profile's rule — without both, the bytes in the certificate
+        // are a claim rather than an identity, and the peer falls
+        // through to `default_role`. This is the substance of the
+        // change: the old envelope's `verified` boolean could not say
+        // which checks ran, so a name was trusted whenever any part
+        // of the handshake succeeded.
+        let name_len = if id.has_principal() {
+            id.principal_len.min(SVID_PREFIX_MAX)
+        } else {
+            0
+        };
+        // Copy the name out of the shared scratch buffer first so the
         // subsequent `&mut r` borrow doesn't clash with the slice.
-        let svid_len = pl.saturating_sub(svid_off).min(SVID_PREFIX_MAX);
-        let mut svid_local = [0u8; SVID_PREFIX_MAX];
-        if svid_len > 0 {
-            svid_local[..svid_len].copy_from_slice(&r.msg_buf[svid_off..svid_off + svid_len]);
+        let mut name_local = [0u8; SVID_PREFIX_MAX];
+        if name_len > 0 {
+            name_local[..name_len]
+                .copy_from_slice(&r.msg_buf[id.principal_at..id.principal_at + name_len]);
         }
-        record_identity(r, conn_id, verified, &svid_local[..svid_len]);
+        record_identity(r, conn_id, true, &name_local[..name_len]);
     }
 }
 

@@ -758,65 +758,126 @@ pub const MSG_SNAPSHOT_INSTALLED: u8 = 0x55;
 /// See RFC §4.2 of the phase-3 plan.
 pub const MSG_SNAPSHOT_INSTALL_REQUEST: u8 = 0x56;
 
-/// TLS peer identity binding from the foundation `tls` module to
-/// `peer_router`. Fired once per accepted/established TLS session;
-/// `peer_router` keys the connection's `replica_id` from this
-/// envelope and refuses to honour any in-band plaintext handshake
-/// that disagrees. Until fluxor TLS exposes the SVID this envelope
-/// remains the binding-contract surface — operators can stub it via
-/// a sidecar module that reads cert metadata directly.
+/// TLS peer identity from the foundation `tls` module to
+/// `peer_router` and `operations`' RBAC. Fired once per accepted or
+/// established TLS session. A consumer keys the connection's
+/// authorisation from this record and refuses to honour any in-band
+/// plaintext handshake that disagrees.
+///
+/// The record is fluxor's — `modules/foundation/tls/mod.rs` owns the
+/// format and this is a mirror of it, not a second definition. It
+/// replaced a `[conn_id][replica_id][verified][svid_len][svid]`
+/// payload in which the transport was expected to name a clustor
+/// replica id. It never could: fluxor has no idea what a replica is
+/// and always wrote `0xFF`, which was this repo's "clear the
+/// binding" sentinel, so every TLS identity envelope tore down the
+/// binding it was supposed to establish. The replica id is now
+/// derived where it is actually known — from the peer's own
+/// handshake, cross-checked against the fingerprint below.
 ///
 /// Payload (variable):
-///   `[conn_id:u8]
-///    [replica_id:u8]
-///    [verified:u8 (0 = plaintext, 1 = TLS-verified)]
-///    [svid_len:u8]
-///    [svid:svid_len bytes — UTF-8 SPIFFE ID, may be empty]`
+///   `[session_id:u32 LE]
+///    [verification_result:u8]
+///    [credential_kind:u8]
+///    [profile_id:u16 LE]
+///    [not_before:u64 LE][not_after:u64 LE]
+///    [verification_flags:u32 LE]
+///    [key_fp_alg:u8][key_fp_len:u8]
+///    [principal_len:u16 LE]
+///    [key_fingerprint:key_fp_len][principal:principal_len]`
 ///
-/// `replica_id == 0xFF` clears any previously bound identity for the
-/// connection (e.g. the TLS layer downgraded / mismatched). See RFC
-/// §5.1 of the phase-3 plan.
+/// `verification_result != PEER_RESULT_OK` clears any previously
+/// bound identity for the connection: the peer offered no usable
+/// credential, or one that failed a check the profile required.
 pub const MSG_PEER_IDENTITY: u8 = 0x5A;
 
-/// `MSG_PEER_IDENTITY` payload minimum size (no SVID body): 4 bytes.
-pub const PEER_IDENTITY_HDR: usize = 4;
+/// `MSG_PEER_IDENTITY` fixed payload size; fingerprint and principal
+/// follow.
+pub const PEER_IDENTITY_HDR: usize = 4 + 1 + 1 + 2 + 8 + 8 + 4 + 1 + 1 + 2;
 
-#[inline]
-pub fn encode_peer_identity(
-    buf: &mut [u8],
-    conn_id: u8,
-    replica_id: u8,
-    verified: bool,
-    svid: &[u8],
-) -> usize {
-    let total = PEER_IDENTITY_HDR + svid.len();
-    if buf.len() < total {
-        return 0;
+/// Every check the profile demanded passed.
+pub const PEER_RESULT_OK: u8 = 0;
+
+/// The peer's certificate chain was validated to a configured anchor.
+pub const PEER_CHECK_CHAIN: u32 = 0x0000_0001;
+/// The SAN was parsed and matched the profile's name rule.
+pub const PEER_CHECK_SAN: u32 = 0x0000_0008;
+/// The peer proved possession of the key its credential names.
+pub const PEER_CHECK_KEY_POSSESSION: u32 = 0x0000_0010;
+
+/// A decoded `MSG_PEER_IDENTITY`, with offsets rather than slices so
+/// a caller can copy out of its own scratch buffer without holding a
+/// borrow across the copy.
+pub struct PeerIdentity {
+    pub session_id: u32,
+    pub result: u8,
+    pub flags: u32,
+    /// Offset and length of the key fingerprint within the payload.
+    pub fingerprint_at: usize,
+    pub fingerprint_len: usize,
+    /// Offset and length of the principal name. Empty unless the
+    /// chain and the SAN were both verified — fluxor drops the name
+    /// rather than report one it did not establish.
+    pub principal_at: usize,
+    pub principal_len: usize,
+}
+
+impl PeerIdentity {
+    /// Whether this record establishes an identity worth binding: the
+    /// profile's checks passed, the chain reached an anchor, and the
+    /// peer proved it holds the key. A fingerprint without those is a
+    /// value copied off a certificate anyone could present.
+    #[inline]
+    #[must_use]
+    pub fn is_established(&self) -> bool {
+        self.result == PEER_RESULT_OK
+            && (self.flags & PEER_CHECK_CHAIN) != 0
+            && (self.flags & PEER_CHECK_KEY_POSSESSION) != 0
     }
-    buf[0] = conn_id;
-    buf[1] = replica_id;
-    buf[2] = if verified { 1 } else { 0 };
-    buf[3] = svid.len().min(0xFF) as u8;
-    if !svid.is_empty() {
-        buf[PEER_IDENTITY_HDR..total].copy_from_slice(&svid[..svid.len().min(0xFF)]);
+
+    /// Whether the principal name may be used to authorize. Requires
+    /// everything `is_established` does plus a verified SAN.
+    #[inline]
+    #[must_use]
+    pub fn has_principal(&self) -> bool {
+        self.is_established() && (self.flags & PEER_CHECK_SAN) != 0 && self.principal_len > 0
     }
-    total
+
+    /// Connection ids are `u8` on this side; slot ids never reach 256.
+    #[inline]
+    #[must_use]
+    pub fn conn_id(&self) -> u8 {
+        (self.session_id & 0xFF) as u8
+    }
 }
 
 #[inline]
-pub fn decode_peer_identity(buf: &[u8]) -> Option<(u8, u8, bool, usize)> {
+#[must_use]
+pub fn decode_peer_identity(buf: &[u8]) -> Option<PeerIdentity> {
     if buf.len() < PEER_IDENTITY_HDR {
         return None;
     }
-    let conn_id = buf[0];
-    let replica_id = buf[1];
-    let verified = buf[2] != 0;
-    let svid_len = buf[3] as usize;
-    if buf.len() < PEER_IDENTITY_HDR + svid_len {
+    let session_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    let result = buf[4];
+    let flags = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
+    let fingerprint_len = buf[29] as usize;
+    let principal_len = u16::from_le_bytes([buf[30], buf[31]]) as usize;
+    let fingerprint_at = PEER_IDENTITY_HDR;
+    let principal_at = fingerprint_at + fingerprint_len;
+    if buf.len() < principal_at + principal_len {
         return None;
     }
-    Some((conn_id, replica_id, verified, PEER_IDENTITY_HDR))
+    Some(PeerIdentity {
+        session_id,
+        result,
+        flags,
+        fingerprint_at,
+        fingerprint_len,
+        principal_at,
+        principal_len,
+    })
 }
+
 /// State-machine snapshot chunk sent from a downstream consumer to
 /// `durability` (export path) or from `durability` to the
 /// downstream consumer (install path). Payload (28+ bytes):
