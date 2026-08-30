@@ -104,17 +104,22 @@ pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
     // Drain cross-node acks
     if l.in_ack >= 0 {
         for _ in 0..32 {
-            let poll = (sys.channel_poll)(l.in_ack, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, l.in_ack, &mut l.msg_buf)
+            else {
                 break;
-            }
-
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, l.in_ack, &mut l.msg_buf);
-            if msg_type != wire::MSG_FSYNC_ACK || plen < 17 {
+            };
+            if msg_type != wire::MSG_FSYNC_ACK {
                 continue;
             }
 
-            let (term, index, replica) = wire::decode_fsync_ack(&l.msg_buf);
+            // Slice to the declared payload: `msg_buf` is reused
+            // across messages, so a short frame must not read the
+            // previous one's tail.
+            let Some((term, index, replica)) =
+                wire::decode_fsync_ack(&l.msg_buf[..plen as usize])
+            else {
+                continue;
+            };
             if on_ack(l, term, index, replica) {
                 advanced = true;
             }
@@ -154,8 +159,7 @@ pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
         if l.out_quorum < 0 {
             l.proof_pending = false; // no consumer wired
         } else {
-            let poll_out = (sys.channel_poll)(l.out_quorum, 0x02);
-            if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, l.out_quorum) {
                 let mut proof = [0u8; wire::DURABILITY_PROOF_LEN];
                 wire::encode_durability_proof(
                     &mut proof,

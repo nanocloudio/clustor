@@ -80,7 +80,7 @@ e2e:
 	# gate `fluxor ci` reaches for anything under tests/ (phase 4 needs
 	# a tests/harness sub-workspace, which this project does not have).
 	cargo test --test raft_meta --test wal_scan --test wal_truncate \
-	  --test snap_pointer --test name_fence
+	  --test snap_pointer --test name_fence --test wire_codec_truncation
 	# The fault matrix mounts several nodes' composites in one crate
 	# against a process-global mock kernel: one test at a time.
 	cargo test --test raft_fault_matrix -- --test-threads=1

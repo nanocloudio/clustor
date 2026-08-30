@@ -156,6 +156,18 @@ emit a durability proof. Acknowledgements on `flushed` mean
 replicated-volatile at best, and graph validation rejects a
 wiring that expects a proof from a volatile node.
 
+The variant also decides the module's state footprint, which is
+what makes it deployable on a constrained target. Each build
+carries only the ring its retention model uses: a disk build holds
+the 8192-slot entry-location map and a single body slot, a
+volatile build holds `VOLATILE_RETENTION_SLOTS` of each. `Wal` is
+the largest component either way, so it is the dominant term:
+`size_of::<Wal>()` is 285,664 B on a disk build and 558,032 B on a
+volatile one, bounded at compile time by `WAL_FOOTPRINT_BUDGET`.
+The kernel allocates module state from `module_state_size()` rather
+than BSS, so nothing in the linker output would show a regression
+here and that assertion is what catches one.
+
 `partition_id`, `self_id` and `root_path` are shared across all
 four components, so the on-disk layout for segments and snapshots
 is chosen once per module rather than per component.

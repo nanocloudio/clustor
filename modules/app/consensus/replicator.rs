@@ -379,8 +379,7 @@ unsafe fn replicate_entries(s: &mut Repl, sys: &SyscallTable, ae: &mut SeamRing<
 
         // Check output readiness (gate kept before each pop so a frame
         // is never consumed from the ring while `net_out` is full).
-        let poll_out = (sys.channel_poll)(s.out_net, 0x02);
-        if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 { break; }
+        if !wire_channels::writable(sys, s.out_net) { break; }
 
         let (msg_type, plen) = match ae.pop(&mut s.msg_buf) {
             Some(v) => v,
@@ -435,8 +434,7 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
     // partition consensus instance (fluxor inserts a tee), so each
     // instance sees every ack and filters by its own partition_id.
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(s.in_ack, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+        if !wire_channels::readable(sys, s.in_ack) { break; }
 
         let (partition_id, msg_type, plen) =
             wire_channels::channel_read_partitioned(sys, s.in_ack, &mut s.msg_buf);
@@ -478,8 +476,7 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                     && durable_index > s.last_forwarded_durable[replica as usize]
                     && s.out_cross_durability_ack >= 0
                 {
-                    let poll_d = (sys.channel_poll)(s.out_cross_durability_ack, 0x02);
-                    if poll_d > 0 && (poll_d as u32 & 0x02) != 0 {
+                    if wire_channels::writable(sys, s.out_cross_durability_ack) {
                         let mut ack = [0u8; 17];
                         wire::encode_fsync_ack(&mut ack, term, durable_index, replica);
                         let w = wire_channels::channel_write_msg(
@@ -594,8 +591,7 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                 // the snapshot side via out_snapshot_import so it can
                 // accumulate / install (RFC §5.13).
                 if s.out_snapshot_import >= 0 {
-                    let poll_out = (sys.channel_poll)(s.out_snapshot_import, 0x02);
-                    if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+                    if wire_channels::writable(sys, s.out_snapshot_import) {
                         wire_channels::channel_write_msg(
                             sys, s.out_snapshot_import,
                             msg_type, &s.msg_buf[..plen as usize],
@@ -759,8 +755,7 @@ unsafe fn issue_wal_request(
     s.next_request_id = (s.next_request_id.wrapping_add(1) & 0x7FFF_FFFF).max(1);
     s.pending[slot_idx] = PendingWalReq { request_id, peer, wal_index, age: 0 };
 
-    let poll_out = (sys.channel_poll)(s.out_wal_request, 0x02);
-    if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, s.out_wal_request) {
         // Channel full — free the slot so we retry next tick.
         s.pending[slot_idx] = PendingWalReq::zero();
         return;
@@ -880,8 +875,7 @@ unsafe fn request_snapshot_install(s: &mut Repl, sys: &SyscallTable, target: u8)
         }
         return;
     }
-    let poll = (sys.channel_poll)(s.out_snapshot_request, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_snapshot_request) { return; }
     let buf = [target; 1];
     wire_channels::channel_write_msg(
         sys, s.out_snapshot_request, wire::MSG_SNAPSHOT_INSTALL_REQUEST, &buf,
@@ -973,8 +967,7 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
     );
     if total == 0 { return; }
 
-    let poll_out = (sys.channel_poll)(s.out_net, 0x02);
-    if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_net) { return; }
     let w = wire_channels::channel_write_routed_partitioned(
         sys,
         s.out_net,
@@ -1005,10 +998,10 @@ unsafe fn forward_snapshots(s: &mut Repl, sys: &SyscallTable) {
     if s.in_snapshot_rx < 0 { return; }
 
     for _ in 0..4 {
-        let poll = (sys.channel_poll)(s.in_snapshot_rx, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_snapshot_rx, &mut s.msg_buf);
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_snapshot_rx, &mut s.msg_buf)
+        else {
+            break;
+        };
         if plen == 0 { continue; }
 
         let pass_through = matches!(
@@ -1030,8 +1023,7 @@ unsafe fn forward_snapshots(s: &mut Repl, sys: &SyscallTable) {
         let last_chunk = msg_type == wire::MSG_INSTALL_SNAPSHOT
             && wire::decode_install_snapshot(&s.msg_buf[..plen as usize])
                 .is_some_and(|(_, _, _, _, done, _)| done);
-        let poll_out = (sys.channel_poll)(s.out_net, 0x02);
-        if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, s.out_net) {
             let w = wire_channels::channel_write_routed_partitioned(
                 sys, s.out_net, target, s.partition_id,
                 msg_type, &s.msg_buf[..plen as usize],
@@ -1082,13 +1074,7 @@ unsafe fn emit_metrics(s: &mut Repl, sys: &SyscallTable) {
         (wire::metric_ids::REPL_TIP_UNRESOLVED, kg, i64::from(s.tip_unresolved)),
         (wire::metric_ids::REPL_SNAPSHOT_DROPPED, kc, i64::from(s.snapshot_escalations_dropped)),
     ];
-    for &(metric_id, kind, value) in samples.iter() {
-        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
-        let mut sbuf = [0u8; wire::METRIC_SAMPLE_LEN];
-        wire::encode_metric_sample(&mut sbuf, mid, pid, metric_id, kind, value);
-        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &sbuf);
-    }
+    wire_channels::emit_metrics(sys, s.out_metrics, mid, pid, &samples);
 
     // rpcs_sent(4) + acks_received(4) + nacks(4) + catchup(4) = 16 bytes
     let mut buf = [0u8; 16];
@@ -1097,8 +1083,7 @@ unsafe fn emit_metrics(s: &mut Repl, sys: &SyscallTable) {
     buf[8..12].copy_from_slice(&s.nacks_received.to_le_bytes());
     buf[12..16].copy_from_slice(&s.catchup_sent.to_le_bytes());
 
-    let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-    if poll > 0 && (poll as u32 & 0x02) != 0 {
+    if wire_channels::writable(sys, s.out_metrics) {
         wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf[..16]);
     }
 }

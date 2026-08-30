@@ -244,11 +244,10 @@ unsafe fn drain_placement(c: &mut Codec, sys: &SyscallTable) {
         return;
     }
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(c.in_placement, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, c.in_placement, &mut c.msg_buf)
+        else {
             break;
-        }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, c.in_placement, &mut c.msg_buf);
+        };
         if msg_type == wire::MSG_PLACEMENT_UPDATE && plen >= 4 {
             c.placement_epoch = u32::from_le_bytes([
                 c.msg_buf[0], c.msg_buf[1], c.msg_buf[2], c.msg_buf[3],
@@ -262,11 +261,10 @@ unsafe fn drain_leader_state(c: &mut Codec, sys: &SyscallTable) {
         return;
     }
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(c.in_leader_state, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, c.in_leader_state, &mut c.msg_buf)
+        else {
             break;
-        }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, c.in_leader_state, &mut c.msg_buf);
+        };
         if msg_type != wire::MSG_LEADER_HINT || (plen as usize) < 1 {
             continue;
         }
@@ -280,16 +278,18 @@ unsafe fn drain_proposal_assigned(c: &mut Codec, sys: &SyscallTable) {
     }
     let now_ms = dev_millis(sys);
     for _ in 0..16 {
-        let poll = (sys.channel_poll)(c.in_proposal_assigned, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, c.in_proposal_assigned, &mut c.msg_buf)
+        else {
             break;
-        }
-        let (msg_type, plen) =
-            wire_channels::channel_read_msg(sys, c.in_proposal_assigned, &mut c.msg_buf);
-        if msg_type != wire::MSG_PROPOSAL_ASSIGNED || (plen as usize) < wire::PROPOSAL_ASSIGNED_LEN {
+        };
+        if msg_type != wire::MSG_PROPOSAL_ASSIGNED {
             continue;
         }
-        let (corr_id, partition_id, wal_index) = wire::decode_proposal_assigned(&c.msg_buf);
+        let Some((corr_id, partition_id, wal_index)) =
+            wire::decode_proposal_assigned(&c.msg_buf[..plen as usize])
+        else {
+            continue;
+        };
         // Look up the conn_id we recorded when emitting this proposal.
         if let Some(conn_id) = take_corr(c, corr_id) {
             put_idx(c, partition_id, wal_index, conn_id, now_ms);
@@ -328,8 +328,7 @@ pub unsafe fn next_client_request(
     if c.in_client_requests < 0 {
         return Pulled::Empty;
     }
-    let poll = (sys.channel_poll)(c.in_client_requests, 0x01);
-    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+    if !wire_channels::readable(sys, c.in_client_requests) {
         return Pulled::Empty;
     }
     let (msg_type, plen) =
@@ -403,8 +402,7 @@ pub unsafe fn on_request(
             let mut framed = [0u8; 2048];
             framed[0..8].copy_from_slice(&corr_id.to_le_bytes());
             framed[8..total].copy_from_slice(&body[..body_len]);
-            let poll_out = (sys.channel_poll)(c.out_reads, 0x02);
-            if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
+            if !wire_channels::writable(sys, c.out_reads) {
                 return Route::Done;
             }
             // Write FIRST, record on success. Recording before the
@@ -492,8 +490,7 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
     if c.in_applied < 0 {
         return None;
     }
-    let poll = (sys.channel_poll)(c.in_applied, 0x01);
-    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+    if !wire_channels::readable(sys, c.in_applied) {
         return None;
     }
 

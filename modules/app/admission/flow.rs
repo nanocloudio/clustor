@@ -93,11 +93,10 @@ pub unsafe fn step(f: &mut Flow, sys: &SyscallTable, now: u64) {
     // 1. Drain lag signals (keep latest)
     if f.in_lag >= 0 {
         for _ in 0..8 {
-            let poll = (sys.channel_poll)(f.in_lag, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, f.in_lag, &mut f.msg_buf)
+            else {
                 break;
-            }
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, f.in_lag, &mut f.msg_buf);
+            };
             if msg_type == wire::MSG_LAG_SIGNAL && plen >= 4 {
                 f.current_lag = i32::from_le_bytes([
                     f.msg_buf[0], f.msg_buf[1], f.msg_buf[2], f.msg_buf[3],
@@ -175,8 +174,7 @@ pub unsafe fn step(f: &mut Flow, sys: &SyscallTable, now: u64) {
 
         // 3. Emit credit update
         if f.out_credits >= 0 {
-            let poll_out = (sys.channel_poll)(f.out_credits, 0x02);
-            if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, f.out_credits) {
                 if f.entry_rate_per_sec > 0 {
                     let mut buf = [0u8; wire::THROTTLE_REFILL_LEN];
                     wire::encode_throttle_refill(
@@ -212,19 +210,15 @@ unsafe fn emit_metrics(f: &mut Flow, sys: &SyscallTable, now: u64) {
     }
     f.last_metrics_ms = now;
 
-    let mid = wire::SOURCE_ID_FLOW;
     let kg = wire::METRIC_KIND_GAUGE;
-    let samples: [(u16, i64); 2] = [
-        (wire::metric_ids::FLOW_ENTRY_CREDITS, i64::from(f.entry_credits)),
-        (wire::metric_ids::FLOW_BYTE_CREDITS, i64::from(f.byte_credits)),
-    ];
-    for &(metric_id, value) in samples.iter() {
-        let poll = (sys.channel_poll)(f.out_metrics, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 {
-            break;
-        }
-        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
-        wire::encode_metric_sample(&mut buf, mid, 0, metric_id, kg, value);
-        wire_channels::channel_write_msg(sys, f.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
-    }
+    wire_channels::emit_metrics(
+        sys,
+        f.out_metrics,
+        wire::SOURCE_ID_FLOW,
+        0,
+        &[
+            (wire::metric_ids::FLOW_ENTRY_CREDITS, kg, i64::from(f.entry_credits)),
+            (wire::metric_ids::FLOW_BYTE_CREDITS, kg, i64::from(f.byte_credits)),
+        ],
+    );
 }

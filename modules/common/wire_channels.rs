@@ -27,6 +27,135 @@ use super::wire::{
     ENVELOPE_HDR, MAX_PAYLOAD, PARTITIONED_HDR, ROUTED_HDR, ROUTED_PARTITIONED_HDR,
 };
 
+/// Emit a batch of metric samples on `chan`, stopping at the first
+/// sample the channel has no room for.
+///
+/// This is the graph-wide telemetry publish contract, held in one
+/// place: iterate `[(metric_id, kind, value)]`, check writability, and
+/// drop the tail of the batch under backpressure rather than blocking
+/// or spinning. Metrics are lossy by design — the next tick re-reports
+/// every gauge — and holding a step open for a full metrics channel
+/// would trade a real deadline for a disposable sample. Naming the
+/// contract keeps a module from quietly deciding otherwise.
+///
+/// # Safety
+/// `sys` must point to a valid SyscallTable. `chan` must be a channel
+/// handle this module owns, or negative for an unwired port.
+#[inline]
+pub unsafe fn emit_metrics(
+    sys: &super::abi::SyscallTable,
+    chan: i32,
+    source_id: u8,
+    partition_id: u16,
+    samples: &[(u16, u8, i64)],
+) {
+    if chan < 0 {
+        return;
+    }
+    for &(metric_id, kind, value) in samples {
+        if !writable(sys, chan) {
+            break;
+        }
+        let mut buf = [0u8; super::wire::METRIC_SAMPLE_LEN];
+        super::wire::encode_metric_sample(&mut buf, source_id, partition_id, metric_id, kind, value);
+        channel_write_msg(sys, chan, super::wire::MSG_METRIC_SAMPLE, &buf);
+    }
+}
+
+// ── Poll predicates ─────────────────────────────────────────────────
+//
+// `channel_poll` returns a bitmask. Every readiness test in the graph
+// goes through the two predicates below rather than testing that mask
+// in place, because the test has two easy ways to be wrong.
+//
+// The `poll > 0` half is load bearing: `channel_poll` reports errors as
+// negative values, and masking a negative directly (`poll as u32 &
+// 0x01`) can leave the bit set, reading an errored channel as ready.
+// And the mask has to match the direction being polled — readable where
+// writable was meant is a silent always-false that stalls an output
+// path. Naming both directions puts each on one side of that line.
+
+/// Poll bit: the channel has at least one byte readable.
+pub const POLL_READABLE: u32 = 0x01;
+/// Poll bit: the channel has room for at least one byte.
+pub const POLL_WRITABLE: u32 = 0x02;
+
+/// Whether `chan` has data to read.
+///
+/// `false` covers all three "not now" cases uniformly — an unwired port
+/// (`chan < 0`, which a composite leaves for every optional edge the
+/// graph did not connect), an errored or closed channel, and an empty
+/// one — so a caller can treat it as "nothing to do this step" without
+/// a separate wiring guard.
+///
+/// # Safety
+/// `sys` must point to a valid SyscallTable. `chan` must be a channel
+/// handle this module owns, or negative for an unwired port.
+#[inline]
+pub unsafe fn readable(sys: &super::abi::SyscallTable, chan: i32) -> bool {
+    if chan < 0 {
+        return false;
+    }
+    let poll = (sys.channel_poll)(chan, POLL_READABLE);
+    poll > 0 && (poll as u32 & POLL_READABLE) != 0
+}
+
+/// Whether `chan` has room to write. Unwired, errored and full all
+/// answer `false`, as in [`readable`].
+///
+/// Note the kernel contract: a `true` here means at least ONE byte is
+/// free, never that a whole frame fits. That is why it is a gate and
+/// not a guarantee — `write_framed` composes a single all-or-nothing
+/// write and its return value is what actually reports whether the
+/// frame landed.
+///
+/// # Safety
+/// `sys` must point to a valid SyscallTable. `chan` must be a channel
+/// handle this module owns, or negative for an unwired port.
+#[inline]
+pub unsafe fn writable(sys: &super::abi::SyscallTable, chan: i32) -> bool {
+    if chan < 0 {
+        return false;
+    }
+    let poll = (sys.channel_poll)(chan, POLL_WRITABLE);
+    poll > 0 && (poll as u32 & POLL_WRITABLE) != 0
+}
+
+/// Read the next envelope from `chan`, or `None` when the channel has
+/// nothing readable (or handed back a frame this buffer could not
+/// hold). Pairs a readiness check with `channel_read_msg` so a drain
+/// loop is one `let ... else { break }` rather than a poll block, a
+/// read, and a sentinel comparison at each site.
+///
+/// The buffer stays an explicit parameter rather than being captured:
+/// module state owns `msg_buf`, and a closure taking `&mut State` while
+/// the buffer is borrowed would not pass the borrow checker.
+///
+/// # Safety
+/// `sys` must point to a valid SyscallTable. `chan` must be a channel
+/// handle this module owns, or negative for an unwired port.
+#[inline]
+pub unsafe fn next_msg(
+    sys: &super::abi::SyscallTable,
+    chan: i32,
+    buf: &mut [u8],
+) -> Option<(u8, u16)> {
+    if !readable(sys, chan) {
+        return None;
+    }
+    // `channel_read_msg` collapses three outcomes onto `(0, 0)`: an
+    // empty channel, a payload too large for `buf` (drained and
+    // discarded), and a short read. None of them yields a message, so
+    // all three are `None` here — but only the first is routine, and
+    // the other two are currently indistinguishable from it to any
+    // caller. No `MSG_*` constant is 0, so a real envelope never
+    // collides with the sentinel.
+    match channel_read_msg(sys, chan, buf) {
+        (0, 0) => None,
+        got => Some(got),
+    }
+}
+
 /// Compose `hdr` + `payload` into one stack buffer and emit a SINGLE
 /// `channel_write`. Returns the total bytes written (`hdr.len() +
 /// payload.len()`) on success, or `<= 0` when the frame did not fit (the
@@ -126,7 +255,11 @@ pub unsafe fn channel_read_msg(
         return (0, 0);
     }
 
-    let (msg_type, payload_len) = decode_header(&hdr);
+    // The read above already delivered a full envelope, so this cannot
+    // fail; treat a `None` as "no message" rather than asserting.
+    let Some((msg_type, payload_len)) = decode_header(&hdr) else {
+        return (0, 0);
+    };
     let plen = payload_len as usize;
 
     if plen == 0 {
@@ -198,7 +331,9 @@ pub unsafe fn channel_read_partitioned(
         return (0, 0, 0);
     }
 
-    let (partition_id, msg_type, payload_len) = decode_partitioned_header(&hdr);
+    let Some((partition_id, msg_type, payload_len)) = decode_partitioned_header(&hdr) else {
+        return (0, 0, 0);
+    };
     let plen = payload_len as usize;
 
     if plen == 0 {

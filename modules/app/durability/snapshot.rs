@@ -506,11 +506,16 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     // 2. External snapshot triggers.
     if s.in_trigger >= 0 {
         for _ in 0..4 {
-            let poll = (sys.channel_poll)(s.in_trigger, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_trigger, &mut s.msg_buf);
-            if msg_type == wire::MSG_SNAPSHOT_TRIGGER && plen >= 16 {
-                let (term, index) = wire::decode_term_index(&s.msg_buf);
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_trigger, &mut s.msg_buf)
+            else {
+                break;
+            };
+            let trig = if msg_type == wire::MSG_SNAPSHOT_TRIGGER {
+                wire::decode_term_index(&s.msg_buf[..plen as usize])
+            } else {
+                None
+            };
+            if let Some((term, index)) = trig {
                 if on_trigger(s, sys, term, index) {
                     cold_fs = true;
                 }
@@ -533,10 +538,10 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     if s.in_install_request >= 0 {
         let mut demand_trigger = false;
         for _ in 0..4 {
-            let poll = (sys.channel_poll)(s.in_install_request, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-            let (msg_type, plen) =
-                wire_channels::channel_read_msg(sys, s.in_install_request, &mut s.msg_buf);
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_install_request, &mut s.msg_buf)
+            else {
+                break;
+            };
             if msg_type != wire::MSG_SNAPSHOT_INSTALL_REQUEST || (plen as usize) < 1 {
                 continue;
             }
@@ -572,13 +577,18 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     //     own (term, index) is authoritative — the app may have
     //     applied past the trigger that prompted the capture.
     if s.in_app_body >= 0 && s.app_capture_pending {
-        let poll = (sys.channel_poll)(s.in_app_body, 0x01);
-        if poll > 0 && (poll as u32 & 0x01) != 0 {
+        if wire_channels::readable(sys, s.in_app_body) {
             let (msg_type, plen) =
                 wire_channels::channel_read_msg(sys, s.in_app_body, &mut s.msg_buf);
             let pl = plen as usize;
-            if msg_type == wire::MSG_APP_SNAPSHOT_CHUNK && pl >= wire::APP_SNAPSHOT_HDR {
-                let (term, index) = wire::decode_term_index(&s.msg_buf);
+            let chunk = if msg_type == wire::MSG_APP_SNAPSHOT_CHUNK
+                && pl >= wire::APP_SNAPSHOT_HDR
+            {
+                wire::decode_term_index(&s.msg_buf[..pl])
+            } else {
+                None
+            };
+            if let Some((term, index)) = chunk {
                 let offset = u64::from_le_bytes([
                     s.msg_buf[16], s.msg_buf[17], s.msg_buf[18], s.msg_buf[19],
                     s.msg_buf[20], s.msg_buf[21], s.msg_buf[22], s.msg_buf[23],
@@ -631,9 +641,10 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     // 3. Drain incoming chunks (InstallSnapshot RPC from leader).
     if s.in_import >= 0 {
         for _ in 0..4 {
-            let poll = (sys.channel_poll)(s.in_import, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_import, &mut s.msg_buf);
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_import, &mut s.msg_buf)
+            else {
+                break;
+            };
             if plen == 0 { continue; }
             let pl = plen as usize;
             match msg_type {
@@ -717,8 +728,7 @@ unsafe fn emit_sample(
     kind: u8,
     value: i64,
 ) {
-    let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_metrics) { return; }
     let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
     wire::encode_metric_sample(&mut buf, module_id, partition_id, metric_id, kind, value);
     wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
@@ -813,8 +823,7 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         }
 
         if app_restored && (durable || !had_fs) && s.out_installed >= 0 {
-            let poll = (sys.channel_poll)(s.out_installed, 0x02);
-            if poll > 0 && (poll as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, s.out_installed) {
                 let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
                 wire::encode_snapshot_installed(
                     &mut buf,
@@ -928,8 +937,7 @@ unsafe fn finalize_local_snapshot(
     // path; skipped when the port is unwired or briefly full (the next
     // trigger re-signals).
     if s.out_installed >= 0 {
-        let poll = (sys.channel_poll)(s.out_installed, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, s.out_installed) {
             let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
             wire::encode_snapshot_installed(&mut buf, term, index, term);
             wire_channels::channel_write_msg(
@@ -966,8 +974,7 @@ unsafe fn request_app_capture(
     if s.out_app_ctl < 0 {
         return false;
     }
-    let poll = (sys.channel_poll)(s.out_app_ctl, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, s.out_app_ctl) {
         return false;
     }
     let mut buf = [0u8; 16];
@@ -1017,8 +1024,7 @@ unsafe fn emit_app_restore(
     // RESET first: the app discards state up front, so a stream that
     // dies mid-way leaves it empty (catch-up from leader) rather than
     // half-old/half-new.
-    let poll = (sys.channel_poll)(s.out_app_ctl, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, s.out_app_ctl) {
         return false;
     }
     let mut hdr = [0u8; 16];
@@ -1030,8 +1036,7 @@ unsafe fn emit_app_restore(
     loop {
         let chunk = (total - sent).min(MAX_CHUNK_BODY);
         let done = sent + chunk == total;
-        let poll = (sys.channel_poll)(s.out_app_ctl, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, s.out_app_ctl) {
             return false;
         }
         let mut buf = [0u8; wire::APP_SNAPSHOT_HDR + MAX_CHUNK_BODY];
@@ -1084,8 +1089,7 @@ unsafe fn emit_install_staged(
     while sent < total {
         let chunk = (total - sent).min(MAX_CHUNK_BODY);
         let done = sent + chunk == total;
-        let poll = (sys.channel_poll)(s.out_export, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, s.out_export) {
             // Channel saturated — the trigger path retries on the next
             // rotation or an explicit ADMIN_OP_SNAPSHOT.
             return;
@@ -1127,8 +1131,7 @@ unsafe fn emit_install_body(
     if total == 0 {
         // Manifest-only install: still send one chunk so the follower
         // can update its (term, index) bookkeeping.
-        let poll = (sys.channel_poll)(s.out_export, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+        if !wire_channels::writable(sys, s.out_export) { return; }
         let mut buf = [0u8; wire::INSTALL_SNAPSHOT_HDR];
         let n = wire::encode_install_snapshot(&mut buf, term, index, term, 0, true, &[]);
         if n > 0 {
@@ -1143,8 +1146,7 @@ unsafe fn emit_install_body(
         let chunk = remaining.min(MAX_CHUNK_BODY);
         let start = total - remaining;
         let done = chunk == remaining;
-        let poll = (sys.channel_poll)(s.out_export, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, s.out_export) {
             // Channel saturated. We bail — the trigger path will retry
             // on the next segment rollover or explicit ADMIN_OP_SNAPSHOT.
             return;
@@ -1724,12 +1726,10 @@ pub unsafe fn drain_retention_floors(s: &mut Snapshot, sys: &SyscallTable) {
         return;
     }
     for _ in 0..4 {
-        let poll = (sys.channel_poll)(s.in_retention_floor, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_retention_floor, &mut s.msg_buf)
+        else {
             break;
-        }
-        let (msg_type, plen) =
-            wire_channels::channel_read_msg(sys, s.in_retention_floor, &mut s.msg_buf);
+        };
         if msg_type != wire::MSG_COMPACTION_FLOOR || (plen as usize) < 10 {
             continue;
         }

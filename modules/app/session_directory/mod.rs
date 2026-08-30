@@ -304,8 +304,7 @@ unsafe fn propose(s: &mut ModuleState, request_id: u64, body: &[u8]) -> bool {
     let Some(slot) = (0..MAX_PENDING).find(|&i| !s.pending_used[i]) else {
         return false;
     };
-    let poll = (sys.channel_poll)(s.out_proposals, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, s.out_proposals) {
         return false;
     }
     let corr = next_correlation(s);
@@ -338,8 +337,7 @@ unsafe fn propose(s: &mut ModuleState, request_id: u64, body: &[u8]) -> bool {
 /// has no space (retry next step).
 unsafe fn propose_raw(s: &mut ModuleState, body: &[u8]) -> bool {
     let sys = &*s.syscalls;
-    let poll = (sys.channel_poll)(s.out_proposals, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, s.out_proposals) {
         return false;
     }
     let corr = next_correlation(s);
@@ -693,12 +691,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //    attribution the committed-entry pass matches on.
         if s.in_proposal_assigned >= 0 {
             for _ in 0..8 {
-                let poll = (sys.channel_poll)(s.in_proposal_assigned, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_proposal_assigned, &mut s.msg_buf)
+                else {
                     break;
-                }
-                let (msg_type, plen) =
-                    wire_channels::channel_read_msg(sys, s.in_proposal_assigned, &mut s.msg_buf);
+                };
                 if msg_type != wire::MSG_PROPOSAL_ASSIGNED || (plen as usize) < 18 {
                     continue;
                 }
@@ -739,12 +735,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 1) Committed entries — apply in strict order, reply on match.
         for _ in 0..16 {
-            let poll = (sys.channel_poll)(s.in_entries, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_entries, &mut s.msg_buf)
+            else {
                 break;
-            }
-            let (msg_type, plen) =
-                wire_channels::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
+            };
             if msg_type != wire::MSG_COMMITTED_ENTRY {
                 continue;
             }
@@ -780,12 +774,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if !has_free {
                     break;
                 }
-                let poll = (sys.channel_poll)(s.in_requests, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_requests, &mut s.msg_buf)
+                else {
                     break;
-                }
-                let (msg_type, plen) =
-                    wire_channels::channel_read_msg(sys, s.in_requests, &mut s.msg_buf);
+                };
                 if msg_type != wire::MSG_SR_REQUEST {
                     continue;
                 }
@@ -842,12 +834,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 4) Snapshot install (catch-up path).
         if s.in_snapshot_chunk >= 0 {
             for _ in 0..4 {
-                let poll = (sys.channel_poll)(s.in_snapshot_chunk, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_snapshot_chunk, &mut s.msg_buf)
+                else {
                     break;
-                }
-                let (msg_type, plen) =
-                    wire_channels::channel_read_msg(sys, s.in_snapshot_chunk, &mut s.msg_buf);
+                };
                 let pl = plen as usize;
                 match msg_type {
                     wire::MSG_APP_SNAPSHOT_RESET => {
@@ -897,12 +887,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 5) Snapshot export on request. The registry state is small
         //    enough to serialize and stream inline in one step.
         if s.in_snapshot_request >= 0 && s.out_snapshot_export >= 0 {
-            let poll = (sys.channel_poll)(s.in_snapshot_request, 0x01);
-            if poll > 0 && (poll as u32 & 0x01) != 0 {
+            if wire_channels::readable(sys, s.in_snapshot_request) {
                 let (msg_type, plen) =
                     wire_channels::channel_read_msg(sys, s.in_snapshot_request, &mut s.msg_buf);
-                if msg_type == wire::MSG_APP_SNAPSHOT_REQUEST && (plen as usize) >= 16 {
-                    let (term, last_idx) = wire::decode_term_index(&s.msg_buf);
+                let req = if msg_type == wire::MSG_APP_SNAPSHOT_REQUEST {
+                    wire::decode_term_index(&s.msg_buf[..plen as usize])
+                } else {
+                    None
+                };
+                if let Some((term, last_idx)) = req {
                     if s.registry.snapshot(&mut s.snap_buf) > 0 {
                         let total = SessionRegistry::SNAPSHOT_LEN;
                         let mut off = 0usize;
@@ -936,12 +929,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 5.5) Leader hints — the fence for the time producer.
         if s.in_leader_state >= 0 {
             for _ in 0..8 {
-                let poll = (sys.channel_poll)(s.in_leader_state, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 {
+                let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_leader_state, &mut s.msg_buf)
+                else {
                     break;
-                }
-                let (msg_type, plen) =
-                    wire_channels::channel_read_msg(sys, s.in_leader_state, &mut s.msg_buf);
+                };
                 if msg_type == wire::MSG_LEADER_HINT && plen >= 1 {
                     s.leader_id = s.msg_buf[0];
                 }
@@ -1009,8 +1000,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             buf[20..24].copy_from_slice(&s.replies_out.to_le_bytes());
             buf[24..28].copy_from_slice(&s.stream_gaps.to_le_bytes());
             buf[28..32].copy_from_slice(&s.registry.recovery_epoch.to_le_bytes());
-            let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-            if poll > 0 && (poll as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, s.out_metrics) {
                 wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf);
             }
 
@@ -1070,8 +1060,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 ),
             ];
             for (metric_id, kind, value) in samples {
-                let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-                if poll <= 0 || (poll as u32 & 0x02) == 0 {
+                if !wire_channels::writable(sys, s.out_metrics) {
                     break;
                 }
                 let mut mb = [0u8; wire::METRIC_SAMPLE_LEN];

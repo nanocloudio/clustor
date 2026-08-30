@@ -129,11 +129,10 @@ unsafe fn drain_applied(a: &mut Admin, sys: &SyscallTable) {
         return;
     }
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(a.in_applied, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, a.in_applied, &mut a.msg_buf)
+        else {
             break;
-        }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, a.in_applied, &mut a.msg_buf);
+        };
         if msg_type != wire::MSG_ADMIN_APPLIED || (plen as usize) < 5 {
             continue;
         }
@@ -158,11 +157,10 @@ unsafe fn drain_requests(a: &mut Admin, sys: &SyscallTable, now: u64) {
         return;
     }
     for _ in 0..4 {
-        let poll = (sys.channel_poll)(a.in_requests, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, a.in_requests, &mut a.msg_buf)
+        else {
             break;
-        }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, a.in_requests, &mut a.msg_buf);
+        };
         if msg_type != wire::MSG_ADMIN_COMMAND || plen == 0 {
             continue;
         }
@@ -210,8 +208,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     // proposal body is `cmd[1..]`.
     if op_code == wire::ADMIN_OP_PROPOSE {
         if a.out_proposal >= 0 && cmd_len > 1 {
-            let poll_out = (sys.channel_poll)(a.out_proposal, 0x02);
-            if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, a.out_proposal) {
                 let written = wire_channels::channel_write_msg(
                     sys,
                     a.out_proposal,
@@ -310,8 +307,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
         env[8..12].copy_from_slice(&command_id.to_le_bytes());
         env[12..12 + cmd_len].copy_from_slice(&cmd[..cmd_len]);
         let total = 12 + cmd_len;
-        let poll_out = (sys.channel_poll)(a.out_proposal, 0x02);
-        if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, a.out_proposal) {
             wire_channels::channel_write_msg(
                 sys,
                 a.out_proposal,
@@ -326,8 +322,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
         env[0..4].copy_from_slice(&command_id.to_le_bytes());
         env[4..4 + cmd_len].copy_from_slice(&cmd[..cmd_len]);
         let total = 4 + cmd_len;
-        let poll_out = (sys.channel_poll)(a.out_raft, 0x02);
-        if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, a.out_raft) {
             wire_channels::channel_write_msg(sys, a.out_raft, wire::MSG_ADMIN_COMMAND, &env[..total]);
         }
     }
@@ -342,8 +337,7 @@ unsafe fn emit_admin_response(a: &mut Admin, sys: &SyscallTable, conn_id: u8, st
     if a.out_responses < 0 {
         return;
     }
-    let poll_out = (sys.channel_poll)(a.out_responses, 0x02);
-    if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+    if wire_channels::writable(sys, a.out_responses) {
         let resp = [conn_id, status];
         wire_channels::channel_write_msg(sys, a.out_responses, wire::MSG_ADMIN_RESPONSE, &resp);
     }

@@ -316,19 +316,20 @@ unsafe fn emit_metrics(s: &mut Commit, sys: &SyscallTable) {
 
     if s.out_metrics < 0 { return; }
 
-    let mid = wire::SOURCE_ID_COMMIT;
-    let pid = s.partition_id;
-    let samples: [(u16, u8, i64); 2] = [
-        (wire::metric_ids::COMMIT_INDEX, wire::METRIC_KIND_GAUGE, s.committed_index as i64),
-        (wire::metric_ids::COMMIT_ADVANCES, wire::METRIC_KIND_COUNTER, i64::from(s.commit_advances)),
-    ];
-    for &(metric_id, kind, value) in samples.iter() {
-        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
-        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
-        wire::encode_metric_sample(&mut buf, mid, pid, metric_id, kind, value);
-        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
-    }
+    wire_channels::emit_metrics(
+        sys,
+        s.out_metrics,
+        wire::SOURCE_ID_COMMIT,
+        s.partition_id,
+        &[
+            (wire::metric_ids::COMMIT_INDEX, wire::METRIC_KIND_GAUGE, s.committed_index as i64),
+            (
+                wire::metric_ids::COMMIT_ADVANCES,
+                wire::METRIC_KIND_COUNTER,
+                i64::from(s.commit_advances),
+            ),
+        ],
+    );
 }
 
 /// # Safety
@@ -342,10 +343,10 @@ unsafe fn drain_durability(s: &mut Commit, sys: &SyscallTable) -> bool {
     let mut changed = false;
     // Cap 32 per step (matches the durability ledger's ack-drain bound).
     for _ in 0..32 {
-        let poll = (sys.channel_poll)(s.in_durable, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_durable, &mut s.msg_buf);
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_durable, &mut s.msg_buf)
+        else {
+            break;
+        };
         if msg_type != wire::MSG_DURABILITY_PROOF || (plen as usize) < wire::DURABILITY_PROOF_LEN {
             continue;
         }
@@ -354,7 +355,11 @@ unsafe fn drain_durability(s: &mut Commit, sys: &SyscallTable) -> bool {
         // tracker is per-partition; we just discard it (the proof always
         // matches our slot because each durability ledger only fans
         // out to one commit tracker).
-        let (_partition_id, term, index, _replica) = wire::decode_durability_proof(&s.msg_buf);
+        let Some((_partition_id, term, index, _replica)) =
+            wire::decode_durability_proof(&s.msg_buf[..plen as usize])
+        else {
+            continue;
+        };
         if index > s.durable_index {
             s.durable_index = index;
             s.committed_term = term;
@@ -375,8 +380,8 @@ unsafe fn drain_durability(s: &mut Commit, sys: &SyscallTable) -> bool {
 /// fan-in (dispatch-table demux, capped 8/step there — the ledger-
 /// precedent bound).
 pub fn on_cache_state(s: &mut Commit, msg: &[u8], plen: u16) {
-    if plen >= 1 {
-        s.cp_cache_state = wire::decode_cache_state(msg);
+    if let Some(state) = wire::decode_cache_state(&msg[..(plen as usize).min(msg.len())]) {
+        s.cp_cache_state = state;
         s.strict_fallback = s.cp_cache_state >= CP_STALE;
     }
 }

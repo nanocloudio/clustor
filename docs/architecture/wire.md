@@ -20,8 +20,19 @@ it.
 All on-wire integers are fixed-width little-endian. There is no
 schema-version header, no handshake or extension negotiation, and no
 numeric wire-error registry: a decoder that receives a truncated or
-malformed payload returns a failure value (`None`, or inert zeros on
-the infallible paths) and the frame is dropped.
+malformed payload returns `None` and the frame is dropped.
+
+`None` is the only failure channel, and it is uniform — every decoder
+in `modules/common/wire.rs` returns `Option`. That matters because a
+zeroed tuple would be a *legal* record on several of these payloads: a
+vote request at term 0 from candidate 0, a durability proof at index 0,
+a `(term 0, index 0)` replay high-water. A decoder that answered a
+truncated frame with zeros would hand the election and commit paths
+something they act on. Each decoder therefore checks the payload's
+fixed width itself rather than trusting the caller, and callers pass
+the declared payload length rather than their whole receive buffer —
+a scratch buffer outlives the message in it, so an unbounded decode
+would read the previous frame's tail.
 
 Every message travels in an envelope. Four envelope shapes exist, on
 distinct channels — the shape is a property of the port, never

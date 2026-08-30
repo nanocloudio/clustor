@@ -37,8 +37,7 @@ pub unsafe fn step(g: &mut ReadGate, sys: &SyscallTable) {
     if g.cache_state <= types::CP_CACHED && g.out_permits >= 0 {
         // Emit a standing permit each step so the apply component knows
         // reads are allowed. This is a lightweight signal.
-        let poll_out = (sys.channel_poll)(g.out_permits, 0x02);
-        if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, g.out_permits) {
             let buf = [g.cache_state];
             wire_channels::channel_write_msg(sys, g.out_permits, wire::MSG_READ_PERMIT, &buf[..1]);
         }

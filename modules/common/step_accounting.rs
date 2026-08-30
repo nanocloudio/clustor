@@ -21,6 +21,7 @@
 
 use super::abi::SyscallTable;
 use super::wire;
+use super::wire_channels;
 
 /// Bucket count: one per `COMP_STEP_US` bound + the `+Inf` bucket.
 pub const COMP_STEP_BUCKETS: usize = wire::hist::COMP_STEP_US.len() + 1;
@@ -68,8 +69,7 @@ impl CompStepHist {
         }
         // Early-out only: poll(OUT) means ">=1 byte free", not "the
         // snapshot fits" — the write below is the authority.
-        let poll = (sys.channel_poll)(chan, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, chan) {
             return;
         }
         const FRAME_LEN: usize = wire::ENVELOPE_HDR + wire::METRIC_SAMPLE_LEN;

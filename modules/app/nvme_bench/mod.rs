@@ -1111,8 +1111,7 @@ unsafe fn emit_sample(
     kind: u8,
     value: i64,
 ) {
-    let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_metrics) { return; }
     let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
     wire::encode_metric_sample(&mut buf, module_id, 0, metric_id, kind, value);
     wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);

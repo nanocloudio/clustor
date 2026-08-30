@@ -14,6 +14,195 @@
     reason = "shared via #[path] into multiple modules; each consumer uses a subset of the surface so single-module rustc invocations see unused items"
 )]
 
+// ── Fixed-layout codec primitives ───────────────────────────────────────────
+//
+// Every payload in this file is a fixed sequence of little-endian
+// scalars, and every codec below reads and writes it through `Reader` /
+// `Writer`. Access is positional: fields come off the cursor in
+// declaration order, so an encoder and its decoder can be compared line
+// for line and neither can drift to an offset the other does not share.
+// The length check lives at `Reader::new` — one check per payload, in
+// the decoder rather than in each caller.
+//
+// Both are `#[inline]` and every offset is a compile-time constant, so
+// each accessor folds to the same indexed load or store a literal
+// `buf[9..17]` spells out. Nothing here is benchmarked separately —
+// `benches/wire_codec.rs` covers the facade's codecs, not these — so
+// treat that as the design intent it is built to, not a measured
+// result.
+
+/// Sequential little-endian reader over a payload slice.
+///
+/// Construct with [`Reader::new`], which is where the single length
+/// check lives: a payload shorter than the codec's fixed width yields
+/// `None` and the decoder returns `None` in turn, so a truncated frame
+/// is reported as absent rather than decoded into zeros.
+///
+/// The accessors below are unchecked by design — one check per payload,
+/// not one per field. That makes `need` a contract: it MUST cover every
+/// byte the decoder goes on to consume, skips included. Understating it
+/// indexes past the slice, and a `no_std` module cannot unwind, so the
+/// panic kills the module rather than failing the frame.
+///
+/// Each accessor advances the cursor, so call order IS field order.
+/// Decoders here build their tuple inline (`Some((r.u64(), r.u8()))`),
+/// which is well defined: Rust evaluates a tuple expression's operands
+/// left to right.
+pub struct Reader<'a> {
+    buf: &'a [u8],
+    off: usize,
+}
+
+impl<'a> Reader<'a> {
+    /// Bind a reader to `buf`, requiring at least `need` readable bytes.
+    ///
+    /// `need` is the codec's whole fixed width — see the type-level note
+    /// on why it must cover every subsequent read.
+    #[inline]
+    pub fn new(buf: &'a [u8], need: usize) -> Option<Self> {
+        if buf.len() < need {
+            return None;
+        }
+        Some(Self { buf, off: 0 })
+    }
+
+    #[inline]
+    pub fn u64(&mut self) -> u64 {
+        let b = &self.buf[self.off..self.off + 8];
+        self.off += 8;
+        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+    }
+
+    #[inline]
+    pub fn u32(&mut self) -> u32 {
+        let b = &self.buf[self.off..self.off + 4];
+        self.off += 4;
+        u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+    }
+
+    #[inline]
+    pub fn u16(&mut self) -> u16 {
+        let b = &self.buf[self.off..self.off + 2];
+        self.off += 2;
+        u16::from_le_bytes([b[0], b[1]])
+    }
+
+    #[inline]
+    pub fn u8(&mut self) -> u8 {
+        let v = self.buf[self.off];
+        self.off += 1;
+        v
+    }
+
+    #[inline]
+    pub fn i64(&mut self) -> i64 {
+        self.u64() as i64
+    }
+
+    #[inline]
+    pub fn i32(&mut self) -> i32 {
+        self.u32() as i32
+    }
+
+    #[inline]
+    pub fn i16(&mut self) -> i16 {
+        self.u16() as i16
+    }
+
+    /// A `u8` field carrying a boolean. Any non-zero byte is `true`, so
+    /// a peer that writes `1` and one that writes `0xFF` agree.
+    #[inline]
+    pub fn bool(&mut self) -> bool {
+        self.u8() != 0
+    }
+
+    /// Advance past `n` bytes the decoder does not surface — a field
+    /// present on the wire that this caller has no use for, or a
+    /// reserved span. Counts toward the `need` the reader was built
+    /// with, and keeps every following field positional.
+    #[inline]
+    pub fn skip(&mut self, n: usize) -> &mut Self {
+        self.off += n;
+        self
+    }
+}
+
+/// Sequential little-endian writer over a destination slice.
+///
+/// Encoders here take a buffer the caller has already sized against the
+/// codec's published width — usually a `[u8; N]`, otherwise behind an
+/// explicit length check — so `Writer` indexes directly and a short
+/// buffer panics rather than silently truncating the frame.
+pub struct Writer<'a> {
+    buf: &'a mut [u8],
+    off: usize,
+}
+
+impl<'a> Writer<'a> {
+    #[inline]
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        Self { buf, off: 0 }
+    }
+
+    #[inline]
+    pub fn u64(&mut self, v: u64) -> &mut Self {
+        self.buf[self.off..self.off + 8].copy_from_slice(&v.to_le_bytes());
+        self.off += 8;
+        self
+    }
+
+    #[inline]
+    pub fn u32(&mut self, v: u32) -> &mut Self {
+        self.buf[self.off..self.off + 4].copy_from_slice(&v.to_le_bytes());
+        self.off += 4;
+        self
+    }
+
+    #[inline]
+    pub fn u16(&mut self, v: u16) -> &mut Self {
+        self.buf[self.off..self.off + 2].copy_from_slice(&v.to_le_bytes());
+        self.off += 2;
+        self
+    }
+
+    #[inline]
+    pub fn u8(&mut self, v: u8) -> &mut Self {
+        self.buf[self.off] = v;
+        self.off += 1;
+        self
+    }
+
+    #[inline]
+    pub fn i64(&mut self, v: i64) -> &mut Self {
+        self.u64(v as u64)
+    }
+
+    #[inline]
+    pub fn i32(&mut self, v: i32) -> &mut Self {
+        self.u32(v as u32)
+    }
+
+    #[inline]
+    pub fn i16(&mut self, v: i16) -> &mut Self {
+        self.u16(v as u16)
+    }
+
+    #[inline]
+    pub fn bool(&mut self, v: bool) -> &mut Self {
+        self.u8(u8::from(v))
+    }
+
+    /// Copy a byte run verbatim: a magic prefix, a nested body, or a
+    /// variable-length tail. Keeps a payload that mixes scalars and
+    /// opaque bytes on one cursor.
+    #[inline]
+    pub fn bytes(&mut self, v: &[u8]) -> &mut Self {
+        self.buf[self.off..self.off + v.len()].copy_from_slice(v);
+        self.off += v.len();
+        self
+    }
+}
+
 // ── Message type constants ──────────────────────────────────────────────────
 
 // Raft RPC
@@ -57,43 +246,26 @@ pub const MSG_READ_PROBE_REPLY: u8 = 0x0E;
 
 #[inline]
 pub fn encode_read_index_probe(buf: &mut [u8; 16], probe_id: u64, term: u64) {
-    buf[0..8].copy_from_slice(&probe_id.to_le_bytes());
-    buf[8..16].copy_from_slice(&term.to_le_bytes());
+    Writer::new(buf).u64(probe_id).u64(term);
 }
 
 #[inline]
 pub fn decode_read_index_probe(buf: &[u8]) -> Option<(u64, u64)> {
-    if buf.len() < 16 {
-        return None;
-    }
-    let probe = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let term = u64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ]);
+    let mut r = Reader::new(buf, 16)?;
+    let probe = r.u64();
+    let term = r.u64();
     Some((probe, term))
 }
 
 #[inline]
 pub fn encode_read_index_probe_resp(buf: &mut [u8; 17], probe_id: u64, term: u64, replica: u8) {
-    buf[0..8].copy_from_slice(&probe_id.to_le_bytes());
-    buf[8..16].copy_from_slice(&term.to_le_bytes());
-    buf[16] = replica;
+    Writer::new(buf).u64(probe_id).u64(term).u8(replica);
 }
 
 #[inline]
 pub fn decode_read_index_probe_resp(buf: &[u8]) -> Option<(u64, u64, u8)> {
-    if buf.len() < 17 {
-        return None;
-    }
-    let probe = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let term = u64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ]);
-    Some((probe, term, buf[16]))
+    let mut r = Reader::new(buf, 17)?;
+    Some((r.u64(), r.u64(), r.u8()))
 }
 
 #[inline]
@@ -103,23 +275,18 @@ pub fn encode_read_probe_reply(
     confirmed_commit: u64,
     confirmed: bool,
 ) {
-    buf[0..8].copy_from_slice(&correlation_id.to_le_bytes());
-    buf[8..16].copy_from_slice(&confirmed_commit.to_le_bytes());
-    buf[16] = confirmed as u8;
+    Writer::new(buf)
+        .u64(correlation_id)
+        .u64(confirmed_commit)
+        .u8(confirmed as u8);
 }
 
 #[inline]
 pub fn decode_read_probe_reply(buf: &[u8]) -> Option<(u64, u64, bool)> {
-    if buf.len() < 17 {
-        return None;
-    }
-    let correlation_id = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let confirmed_commit = u64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ]);
-    let confirmed = buf[16] != 0;
+    let mut r = Reader::new(buf, 17)?;
+    let correlation_id = r.u64();
+    let confirmed_commit = r.u64();
+    let confirmed = r.bool();
     Some((correlation_id, confirmed_commit, confirmed))
 }
 
@@ -260,10 +427,11 @@ pub fn encode_config_change(buf: &mut [u8], op_code: u8, voters: &[u8]) -> usize
     if buf.len() < total {
         return 0;
     }
-    buf[..8].copy_from_slice(&CONFIG_CHANGE_MAGIC);
-    buf[8] = op_code;
-    buf[9] = n as u8;
-    buf[10..10 + n].copy_from_slice(&voters[..n]);
+    Writer::new(buf)
+        .bytes(&CONFIG_CHANGE_MAGIC)
+        .u8(op_code)
+        .u8(n as u8)
+        .bytes(&voters[..n]);
     total
 }
 
@@ -313,9 +481,7 @@ pub fn encode_time_entry(buf: &mut [u8], op: u8, time_ms: u64) -> usize {
     if buf.len() < TIMING_ENTRY_LEN || (op != TIMING_OP_ADVANCE && op != TIMING_OP_DRAIN) {
         return 0;
     }
-    buf[..8].copy_from_slice(&TIMING_MAGIC);
-    buf[8] = op;
-    buf[9..17].copy_from_slice(&time_ms.to_le_bytes());
+    Writer::new(buf).bytes(&TIMING_MAGIC).u8(op).u64(time_ms);
     TIMING_ENTRY_LEN
 }
 
@@ -327,14 +493,13 @@ pub fn decode_time_entry(buf: &[u8]) -> Option<(u8, u64)> {
     if !has_timing_magic(buf) || buf.len() < TIMING_ENTRY_LEN {
         return None;
     }
-    let op = buf[8];
+    let mut r = Reader::new(buf, TIMING_ENTRY_LEN)?;
+    r.skip(TIMING_MAGIC.len());
+    let op = r.u8();
     if op != TIMING_OP_ADVANCE && op != TIMING_OP_DRAIN {
         return None;
     }
-    let time_ms = u64::from_le_bytes([
-        buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16],
-    ]);
-    Some((op, time_ms))
+    Some((op, r.u64()))
 }
 
 /// `consensus` → `consensus` / `durability` voter-set
@@ -353,9 +518,10 @@ pub fn encode_voter_set_update(
     joint_set: u8,
     joint_active: bool,
 ) {
-    buf[0] = current_set;
-    buf[1] = joint_set;
-    buf[2] = joint_active as u8;
+    Writer::new(buf)
+        .u8(current_set)
+        .u8(joint_set)
+        .bool(joint_active);
 }
 
 #[inline]
@@ -401,11 +567,12 @@ pub fn encode_client_reject_body(
     entry_credits: i16,
     byte_credits: i32,
 ) {
-    buf[0] = status;
-    buf[1] = reserved;
-    buf[2..4].copy_from_slice(&retry_after_ms.to_le_bytes());
-    buf[4..6].copy_from_slice(&entry_credits.to_le_bytes());
-    buf[6..10].copy_from_slice(&byte_credits.to_le_bytes());
+    Writer::new(buf)
+        .u8(status)
+        .u8(reserved)
+        .u16(retry_after_ms)
+        .i16(entry_credits)
+        .i32(byte_credits);
 }
 
 /// Encode an internal reject envelope `[correlation_id:u64][body 10b]`.
@@ -418,7 +585,6 @@ pub fn encode_client_reject_internal(
     entry_credits: i16,
     byte_credits: i32,
 ) {
-    buf[0..8].copy_from_slice(&correlation_id.to_le_bytes());
     let mut body = [0u8; CLIENT_REJECT_BODY_LEN];
     encode_client_reject_body(
         &mut body,
@@ -428,23 +594,20 @@ pub fn encode_client_reject_internal(
         entry_credits,
         byte_credits,
     );
-    buf[8..8 + CLIENT_REJECT_BODY_LEN].copy_from_slice(&body);
+    Writer::new(buf).u64(correlation_id).bytes(&body);
 }
 
 /// Decode an internal reject envelope. Returns
 /// `(correlation_id, status, retry_after_ms, entry_credits, byte_credits)`.
 #[inline]
 pub fn decode_client_reject_internal(buf: &[u8]) -> Option<(u64, u8, u16, i16, i32)> {
-    if buf.len() < CLIENT_REJECT_INTERNAL_LEN {
-        return None;
-    }
-    let correlation_id = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let status = buf[8];
-    let retry = u16::from_le_bytes([buf[10], buf[11]]);
-    let entry = i16::from_le_bytes([buf[12], buf[13]]);
-    let byte = i32::from_le_bytes([buf[14], buf[15], buf[16], buf[17]]);
+    let mut r = Reader::new(buf, CLIENT_REJECT_INTERNAL_LEN)?;
+    let correlation_id = r.u64();
+    let status = r.u8();
+    r.skip(1); // reserved
+    let retry = r.u16();
+    let entry = r.i16();
+    let byte = r.i32();
     Some((correlation_id, status, retry, entry, byte))
 }
 
@@ -568,8 +731,7 @@ pub fn encode_wal_truncate_after(
     keep_through_index: u64,
     request_id: u32,
 ) {
-    buf[0..8].copy_from_slice(&keep_through_index.to_le_bytes());
-    buf[8..12].copy_from_slice(&request_id.to_le_bytes());
+    Writer::new(buf).u64(keep_through_index).u32(request_id);
 }
 
 /// Decode the `MSG_WAL_TRUNCATE_AFTER` payload. A shorter payload
@@ -579,14 +741,11 @@ pub fn decode_wal_truncate_after(buf: &[u8]) -> Option<(u64, u32)> {
     if buf.len() < 8 {
         return None;
     }
-    let index = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let request_id = if buf.len() >= WAL_TRUNCATE_AFTER_LEN {
-        u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]])
-    } else {
-        0
-    };
+    let index = Reader::new(buf, 8)?.u64();
+    // `request_id` is optional on the wire: an 8-byte frame carries
+    // none and decodes with id 0, so a peer emitting the narrower
+    // shape stays readable.
+    let request_id = Reader::new(buf, WAL_TRUNCATE_AFTER_LEN).map_or(0, |mut r| r.skip(8).u32());
     Some((index, request_id))
 }
 
@@ -598,24 +757,17 @@ pub fn encode_wal_truncate_ack(
     request_id: u32,
     durable: bool,
 ) {
-    buf[0..8].copy_from_slice(&keep_through_index.to_le_bytes());
-    buf[8..12].copy_from_slice(&request_id.to_le_bytes());
-    buf[12] = durable as u8;
+    Writer::new(buf)
+        .u64(keep_through_index)
+        .u32(request_id)
+        .u8(durable as u8);
 }
 
 /// Decode the `MSG_WAL_TRUNCATE_ACK` payload.
 #[inline]
 pub fn decode_wal_truncate_ack(buf: &[u8]) -> Option<(u64, u32, bool)> {
-    if buf.len() < WAL_TRUNCATE_ACK_LEN {
-        return None;
-    }
-    Some((
-        u64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]),
-        u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-        buf[12] != 0,
-    ))
+    let mut r = Reader::new(buf, WAL_TRUNCATE_ACK_LEN)?;
+    Some((r.u64(), r.u32(), r.bool()))
 }
 
 /// `durability` → `consensus` continuity rejection. Emitted when the WAL is
@@ -635,17 +787,12 @@ pub const MSG_WAL_REJECT: u8 = 0x2F;
 /// Encode / decode the 8-byte `MSG_WAL_REJECT` payload.
 #[inline]
 pub fn encode_wal_reject(buf: &mut [u8; 8], expected_index: u64) {
-    buf.copy_from_slice(&expected_index.to_le_bytes());
+    Writer::new(buf).u64(expected_index);
 }
 
 #[inline]
 pub fn decode_wal_reject(buf: &[u8]) -> Option<u64> {
-    if buf.len() < 8 {
-        return None;
-    }
-    Some(u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]))
+    Some(Reader::new(buf, 8)?.u64())
 }
 
 /// `MSG_WAL_ENTRY_REQUEST` payload size (12 bytes).
@@ -664,19 +811,14 @@ pub fn encode_wal_entry_request(
     request_id: u32,
     wal_index: u64,
 ) {
-    buf[0..4].copy_from_slice(&request_id.to_le_bytes());
-    buf[4..12].copy_from_slice(&wal_index.to_le_bytes());
+    Writer::new(buf).u32(request_id).u64(wal_index);
 }
 
 #[inline]
 pub fn decode_wal_entry_request(buf: &[u8]) -> Option<(u32, u64)> {
-    if buf.len() < WAL_ENTRY_REQUEST_LEN {
-        return None;
-    }
-    let request_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let wal_index = u64::from_le_bytes([
-        buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-    ]);
+    let mut r = Reader::new(buf, WAL_ENTRY_REQUEST_LEN)?;
+    let request_id = r.u32();
+    let wal_index = r.u64();
     Some((request_id, wal_index))
 }
 
@@ -688,27 +830,20 @@ pub fn encode_wal_entry_reply_hdr(
     index: u64,
     prev_term: u64,
 ) {
-    buf[0..4].copy_from_slice(&request_id.to_le_bytes());
-    buf[4..12].copy_from_slice(&term.to_le_bytes());
-    buf[12..20].copy_from_slice(&index.to_le_bytes());
-    buf[20..28].copy_from_slice(&prev_term.to_le_bytes());
+    Writer::new(buf)
+        .u32(request_id)
+        .u64(term)
+        .u64(index)
+        .u64(prev_term);
 }
 
 #[inline]
 pub fn decode_wal_entry_reply(buf: &[u8]) -> Option<(u32, u64, u64, u64, usize)> {
-    if buf.len() < WAL_ENTRY_REPLY_HDR {
-        return None;
-    }
-    let request_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let term = u64::from_le_bytes([
-        buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
-    ]);
-    let index = u64::from_le_bytes([
-        buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
-    ]);
-    let prev_term = u64::from_le_bytes([
-        buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
-    ]);
+    let mut r = Reader::new(buf, WAL_ENTRY_REPLY_HDR)?;
+    let request_id = r.u32();
+    let term = r.u64();
+    let index = r.u64();
+    let prev_term = r.u64();
     Some((request_id, term, index, prev_term, WAL_ENTRY_REPLY_HDR))
 }
 /// Per-entry committed envelope emitted on `consensus.committed_entries`.
@@ -854,14 +989,17 @@ impl PeerIdentity {
 #[inline]
 #[must_use]
 pub fn decode_peer_identity(buf: &[u8]) -> Option<PeerIdentity> {
-    if buf.len() < PEER_IDENTITY_HDR {
-        return None;
-    }
-    let session_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let result = buf[4];
-    let flags = u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]);
-    let fingerprint_len = buf[29] as usize;
-    let principal_len = u16::from_le_bytes([buf[30], buf[31]]) as usize;
+    let mut r = Reader::new(buf, PEER_IDENTITY_HDR)?;
+    let session_id = r.u32();
+    let result = r.u8();
+    // `credential_kind:u8`, `profile_id:u16`, `not_before:u64`,
+    // `not_after:u64` — on the wire and counted in PEER_IDENTITY_HDR,
+    // but nothing downstream of this decoder consumes them.
+    r.skip(1 + 2 + 8 + 8);
+    let flags = r.u32();
+    r.skip(1); // key_fp_alg
+    let fingerprint_len = r.u8() as usize;
+    let principal_len = r.u16() as usize;
     let fingerprint_at = PEER_IDENTITY_HDR;
     let principal_at = fingerprint_at + fingerprint_len;
     if buf.len() < principal_at + principal_len {
@@ -914,13 +1052,14 @@ pub fn encode_app_snapshot_chunk(
     if buf.len() < total {
         return 0;
     }
-    buf[0..8].copy_from_slice(&term.to_le_bytes());
-    buf[8..16].copy_from_slice(&last_included_index.to_le_bytes());
-    buf[16..24].copy_from_slice(&offset.to_le_bytes());
-    buf[24] = done as u8;
-    buf[25] = 0;
-    buf[26] = 0;
-    buf[27] = 0;
+    Writer::new(buf)
+        .u64(term)
+        .u64(last_included_index)
+        .u64(offset)
+        .u8(done as u8)
+        .u8(0)
+        .u8(0)
+        .u8(0);
     if !body.is_empty() {
         buf[APP_SNAPSHOT_HDR..total].copy_from_slice(body);
     }
@@ -929,19 +1068,11 @@ pub fn encode_app_snapshot_chunk(
 
 #[inline]
 pub fn decode_app_snapshot_chunk(buf: &[u8]) -> Option<(u64, u64, u64, bool, usize)> {
-    if buf.len() < APP_SNAPSHOT_HDR {
-        return None;
-    }
-    let term = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let idx = u64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ]);
-    let offset = u64::from_le_bytes([
-        buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-    ]);
-    let done = buf[24] != 0;
+    let mut r = Reader::new(buf, APP_SNAPSHOT_HDR)?;
+    let term = r.u64();
+    let idx = r.u64();
+    let offset = r.u64();
+    let done = r.bool();
     Some((term, idx, offset, done, APP_SNAPSHOT_HDR))
 }
 
@@ -961,11 +1092,12 @@ pub fn encode_install_snapshot(
     if buf.len() < total {
         return 0;
     }
-    buf[0..8].copy_from_slice(&term.to_le_bytes());
-    buf[8..16].copy_from_slice(&last_included_index.to_le_bytes());
-    buf[16..24].copy_from_slice(&last_included_term.to_le_bytes());
-    buf[24..32].copy_from_slice(&offset.to_le_bytes());
-    buf[32] = if done { 1 } else { 0 };
+    Writer::new(buf)
+        .u64(term)
+        .u64(last_included_index)
+        .u64(last_included_term)
+        .u64(offset)
+        .u8(if done { 1 } else { 0 });
     if !data.is_empty() {
         buf[INSTALL_SNAPSHOT_HDR..total].copy_from_slice(data);
     }
@@ -974,22 +1106,12 @@ pub fn encode_install_snapshot(
 
 #[inline]
 pub fn decode_install_snapshot(buf: &[u8]) -> Option<(u64, u64, u64, u64, bool, usize)> {
-    if buf.len() < INSTALL_SNAPSHOT_HDR {
-        return None;
-    }
-    let term = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let last_idx = u64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ]);
-    let last_term = u64::from_le_bytes([
-        buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-    ]);
-    let offset = u64::from_le_bytes([
-        buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
-    ]);
-    let done = buf[32] != 0;
+    let mut r = Reader::new(buf, INSTALL_SNAPSHOT_HDR)?;
+    let term = r.u64();
+    let last_idx = r.u64();
+    let last_term = r.u64();
+    let offset = r.u64();
+    let done = r.bool();
     Some((
         term,
         last_idx,
@@ -1010,25 +1132,18 @@ pub fn encode_snapshot_installed(
     last_included_index: u64,
     last_included_term: u64,
 ) {
-    buf[0..8].copy_from_slice(&term.to_le_bytes());
-    buf[8..16].copy_from_slice(&last_included_index.to_le_bytes());
-    buf[16..24].copy_from_slice(&last_included_term.to_le_bytes());
+    Writer::new(buf)
+        .u64(term)
+        .u64(last_included_index)
+        .u64(last_included_term);
 }
 
 #[inline]
 pub fn decode_snapshot_installed(buf: &[u8]) -> Option<(u64, u64, u64)> {
-    if buf.len() < SNAPSHOT_INSTALLED_LEN {
-        return None;
-    }
-    let term = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let last_idx = u64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ]);
-    let last_term = u64::from_le_bytes([
-        buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
-    ]);
+    let mut r = Reader::new(buf, SNAPSHOT_INSTALLED_LEN)?;
+    let term = r.u64();
+    let last_idx = r.u64();
+    let last_term = r.u64();
     Some((term, last_idx, last_term))
 }
 
@@ -1592,25 +1707,22 @@ pub fn encode_metric_sample(
     kind: u8,
     value: i64,
 ) {
-    buf[0] = module_id;
-    buf[1..3].copy_from_slice(&partition_id.to_le_bytes());
-    buf[3..5].copy_from_slice(&metric_id.to_le_bytes());
-    buf[5] = kind;
-    buf[6..14].copy_from_slice(&value.to_le_bytes());
+    Writer::new(buf)
+        .u8(module_id)
+        .u16(partition_id)
+        .u16(metric_id)
+        .u8(kind)
+        .i64(value);
 }
 
 #[inline]
 pub fn decode_metric_sample(buf: &[u8]) -> Option<(u8, u16, u16, u8, i64)> {
-    if buf.len() < METRIC_SAMPLE_LEN {
-        return None;
-    }
-    let module_id = buf[0];
-    let partition_id = u16::from_le_bytes([buf[1], buf[2]]);
-    let metric_id = u16::from_le_bytes([buf[3], buf[4]]);
-    let kind = buf[5];
-    let value = i64::from_le_bytes([
-        buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13],
-    ]);
+    let mut r = Reader::new(buf, METRIC_SAMPLE_LEN)?;
+    let module_id = r.u8();
+    let partition_id = r.u16();
+    let metric_id = r.u16();
+    let kind = r.u8();
+    let value = r.i64();
     Some((module_id, partition_id, metric_id, kind, value))
 }
 
@@ -1684,20 +1796,16 @@ pub fn encode_header(buf: &mut [u8], msg_type: u8, payload_len: u16) -> i32 {
     if buf.len() < ENVELOPE_HDR {
         return -1;
     }
-    buf[0] = msg_type;
-    let lb = payload_len.to_le_bytes();
-    buf[1] = lb[0];
-    buf[2] = lb[1];
+    Writer::new(buf).u8(msg_type).u16(payload_len);
     ENVELOPE_HDR as i32
 }
 
-/// Decode an envelope header from `buf[0..3]`. Returns `(msg_type, payload_len)`.
-/// Caller must ensure buf.len() >= ENVELOPE_HDR.
+/// Decode an envelope header from `buf[0..3]` — `(msg_type, payload_len)`,
+/// or `None` if the buffer is shorter than the envelope.
 #[inline]
-pub fn decode_header(buf: &[u8]) -> (u8, u16) {
-    let msg_type = buf[0];
-    let payload_len = u16::from_le_bytes([buf[1], buf[2]]);
-    (msg_type, payload_len)
+pub fn decode_header(buf: &[u8]) -> Option<(u8, u16)> {
+    let mut r = Reader::new(buf, ENVELOPE_HDR)?;
+    Some((r.u8(), r.u16()))
 }
 
 // Channel I/O over `SyscallTable` (`channel_{write,read}_msg`,
@@ -1729,25 +1837,20 @@ pub fn encode_partitioned_header(
     if buf.len() < PARTITIONED_HDR {
         return -1;
     }
-    let pid = partition_id.to_le_bytes();
-    buf[0] = pid[0];
-    buf[1] = pid[1];
-    buf[2] = msg_type;
-    let lb = payload_len.to_le_bytes();
-    buf[3] = lb[0];
-    buf[4] = lb[1];
+    Writer::new(buf)
+        .u16(partition_id)
+        .u8(msg_type)
+        .u16(payload_len);
     PARTITIONED_HDR as i32
 }
 
-/// Decode a partitioned envelope header from `buf[0..5]`. Returns
-/// `(partition_id, msg_type, payload_len)`. Caller must ensure
-/// `buf.len() >= PARTITIONED_HDR`.
+/// Decode a partitioned envelope header from `buf[0..5]` —
+/// `(partition_id, msg_type, payload_len)`, or `None` if the buffer is
+/// shorter than the partitioned envelope.
 #[inline]
-pub fn decode_partitioned_header(buf: &[u8]) -> (u16, u8, u16) {
-    let partition_id = u16::from_le_bytes([buf[0], buf[1]]);
-    let msg_type = buf[2];
-    let payload_len = u16::from_le_bytes([buf[3], buf[4]]);
-    (partition_id, msg_type, payload_len)
+pub fn decode_partitioned_header(buf: &[u8]) -> Option<(u16, u8, u16)> {
+    let mut r = Reader::new(buf, PARTITIONED_HDR)?;
+    Some((r.u16(), r.u8(), r.u16()))
 }
 
 // ── Routed message helpers (for peer_tx channel) ────────────────────────────
@@ -1786,26 +1889,20 @@ pub const ROUTED_PARTITIONED_HDR: usize = 6;
 /// Encode a term + index pair (16 bytes).
 #[inline]
 pub fn encode_term_index(buf: &mut [u8], term: u64, index: u64) {
-    buf[0..8].copy_from_slice(&term.to_le_bytes());
-    buf[8..16].copy_from_slice(&index.to_le_bytes());
+    Writer::new(buf).u64(term).u64(index);
 }
 
-/// Decode a term + index pair (16 bytes).
+/// Decode a term + index pair (16 bytes), or `None` on a short frame.
+///
+/// A truncated peer frame must never index past the buffer: `no_std`
+/// modules cannot unwind, so a panic kills the module. It must also
+/// never decode to inert zeros, which `(term 0, index 0)` — a legal
+/// pre-election value — makes indistinguishable from a real record.
+/// `None` is the only answer that is both safe and honest.
 #[inline]
-pub fn decode_term_index(buf: &[u8]) -> (u64, u64) {
-    // Truncated-frame guard: a short peer frame must degrade to inert
-    // zeros, not an index panic (no_std modules cannot unwind — a panic
-    // kills the module).
-    if buf.len() < 16 {
-        return (0, 0);
-    }
-    let term = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let index = u64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-    ]);
-    (term, index)
+pub fn decode_term_index(buf: &[u8]) -> Option<(u64, u64)> {
+    let mut r = Reader::new(buf, 16)?;
+    Some((r.u64(), r.u64()))
 }
 
 // ── Extended AppendEntries envelope (RFC §5.1 log matching) ────────────────
@@ -1836,13 +1933,14 @@ pub fn encode_append_entries(
     if buf.len() < total {
         return 0;
     }
-    buf[0..8].copy_from_slice(&term.to_le_bytes());
-    buf[8] = leader_id;
-    buf[9..17].copy_from_slice(&prev_log_index.to_le_bytes());
-    buf[17..25].copy_from_slice(&prev_log_term.to_le_bytes());
-    buf[25..33].copy_from_slice(&leader_commit.to_le_bytes());
-    buf[33..41].copy_from_slice(&entry_term.to_le_bytes());
-    buf[41..49].copy_from_slice(&entry_index.to_le_bytes());
+    Writer::new(buf)
+        .u64(term)
+        .u8(leader_id)
+        .u64(prev_log_index)
+        .u64(prev_log_term)
+        .u64(leader_commit)
+        .u64(entry_term)
+        .u64(entry_index);
     if !body.is_empty() {
         buf[AE_HDR_LEN..total].copy_from_slice(body);
     }
@@ -1851,28 +1949,14 @@ pub fn encode_append_entries(
 
 #[inline]
 pub fn decode_append_entries(buf: &[u8]) -> Option<(u64, u8, u64, u64, u64, u64, u64)> {
-    if buf.len() < AE_HDR_LEN {
-        return None;
-    }
-    let term = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let leader_id = buf[8];
-    let prev_idx = u64::from_le_bytes([
-        buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16],
-    ]);
-    let prev_term = u64::from_le_bytes([
-        buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23], buf[24],
-    ]);
-    let leader_commit = u64::from_le_bytes([
-        buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32],
-    ]);
-    let entry_term = u64::from_le_bytes([
-        buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39], buf[40],
-    ]);
-    let entry_index = u64::from_le_bytes([
-        buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47], buf[48],
-    ]);
+    let mut r = Reader::new(buf, AE_HDR_LEN)?;
+    let term = r.u64();
+    let leader_id = r.u8();
+    let prev_idx = r.u64();
+    let prev_term = r.u64();
+    let leader_commit = r.u64();
+    let entry_term = r.u64();
+    let entry_index = r.u64();
     Some((
         term,
         leader_id,
@@ -1885,18 +1969,14 @@ pub fn decode_append_entries(buf: &[u8]) -> Option<(u64, u8, u64, u64, u64, u64,
 }
 
 pub fn encode_term_index_replica(buf: &mut [u8], term: u64, index: u64, replica: u8) {
-    encode_term_index(buf, term, index);
-    buf[16] = replica;
+    Writer::new(buf).u64(term).u64(index).u8(replica);
 }
 
-/// Decode term + index + replica_id (17 bytes).
+/// Decode term + index + replica_id (17 bytes), or `None` on a short frame.
 #[inline]
-pub fn decode_term_index_replica(buf: &[u8]) -> (u64, u64, u8) {
-    if buf.len() < 17 {
-        return (0, 0, 0);
-    }
-    let (term, index) = decode_term_index(buf);
-    (term, index, buf[16])
+pub fn decode_term_index_replica(buf: &[u8]) -> Option<(u64, u64, u8)> {
+    let mut r = Reader::new(buf, 17)?;
+    Some((r.u64(), r.u64(), r.u8()))
 }
 
 /// Encode a RequestVote / PreVote payload (25 bytes):
@@ -1909,52 +1989,35 @@ pub fn encode_vote_request(
     last_index: u64,
     last_term: u64,
 ) {
-    buf[0..8].copy_from_slice(&term.to_le_bytes());
-    buf[8] = candidate;
-    buf[9..17].copy_from_slice(&last_index.to_le_bytes());
-    buf[17..25].copy_from_slice(&last_term.to_le_bytes());
+    Writer::new(buf)
+        .u64(term)
+        .u8(candidate)
+        .u64(last_index)
+        .u64(last_term);
 }
 
-/// Decode a RequestVote / PreVote payload (25 bytes).
+/// Decode a RequestVote / PreVote payload (25 bytes), or `None` on a
+/// short frame. A truncated vote request must not decode to term 0 /
+/// candidate 0 — that is a well-formed message the election path would
+/// otherwise act on.
 #[inline]
-pub fn decode_vote_request(buf: &[u8]) -> (u64, u8, u64, u64) {
-    if buf.len() < 25 {
-        return (0, 0, 0, 0);
-    }
-    let term = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let candidate = buf[8];
-    let last_index = u64::from_le_bytes([
-        buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16],
-    ]);
-    let last_term = u64::from_le_bytes([
-        buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23], buf[24],
-    ]);
-    (term, candidate, last_index, last_term)
+pub fn decode_vote_request(buf: &[u8]) -> Option<(u64, u8, u64, u64)> {
+    let mut r = Reader::new(buf, 25)?;
+    Some((r.u64(), r.u8(), r.u64(), r.u64()))
 }
 
 /// Encode a VoteResponse payload (10 bytes):
 ///   term(8) + granted(1) + voter_id(1)
 #[inline]
 pub fn encode_vote_response(buf: &mut [u8], term: u64, granted: bool, voter: u8) {
-    buf[0..8].copy_from_slice(&term.to_le_bytes());
-    buf[8] = granted as u8;
-    buf[9] = voter;
+    Writer::new(buf).u64(term).bool(granted).u8(voter);
 }
 
-/// Decode a VoteResponse payload (10 bytes).
+/// Decode a VoteResponse payload (10 bytes), or `None` on a short frame.
 #[inline]
-pub fn decode_vote_response(buf: &[u8]) -> (u64, bool, u8) {
-    if buf.len() < 10 {
-        return (0, false, 0);
-    }
-    let term = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let granted = buf[8] != 0;
-    let voter = buf[9];
-    (term, granted, voter)
+pub fn decode_vote_response(buf: &[u8]) -> Option<(u64, bool, u8)> {
+    let mut r = Reader::new(buf, 10)?;
+    Some((r.u64(), r.bool(), r.u8()))
 }
 
 /// Encode an FsyncAck payload (17 bytes):
@@ -1975,9 +2038,9 @@ pub fn encode_fsync_ack(buf: &mut [u8], term: u64, index: u64, replica: u8) {
     encode_term_index_replica(buf, term, index, replica);
 }
 
-/// Decode an FsyncAck payload (17 bytes).
+/// Decode an FsyncAck payload (17 bytes), or `None` on a short frame.
 #[inline]
-pub fn decode_fsync_ack(buf: &[u8]) -> (u64, u64, u8) {
+pub fn decode_fsync_ack(buf: &[u8]) -> Option<(u64, u64, u8)> {
     decode_term_index_replica(buf)
 }
 
@@ -2011,10 +2074,12 @@ pub fn encode_append_entries_resp(
     durable_index: u64,
     busy: bool,
 ) {
-    encode_term_index_replica(buf, term, last_log_index, self_id);
-    buf[16] = self_id | ((success as u8) << 7);
-    buf[17..25].copy_from_slice(&durable_index.to_le_bytes());
-    buf[25] = busy as u8;
+    Writer::new(buf)
+        .u64(term)
+        .u64(last_log_index)
+        .u8(self_id | (u8::from(success) << 7))
+        .u64(durable_index)
+        .bool(busy);
 }
 
 /// Decode an AppendEntriesResponse payload. Accepts the 26-byte modern shape,
@@ -2024,20 +2089,15 @@ pub fn encode_append_entries_resp(
 /// Returns `(term, last_log_index, replica, success, durable_index, busy)`.
 #[inline]
 pub fn decode_append_entries_resp(buf: &[u8]) -> Option<(u64, u64, u8, bool, u64, bool)> {
-    if buf.len() < 17 {
-        return None;
-    }
-    let (term, last_index, replica_byte) = decode_term_index_replica(buf);
+    let (term, last_index, replica_byte) = decode_term_index_replica(buf)?;
     let success = (replica_byte & 0x80) != 0;
     let replica = replica_byte & 0x7F;
-    let durable_index = if buf.len() >= 25 {
-        u64::from_le_bytes([
-            buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23], buf[24],
-        ])
-    } else {
-        0
-    };
-    let busy = buf.len() >= 26 && buf[25] != 0;
+    // Both tail fields are optional on the wire: a 17-byte response
+    // carries neither, a 25-byte one carries `durable_index` only.
+    // Each decodes to its default when absent, so a peer emitting a
+    // narrower response stays readable.
+    let durable_index = Reader::new(buf, 25).map_or(0, |mut r| r.skip(17).u64());
+    let busy = Reader::new(buf, 26).is_some_and(|mut r| r.skip(25).bool());
     Some((term, last_index, replica, success, durable_index, busy))
 }
 
@@ -2059,30 +2119,23 @@ pub fn encode_durability_proof(
     index: u64,
     replica: u8,
 ) {
-    let pid = partition_id.to_le_bytes();
-    buf[0] = pid[0];
-    buf[1] = pid[1];
-    buf[2..10].copy_from_slice(&term.to_le_bytes());
-    buf[10..18].copy_from_slice(&index.to_le_bytes());
-    buf[18] = replica;
+    Writer::new(buf)
+        .u16(partition_id)
+        .u64(term)
+        .u64(index)
+        .u8(replica);
 }
 
-/// Decode a DurabilityProof payload (19 bytes).
-/// Returns `(partition_id, term, index, replica)`.
+/// Decode a DurabilityProof payload (19 bytes) —
+/// `(partition_id, term, index, replica)`, or `None` on a short frame.
+///
+/// This proof is what `commit` trusts to advance the durable index, so
+/// a truncated one decoding to index 0 would be a silent no-op where a
+/// dropped frame is the honest outcome.
 #[inline]
-pub fn decode_durability_proof(buf: &[u8]) -> (u16, u64, u64, u8) {
-    if buf.len() < 19 {
-        return (0, 0, 0, 0);
-    }
-    let partition_id = u16::from_le_bytes([buf[0], buf[1]]);
-    let term = u64::from_le_bytes([
-        buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8], buf[9],
-    ]);
-    let index = u64::from_le_bytes([
-        buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
-    ]);
-    let replica = buf[18];
-    (partition_id, term, index, replica)
+pub fn decode_durability_proof(buf: &[u8]) -> Option<(u16, u64, u64, u8)> {
+    let mut r = Reader::new(buf, DURABILITY_PROOF_LEN)?;
+    Some((r.u16(), r.u64(), r.u64(), r.u8()))
 }
 
 /// Encode a CacheState payload (1 byte): the CP_* constant.
@@ -2091,31 +2144,23 @@ pub fn encode_cache_state(buf: &mut [u8], state: u8) {
     buf[0] = state;
 }
 
-/// Decode a CacheState payload (1 byte).
+/// Decode a CacheState payload (1 byte), or `None` on an empty frame.
 #[inline]
-pub fn decode_cache_state(buf: &[u8]) -> u8 {
-    if buf.is_empty() {
-        return 0;
-    }
-    buf[0]
+pub fn decode_cache_state(buf: &[u8]) -> Option<u8> {
+    Some(Reader::new(buf, 1)?.u8())
 }
 
 /// Encode ThrottleCredits payload (8 bytes): entry_credits(4) + byte_credits(4).
 #[inline]
 pub fn encode_credits(buf: &mut [u8], entry: i32, byte: i32) {
-    buf[0..4].copy_from_slice(&entry.to_le_bytes());
-    buf[4..8].copy_from_slice(&byte.to_le_bytes());
+    Writer::new(buf).i32(entry).i32(byte);
 }
 
-/// Decode ThrottleCredits payload (8 bytes).
+/// Decode ThrottleCredits payload (8 bytes), or `None` on a short frame.
 #[inline]
-pub fn decode_credits(buf: &[u8]) -> (i32, i32) {
-    if buf.len() < 8 {
-        return (0, 0);
-    }
-    let entry = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-    let byte = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    (entry, byte)
+pub fn decode_credits(buf: &[u8]) -> Option<(i32, i32)> {
+    let mut r = Reader::new(buf, 8)?;
+    Some((r.i32(), r.i32()))
 }
 
 pub const THROTTLE_REFILL_LEN: usize = 16;
@@ -2128,10 +2173,11 @@ pub fn encode_throttle_refill(
     entry_capacity: i32,
     byte_capacity: i32,
 ) {
-    buf[0..4].copy_from_slice(&entry_grant.to_le_bytes());
-    buf[4..8].copy_from_slice(&byte_grant.to_le_bytes());
-    buf[8..12].copy_from_slice(&entry_capacity.to_le_bytes());
-    buf[12..16].copy_from_slice(&byte_capacity.to_le_bytes());
+    Writer::new(buf)
+        .i32(entry_grant)
+        .i32(byte_grant)
+        .i32(entry_capacity)
+        .i32(byte_capacity);
 }
 
 #[inline]
@@ -2139,9 +2185,8 @@ pub fn decode_throttle_refill(buf: &[u8]) -> Option<(i32, i32, i32, i32)> {
     if buf.len() < THROTTLE_REFILL_LEN {
         return None;
     }
-    let i32_at =
-        |off: usize| i32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
-    Some((i32_at(0), i32_at(4), i32_at(8), i32_at(12)))
+    let mut r = Reader::new(buf, THROTTLE_REFILL_LEN)?;
+    Some((r.i32(), r.i32(), r.i32(), r.i32()))
 }
 
 // ── FNV-1a 64-bit hash ──────────────────────────────────────────────────────
@@ -2196,8 +2241,7 @@ pub fn encode_tagged_proposal(dst: &mut [u8], correlation_id: u64, body: &[u8]) 
     if dst.len() < total {
         return -1;
     }
-    dst[0..8].copy_from_slice(&correlation_id.to_le_bytes());
-    dst[8..total].copy_from_slice(body);
+    Writer::new(dst).u64(correlation_id).bytes(body);
     total as i32
 }
 
@@ -2206,12 +2250,7 @@ pub fn encode_tagged_proposal(dst: &mut [u8], correlation_id: u64, body: &[u8]) 
 /// to obtain the body. Returns `None` if `buf` is shorter than the header.
 #[inline]
 pub fn decode_tagged_proposal(buf: &[u8]) -> Option<(u64, usize)> {
-    if buf.len() < TAGGED_PROPOSAL_HDR {
-        return None;
-    }
-    let correlation_id = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
+    let correlation_id = Reader::new(buf, TAGGED_PROPOSAL_HDR)?.u64();
     Some((correlation_id, TAGGED_PROPOSAL_HDR))
 }
 
@@ -2231,26 +2270,16 @@ pub fn encode_proposal_assigned(
     partition_id: u16,
     wal_index: u64,
 ) {
-    dst[0..8].copy_from_slice(&correlation_id.to_le_bytes());
-    let pid = partition_id.to_le_bytes();
-    dst[8] = pid[0];
-    dst[9] = pid[1];
-    dst[10..18].copy_from_slice(&wal_index.to_le_bytes());
+    Writer::new(dst)
+        .u64(correlation_id)
+        .u16(partition_id)
+        .u64(wal_index);
 }
 
-/// Decode a MSG_PROPOSAL_ASSIGNED payload (18 bytes).
-/// Returns `(correlation_id, partition_id, wal_index)`.
+/// Decode a MSG_PROPOSAL_ASSIGNED payload (18 bytes) —
+/// `(correlation_id, partition_id, wal_index)`, or `None` on a short frame.
 #[inline]
-pub fn decode_proposal_assigned(buf: &[u8]) -> (u64, u16, u64) {
-    if buf.len() < 18 {
-        return (0, 0, 0);
-    }
-    let correlation_id = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    let partition_id = u16::from_le_bytes([buf[8], buf[9]]);
-    let wal_index = u64::from_le_bytes([
-        buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17],
-    ]);
-    (correlation_id, partition_id, wal_index)
+pub fn decode_proposal_assigned(buf: &[u8]) -> Option<(u64, u16, u64)> {
+    let mut r = Reader::new(buf, 18)?;
+    Some((r.u64(), r.u16(), r.u64()))
 }

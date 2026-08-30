@@ -191,8 +191,7 @@ pub unsafe fn next_wire_command(
     if r.in_requests < 0 {
         return Pulled::Empty;
     }
-    let poll = (sys.channel_poll)(r.in_requests, 0x01);
-    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+    if !wire_channels::readable(sys, r.in_requests) {
         return Pulled::Empty;
     }
     let (msg_type, plen) = wire_channels::channel_read_msg(sys, r.in_requests, &mut r.msg_buf);
@@ -247,8 +246,7 @@ pub unsafe fn evaluate(
         // Best-effort: an unwired or full port costs one poll and
         // never gates the dispatch table's delivery to `admin`.
         if r.out_authorized >= 0 {
-            let poll_out = (sys.channel_poll)(r.out_authorized, 0x02);
-            if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, r.out_authorized) {
                 wire_channels::channel_write_msg(
                     sys,
                     r.out_authorized,
@@ -259,8 +257,7 @@ pub unsafe fn evaluate(
         }
     } else {
         if origin == Origin::Wire && r.out_denied >= 0 {
-            let poll_out = (sys.channel_poll)(r.out_denied, 0x02);
-            if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, r.out_denied) {
                 let resp = [conn_id, wire::ADMIN_STATUS_REJECTED];
                 wire_channels::channel_write_msg(sys, r.out_denied, wire::MSG_ADMIN_RESPONSE, &resp);
             }
@@ -272,8 +269,7 @@ pub unsafe fn evaluate(
     // consumers see it on `audit_events`; the telemetry component
     // counts it like any other legacy metrics envelope.
     if r.out_audit >= 0 {
-        let poll_out = (sys.channel_poll)(r.out_audit, 0x02);
-        if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, r.out_audit) {
             let audit = [authorized as u8, role, conn_id];
             wire_channels::channel_write_msg(sys, r.out_audit, wire::MSG_METRICS, &audit);
         }
@@ -291,11 +287,10 @@ unsafe fn drain_identity(r: &mut Rbac, sys: &SyscallTable) {
         return;
     }
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(r.in_identity, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, r.in_identity, &mut r.msg_buf)
+        else {
             break;
-        }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, r.in_identity, &mut r.msg_buf);
+        };
         if msg_type != wire::MSG_PEER_IDENTITY {
             continue;
         }

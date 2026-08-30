@@ -553,15 +553,7 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
             s.frames_dropped as i64,
         ),
     ];
-    for &(metric_id, kind, value) in samples.iter() {
-        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 {
-            break;
-        }
-        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
-        wire::encode_metric_sample(&mut buf, mid, 0, metric_id, kind, value);
-        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
-    }
+    wire_channels::emit_metrics(sys, s.out_metrics, mid, 0, &samples);
 }
 
 /// # Safety
@@ -575,11 +567,10 @@ unsafe fn drain_tls_identity(s: &mut ModuleState, sys: &SyscallTable) {
         return;
     }
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(s.tls_identity, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.tls_identity, &mut s.buf)
+        else {
             break;
-        }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.tls_identity, &mut s.buf);
+        };
         if msg_type != wire::MSG_PEER_IDENTITY {
             continue;
         }
@@ -707,8 +698,7 @@ unsafe fn connect_peers(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
         }
         s.peer_addrs[i].last_attempt_ms = now;
 
-        let poll = (sys.channel_poll)(s.net_out, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, s.net_out) {
             return;
         }
 
@@ -741,8 +731,7 @@ unsafe fn close_conn(s: &mut ModuleState, sys: &SyscallTable, conn_id: u16) {
     if s.net_out < 0 {
         return;
     }
-    let poll = (sys.channel_poll)(s.net_out, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, s.net_out) {
         return;
     }
     // CMD_CLOSE payload: [conn_id:u16 LE]
@@ -829,8 +818,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
     }
 
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(s.net_in, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        if !wire_channels::readable(sys, s.net_in) {
             break;
         }
 
@@ -962,8 +950,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                         let dest = peer_dest(s, peer_msg_type);
 
                         if dest >= 0 {
-                            let p = (sys.channel_poll)(dest, 0x02);
-                            let wrote = if p > 0 && (p as u32 & 0x02) != 0 {
+                            let wrote = if wire_channels::writable(sys, dest) {
                                 (sys.channel_write)(dest, local.as_ptr(), cl)
                             } else {
                                 0
@@ -1320,8 +1307,7 @@ unsafe fn handle_identity(
                 s.frames_dropped = s.frames_dropped.wrapping_add(1);
             }
             if dest >= 0 {
-                let p = (sys.channel_poll)(dest, 0x02);
-                let wrote = if p > 0 && (p as u32 & 0x02) != 0 {
+                let wrote = if wire_channels::writable(sys, dest) {
                     (sys.channel_write)(dest, data.as_ptr().add(consumed), tail_len)
                 } else {
                     0
@@ -1365,13 +1351,11 @@ unsafe fn route_outbound_chan(s: &mut ModuleState, sys: &SyscallTable, chan: i32
     }
 
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(chan, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        if !wire_channels::readable(sys, chan) {
             break;
         }
 
-        let poll_out = (sys.channel_poll)(s.net_out, 0x02);
-        if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, s.net_out) {
             break;
         }
 
@@ -1519,13 +1503,11 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         // an ack is taken off the channel. poll(OUT) only promises
         // ">=1 byte free", so the atomic net_write_frame can still
         // refuse — the retained stash below catches that residue.
-        let poll_out = (sys.channel_poll)(s.net_out, 0x02);
-        if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, s.net_out) {
             break;
         }
 
-        let poll = (sys.channel_poll)(s.client_resp, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        if !wire_channels::readable(sys, s.client_resp) {
             break;
         }
 
@@ -1630,8 +1612,7 @@ unsafe fn flush_inbound_stash(s: &mut ModuleState, sys: &SyscallTable) -> bool {
         s.inb_stash_len = 0;
         return true;
     }
-    let p = (sys.channel_poll)(dest, 0x02);
-    if p <= 0 || (p as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, dest) {
         return false;
     }
     let wrote = (sys.channel_write)(dest, s.inb_stash.as_ptr(), cl);

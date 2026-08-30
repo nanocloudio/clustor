@@ -173,11 +173,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 1) Drain up to 16 committed entries per step. The handler is
         //    a pure xor over the body bytes — deterministic, no I/O.
         for _ in 0..16 {
-            let poll = (sys.channel_poll)(s.in_entries, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_entries, &mut s.msg_buf)
+            else {
                 break;
-            }
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
+            };
             if msg_type != wire::MSG_COMMITTED_ENTRY {
                 continue;
             }
@@ -217,10 +216,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //     snapshot index.
         if s.in_snapshot_chunk >= 0 {
             for _ in 0..4 {
-                let poll = (sys.channel_poll)(s.in_snapshot_chunk, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (msg_type, plen) =
-                    wire_channels::channel_read_msg(sys, s.in_snapshot_chunk, &mut s.msg_buf);
+                let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_snapshot_chunk, &mut s.msg_buf)
+                else {
+                    break;
+                };
                 let pl = plen as usize;
                 match msg_type {
                     wire::MSG_APP_SNAPSHOT_RESET => {
@@ -263,16 +262,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //     as a single chunk back to durability.
         if s.in_snapshot_request >= 0 && s.out_snapshot_export >= 0 {
             for _ in 0..2 {
-                let poll = (sys.channel_poll)(s.in_snapshot_request, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (msg_type, plen) =
-                    wire_channels::channel_read_msg(sys, s.in_snapshot_request, &mut s.msg_buf);
-                if msg_type != wire::MSG_APP_SNAPSHOT_REQUEST || (plen as usize) < 16 {
+                let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_snapshot_request, &mut s.msg_buf)
+                else {
+                    break;
+                };
+                if msg_type != wire::MSG_APP_SNAPSHOT_REQUEST {
                     continue;
                 }
-                let (term, last_idx) = wire::decode_term_index(&s.msg_buf);
-                let poll_out = (sys.channel_poll)(s.out_snapshot_export, 0x02);
-                if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 { continue; }
+                let Some((term, last_idx)) = wire::decode_term_index(&s.msg_buf[..plen as usize])
+                else {
+                    continue;
+                };
+                if !wire_channels::writable(sys, s.out_snapshot_export) { continue; }
                 let body = s.accumulator.to_le_bytes();
                 let mut out = [0u8; wire::APP_SNAPSHOT_HDR + 4];
                 let n = wire::encode_app_snapshot_chunk(
@@ -298,8 +299,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             buf[12..16].copy_from_slice(&s.accumulator.to_le_bytes());
             buf[16..20].copy_from_slice(&s.stream_gaps.to_le_bytes());
             buf[20..24].copy_from_slice(&(s.subscriber.last_term() as u32).to_le_bytes());
-            let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-            if poll > 0 && (poll as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, s.out_metrics) {
                 wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf);
             }
         }

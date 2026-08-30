@@ -113,13 +113,11 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
         if !flush_retry(su, sys) {
             return Inbound::Empty;
         }
-        let poll_resp = (sys.channel_poll)(su.out_responses, 0x02);
-        if poll_resp <= 0 || (poll_resp as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, su.out_responses) {
             return Inbound::Empty;
         }
     }
-    let poll = (sys.channel_poll)(su.in_requests, 0x01);
-    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+    if !wire_channels::readable(sys, su.in_requests) {
         return Inbound::Empty;
     }
 
@@ -157,8 +155,7 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
         | wire::MSG_HEARTBEAT
         | wire::MSG_HEARTBEAT_RESP => {
             if su.out_raft_rpc >= 0 {
-                let poll_out = (sys.channel_poll)(su.out_raft_rpc, 0x02);
-                if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+                if wire_channels::writable(sys, su.out_raft_rpc) {
                     // consensus.rpc expects 5-byte partitioned
                     // envelopes. Client-injected Raft RPCs are
                     // admin-side and don't carry a partition tag,
@@ -176,8 +173,7 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
         }
         wire::MSG_ADMIN_COMMAND => {
             if su.out_admin_req >= 0 {
-                let poll_out = (sys.channel_poll)(su.out_admin_req, 0x02);
-                if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+                if wire_channels::writable(sys, su.out_admin_req) {
                     // Prepend per-message conn_id so the admin
                     // consumer can correlate responses back to
                     // this connection. See RFC §4.5 / §5.8.
@@ -309,8 +305,7 @@ pub unsafe fn send_response(
     if inner_len > 0 {
         frame[4..4 + inner_len].copy_from_slice(&payload[1..1 + inner_len]);
     }
-    let poll_out = (sys.channel_poll)(su.out_responses, 0x02);
-    let wrote = if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+    let wrote = if wire_channels::writable(sys, su.out_responses) {
         (sys.channel_write)(su.out_responses, frame.as_ptr(), total)
     } else {
         0
@@ -344,8 +339,7 @@ unsafe fn flush_retry(su: &mut Surface, sys: &SyscallTable) -> bool {
         su.retry_len = 0;
         return true;
     }
-    let poll_out = (sys.channel_poll)(su.out_responses, 0x02);
-    if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, su.out_responses) {
         return false;
     }
     let wrote = (sys.channel_write)(su.out_responses, su.retry_frame.as_ptr(), total);
@@ -376,8 +370,7 @@ pub unsafe fn ready_to_send(su: &mut Surface, sys: &SyscallTable) -> bool {
     if !flush_retry(su, sys) {
         return false;
     }
-    let poll_out = (sys.channel_poll)(su.out_responses, 0x02);
-    poll_out > 0 && (poll_out as u32 & 0x02) != 0
+    wire_channels::writable(sys, su.out_responses)
 }
 
 /// Forward admin responses from the `admin_responses` port. Each
@@ -387,13 +380,11 @@ unsafe fn forward_admin_responses(su: &mut Surface, sys: &SyscallTable) {
         return;
     }
     for _ in 0..4 {
-        let poll = (sys.channel_poll)(su.in_admin_resp, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        if !wire_channels::readable(sys, su.in_admin_resp) {
             break;
         }
 
-        let poll_out = (sys.channel_poll)(su.out_responses, 0x02);
-        if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, su.out_responses) {
             break;
         }
 

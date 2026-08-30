@@ -58,8 +58,7 @@ pub unsafe fn step(c: &mut Cp, sys: &SyscallTable, now: u64) {
     buf[8..12].copy_from_slice(&seq.to_le_bytes());
 
     if c.out_proof >= 0 {
-        let poll = (sys.channel_poll)(c.out_proof, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, c.out_proof) {
             return; // output full — retry next step, clock not advanced
         }
         let wrote =
@@ -75,8 +74,7 @@ pub unsafe fn step(c: &mut Cp, sys: &SyscallTable, now: u64) {
     // production these come from the same CP response. Synthetic
     // placeholders for now.
     if c.out_tenant_records >= 0 {
-        let poll_t = (sys.channel_poll)(c.out_tenant_records, 0x02);
-        if poll_t > 0 && (poll_t as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, c.out_tenant_records) {
             // [tenant_id:u32 = 0 (default)] [max_rate:u32 = 10000]
             let mut tr = [0u8; 8];
             tr[0..4].copy_from_slice(&0u32.to_le_bytes());
@@ -85,8 +83,7 @@ pub unsafe fn step(c: &mut Cp, sys: &SyscallTable, now: u64) {
         }
     }
     if c.out_capabilities >= 0 {
-        let poll_c = (sys.channel_poll)(c.out_capabilities, 0x02);
-        if poll_c > 0 && (poll_c as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, c.out_capabilities) {
             // [schema_version:u16 = 1] [mqtt_enabled:u8 = 1]
             let caps = [0x01u8, 0x00, 0x01];
             wire_channels::channel_write_msg(sys, c.out_capabilities, 0xD3, &caps);

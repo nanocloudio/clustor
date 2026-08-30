@@ -476,11 +476,10 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
     //    latest-value table). See RFC §4.3.
     if t.in_ingest >= 0 {
         for _ in 0..16 {
-            let poll = (sys.channel_poll)(t.in_ingest, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, t.in_ingest, &mut t.msg_buf)
+            else {
                 break;
-            }
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, t.in_ingest, &mut t.msg_buf);
+            };
             match msg_type {
                 wire::MSG_METRICS => {
                     t.messages_ingested += 1;
@@ -539,8 +538,7 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
 
         // Readyz: 1 byte (ready flag)
         if t.out_readyz >= 0 {
-            let poll = (sys.channel_poll)(t.out_readyz, 0x02);
-            if poll > 0 && (poll as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, t.out_readyz) {
                 let buf = [t.ready as u8];
                 wire_channels::channel_write_msg(sys, t.out_readyz, wire::MSG_READYZ, &buf);
             }
@@ -552,8 +550,7 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
         // applicable. Extend with further blocking reasons as they
         // gain reporters.
         if t.out_why >= 0 {
-            let poll = (sys.channel_poll)(t.out_why, 0x02);
-            if poll > 0 && (poll as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, t.out_why) {
                 let buf = [1u8, timing_pause_reason(t)];
                 wire_channels::channel_write_msg(sys, t.out_why, wire::MSG_WHY, &buf);
             }
@@ -567,8 +564,7 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
         let len = build_export(t, sys);
         t.export_len = len as u16;
         if t.out_export >= 0 {
-            let poll = (sys.channel_poll)(t.out_export, 0x02);
-            if poll > 0 && (poll as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, t.out_export) {
                 wire_channels::channel_write_msg(sys, t.out_export, wire::MSG_METRICS, &t.export_buf[..len]);
             }
         }

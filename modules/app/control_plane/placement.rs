@@ -70,8 +70,7 @@ pub unsafe fn init(p: &mut Placement) {
 pub unsafe fn step(p: &mut Placement, sys: &SyscallTable) {
     // Emit initial placement epoch once
     if !p.emitted && p.out_routing >= 0 {
-        let poll = (sys.channel_poll)(p.out_routing, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, p.out_routing) {
             let buf = p.current_epoch.to_le_bytes();
             wire_channels::channel_write_msg(sys, p.out_routing, wire::MSG_PLACEMENT_UPDATE, &buf);
             p.emitted = true;
@@ -83,8 +82,7 @@ pub unsafe fn step(p: &mut Placement, sys: &SyscallTable) {
     // on receipt; see the component doc for the wire shape and
     // reason-byte conventions.
     if p.current_epoch != p.prev_epoch && p.out_epoch_events >= 0 {
-        let poll = (sys.channel_poll)(p.out_epoch_events, 0x02);
-        if poll > 0 && (poll as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, p.out_epoch_events) {
             // Bootstrap is the very first transition out of
             // `prev_epoch = 0`. Any subsequent placement change
             // (admin op or, eventually, rebalance) reuses this

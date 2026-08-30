@@ -355,12 +355,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //    feeds raft's proposal-intake gate — both delivered before
         //    their consumers step. ≤8/step.
         for _ in 0..8 {
-            let poll = (sys.channel_poll)(s.in_cp_state, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_cp_state, &mut s.msg_buf)
+            else {
                 break;
-            }
-            let (msg_type, plen) =
-                wire_channels::channel_read_msg(sys, s.in_cp_state, &mut s.msg_buf);
+            };
             match msg_type {
                 wire::MSG_CACHE_STATE => {
                     commit::on_cache_state(&mut s.commit, &s.msg_buf, plen);
@@ -428,12 +426,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //     refetch, clear is the replicator's catch-up read-back.
         //     ≤16/step (≤8 per consumer).
         for _ in 0..16 {
-            let poll = (sys.channel_poll)(s.in_entry_reply, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_entry_reply, &mut s.msg_buf)
+            else {
                 break;
-            }
-            let (msg_type, plen) =
-                wire_channels::channel_read_msg(sys, s.in_entry_reply, &mut s.msg_buf);
+            };
             if msg_type != wire::MSG_WAL_ENTRY_REPLY || (plen as usize) < 4 {
                 continue;
             }

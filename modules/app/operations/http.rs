@@ -283,8 +283,7 @@ pub unsafe fn response_writable(h: &Http, sys: &SyscallTable) -> bool {
     if h.out_response < 0 {
         return false;
     }
-    let poll = (sys.channel_poll)(h.out_response, 0x02);
-    poll > 0 && (poll as u32 & 0x02) != 0
+    wire_channels::writable(sys, h.out_response)
 }
 
 /// Consume the burst flag: whether this component advanced a
@@ -420,8 +419,7 @@ pub unsafe fn next_external_request(
     if h.in_request < 0 {
         return ExtPulled::Empty;
     }
-    let poll = (sys.channel_poll)(h.in_request, 0x01);
-    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+    if !wire_channels::readable(sys, h.in_request) {
         return ExtPulled::Empty;
     }
     let n = (sys.channel_read)(h.in_request, h.req_frame.as_mut_ptr(), MAX_EXT_REQUEST);
@@ -566,18 +564,18 @@ unsafe fn drain_proposal_assignments(h: &mut Http, sys: &SyscallTable) {
         return;
     }
     for _ in 0..16 {
-        let poll = (sys.channel_poll)(h.in_proposal_assigned, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, h.in_proposal_assigned, &mut h.msg_buf)
+        else {
             break;
-        }
-        let (msg_type, plen) =
-            wire_channels::channel_read_msg(sys, h.in_proposal_assigned, &mut h.msg_buf);
-        if msg_type != wire::MSG_PROPOSAL_ASSIGNED
-            || (plen as usize) < wire::PROPOSAL_ASSIGNED_LEN
-        {
+        };
+        if msg_type != wire::MSG_PROPOSAL_ASSIGNED {
             continue;
         }
-        let (correlation_id, _partition_id, index) = wire::decode_proposal_assigned(&h.msg_buf);
+        let Some((correlation_id, _partition_id, index)) =
+            wire::decode_proposal_assigned(&h.msg_buf[..plen as usize])
+        else {
+            continue;
+        };
         let corr_pos = h
             .correlations
             .iter()
@@ -619,8 +617,7 @@ pub unsafe fn next_rejection(h: &mut Http, sys: &SyscallTable) -> Feedback {
     if h.in_proposal_rejected < 0 {
         return Feedback::Empty;
     }
-    let poll = (sys.channel_poll)(h.in_proposal_rejected, 0x01);
-    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+    if !wire_channels::readable(sys, h.in_proposal_rejected) {
         return Feedback::Empty;
     }
     let (msg_type, plen) =
@@ -658,8 +655,7 @@ pub unsafe fn next_applied(h: &mut Http, sys: &SyscallTable) -> Feedback {
     if h.in_applied < 0 {
         return Feedback::Empty;
     }
-    let poll = (sys.channel_poll)(h.in_applied, 0x01);
-    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+    if !wire_channels::readable(sys, h.in_applied) {
         return Feedback::Empty;
     }
     let (msg_type, plen) = wire_channels::channel_read_msg(sys, h.in_applied, &mut h.msg_buf);
@@ -731,8 +727,7 @@ unsafe fn emit_http_proposal(
         Some(v) => v,
         None => return false,
     };
-    let poll = (sys.channel_poll)(h.out_proposal, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, h.out_proposal) {
         return false;
     }
     // Bit 63 keeps this namespace disjoint from the codec component's —

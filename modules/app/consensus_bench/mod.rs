@@ -191,8 +191,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if due && s.out_proposals >= 0 {
                     let mut n = 0u16;
                     while n < s.batch_per_step && s.sent < s.total {
-                        let poll = (sys.channel_poll)(s.out_proposals, 0x02);
-                        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+                        if !wire_channels::writable(sys, s.out_proposals) {
                             s.blocked = s.blocked.saturating_add(1);
                             break; // backpressure — try again next step
                         }
@@ -268,11 +267,5 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
         (wire::metric_ids::CBENCH_PROPOSALS_SENT, wire::METRIC_KIND_COUNTER, i64::from(s.sent)),
         (wire::metric_ids::CBENCH_BLOCKED, wire::METRIC_KIND_COUNTER, i64::from(s.blocked)),
     ];
-    for &(metric_id, kind, value) in samples.iter() {
-        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
-        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
-        wire::encode_metric_sample(&mut buf, mid, 0, metric_id, kind, value);
-        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
-    }
+    wire_channels::emit_metrics(sys, s.out_metrics, mid, 0, &samples);
 }

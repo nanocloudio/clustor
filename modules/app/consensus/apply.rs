@@ -506,8 +506,7 @@ unsafe fn emit_sample(
     kind: u8,
     value: i64,
 ) {
-    let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_metrics) { return; }
     let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
     wire::encode_metric_sample(&mut buf, module_id, partition_id, metric_id, kind, value);
     wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
@@ -541,11 +540,15 @@ unsafe fn drain_log_entries(s: &mut Apply, sys: &SyscallTable, bodies: &mut Seam
             Some(v) => v,
             None => break,
         };
-        if msg_type != wire::MSG_WAL_ENTRY || (plen as usize) < 16 {
+        if msg_type != wire::MSG_WAL_ENTRY {
             continue;
         }
         let plen = plen as usize;
-        let (term, index) = wire::decode_term_index(&s.msg_buf);
+        // Slice to the declared payload: `msg_buf` outlives each
+        // message, so a short frame must not read the last one's tail.
+        let Some((term, index)) = wire::decode_term_index(&s.msg_buf[..plen]) else {
+            continue;
+        };
         if index == 0 || index <= s.apply_index {
             // Already applied — drop. Followers receiving truncate-replays
             // would re-deliver, but apply_index only moves forward.
@@ -735,8 +738,7 @@ unsafe fn request_missing_entry(s: &mut Apply, sys: &SyscallTable, index: Index)
     {
         return;
     }
-    let poll = (sys.channel_poll)(s.out_entry_request, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_entry_request) { return; }
     s.entry_request_id = s.entry_request_id.wrapping_add(1);
     let mut buf = [0u8; wire::WAL_ENTRY_REQUEST_LEN];
     wire::encode_wal_entry_request(&mut buf, s.entry_request_id | ENTRY_REQUEST_ID_BIT, index);
@@ -956,9 +958,10 @@ unsafe fn drain_read_permits(s: &mut Apply, sys: &SyscallTable, now: u64) {
     // reads that haven't seen a permit within READ_PERMIT_TTL_MS.
     if s.in_read_permits < 0 { return; }
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(s.in_read_permits, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_read_permits, &mut s.msg_buf);
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_read_permits, &mut s.msg_buf)
+        else {
+            break;
+        };
         if msg_type != wire::MSG_READ_PERMIT || (plen as usize) < 1 { continue; }
         s.last_permit_state = s.msg_buf[0];
         s.last_permit_ms = now;
@@ -974,9 +977,10 @@ unsafe fn drain_read_permits(s: &mut Apply, sys: &SyscallTable, now: u64) {
 unsafe fn drain_read_submissions(s: &mut Apply, sys: &SyscallTable, now: u64) {
     if s.in_reads < 0 { return; }
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(s.in_reads, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_reads, &mut s.msg_buf);
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_reads, &mut s.msg_buf)
+        else {
+            break;
+        };
         if msg_type != wire::MSG_CLIENT_READ_REQUEST { continue; }
         if (plen as usize) < wire::TAGGED_PROPOSAL_HDR { continue; }
         let corr_id = u64::from_le_bytes([
@@ -1150,8 +1154,7 @@ unsafe fn emit_read_response(
     correlation_id: u64,
     required_commit: u64,
 ) -> bool {
-    let poll = (sys.channel_poll)(s.out_applied, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return false; }
+    if !wire_channels::writable(sys, s.out_applied) { return false; }
     // `[correlation_id:u64][required_commit:u64]`.
     //
     // The index is what makes this a fence a caller can actually
@@ -1181,8 +1184,7 @@ unsafe fn emit_read_response(
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_read_reject(s: &mut Apply, sys: &SyscallTable, correlation_id: u64, status: u8) -> bool {
-    let poll = (sys.channel_poll)(s.out_applied, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return false; }
+    if !wire_channels::writable(sys, s.out_applied) { return false; }
     let mut env = [0u8; wire::CLIENT_REJECT_INTERNAL_LEN];
     wire::encode_client_reject_internal(&mut env, correlation_id, status, 0, 0, 0);
     // See emit_read_response: success is the confirmed write, not the poll.

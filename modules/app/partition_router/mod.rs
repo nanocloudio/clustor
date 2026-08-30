@@ -186,8 +186,7 @@ unsafe fn outputs_writable(
     for pid in 0..num_partitions.max(1) {
         let chan = pick_chan(table, pid);
         if chan < 0 { continue; }
-        let poll = (sys.channel_poll)(chan, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 { return false; }
+        if !wire_channels::writable(sys, chan) { return false; }
     }
     true
 }
@@ -209,10 +208,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         for _ in 0..16 {
             // Writability gate BEFORE consume — see outputs_writable.
             if !outputs_writable(sys, &s.out_untagged, s.num_partitions) { break; }
-            let poll_in = (sys.channel_poll)(s.in_proposals, 0x01);
-            if poll_in <= 0 || (poll_in as u32 & 0x01) == 0 { break; }
-
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_proposals, &mut s.msg_buf);
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_proposals, &mut s.msg_buf)
+            else {
+                break;
+            };
             if msg_type != wire::MSG_CLIENT_PROPOSAL || plen == 0 { continue; }
             let body_len = plen as usize;
 
@@ -254,14 +253,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             for _ in 0..16 {
                 // Writability gate BEFORE consume — see outputs_writable.
                 if !outputs_writable(sys, &s.out_tagged, s.num_partitions) { break; }
-                let poll_in = (sys.channel_poll)(s.in_proposals_tagged, 0x01);
-                if poll_in <= 0 || (poll_in as u32 & 0x01) == 0 { break; }
-
-                let (msg_type, plen) = wire_channels::channel_read_msg(
-                    sys,
-                    s.in_proposals_tagged,
-                    &mut s.msg_buf,
-                );
+                let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_proposals_tagged, &mut s.msg_buf)
+                else {
+                    break;
+                };
                 if msg_type != wire::MSG_CLIENT_PROPOSAL { continue; }
                 let plen = plen as usize;
                 if plen < wire::TAGGED_PROPOSAL_HDR { continue; }

@@ -93,8 +93,7 @@ pub unsafe fn step(p: &mut ProofCache, sys: &SyscallTable, now: u64) -> Option<u
             if chan < 0 {
                 continue;
             }
-            let poll = (sys.channel_poll)(chan, 0x02);
-            if poll > 0 && (poll as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, chan) {
                 wire_channels::channel_write_msg(sys, chan, wire::MSG_CACHE_STATE, &buf[..1]);
             }
         }
@@ -102,8 +101,7 @@ pub unsafe fn step(p: &mut ProofCache, sys: &SyscallTable, now: u64) -> Option<u
         // Emit FallbackSignal when entering/leaving strict fallback
         if p.out_fallback >= 0 {
             let fallback = new_state >= types::CP_STALE;
-            let poll = (sys.channel_poll)(p.out_fallback, 0x02);
-            if poll > 0 && (poll as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, p.out_fallback) {
                 let buf = [fallback as u8];
                 wire_channels::channel_write_msg(sys, p.out_fallback, wire::MSG_FALLBACK_SIGNAL, &buf[..1]);
             }
@@ -119,11 +117,10 @@ unsafe fn drain_proofs(p: &mut ProofCache, sys: &SyscallTable, now: u64, which: 
         return;
     }
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(chan, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, chan, &mut p.msg_buf)
+        else {
             break;
-        }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, chan, &mut p.msg_buf);
+        };
         if msg_type == wire::MSG_CP_PROOF && plen >= 8 {
             p.last_proof_ms = now;
         }

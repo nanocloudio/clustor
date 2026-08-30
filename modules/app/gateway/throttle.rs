@@ -55,13 +55,16 @@ pub unsafe fn init(t: &mut Throttle) {
 pub unsafe fn drain_credits(t: &mut Throttle, sys: &SyscallTable) {
     if t.in_credits >= 0 {
         for _ in 0..16 {
-            let poll = (sys.channel_poll)(t.in_credits, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 {
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, t.in_credits, &mut t.msg_buf)
+            else {
                 break;
-            }
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, t.in_credits, &mut t.msg_buf);
-            if msg_type == wire::MSG_THROTTLE_CREDITS && plen >= 8 {
-                let (entry, byte) = wire::decode_credits(&t.msg_buf);
+            };
+            let credits = if msg_type == wire::MSG_THROTTLE_CREDITS {
+                wire::decode_credits(&t.msg_buf[..plen as usize])
+            } else {
+                None
+            };
+            if let Some((entry, byte)) = credits {
                 t.entry_credits = entry;
                 t.byte_credits = byte;
             } else if msg_type == wire::MSG_THROTTLE_REFILL
@@ -116,19 +119,16 @@ pub unsafe fn next_external(
         return None;
     }
     if t.out_rejected >= 0 {
-        let poll_rejected = (sys.channel_poll)(t.out_rejected, 0x02);
-        if poll_rejected <= 0 || (poll_rejected as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, t.out_rejected) {
             return None;
         }
     }
     if t.entry_credits > 0 && t.out_admitted >= 0 {
-        let poll_out = (sys.channel_poll)(t.out_admitted, 0x02);
-        if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, t.out_admitted) {
             return None;
         }
     }
-    let poll = (sys.channel_poll)(t.in_proposals, 0x01);
-    if poll <= 0 || (poll as u32 & 0x01) == 0 {
+    if !wire_channels::readable(sys, t.in_proposals) {
         return None;
     }
     let (msg_type, plen) = wire_channels::channel_read_msg(sys, t.in_proposals, &mut t.msg_buf);
@@ -192,8 +192,7 @@ pub unsafe fn on_proposal(
     if (unlimited || (t.entry_credits > 0 && t.byte_credits >= payload_len as i32))
         && t.out_admitted >= 0
     {
-        let poll_out = (sys.channel_poll)(t.out_admitted, 0x02);
-        if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+        if wire_channels::writable(sys, t.out_admitted) {
             let written =
                 wire_channels::channel_write_msg(sys, t.out_admitted, wire::MSG_CLIENT_PROPOSAL, frame);
             if written > 0 {
@@ -225,8 +224,7 @@ pub unsafe fn on_proposal(
         // External tee for observers (e.g. the operations module's
         // proposal-rejection feedback). Best-effort.
         if t.out_rejected >= 0 {
-            let poll_out = (sys.channel_poll)(t.out_rejected, 0x02);
-            if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, t.out_rejected) {
                 wire_channels::channel_write_msg(
                     sys,
                     t.out_rejected,
@@ -259,17 +257,14 @@ unsafe fn emit_metrics(t: &mut Throttle, sys: &SyscallTable) {
 
     let mid = wire::SOURCE_ID_THROTTLE;
     let kc = wire::METRIC_KIND_COUNTER;
-    let samples: [(u16, i64); 2] = [
-        (wire::metric_ids::THROTTLE_ADMITTED, i64::from(t.admitted_count)),
-        (wire::metric_ids::THROTTLE_REJECTED, i64::from(t.rejected_count)),
-    ];
-    for &(metric_id, value) in samples.iter() {
-        let poll = (sys.channel_poll)(t.out_metrics, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 {
-            break;
-        }
-        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
-        wire::encode_metric_sample(&mut buf, mid, 0, metric_id, kc, value);
-        wire_channels::channel_write_msg(sys, t.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
-    }
+    wire_channels::emit_metrics(
+        sys,
+        t.out_metrics,
+        mid,
+        0,
+        &[
+            (wire::metric_ids::THROTTLE_ADMITTED, kc, i64::from(t.admitted_count)),
+            (wire::metric_ids::THROTTLE_REJECTED, kc, i64::from(t.rejected_count)),
+        ],
+    );
 }

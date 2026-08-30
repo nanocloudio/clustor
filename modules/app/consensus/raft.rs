@@ -1112,8 +1112,7 @@ pub unsafe fn step(
     //    can short-circuit non-leader proposals with CLIENT_REJECT_NOT_LEADER.
     emit_leader_hint(s, sys);
     if s.proposals_received.wrapping_add(s.entries_appended) != work_before {
-        let poll = (sys.channel_poll)(s.in_proposals_tagged, 0x01);
-        let effect = if poll > 0 && (poll as u32 & 0x01) != 0 {
+        let effect = if wire_channels::readable(sys, s.in_proposals_tagged) {
             step_effect::RUNNABLE_BACKLOG
         } else {
             step_effect::WORK_DONE
@@ -1171,8 +1170,7 @@ unsafe fn process_rpc(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // client frames stamped with the wrong partition) are dropped
     // here.
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(s.in_rpc, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+        if !wire_channels::readable(sys, s.in_rpc) { break; }
 
         let (partition_id, msg_type, plen) =
             wire_channels::channel_read_partitioned(sys, s.in_rpc, &mut s.msg_buf);
@@ -1229,8 +1227,7 @@ unsafe fn handle_read_index_probe(s: &mut Raft, sys: &SyscallTable, plen: u16) {
     }
     if term < s.current_term { return; }
     if s.out_rpc < 0 { return; }
-    let poll = (sys.channel_poll)(s.out_rpc, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_rpc) { return; }
     let mut resp = [0u8; 17];
     wire::encode_read_index_probe_resp(&mut resp, probe_id, s.current_term, s.self_id);
     let target = if s.leader_id >= 0 { s.leader_id as u8 } else { wire::TARGET_BROADCAST };
@@ -1374,8 +1371,7 @@ unsafe fn start_probe(
 /// sent on success. Safe to call repeatedly.
 unsafe fn broadcast_probe(s: &mut Raft, sys: &SyscallTable, i: usize) -> bool {
     if s.out_rpc < 0 { return false; }
-    let poll = (sys.channel_poll)(s.out_rpc, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return false; }
+    if !wire_channels::writable(sys, s.out_rpc) { return false; }
     let mut buf = [0u8; 16];
     wire::encode_read_index_probe(&mut buf, s.probes[i].probe_id, s.probes[i].term);
     let n = wire_channels::channel_write_routed_partitioned(
@@ -1475,9 +1471,10 @@ unsafe fn handle_timeout_now(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u
 unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
     if s.in_snapshot_installed < 0 { return; }
     for _ in 0..4 {
-        let poll = (sys.channel_poll)(s.in_snapshot_installed, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_snapshot_installed, &mut s.msg_buf);
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_snapshot_installed, &mut s.msg_buf)
+        else {
+            break;
+        };
         if msg_type != wire::MSG_SNAPSHOT_INSTALLED { continue; }
         let (term, last_idx, last_term) =
             match wire::decode_snapshot_installed(&s.msg_buf[..plen as usize]) {
@@ -1598,8 +1595,7 @@ unsafe fn flush_wal_compact_before(s: &mut Raft, sys: &SyscallTable) {
 /// function pointers reach live kernel routines per the module ABI.
 unsafe fn emit_wal_truncate_after(s: &mut Raft, sys: &SyscallTable) {
     if !s.truncate_pending || s.out_wal_compact < 0 { return; }
-    let poll = (sys.channel_poll)(s.out_wal_compact, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, s.out_wal_compact) {
         s.truncate_emit_pending = true;
         return;
     }
@@ -1878,9 +1874,10 @@ unsafe fn resync_to_wal(s: &mut Raft, sys: &SyscallTable, expected_index: Index)
 unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
     if s.in_wal_flushed < 0 { return; }
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(s.in_wal_flushed, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_wal_flushed, &mut s.msg_buf);
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_wal_flushed, &mut s.msg_buf)
+        else {
+            break;
+        };
         if msg_type == wire::MSG_WAL_REJECT {
             // The WAL refused our append as discontinuous: our log claims
             // entries it never persisted. A successful `channel_write_msg`
@@ -1905,7 +1902,11 @@ unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
         // The ack's term is the term of the entry AT `index`. It is the
         // only source that pairs the two, and the metadata record needs
         // exactly that pair.
-        let (ack_term, index, _replica) = wire::decode_fsync_ack(&s.msg_buf);
+        let Some((ack_term, index, _replica)) =
+            wire::decode_fsync_ack(&s.msg_buf[..plen as usize])
+        else {
+            continue;
+        };
         if index > s.local_durable_index {
             s.local_durable_index = index;
             s.local_durable_term = ack_term;
@@ -1945,12 +1946,17 @@ unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
 unsafe fn drain_wal_replay_complete(s: &mut Raft, sys: &SyscallTable) {
     if s.in_wal_replay_complete < 0 { return; }
     for _ in 0..4 {
-        let poll = (sys.channel_poll)(s.in_wal_replay_complete, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-        let (msg_type, plen) =
-            wire_channels::channel_read_msg(sys, s.in_wal_replay_complete, &mut s.msg_buf);
-        if msg_type != wire::MSG_WAL_REPLAY_COMPLETE || (plen as usize) < 16 { continue; }
-        let (hw_term, high_water) = wire::decode_term_index(&s.msg_buf);
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_wal_replay_complete, &mut s.msg_buf)
+        else {
+            break;
+        };
+        if msg_type != wire::MSG_WAL_REPLAY_COMPLETE { continue; }
+        // Slice to the declared payload — see `handle_vote_request`.
+        let Some((hw_term, high_water)) =
+            wire::decode_term_index(&s.msg_buf[..plen as usize])
+        else {
+            continue;
+        };
         // Only a genuine recovery boot acts on the high-water. A
         // non-recovery graph (fresh WAL emitting hw=0) must not rewind a
         // log raft is legitimately growing — so we gate on `awaiting_replay`,
@@ -2130,9 +2136,10 @@ unsafe fn emit_voter_set_update(s: &mut Raft, _sys: &SyscallTable) {
 unsafe fn drain_admin(s: &mut Raft, sys: &SyscallTable, _now: u64) {
     if s.in_admin < 0 { return; }
     for _ in 0..4 {
-        let poll = (sys.channel_poll)(s.in_admin, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_admin, &mut s.msg_buf);
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_admin, &mut s.msg_buf)
+        else {
+            break;
+        };
         if msg_type != wire::MSG_ADMIN_COMMAND || (plen as usize) < 5 { continue; }
         let command_id = u32::from_le_bytes([
             s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3],
@@ -2240,8 +2247,7 @@ unsafe fn emit_timeout_now_if_pending(s: &mut Raft, sys: &SyscallTable) {
     if s.pending_transfer_to == 0 { return; }
     if s.role != ROLE_LEADER { s.pending_transfer_to = 0; return; }
     if s.out_rpc < 0 { return; }
-    let poll = (sys.channel_poll)(s.out_rpc, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_rpc) { return; }
     let target = s.pending_transfer_to;
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&s.current_term.to_le_bytes());
@@ -2303,8 +2309,17 @@ fn replay_hold(s: &Raft) -> bool {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, plen: u16) {
-    if plen < 25 { return; }
-    let (term, candidate, last_index, last_term) = wire::decode_vote_request(&s.msg_buf);
+    // Slice to the declared payload before decoding. `msg_buf` is a
+    // long-lived scratch buffer: handing the decoder the whole array
+    // would let a frame shorter than a vote request pass the length
+    // check on the strength of whatever message occupied those bytes
+    // last, and a vote is granted off the result. Every decode against
+    // `msg_buf` in this graph is bounded the same way.
+    let Some((term, candidate, last_index, last_term)) =
+        wire::decode_vote_request(&s.msg_buf[..plen as usize])
+    else {
+        return;
+    };
 
     let is_pre_vote = msg_type == wire::MSG_PRE_VOTE;
 
@@ -2385,8 +2400,7 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
     let mut resp = [0u8; 10];
     wire::encode_vote_response(&mut resp, s.current_term, granted, s.self_id);
 
-    let poll_out = (sys.channel_poll)(s.out_rpc, 0x02);
-    if poll_out > 0 && (poll_out as u32 & 0x02) != 0 {
+    if wire_channels::writable(sys, s.out_rpc) {
         wire_channels::channel_write_routed_partitioned(sys, s.out_rpc, candidate, s.partition_id, resp_type, &resp[..10]);
     }
 }
@@ -2399,9 +2413,11 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn handle_vote_response(s: &mut Raft, sys: &SyscallTable, msg_type: u8, plen: u16) {
     if s.role != ROLE_CANDIDATE { return; }
-    if plen < 10 { return; }
-
-    let (term, granted, voter) = wire::decode_vote_response(&s.msg_buf);
+    let Some((term, granted, voter)) =
+        wire::decode_vote_response(&s.msg_buf[..plen as usize])
+    else {
+        return;
+    };
 
     if term > s.current_term {
         become_follower(s, sys, term);
@@ -2710,8 +2726,7 @@ unsafe fn send_append_response_at(
 
     // Route back to leader
     let target = if s.leader_id >= 0 { s.leader_id as u8 } else { wire::TARGET_BROADCAST };
-    let poll = (sys.channel_poll)(s.out_rpc, 0x02);
-    if poll > 0 && (poll as u32 & 0x02) != 0 {
+    if wire_channels::writable(sys, s.out_rpc) {
         wire_channels::channel_write_routed_partitioned(sys, s.out_rpc, target, s.partition_id, wire::MSG_APPEND_ENTRIES_RESP, &resp);
     }
 }
@@ -2907,9 +2922,10 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
                      s.in_proposals_partitioned, s.in_proposals_partitioned_tagged] {
             if chan < 0 { continue; }
             for _ in 0..16 {
-                let poll = (sys.channel_poll)(chan, 0x01);
-                if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-                let (msg_type, plen) = wire_channels::channel_read_msg(sys, chan, &mut s.msg_buf);
+                let Some((msg_type, plen)) = wire_channels::next_msg(sys, chan, &mut s.msg_buf)
+                else {
+                    break;
+                };
                 // Replicable admin envelopes (ADMIN_MAGIC-prefixed, spec
                 // §3.1) are exempt from the FREEZE gate: freeze blocks
                 // client writes, and the THAW that lifts it rides this
@@ -2958,10 +2974,10 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
             {
                 return;
             }
-            let poll = (sys.channel_poll)(s.in_proposals, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_proposals, &mut s.msg_buf);
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_proposals, &mut s.msg_buf)
+            else {
+                break;
+            };
             if msg_type != wire::MSG_CLIENT_PROPOSAL || plen == 0 { continue; }
 
             if !append_to_batch(s, sys, 0, plen as usize, 0, now) { break; }
@@ -2978,10 +2994,10 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
             {
                 return;
             }
-            let poll = (sys.channel_poll)(s.in_proposals_tagged, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-
-            let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_proposals_tagged, &mut s.msg_buf);
+            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_proposals_tagged, &mut s.msg_buf)
+            else {
+                break;
+            };
             if msg_type != wire::MSG_CLIENT_PROPOSAL { continue; }
             let plen = plen as usize;
             if plen < wire::TAGGED_PROPOSAL_HDR { continue; }
@@ -3011,8 +3027,7 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
             {
                 return;
             }
-            let poll = (sys.channel_poll)(s.in_proposals_partitioned, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+            if !wire_channels::readable(sys, s.in_proposals_partitioned) { break; }
 
             let (partition_id, msg_type, plen) =
                 wire_channels::channel_read_partitioned(sys, s.in_proposals_partitioned, &mut s.msg_buf);
@@ -3037,8 +3052,7 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
             {
                 return;
             }
-            let poll = (sys.channel_poll)(s.in_proposals_partitioned_tagged, 0x01);
-            if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
+            if !wire_channels::readable(sys, s.in_proposals_partitioned_tagged) { break; }
 
             let (partition_id, msg_type, plen) = wire_channels::channel_read_partitioned(
                 sys,
@@ -3303,8 +3317,7 @@ unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
         s.correlation_ids[i] = 0;
         if cid == 0 { continue; }
 
-        let poll = (sys.channel_poll)(s.out_proposal_assigned, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 {
+        if !wire_channels::writable(sys, s.out_proposal_assigned) {
             // Channel full — drop the assignment. The proposer either
             // falls back to its own heuristic or treats this as a lost
             // correlation. Cannot block here.
@@ -3340,8 +3353,7 @@ unsafe fn send_heartbeat(s: &Raft, sys: &SyscallTable) {
         &[],
     );
 
-    let poll = (sys.channel_poll)(s.out_rpc, 0x02);
-    if poll > 0 && (poll as u32 & 0x02) != 0 {
+    if wire_channels::writable(sys, s.out_rpc) {
         wire_channels::channel_write_routed_partitioned(
             sys,
             s.out_rpc,
@@ -4254,8 +4266,7 @@ unsafe fn start_election(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: b
     let req_term = if pre_vote { s.current_term + 1 } else { s.current_term };
     wire::encode_vote_request(&mut req, req_term, s.self_id, s.last_log_index, s.last_log_term);
 
-    let poll = (sys.channel_poll)(s.out_rpc, 0x02);
-    if poll > 0 && (poll as u32 & 0x02) != 0 {
+    if wire_channels::writable(sys, s.out_rpc) {
         wire_channels::channel_write_routed_partitioned(sys, s.out_rpc, wire::TARGET_BROADCAST, s.partition_id, msg_type, &req[..25]);
     }
 
@@ -4356,13 +4367,7 @@ unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
         (wire::metric_ids::RAFT_TRUNCATE_HOLDS, kc, s.truncate_holds as i64),
         (wire::metric_ids::RAFT_TRUNCATE_NACKS, kc, s.truncate_nacks as i64),
     ];
-    for &(metric_id, kind, value) in samples.iter() {
-        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
-        let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
-        wire::encode_metric_sample(&mut buf, mod_id, pid, metric_id, kind, value);
-        wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
-    }
+    wire_channels::emit_metrics(sys, s.out_metrics, mod_id, pid, &samples);
 
     // commit_latency_ms histogram buckets (RFC §4.1), kind=histogram.
     // Cumulative per the wire contract (wire::hist): bucket i carries the
@@ -4371,8 +4376,7 @@ unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
     let mut cum: i64 = 0;
     for i in 0..s.commit_latency_buckets.len() {
         cum += i64::from(s.commit_latency_buckets[i]);
-        let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-        if poll <= 0 || (poll as u32 & 0x02) == 0 { break; }
+        if !wire_channels::writable(sys, s.out_metrics) { break; }
         let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
         wire::encode_metric_sample(&mut buf, mod_id, pid, base + i as u16, wire::METRIC_KIND_HISTOGRAM, cum);
         wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
@@ -4394,8 +4398,7 @@ unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
     if s.strict_fallback { flags |= 0x02; }
     buf[29] = flags;
 
-    let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-    if poll > 0 && (poll as u32 & 0x02) != 0 {
+    if wire_channels::writable(sys, s.out_metrics) {
         wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf[..30]);
     }
 }

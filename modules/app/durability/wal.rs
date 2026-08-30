@@ -78,29 +78,84 @@ const FENCE_RING_MAX: usize = 8;
 const REPLAY_REEMIT_MS: u64 = 20;
 const REPLAY_REEMIT_MAX_ATTEMPTS: u32 = 256;
 
-/// Power of two so `index % RING_SIZE` is a cheap mask. Sized to cover
-/// the last few seconds of a hot writer without inflating module state.
-const ENTRY_RING_SIZE: usize = 256;
-const ENTRY_RING_MASK: u64 = (ENTRY_RING_SIZE as u64) - 1;
+/// Retention window of the volatile variant, in slots: how far back a
+/// refetch can reach in memory. Power of two, so both ring masks below
+/// reduce an index to a slot with a single `&`.
+///
+/// This is the one number that sets a volatile replica's memory cost.
+/// It sizes `memory_entries`, whose slots carry full bodies at
+/// `MemoryEntry` = 2064 B apiece — 516 KiB at 256 slots, which is most
+/// of `Wal`. It also sizes `entry_ring` on a volatile build, for the
+/// reason given there.
+const VOLATILE_RETENTION_SLOTS: usize = 256;
 
-/// Slots in the index->offset map (`entry_ring`). Deliberately separate
-/// from `ENTRY_RING_SIZE`, which also sizes `memory_entries` — those
-/// carry full 2 KiB bodies, so the two cannot share a bound.
+/// Length of `memory_entries`: the retention window on a volatile
+/// build, one slot on a disk build.
+///
+/// The array is written on exactly one path — the `no_fs` branch of
+/// `append_entry` — and `no_fs` is set only by the volatile variant
+/// (`arm`, `ensure_segment_open`); a disk build never sets it, because
+/// a hard open error there fail-closes rather than degrading to memory.
+/// A disk build therefore never populates a slot, and the two paths
+/// that read them see only zeroes: the `no_fs`-gated serve, which it
+/// never enters, and `publish_truncation`'s sweep, which finds every
+/// `index` still 0 and clears nothing. At 2064 B a slot, carrying the
+/// full window on that build would cost a disk replica 514 KiB of
+/// module state no code path can reach. See `memory_slot` for the
+/// accessor that keeps the two sizings honest.
+const MEMORY_RING_SIZE: usize = if VOLATILE { VOLATILE_RETENTION_SLOTS } else { 1 };
+const MEMORY_RING_MASK: u64 = (MEMORY_RING_SIZE as u64) - 1;
+
+/// Per-body cap, taken from the graph-wide entry-body cap rather than
+/// restated here. `wal_frame::MAX_ENTRY_BODY` is what raft's proposal
+/// buffer and the `entry_reply` port's `max_record` are both sized
+/// against; a local literal would pin this ring to one number while
+/// those move, silently truncating every retained body.
+const MEMORY_ENTRY_BODY_CAP: usize = wal_frame::MAX_ENTRY_BODY;
+
+/// Slots in the index->offset map (`entry_ring`). Separate from the
+/// body ring: locations are 32 B, so a disk build affords far more of
+/// them than it could afford bodies.
 ///
 /// On restart, apply restarts at index 0 and refetches every entry;
-/// any index below `entry_ring_min_index` misses the map. Locations
-/// are 32 B, so 8192 slots cost ~256 KiB and cover realistic recovery
-/// windows between snapshots.
+/// any index below `entry_ring_min_index` misses the map. 8192 slots
+/// cost ~256 KiB and cover realistic recovery windows between
+/// snapshots.
 ///
-/// The bound is NOT a hard recovery ceiling: a request below the ring
-/// floor falls back to a bounded forward scan of the on-disk segments
-/// (`step_entry_scan`), which locates the record by walking frames
-/// from the oldest durable segment. Only indices whose segment was
-/// compacted away are truly unservable (`[wal] entry req unservable`)
-/// — for those, snapshot install is the only way back.
-const ENTRY_LOC_RING_SIZE: usize = 8192;
+/// On a DISK build the bound is NOT a hard recovery ceiling: a request
+/// below the ring floor falls back to a bounded forward scan of the
+/// on-disk segments (`step_entry_scan`), which locates the record by
+/// walking frames from the oldest durable segment. Only indices whose
+/// segment was compacted away are truly unservable
+/// (`[wal] entry req unservable`) — for those, snapshot install is the
+/// only way back.
+///
+/// A VOLATILE build has no segments to scan (`step_entry_scan` is
+/// gated off there) and cannot serve any index whose BODY has aged out,
+/// so a location slot outliving its body could never resolve to a
+/// servable reply. The map is therefore sized to the body ring on that
+/// build: 248 KiB less module state, and the two floors coincide, which
+/// makes `entry_ring_min_index` the single honest retention edge rather
+/// than one that under-reports what is actually servable.
+const ENTRY_LOC_RING_SIZE: usize = if VOLATILE { VOLATILE_RETENTION_SLOTS } else { 8192 };
 const ENTRY_LOC_RING_MASK: u64 = (ENTRY_LOC_RING_SIZE as u64) - 1;
-const MEMORY_ENTRY_BODY_CAP: usize = 2048;
+
+/// Footprint budget for `Wal`, enforced at compile time.
+///
+/// `Wal` is by far the largest component in the durability composite,
+/// so it is what decides whether a constrained target fits. The kernel
+/// allocates module state from `module_state_size()`, not from BSS, so
+/// nothing in the linker output flags a regression here — an extra ring
+/// or a widened `MemoryEntry` costs half a megabyte of RAM per replica,
+/// silently. These bounds sit a little above the actual sizes (disk
+/// 285_664 B, volatile 558_032 B) so ordinary field additions pass,
+/// while re-inflating a ring — the only change big enough to matter —
+/// fails the build.
+const WAL_FOOTPRINT_BUDGET: usize = if VOLATILE { 600 * 1024 } else { 320 * 1024 };
+const _: () = assert!(
+    core::mem::size_of::<Wal>() <= WAL_FOOTPRINT_BUDGET,
+    "Wal exceeds its footprint budget — see WAL_FOOTPRINT_BUDGET",
+);
 
 /// Per-step record budget for the below-floor segment scan. Each
 /// record costs one `FS_SEEK` + two small `FS_READ`s (frame header +
@@ -310,15 +365,18 @@ pub struct Wal {
 
     /// Ring buffer of recent entry locations for random-access lookup
     /// (replicator NACK retry, apply gap refetch, crash recovery).
-    /// `ENTRY_LOC_RING_SIZE` covers the last 8192 indices; older
-    /// indices fall through to a NOT_FOUND reply and snapshot fallback.
+    /// `ENTRY_LOC_RING_SIZE` covers the last 8192 indices on a disk
+    /// build and the retention window on a volatile one; older indices
+    /// fall through to a NOT_FOUND reply and snapshot fallback.
     entry_ring: [EntryLoc; ENTRY_LOC_RING_SIZE],
-    /// Proposal bodies retained by the explicit no-filesystem fallback.
-    /// Bodies are 2 KiB each, so this keeps the smaller
-    /// `ENTRY_RING_SIZE` bound: in ephemeral graphs only the last 256
-    /// indices are refetchable; older ones answer NOT_FOUND even when
-    /// their location slot is still live.
-    memory_entries: [MemoryEntry; ENTRY_RING_SIZE],
+    /// Proposal bodies retained by the volatile variant's declared
+    /// in-memory mode. Bodies are 2 KiB each, so this is the ring that
+    /// sets `Wal`'s footprint: only the last `VOLATILE_RETENTION_SLOTS`
+    /// indices are refetchable, and older ones answer NOT_FOUND (which
+    /// escalates to snapshot install). A disk build never sets `no_fs`
+    /// and so never populates a slot, which is why `MEMORY_RING_SIZE`
+    /// is one slot there.
+    memory_entries: [MemoryEntry; MEMORY_RING_SIZE],
     entry_ring_max_index: u64,
     entry_ring_min_index: u64,
 
@@ -803,7 +861,7 @@ pub unsafe fn init(s: &mut Wal) {
     s.compact_pending_to = 0;
     s.floor_persisted = 0;
     s.entry_ring = [EntryLoc::zero(); ENTRY_LOC_RING_SIZE];
-    s.memory_entries = [MemoryEntry::zero(); ENTRY_RING_SIZE];
+    s.memory_entries = [MemoryEntry::zero(); MEMORY_RING_SIZE];
     s.entryreq_floor_logged = false;
     s.replay_recovered_index = 0;
     s.replay_recovered_term = 0;
@@ -965,8 +1023,7 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     }
     s.pump_records = records as u8;
     if records > 0 {
-        let poll = (sys.channel_poll)(s.in_entries, POLL_IN);
-        let effect = if poll > 0 && (poll as u32 & POLL_IN) != 0 {
+        let effect = if wire_channels::readable(sys, s.in_entries) {
             step_effect::RUNNABLE_BACKLOG
         } else {
             step_effect::WORK_DONE
@@ -1027,8 +1084,7 @@ unsafe fn maybe_emit_replay_complete(s: &mut Wal, sys: &SyscallTable) {
     {
         return;
     }
-    let poll = (sys.channel_poll)(s.out_replay_complete, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_replay_complete) { return; }
     let mut buf = [0u8; 16];
     wire::encode_term_index(&mut buf, s.current_term, s.current_index);
     let w = wire_channels::channel_write_msg(
@@ -1052,6 +1108,19 @@ unsafe fn maybe_emit_replay_complete(s: &mut Wal, sys: &SyscallTable) {
 }
 
 // ── Entry-location ring buffer ──────────────────────────────
+
+/// Slot for `index` in the retained-body ring (`memory_entries`).
+///
+/// On a volatile build this is the usual power-of-two mask over
+/// `VOLATILE_RETENTION_SLOTS`. On a disk build the ring is one
+/// slot and the mask is 0, so every index aliases to it — sound because
+/// nothing populates that slot on a disk build (`no_fs`, the only write
+/// path's gate, is never set), leaving the alias to name a permanently
+/// empty entry that no lookup can match.
+#[inline]
+fn memory_slot(index: u64) -> usize {
+    (index & MEMORY_RING_MASK) as usize
+}
 
 /// # Safety
 ///
@@ -1107,10 +1176,10 @@ unsafe fn lookup_entry_loc(s: &Wal, index: u64) -> Option<EntryLoc> {
 unsafe fn drain_entry_requests(s: &mut Wal, sys: &SyscallTable) {
     if s.in_entry_request < 0 || s.out_entry_reply < 0 { return; }
     for _ in 0..8 {
-        let poll = (sys.channel_poll)(s.in_entry_request, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-        let (msg_type, plen) =
-            wire_channels::channel_read_msg(sys, s.in_entry_request, &mut s.msg_buf);
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_entry_request, &mut s.msg_buf)
+        else {
+            break;
+        };
         if msg_type != wire::MSG_WAL_ENTRY_REQUEST { continue; }
         let pl = plen as usize;
         let (request_id, wal_index) = match wire::decode_wal_entry_request(&s.msg_buf[..pl]) {
@@ -1133,8 +1202,7 @@ unsafe fn serve_entry_request(
     request_id: u32,
     wal_index: u64,
 ) {
-    let poll_out = (sys.channel_poll)(s.out_entry_reply, 0x02);
-    if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_entry_reply) { return; }
 
     let loc = match lookup_entry_loc(s, wal_index) {
         Some(l) => l,
@@ -1177,7 +1245,7 @@ unsafe fn serve_entry_request(
     };
 
     if s.no_fs {
-        let slot = (wal_index & ENTRY_RING_MASK) as usize;
+        let slot = memory_slot(wal_index);
         let mem = s.memory_entries[slot];
         if mem.index != wal_index {
             s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
@@ -1219,7 +1287,17 @@ unsafe fn serve_entry_request(
     // is staged in a 4096-byte buffer, so bound the payload by what the
     // REPLY can hold, not just by `body` — the slice write below has no
     // panic path to fall back on.
-    let payload_max = body.len().min(4096 + 16 - wire::WAL_ENTRY_REPLY_HDR);
+    // Bound by the frame contract, not by the staging buffer. Both
+    // `body` and the reply buffer are 4096, so a buffer-derived bound
+    // would admit payloads up to 4084 — past `wal_frame::MAX_ENTRY_LEN`
+    // (2064, what the write path can produce and what replay accepts)
+    // and past what the `entry_reply` port's `max_record` (2079 =
+    // envelope + reply header + `MAX_ENTRY_BODY`) can carry. A payload
+    // in that range builds a well-formed reply that `channel_write_msg`
+    // then refuses, which drops the refetch silently and stalls the
+    // requester until its retry throttle re-asks. Rejecting here makes
+    // it a counted NOT_FOUND that escalates to snapshot install.
+    let payload_max = wal_frame::MAX_ENTRY_LEN.min(body.len());
     if payload_len < 16 || payload_len > payload_max {
         // Defensive: shouldn't happen given the write-path payload cap.
         s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
@@ -1479,8 +1557,7 @@ unsafe fn fail_entry_scan(s: &mut Wal, sys: &SyscallTable) {
         s.entryreq_unservable_logged = true;
         dev_log(sys, 2, b"[wal] entry req unservable (compacted)".as_ptr(), 38);
     }
-    let poll_out = (sys.channel_poll)(s.out_entry_reply, POLL_OUT);
-    if poll_out > 0 && (poll_out as u32 & POLL_OUT) != 0 {
+    if wire_channels::writable(sys, s.out_entry_reply) {
         let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
         wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
         wire_channels::channel_write_msg(sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr);
@@ -1593,7 +1670,11 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
                 reset_scan_cursor(s, sys);
                 return;
             }
-            let (term, index) = wire::decode_term_index(&ti);
+            let Some((term, index)) = wire::decode_term_index(&ti) else {
+                fail_entry_scan(s, sys);
+                reset_scan_cursor(s, sys);
+                return;
+            };
             if index == s.scan_target {
                 s.scan_loc = EntryLoc {
                     index,
@@ -1645,8 +1726,7 @@ unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
         s.scan_target = 0;
         return;
     }
-    let poll_out = (sys.channel_poll)(s.out_entry_reply, POLL_OUT);
-    if poll_out <= 0 || (poll_out as u32 & POLL_OUT) == 0 { return; } // retry next step
+    if !wire_channels::writable(sys, s.out_entry_reply) { return; } // retry next step
 
     let loc = s.scan_loc;
     let payload_len = loc.payload_len as usize;
@@ -1741,9 +1821,7 @@ unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) -> bool {
     // async write/fence is still in flight: a fence completing after a
     // truncation would ack the discarded suffix, and the in-flight write
     // races the rewound region. Wait until the pipeline is empty.
-    let ready = (sys.channel_poll)(s.in_compact_before, 0x01);
-    if ready > 0
-        && (ready as u32 & 0x01) != 0
+    if wire_channels::readable(sys, s.in_compact_before)
         && (s.has_batch || s.fence_pending || s.fence_ring_count > 0)
     {
         flush_batch(s, sys);
@@ -1751,10 +1829,10 @@ unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) -> bool {
     }
 
     for _ in 0..4 {
-        let poll = (sys.channel_poll)(s.in_compact_before, 0x01);
-        if poll <= 0 || (poll as u32 & 0x01) == 0 { break; }
-        let (msg_type, plen) =
-            wire_channels::channel_read_msg(sys, s.in_compact_before, &mut s.msg_buf);
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_compact_before, &mut s.msg_buf)
+        else {
+            break;
+        };
         if (plen as usize) < 8 { continue; }
         let index = u64::from_le_bytes([
             s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3],
@@ -1898,7 +1976,7 @@ unsafe fn publish_truncation(
                 i += 1;
             }
         }
-        if span >= ENTRY_RING_SIZE as u64 {
+        if span >= MEMORY_RING_SIZE as u64 {
             for m in s.memory_entries.iter_mut() {
                 if m.index > keep_through_index {
                     m.index = 0;
@@ -1908,7 +1986,7 @@ unsafe fn publish_truncation(
         } else {
             let mut i = keep_through_index + 1;
             while i <= s.entry_ring_max_index {
-                let slot = (i & ENTRY_RING_MASK) as usize;
+                let slot = memory_slot(i);
                 if s.memory_entries[slot].index == i {
                     s.memory_entries[slot].index = 0;
                     s.memory_entries[slot].body_len = 0;
@@ -2036,8 +2114,7 @@ unsafe fn flush_truncate_ack(s: &mut Wal, sys: &SyscallTable) {
         s.trunc_ack_pending = false;
         return;
     }
-    let poll = (sys.channel_poll)(s.out_flushed, POLL_OUT);
-    if poll <= 0 || (poll as u32 & POLL_OUT) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_flushed) { return; }
     let mut buf = [0u8; wire::WAL_TRUNCATE_ACK_LEN];
     wire::encode_wal_truncate_ack(
         &mut buf,
@@ -2767,8 +2844,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         }
 
         // Parse: first 16 bytes are term(8) + index(8)
-        if entry_len >= 16 {
-            let (term, index) = wire::decode_term_index(&s.msg_buf);
+        if let Some((term, index)) = wire::decode_term_index(&s.msg_buf[..entry_len]) {
 
             // An index jump means the records between the last replayed
             // entry and this one are gone. Acking across that hole would
@@ -2795,8 +2871,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             // Re-emit as FsyncAck — entry is already durable on disk.
             // Best-effort: the ledger latch above carries the high-water
             // even when the external ack channel is momentarily full.
-            let poll = (sys.channel_poll)(s.out_flushed, 0x02);
-            if poll > 0 && (poll as u32 & 0x02) != 0 {
+            if wire_channels::writable(sys, s.out_flushed) {
                 let mut ack = [0u8; 17];
                 wire::encode_fsync_ack(&mut ack, term, index, s.self_id);
                 wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack[..17]);
@@ -2952,8 +3027,7 @@ unsafe fn emit_wal_reject(s: &mut Wal, sys: &SyscallTable, expected: u64) {
     if s.out_flushed < 0 {
         return;
     }
-    let poll = (sys.channel_poll)(s.out_flushed, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 {
+    if !wire_channels::writable(sys, s.out_flushed) {
         return;
     }
     let mut buf = [0u8; 8];
@@ -2989,8 +3063,7 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     }
 
     // Check input readiness
-    let poll_in = (sys.channel_poll)(s.in_entries, 0x01);
-    if poll_in <= 0 || (poll_in as u32 & 0x01) == 0 { return; }
+    if !wire_channels::readable(sys, s.in_entries) { return; }
 
     // Output back-pressure: only block when out_flushed is wired AND
     // currently not writable. An unwired output (`out_flushed < 0`,
@@ -3000,8 +3073,7 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     // optimisation. Skipping the ack is fine; skipping the write
     // would silently drop committed log entries.
     if s.out_flushed >= 0 {
-        let poll_out = (sys.channel_poll)(s.out_flushed, 0x02);
-        if poll_out <= 0 || (poll_out as u32 & 0x02) == 0 { return; }
+        if !wire_channels::writable(sys, s.out_flushed) { return; }
     }
 
     // Read entry — unless `msg_buf` still holds one we consumed but could not
@@ -3013,12 +3085,16 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         n
     } else {
         let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
-        if msg_type != wire::MSG_WAL_ENTRY || plen < 16 { return; }
+        if msg_type != wire::MSG_WAL_ENTRY { return; }
         plen
     };
 
-    let (term, index) = wire::decode_term_index(&s.msg_buf);
     let payload_len = plen as usize;
+    // Slice to the declared payload: `msg_buf` outlives each message,
+    // so a short frame must not read the last one's tail.
+    let Some((term, index)) = wire::decode_term_index(&s.msg_buf[..payload_len]) else {
+        return;
+    };
 
     let expected = s.current_index.saturating_add(1);
     if index != expected {
@@ -3089,7 +3165,7 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
             // the same random-access gap-refetch contract as the disk path,
             // then acknowledge immediately (there is no durability barrier).
             let body_len = payload_len.saturating_sub(16).min(MEMORY_ENTRY_BODY_CAP);
-            let slot = (index & ENTRY_RING_MASK) as usize;
+            let slot = memory_slot(index);
             s.memory_entries[slot].index = index;
             s.memory_entries[slot].body_len = body_len as u16;
             if body_len > 0 {
@@ -3293,8 +3369,7 @@ unsafe fn flush_batch_pipelined(s: &mut Wal, sys: &SyscallTable) {
         // fence's FsyncAck (retry next step if channel full).
         note_ledger_ack(s, max_term, max_index);
         if s.out_flushed >= 0 {
-            let poll_out = (sys.channel_poll)(s.out_flushed, POLL_OUT);
-            if poll_out <= 0 || (poll_out as u32 & POLL_OUT) == 0 {
+            if !wire_channels::writable(sys, s.out_flushed) {
                 return; // ack channel full — keep the fence queued, retry later
             }
             let mut ack_buf = [0u8; 17];
@@ -3576,8 +3651,7 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
 
     note_ledger_ack(s, s.pending_max_term, s.pending_max_index);
     if s.out_flushed >= 0 {
-        let poll_out = (sys.channel_poll)(s.out_flushed, POLL_OUT);
-        if poll_out <= 0 || (poll_out as u32 & POLL_OUT) == 0 {
+        if !wire_channels::writable(sys, s.out_flushed) {
             // Channel full: the batch is durable but unacked. Keep it and retry
             // the ack on a later step (next entry or the time-based flush).
             dev_log(sys, 3, b"[wal] group ack deferred".as_ptr(), 24);
@@ -4010,8 +4084,7 @@ unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
     buf[4..12].copy_from_slice(&s.bytes_written.to_le_bytes());
     buf[12..16].copy_from_slice(&s.segment_seq.to_le_bytes());
 
-    let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-    if poll > 0 && (poll as u32 & 0x02) != 0 {
+    if wire_channels::writable(sys, s.out_metrics) {
         wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRICS, &buf[..16]);
     }
 }
@@ -4032,8 +4105,7 @@ unsafe fn emit_sample(
     kind: u8,
     value: i64,
 ) {
-    let poll = (sys.channel_poll)(s.out_metrics, 0x02);
-    if poll <= 0 || (poll as u32 & 0x02) == 0 { return; }
+    if !wire_channels::writable(sys, s.out_metrics) { return; }
     let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
     wire::encode_metric_sample(&mut buf, module_id, partition_id, metric_id, kind, value);
     wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);

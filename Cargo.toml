@@ -209,6 +209,13 @@ path = "tests/http_admin.rs"
 name = "sdk_primitives"
 path = "tests/sdk_primitives.rs"
 
+# Pure codec suite over `modules/common/wire.rs`: round-trip plus the
+# every-short-prefix truncation sweep. No fluxor-linux or .fmod
+# prereqs, so it always runs.
+[[test]]
+name = "wire_codec_truncation"
+path = "tests/wire_codec_truncation.rs"
+
 [[test]]
 name = "session_registry"
 path = "tests/session_registry.rs"

@@ -206,11 +206,15 @@ memory on a quorum of live voters.** Consequences, stated plainly:
 
 - A single node that restarts rejoins with the same identity and an
   empty log, and is rebuilt from the cluster. The in-memory log serves
-  random-access refetch only for the most recent 256 entry bodies; a
-  replica further behind (a restarted node is the extreme case) is
-  caught up by snapshot install, so agreement-only graphs must wire
-  the consensus snapshot-request edge to the durability module's
-  install input.
+  random-access refetch only for the most recent
+  `VOLATILE_RETENTION_SLOTS` entry bodies (256 — see the
+  [limit register](limit_register.md)); a replica further behind (a
+  restarted node is the extreme case) is caught up by snapshot
+  install, so agreement-only graphs must wire the consensus
+  snapshot-request edge to the durability module's install input.
+  That window is also what the posture costs in RAM: the retained
+  bodies dominate the WAL's module state, so it is the number to move
+  when trading refetch reach against footprint on a constrained node.
 - A node with no stable term or vote could, in principle, vote twice
   in an election that spans its restart. Two mitigations narrow the
   window: for one election timeout after boot the node grants no real
