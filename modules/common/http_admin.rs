@@ -31,6 +31,17 @@ pub const ADMIN_OP_DURABILITY_MODE: u8 = 0x04;
 pub const ADMIN_OP_SNAPSHOT: u8 = 0x05;
 /// `POST /propose` client-write bridge — see `wire::ADMIN_OP_PROPOSE`.
 pub const ADMIN_OP_PROPOSE: u8 = 0x08;
+/// Shard migration control — see `wire::ADMIN_OP_MIGRATE_*`.
+pub const ADMIN_OP_MIGRATE_BEGIN: u8 = 0x0E;
+pub const ADMIN_OP_MIGRATE_PHASE_DONE: u8 = 0x0F;
+pub const ADMIN_OP_MIGRATE_ABORT: u8 = 0x10;
+/// Placement topology — see `wire::ADMIN_OP_PLACEMENT_TOPOLOGY`.
+pub const ADMIN_OP_PLACEMENT_TOPOLOGY: u8 = 0x11;
+/// Tenant quota — see `wire::ADMIN_OP_TENANT_QUOTA`.
+pub const ADMIN_OP_TENANT_QUOTA: u8 = 0x12;
+
+/// Shard-map override — see `wire::ADMIN_OP_SHARD_MAP`.
+pub const ADMIN_OP_SHARD_MAP: u8 = 0x13;
 
 /// Max body length the admin envelope can carry. `emit_admin_command`
 /// uses a 1 KiB stack buffer with a 2-byte header (conn_id + op_code),
@@ -52,6 +63,18 @@ pub fn admin_op_code(name: &[u8]) -> Option<u8> {
         Some(ADMIN_OP_DURABILITY_MODE)
     } else if name == b"snapshot" {
         Some(ADMIN_OP_SNAPSHOT)
+    } else if name == b"migrate-begin" {
+        Some(ADMIN_OP_MIGRATE_BEGIN)
+    } else if name == b"migrate-phase-done" {
+        Some(ADMIN_OP_MIGRATE_PHASE_DONE)
+    } else if name == b"migrate-abort" {
+        Some(ADMIN_OP_MIGRATE_ABORT)
+    } else if name == b"placement-topology" {
+        Some(ADMIN_OP_PLACEMENT_TOPOLOGY)
+    } else if name == b"tenant-quota" {
+        Some(ADMIN_OP_TENANT_QUOTA)
+    } else if name == b"shard-map" {
+        Some(ADMIN_OP_SHARD_MAP)
     } else {
         None
     }

@@ -9,34 +9,33 @@
 //! them for `GET /readyz|/why|/metrics`.
 
 use super::abi::SyscallTable;
-use super::{wire, wire_channels};
 use super::dev_millis;
+use super::{wire, wire_channels};
 
-/// Default `/metrics` export cadence (ms). Overridable per-graph via
-/// the `emit_interval_ms` param (RFC §4.4) — a bench profile lowers it
-/// so a short measurement window still sees fresh samples; production
-/// profiles leave it at 1 s. Cadence is configuration, never hardcoded
-/// in a producer (standards `observability.md` §7).
+/// Default `/metrics` export cadence (ms). Overridable per-graph via the
+/// `emit_interval_ms` param — a bench profile lowers it so a short
+/// measurement window still sees fresh samples; production profiles leave it
+/// at 1 s. Cadence is configuration, never hardcoded in a producer
+/// (standards `observability.md` §7).
 pub const EMIT_INTERVAL_MS_DEFAULT: u64 = 1000;
 
-/// Kernel scheduler step-timing histogram query (RFC §4.3). Internal
-/// monitor opcode (`abi::internal::monitor::STEP_HISTOGRAM_QUERY`);
-/// `handle = -1` reads the global histogram into 8 × u32 bucket counts.
-/// Defined locally so the producer path doesn't depend on the unstable
-/// internal-ABI module path.
+/// Kernel scheduler step-timing histogram query. Internal monitor opcode
+/// (`abi::internal::monitor::STEP_HISTOGRAM_QUERY`); `handle = -1` reads the
+/// global histogram into 8 × u32 bucket counts. Defined locally so the
+/// producer path doesn't depend on the unstable internal-ABI module path.
 const STEP_HISTOGRAM_QUERY: u32 = 0x0C55;
 const STEP_HIST_BUCKETS: usize = 8;
 
-/// Size of the per-(module, metric_id) latest-value table. 256 slots
-/// covers the current scalar set plus the four fixed-bucket histograms
-/// (RFC §4.1, ~50 bucket-slots) with headroom; older entries are
-/// LRU-evicted by simple oldest-write replacement.
+/// Size of the per-(module, metric_id) latest-value table. 320 slots cover
+/// the current scalar set plus the four fixed-bucket histograms (~50
+/// bucket-slots) with headroom; older entries are LRU-evicted by simple
+/// oldest-write replacement.
 const METRIC_SLOTS: usize = 320;
 
 /// Number of scheduler module slots scraped for the per-module step-timing
-/// histogram (RFC §4.3). The kernel exposes `[u32; 8]` per module via
-/// `STEP_HISTOGRAM_QUERY` with `handle = module_idx`. Only non-zero (active)
-/// modules are exported, byte-budgeted against the channel ring.
+/// histogram. The kernel exposes `[u32; 8]` per module via
+/// `STEP_HISTOGRAM_QUERY` with `handle = module_idx`. Only non-zero
+/// (active) modules are exported, byte-budgeted against the channel ring.
 const STEP_MODULES: usize = 32;
 
 /// Safe export ceiling. The telemetry→client and http-response channels both
@@ -80,7 +79,7 @@ const EXPORT_BUF_LEN: usize = 8192;
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct MetricEntry {
-    /// 0 = slot empty. Module ids are non-zero (RFC §4.3).
+    /// 0 = slot empty. Module ids are non-zero.
     module_id: u8,
     partition_id: u16,
     metric_id: u16,
@@ -119,7 +118,7 @@ pub struct Telemetry {
     /// Export records dropped on the last scrape because the channel-ring
     /// byte budget was hit (table tail or per-module step histograms).
     records_dropped: u32,
-    /// `/metrics` export cadence in ms (param `emit_interval_ms`, §4.4).
+    /// `/metrics` export cadence in ms (param `emit_interval_ms`).
     pub emit_interval_ms: u64,
     last_emit_ms: u64,
     pub ready: bool,
@@ -139,9 +138,9 @@ pub struct Telemetry {
     msg_buf: [u8; 256],
     /// Serialized `/metrics` payload, rebuilt each export tick.
     pub export_buf: [u8; EXPORT_BUF_LEN],
-    /// Global scheduler step-timing histogram (RFC §4.3), scraped from
-    /// the kernel each export tick and appended to the export so a
-    /// single `/metrics` read attributes time across modules.
+    /// Global scheduler step-timing histogram, scraped from the kernel each
+    /// export tick and appended to the export so a single `/metrics` read
+    /// attributes time across modules.
     step_buckets: [u32; STEP_HIST_BUCKETS],
 }
 
@@ -222,8 +221,7 @@ fn compute_ready(t: &Telemetry, now: u64) -> bool {
             continue;
         }
         let stale = now.wrapping_sub(slot.last_update_ms) > READY_STALE_MS;
-        if slot.module_id == wire::SOURCE_ID_RAFT
-            && slot.metric_id == wire::metric_ids::RAFT_READY
+        if slot.module_id == wire::SOURCE_ID_RAFT && slot.metric_id == wire::metric_ids::RAFT_READY
         {
             saw_raft = true;
             if slot.value == 0 || stale {
@@ -385,23 +383,63 @@ unsafe fn build_export(t: &mut Telemetry, sys: &SyscallTable) -> usize {
     let tele = wire::SOURCE_ID_TELEMETRY;
     let kc = wire::METRIC_KIND_COUNTER;
     let kg = wire::METRIC_KIND_GAUGE;
-    pos = push_record(&mut t.export_buf, pos, tele, 0, wire::metric_ids::TELE_MESSAGES_INGESTED, kc, i64::from(t.messages_ingested));
-    pos = push_record(&mut t.export_buf, pos, tele, 0, wire::metric_ids::TELE_TYPED_SAMPLES, kc, i64::from(t.typed_samples_ingested));
-    pos = push_record(&mut t.export_buf, pos, tele, 0, wire::metric_ids::TELE_METRIC_SLOTS_USED, kg, i64::from(count));
-    pos = push_record(&mut t.export_buf, pos, tele, 0, wire::metric_ids::TELE_METRICS_EVICTED, kc, i64::from(t.metrics_evicted));
+    pos = push_record(
+        &mut t.export_buf,
+        pos,
+        tele,
+        0,
+        wire::metric_ids::TELE_MESSAGES_INGESTED,
+        kc,
+        i64::from(t.messages_ingested),
+    );
+    pos = push_record(
+        &mut t.export_buf,
+        pos,
+        tele,
+        0,
+        wire::metric_ids::TELE_TYPED_SAMPLES,
+        kc,
+        i64::from(t.typed_samples_ingested),
+    );
+    pos = push_record(
+        &mut t.export_buf,
+        pos,
+        tele,
+        0,
+        wire::metric_ids::TELE_METRIC_SLOTS_USED,
+        kg,
+        i64::from(count),
+    );
+    pos = push_record(
+        &mut t.export_buf,
+        pos,
+        tele,
+        0,
+        wire::metric_ids::TELE_METRICS_EVICTED,
+        kc,
+        i64::from(t.metrics_evicted),
+    );
     count += 4;
 
-    // 3. Global kernel scheduler step-timing histogram (RFC §4.3). Cumulative
+    // 3. Global kernel scheduler step-timing histogram. Cumulative
     //    per the wire contract: bucket i = count of samples <= bound[i].
     let kh = wire::METRIC_KIND_HISTOGRAM;
     let mut cum: i64 = 0;
     for i in 0..STEP_HIST_BUCKETS {
         cum += i64::from(t.step_buckets[i]);
-        pos = push_record(&mut t.export_buf, pos, tele, 0, wire::hist::HIST_BASE + i as u16, kh, cum);
+        pos = push_record(
+            &mut t.export_buf,
+            pos,
+            tele,
+            0,
+            wire::hist::HIST_BASE + i as u16,
+            kh,
+            cum,
+        );
         count += 1;
     }
 
-    // 4. Per-module step histograms (RFC §4.3). Scrape each scheduler module
+    // 4. Per-module step histograms. Scrape each scheduler module
     //    slot; export only NON-ZERO (active) modules, byte-budgeted. Tagged by
     //    partition_id = scheduler module_idx, metric_id = STEP_PERMOD_BASE + i.
     //    Composites additionally publish per-COMPONENT step histograms as
@@ -446,7 +484,15 @@ unsafe fn build_export(t: &mut Telemetry, sys: &SyscallTable) -> usize {
     // 5. Drop counter last (its own value reflects this scrape). Always fits —
     //    it is the final record of the tail `EXPORT_BUDGET` reserved for.
     t.records_dropped = dropped;
-    pos = push_record(&mut t.export_buf, pos, tele, 0, wire::metric_ids::TELE_RECORDS_DROPPED, kc, i64::from(dropped));
+    pos = push_record(
+        &mut t.export_buf,
+        pos,
+        tele,
+        0,
+        wire::metric_ids::TELE_RECORDS_DROPPED,
+        kc,
+        i64::from(dropped),
+    );
     count += 1;
 
     // Header: magic, version, record_count LE.
@@ -473,7 +519,7 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
     // 1. Drain all ingest metrics. Two envelope shapes coexist:
     //    legacy `MSG_METRICS` (opaque per-module payload — counted
     //    only) and typed `MSG_METRIC_SAMPLE` (decoded into the
-    //    latest-value table). See RFC §4.3.
+    //    latest-value table).
     if t.in_ingest >= 0 {
         for _ in 0..16 {
             let Some((msg_type, plen)) = wire_channels::next_msg(sys, t.in_ingest, &mut t.msg_buf)
@@ -522,9 +568,9 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
         t.last_emit_ms = now;
         t.emitted = true;
 
-        // Scrape the kernel scheduler step-timing histogram (RFC
-        // §4.3). Best-effort: a negative return (opcode unsupported
-        // on this target) leaves the last sample in place.
+        // Scrape the kernel scheduler step-timing histogram. Best-effort: a
+        // negative return (opcode unsupported on this target) leaves the
+        // last sample in place.
         let mut sb = [0u32; STEP_HIST_BUCKETS];
         let rc = (sys.provider_call)(
             -1,
@@ -545,10 +591,9 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
         }
 
         // Why: `[version:u8 = 1][timing_pause_reason:u8]`. The reason
-        // vocabulary is `wire::TIMING_PAUSE_*`
-        // (rfc_deterministic_timing.md §16); 0 = nothing paused / not
-        // applicable. Extend with further blocking reasons as they
-        // gain reporters.
+        // vocabulary is `wire::TIMING_PAUSE_*`; 0 = nothing paused / not
+        // applicable. Extend with further blocking reasons as they gain
+        // reporters.
         if t.out_why >= 0 {
             if wire_channels::writable(sys, t.out_why) {
                 let buf = [1u8, timing_pause_reason(t)];
@@ -556,16 +601,21 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
             }
         }
 
-        // Export: full latest-value table (RFC §4.1/§4.3). The payload
-        // is the binary record stream documented at
-        // `wire::METRICS_EXPORT_MAGIC`; the http component caches it
-        // and serves it verbatim at `GET /metrics`. Built once per
-        // tick and shared by the port write and the http cache.
+        // Export: full latest-value table. The payload is the binary record
+        // stream documented at `wire::METRICS_EXPORT_MAGIC`; the http
+        // component caches it and serves it verbatim at `GET /metrics`.
+        // Built once per tick and shared by the port write and the http
+        // cache.
         let len = build_export(t, sys);
         t.export_len = len as u16;
         if t.out_export >= 0 {
             if wire_channels::writable(sys, t.out_export) {
-                wire_channels::channel_write_msg(sys, t.out_export, wire::MSG_METRICS, &t.export_buf[..len]);
+                wire_channels::channel_write_msg(
+                    sys,
+                    t.out_export,
+                    wire::MSG_METRICS,
+                    &t.export_buf[..len],
+                );
             }
         }
     }

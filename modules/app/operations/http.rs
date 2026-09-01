@@ -7,7 +7,7 @@
 //!     latest readyz byte.
 //!   - `GET /why`     → 200 with the latest why body.
 //!   - `GET /metrics` → 200 with the latest export payload, served
-//!     verbatim — see RFC §4.3.
+//!     verbatim.
 //!
 //! `POST /admin/<op>` is admitted through the [`rbac`](super::rbac)
 //! component like every other admin command — HTTP-origin commands
@@ -46,8 +46,8 @@
 //! a concurrent `/metrics` answers 503 until the slot frees.
 
 use super::abi::SyscallTable;
-use super::{http_admin, telemetry, wire, wire_channels};
 use super::{dev_log, dev_millis, dev_report_step_effect, step_effect};
+use super::{http_admin, telemetry, wire, wire_channels};
 
 /// Bound on the small cached envelopes — `/readyz` and `/why` carry a
 /// single status byte, so 1 KiB is ample.
@@ -149,7 +149,12 @@ struct CorrSlot {
 
 impl CorrSlot {
     const fn empty() -> Self {
-        Self { correlation_id: 0, started_ms: 0, conn_id: 0, stream_id: 0 }
+        Self {
+            correlation_id: 0,
+            started_ms: 0,
+            conn_id: 0,
+            stream_id: 0,
+        }
     }
 }
 
@@ -164,7 +169,12 @@ struct IndexSlot {
 
 impl IndexSlot {
     const fn empty() -> Self {
-        Self { index: 0, started_ms: 0, conn_id: 0, stream_id: 0 }
+        Self {
+            index: 0,
+            started_ms: 0,
+            conn_id: 0,
+            stream_id: 0,
+        }
     }
 }
 
@@ -361,7 +371,18 @@ unsafe fn finish(
     body: &[u8],
 ) {
     let n = body.len().min(RESP_SLICE);
-    emit_envelope(h, sys, conn_id, stream_id, status, 0, CT_TEXT, &[], body.as_ptr(), n);
+    emit_envelope(
+        h,
+        sys,
+        conn_id,
+        stream_id,
+        status,
+        0,
+        CT_TEXT,
+        &[],
+        body.as_ptr(),
+        n,
+    );
 }
 
 /// One request pulled off the `request` port, handed to the dispatch
@@ -548,7 +569,18 @@ unsafe fn stream_step(h: &mut Http, sys: &SyscallTable) {
             let n = rest.min(RESP_SLICE);
             let flags = if off + n < total { FLAG_MORE_BODY } else { 0 };
             let body = h.metrics_buf.as_ptr().add(off);
-            if !emit_envelope(h, sys, h.st_conn, h.st_stream, 200, flags, &[], &[], body, n) {
+            if !emit_envelope(
+                h,
+                sys,
+                h.st_conn,
+                h.st_stream,
+                200,
+                flags,
+                &[],
+                &[],
+                body,
+                n,
+            ) {
                 return;
             }
             h.st_off = (off + n) as u32;
@@ -564,7 +596,8 @@ unsafe fn drain_proposal_assignments(h: &mut Http, sys: &SyscallTable) {
         return;
     }
     for _ in 0..16 {
-        let Some((msg_type, plen)) = wire_channels::next_msg(sys, h.in_proposal_assigned, &mut h.msg_buf)
+        let Some((msg_type, plen)) =
+            wire_channels::next_msg(sys, h.in_proposal_assigned, &mut h.msg_buf)
         else {
             break;
         };
@@ -723,7 +756,11 @@ unsafe fn emit_http_proposal(
     if h.out_proposal < 0 || body.len() > MAX_EXT_BODY {
         return false;
     }
-    let slot = match h.correlations.iter().position(|slot| slot.correlation_id == 0) {
+    let slot = match h
+        .correlations
+        .iter()
+        .position(|slot| slot.correlation_id == 0)
+    {
         Some(v) => v,
         None => return false,
     };
@@ -752,9 +789,15 @@ unsafe fn emit_http_proposal(
         conn_id,
         stream_id,
     };
-    let occupied = h.correlations.iter().filter(|v| v.correlation_id != 0).count()
+    let occupied = h
+        .correlations
+        .iter()
+        .filter(|v| v.correlation_id != 0)
+        .count()
         + h.indices.iter().filter(|v| v.index != 0).count();
-    h.inflight_high_water = h.inflight_high_water.max(occupied.min(u8::MAX as usize) as u8);
+    h.inflight_high_water = h
+        .inflight_high_water
+        .max(occupied.min(u8::MAX as usize) as u8);
     true
 }
 
@@ -781,7 +824,14 @@ pub unsafe fn on_request(
     if method == METHOD_POST && path == b"/propose" {
         if !emit_http_proposal(h, sys, conn_id, stream_id, body) {
             h.queue_unavailable = h.queue_unavailable.saturating_add(1);
-            finish(h, sys, conn_id, stream_id, 503, b"propose queue unavailable");
+            finish(
+                h,
+                sys,
+                conn_id,
+                stream_id,
+                503,
+                b"propose queue unavailable",
+            );
         }
         h.requests_handled = h.requests_handled.saturating_add(1);
         h.worked = 1;
@@ -812,7 +862,10 @@ pub unsafe fn on_request(
                     h.admin_env[0] = conn_id as u8;
                     h.admin_env[1] = op_code;
                     h.admin_env[2..2 + body.len()].copy_from_slice(body);
-                    ReqOut::Admin { op_code, len: (2 + body.len()) as u16 }
+                    ReqOut::Admin {
+                        op_code,
+                        len: (2 + body.len()) as u16,
+                    }
                 }
             }
             None => {
@@ -907,26 +960,82 @@ pub fn take_metrics(h: &mut Http, now: u64) -> Option<[(u16, u8, i64); 15]> {
     }
     h.last_metrics_ms = now;
 
-    let correlations = h.correlations.iter().filter(|v| v.correlation_id != 0).count() as i64;
+    let correlations = h
+        .correlations
+        .iter()
+        .filter(|v| v.correlation_id != 0)
+        .count() as i64;
     let indices = h.indices.iter().filter(|v| v.index != 0).count() as i64;
     let kg = wire::METRIC_KIND_GAUGE;
     let kc = wire::METRIC_KIND_COUNTER;
     let samples: [(u16, u8, i64); 15] = [
-        (wire::metric_ids::HTTP_CORRELATIONS_INFLIGHT, kg, correlations),
+        (
+            wire::metric_ids::HTTP_CORRELATIONS_INFLIGHT,
+            kg,
+            correlations,
+        ),
         (wire::metric_ids::HTTP_INDICES_INFLIGHT, kg, indices),
-        (wire::metric_ids::HTTP_INFLIGHT_HIGH_WATER, kg, i64::from(h.inflight_high_water)),
-        (wire::metric_ids::HTTP_PROPOSAL_TIMEOUTS, kc, i64::from(h.proposal_timeouts)),
-        (wire::metric_ids::HTTP_COMMIT_TIMEOUTS, kc, i64::from(h.commit_timeouts)),
-        (wire::metric_ids::HTTP_ASSIGNMENTS_UNMATCHED, kc, i64::from(h.assignments_unmatched)),
-        (wire::metric_ids::HTTP_ASSIGNMENTS_NO_SLOT, kc, i64::from(h.assignments_no_slot)),
-        (wire::metric_ids::HTTP_APPLIES_UNMATCHED, kc, i64::from(h.applies_unmatched)),
-        (wire::metric_ids::HTTP_REJECTIONS, kc, i64::from(h.proposal_rejections)),
-        (wire::metric_ids::HTTP_QUEUE_UNAVAILABLE, kc, i64::from(h.queue_unavailable)),
+        (
+            wire::metric_ids::HTTP_INFLIGHT_HIGH_WATER,
+            kg,
+            i64::from(h.inflight_high_water),
+        ),
+        (
+            wire::metric_ids::HTTP_PROPOSAL_TIMEOUTS,
+            kc,
+            i64::from(h.proposal_timeouts),
+        ),
+        (
+            wire::metric_ids::HTTP_COMMIT_TIMEOUTS,
+            kc,
+            i64::from(h.commit_timeouts),
+        ),
+        (
+            wire::metric_ids::HTTP_ASSIGNMENTS_UNMATCHED,
+            kc,
+            i64::from(h.assignments_unmatched),
+        ),
+        (
+            wire::metric_ids::HTTP_ASSIGNMENTS_NO_SLOT,
+            kc,
+            i64::from(h.assignments_no_slot),
+        ),
+        (
+            wire::metric_ids::HTTP_APPLIES_UNMATCHED,
+            kc,
+            i64::from(h.applies_unmatched),
+        ),
+        (
+            wire::metric_ids::HTTP_REJECTIONS,
+            kc,
+            i64::from(h.proposal_rejections),
+        ),
+        (
+            wire::metric_ids::HTTP_QUEUE_UNAVAILABLE,
+            kc,
+            i64::from(h.queue_unavailable),
+        ),
         (wire::metric_ids::HTTP_COMMITTED, kc, i64::from(h.committed)),
-        (wire::metric_ids::HTTP_REQUESTS, kc, i64::from(h.requests_handled)),
-        (wire::metric_ids::HTTP_REQUESTS_404, kc, i64::from(h.requests_404)),
-        (wire::metric_ids::HTTP_RESPONSES_DROPPED, kc, i64::from(h.responses_dropped)),
-        (wire::metric_ids::HTTP_ADMIN_DROPPED, kc, i64::from(h.admin_dropped)),
+        (
+            wire::metric_ids::HTTP_REQUESTS,
+            kc,
+            i64::from(h.requests_handled),
+        ),
+        (
+            wire::metric_ids::HTTP_REQUESTS_404,
+            kc,
+            i64::from(h.requests_404),
+        ),
+        (
+            wire::metric_ids::HTTP_RESPONSES_DROPPED,
+            kc,
+            i64::from(h.responses_dropped),
+        ),
+        (
+            wire::metric_ids::HTTP_ADMIN_DROPPED,
+            kc,
+            i64::from(h.admin_dropped),
+        ),
     ];
     Some(samples)
 }

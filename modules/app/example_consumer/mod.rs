@@ -73,11 +73,11 @@ const SCRATCH_BUF_BYTES: usize = wal_frame::MAX_ENTRY_LEN + 32;
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_entries: i32,            // in[0]: MSG_COMMITTED_ENTRY from consensus.committed_entries
-    in_snapshot_chunk: i32,     // in[1]: MSG_APP_SNAPSHOT_CHUNK / MSG_APP_SNAPSHOT_RESET
-    in_snapshot_request: i32,   // in[2]: MSG_APP_SNAPSHOT_REQUEST
-    out_metrics: i32,           // out[0]: MSG_METRICS to operations
-    out_snapshot_export: i32,   // out[1]: MSG_APP_SNAPSHOT_CHUNK back to durability
+    in_entries: i32, // in[0]: MSG_COMMITTED_ENTRY from consensus.committed_entries
+    in_snapshot_chunk: i32, // in[1]: MSG_APP_SNAPSHOT_CHUNK / MSG_APP_SNAPSHOT_RESET
+    in_snapshot_request: i32, // in[2]: MSG_APP_SNAPSHOT_REQUEST
+    out_metrics: i32, // out[0]: MSG_METRICS to operations
+    out_snapshot_export: i32, // out[1]: MSG_APP_SNAPSHOT_CHUNK back to durability
 
     /// Strict-commit-order subscriber for the per-entry stream.
     subscriber: CommittedSubscriber,
@@ -208,7 +208,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // 1b) Drain incoming state-machine snapshot chunks (RFC §2.1).
+        // 1b) Drain incoming state-machine snapshot chunks.
         //     The example accumulator has trivial state — a u32 xor —
         //     so a "snapshot" is just that u32. On reset, zero the
         //     state and accept incoming chunks as the new accumulator
@@ -216,7 +216,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //     snapshot index.
         if s.in_snapshot_chunk >= 0 {
             for _ in 0..4 {
-                let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_snapshot_chunk, &mut s.msg_buf)
+                let Some((msg_type, plen)) =
+                    wire_channels::next_msg(sys, s.in_snapshot_chunk, &mut s.msg_buf)
                 else {
                     break;
                 };
@@ -262,7 +263,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //     as a single chunk back to durability.
         if s.in_snapshot_request >= 0 && s.out_snapshot_export >= 0 {
             for _ in 0..2 {
-                let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_snapshot_request, &mut s.msg_buf)
+                let Some((msg_type, plen)) =
+                    wire_channels::next_msg(sys, s.in_snapshot_request, &mut s.msg_buf)
                 else {
                     break;
                 };
@@ -273,15 +275,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 else {
                     continue;
                 };
-                if !wire_channels::writable(sys, s.out_snapshot_export) { continue; }
+                if !wire_channels::writable(sys, s.out_snapshot_export) {
+                    continue;
+                }
                 let body = s.accumulator.to_le_bytes();
                 let mut out = [0u8; wire::APP_SNAPSHOT_HDR + 4];
-                let n = wire::encode_app_snapshot_chunk(
-                    &mut out, term, last_idx, 0, true, &body,
-                );
+                let n = wire::encode_app_snapshot_chunk(&mut out, term, last_idx, 0, true, &body);
                 if n > 0 {
                     wire_channels::channel_write_msg(
-                        sys, s.out_snapshot_export, wire::MSG_APP_SNAPSHOT_CHUNK, &out[..n],
+                        sys,
+                        s.out_snapshot_export,
+                        wire::MSG_APP_SNAPSHOT_CHUNK,
+                        &out[..n],
                     );
                     s.snapshot_chunks_out = s.snapshot_chunks_out.saturating_add(1);
                 }

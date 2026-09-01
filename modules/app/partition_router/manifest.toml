@@ -19,6 +19,16 @@ name = "proposals_tagged"
 direction = "input"
 content_type = "OctetStream"
 
+# NOTE: this module deliberately has no `shard_map` input. The
+# control-plane shard map names the PRG that SERVES a shard, which is a
+# different namespace from the raft partition this router picks; it is
+# consumed on the ownership path (`EdgeMap` in `edge_routing_core`, on
+# the routing stream). This router places a shard's LOG by
+# `shard % num_partitions`, always.
+#
+# Adding an input here renumbers the inputs after it; check
+# `dev_channel_port(sys, 0, N)` indices when touching this file.
+
 # Per-partition outputs in two families:
 #
 #   out[0..N]  proposals_p<i>          → consensus_p<i>.proposals_partitioned

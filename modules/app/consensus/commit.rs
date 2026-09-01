@@ -22,8 +22,12 @@ const METRICS_INTERVAL_MS: u64 = 1000;
 #[repr(C)]
 pub struct Commit {
     // Channels
-    pub in_durable: i32,     // in: DurabilityProof from durability's ledger
-    pub out_metrics: i32,    // out: MSG_METRIC_SAMPLE (shared module port)
+    pub in_durable: i32,          // in: DurabilityProof from durability's ledger
+    /// Set when the ENGINE routed a proof into this slot. K slots share
+    /// one `in_durable` handle, so a slot cannot drain it itself — see
+    /// `apply_durability_proof`.
+    pub durable_dirty: bool,
+    pub out_metrics: i32,         // out: MSG_METRIC_SAMPLE (shared module port)
     pub out_retention_floor: i32, // out: MSG_COMPACTION_FLOOR to durability's retention_floor
 
     // ── Seams ───────────────────────────────────────────────
@@ -38,7 +42,7 @@ pub struct Commit {
 
     // Configuration
     pub voter_count: u8,
-    pub durability_mode: u8,  // DUR_STRICT / DUR_GROUP_FSYNC / DUR_RELAXED
+    pub durability_mode: u8, // DUR_STRICT / DUR_GROUP_FSYNC / DUR_RELAXED
     pub self_id: ReplicaId,
     pub partition_id: u16,
 
@@ -46,10 +50,9 @@ pub struct Commit {
     commit_advances: u32,
     last_metrics_ms: u64,
 
-    /// Current and joint voter NodeSet bitmasks (RFC §1.2). Until
-    /// raft pushes the first voter-set update, the
-    /// commit tracker falls back to `voter_count` for the median —
-    /// preserving the existing single-config behaviour.
+    /// Current and joint voter NodeSet bitmasks. Until raft pushes the first
+    /// voter-set update, the commit tracker falls back to `voter_count` for
+    /// the median — preserving the existing single-config behaviour.
     current_voters: NodeSet,
     joint_voters: NodeSet,
     joint_active: bool,
@@ -62,6 +65,13 @@ pub struct Commit {
 
     // Durability state
     durable_index: Index,
+    /// Peer match-index advances observed. Reported in the heartbeat
+    /// beside `commit` and `durable`: those three together say WHICH
+    /// half of a commit stall is at fault — replication (no match
+    /// advances) or durability (matches advancing but `durable_index`
+    /// pinned). Neither the commit index nor the log alone separates
+    /// those two cases.
+    dbg_matches: u32,
 
     // Commit state
     committed_index: Index,
@@ -91,6 +101,7 @@ pub struct Commit {
 /// post-param boot logic.
 pub fn init(s: &mut Commit) {
     s.in_durable = -1;
+    s.durable_dirty = false;
     s.out_metrics = -1;
     s.out_retention_floor = -1;
     s.horizon_out = HorizonLatch::new();
@@ -108,6 +119,7 @@ pub fn init(s: &mut Commit) {
     s.match_indices = [0; MAX_NODES];
     s.last_floor_emitted = 0;
     s.durable_index = 0;
+    s.dbg_matches = 0;
     s.committed_index = 0;
     s.committed_term = 0;
     s.term_fence_index = 0;
@@ -142,6 +154,7 @@ pub fn on_match(s: &mut Commit, replica: u8, index: Index) {
     if (replica as usize) < MAX_NODES && index > s.match_indices[replica as usize] {
         s.match_indices[replica as usize] = index;
         s.match_changed = true;
+        s.dbg_matches = s.dbg_matches.saturating_add(1);
     }
 }
 
@@ -158,7 +171,9 @@ pub fn on_match(s: &mut Commit, replica: u8, index: Index) {
 /// zero fence or this node's previous reign's), then again with the
 /// real index once the no-op is in the WAL.
 pub fn on_term_fence(s: &mut Commit, term: Term, index: Index) {
-    if term < s.term_fence_term { return; }
+    if term < s.term_fence_term {
+        return;
+    }
     if term > s.term_fence_term {
         // New leadership. Match indices are monotone only WITHIN a
         // leadership: across a term change a stale one can name a log
@@ -257,13 +272,14 @@ pub unsafe fn step(s: &mut Commit, sys: &SyscallTable) {
 /// `wire::MSG_COMPACTION_FLOOR`):
 /// `[kpg_id:u16 LE][floor_revision:u64 LE]`.
 unsafe fn emit_retention_floor(s: &mut Commit, sys: &SyscallTable) {
-    if s.out_retention_floor < 0 { return; }
+    if s.out_retention_floor < 0 {
+        return;
+    }
     let mut floor = Index::MAX;
     let mut any = false;
     for id in 0..MAX_NODES as u8 {
         let in_set = if s.current_voters.count() > 0 {
-            s.current_voters.contains(id)
-                || (s.joint_active && s.joint_voters.contains(id))
+            s.current_voters.contains(id) || (s.joint_active && s.joint_voters.contains(id))
         } else {
             // Pre-voter-set fallback: ids 0..voter_count (mirrors the
             // quorum computation's fallback).
@@ -276,45 +292,67 @@ unsafe fn emit_retention_floor(s: &mut Commit, sys: &SyscallTable) {
             }
         }
     }
-    if !any || floor == Index::MAX { return; }
-    if floor == s.last_floor_emitted { return; }
+    if !any || floor == Index::MAX {
+        return;
+    }
+    if floor == s.last_floor_emitted {
+        return;
+    }
     let mut buf = [0u8; 10];
     buf[0..2].copy_from_slice(&s.partition_id.to_le_bytes());
     buf[2..10].copy_from_slice(&floor.to_le_bytes());
     // No poll pre-check: it reports >=1 byte free, not room for this
     // frame. The all-or-nothing write's return value is the only answer,
     // and the latch moves only on a confirmed one.
-    let n = wire_channels::channel_write_msg(
-        sys, s.out_retention_floor, wire::MSG_COMPACTION_FLOOR, &buf,
+    let n = wire_channels::channel_write_partitioned(
+        sys,
+        s.out_retention_floor,
+        s.partition_id,
+        wire::MSG_COMPACTION_FLOOR,
+        &buf,
     );
     if n > 0 {
         s.last_floor_emitted = floor;
     }
 }
 
-/// Emit commit-index gauge + commit-advance counter as typed samples
-/// (RFC §4.3). Dropped under backpressure — telemetry never stalls the
-/// consensus path.
+/// Emit commit-index gauge + commit-advance counter as typed samples.
+/// Dropped under backpressure — telemetry never stalls the consensus path.
 ///
 /// # Safety
 ///
 /// Caller must supply a valid `&SyscallTable` per the module ABI.
 unsafe fn emit_metrics(s: &mut Commit, sys: &SyscallTable) {
     let now = dev_millis(sys);
-    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS {
+        return;
+    }
     s.last_metrics_ms = now;
 
     // Recurring commit heartbeat: the only commit-progress signal that
     // is visible to log-line matchers (the gauges below are binary
     // /metrics only). Rig scenarios key on this line advancing; an
     // append-side heartbeat cannot detect a commit wedge.
-    let mut line = [0u8; 40];
+    let mut line = [0u8; 72];
     let mut pos = 0usize;
-    pos = super::log_fmt::log_field(&mut line, pos, b"[commit] hb commit=",
-        s.committed_index.min(u32::MAX as u64) as u32);
+    pos = super::log_fmt::log_field(
+        &mut line,
+        pos,
+        b"[commit] hb commit=",
+        s.committed_index.min(u32::MAX as u64) as u32,
+    );
+    pos = super::log_fmt::log_field(&mut line, pos, b" m=", s.dbg_matches);
+    pos = super::log_fmt::log_field(
+        &mut line,
+        pos,
+        b" d=",
+        s.durable_index.min(u32::MAX as u64) as u32,
+    );
     super::dev_log(sys, 3, line.as_ptr(), pos);
 
-    if s.out_metrics < 0 { return; }
+    if s.out_metrics < 0 {
+        return;
+    }
 
     wire_channels::emit_metrics(
         sys,
@@ -322,7 +360,11 @@ unsafe fn emit_metrics(s: &mut Commit, sys: &SyscallTable) {
         wire::SOURCE_ID_COMMIT,
         s.partition_id,
         &[
-            (wire::metric_ids::COMMIT_INDEX, wire::METRIC_KIND_GAUGE, s.committed_index as i64),
+            (
+                wire::metric_ids::COMMIT_INDEX,
+                wire::METRIC_KIND_GAUGE,
+                s.committed_index as i64,
+            ),
             (
                 wire::metric_ids::COMMIT_ADVANCES,
                 wire::METRIC_KIND_COUNTER,
@@ -338,9 +380,32 @@ unsafe fn emit_metrics(s: &mut Commit, sys: &SyscallTable) {
 /// `&Commit` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+pub fn apply_durability_proof(s: &mut Commit, term: u64, index: u64) {
+    if index <= s.durable_index {
+        return;
+    }
+    s.durable_index = index;
+    s.committed_term = term;
+    s.durable_dirty = true;
+    // Self-match: the local durable index counts as this node's match
+    // index for quorum computation. Essential for single-node clusters
+    // and for the leader's own vote in multi-node quorum.
+    if (s.self_id as usize) < MAX_NODES && index > s.match_indices[s.self_id as usize] {
+        s.match_indices[s.self_id as usize] = index;
+    }
+}
+
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Commit` and supply a valid
+/// `&SyscallTable` per the module ABI.
 unsafe fn drain_durability(s: &mut Commit, sys: &SyscallTable) -> bool {
-    if s.in_durable < 0 { return false; }
-    let mut changed = false;
+    // Proofs routed by the engine land through `apply_durability_proof`;
+    // take that signal first so the recompute below still fires.
+    let mut changed = core::mem::take(&mut s.durable_dirty);
+    if s.in_durable < 0 {
+        return changed;
+    }
     // Cap 32 per step (matches the durability ledger's ack-drain bound).
     for _ in 0..32 {
         let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_durable, &mut s.msg_buf)
@@ -351,15 +416,20 @@ unsafe fn drain_durability(s: &mut Commit, sys: &SyscallTable) -> bool {
             continue;
         }
 
-        // partition_id is part of the proof envelope but the commit
-        // tracker is per-partition; we just discard it (the proof always
-        // matches our slot because each durability ledger only fans
-        // out to one commit tracker).
-        let Some((_partition_id, term, index, _replica)) =
+        // The proof carries its own `partition_id`, so this is where a
+        // hosted group filters: with one durability instance tallying K
+        // groups, a proof for another group must not advance this
+        // tracker's durable index. Filtering on the payload field rather
+        // than an envelope keeps the channel readable by `quantum`'s
+        // `flow` module, which shares it.
+        let Some((partition_id, term, index, _replica)) =
             wire::decode_durability_proof(&s.msg_buf[..plen as usize])
         else {
             continue;
         };
+        if partition_id != s.partition_id {
+            continue;
+        }
         if index > s.durable_index {
             s.durable_index = index;
             s.committed_term = term;
@@ -392,11 +462,11 @@ pub fn on_cache_state(s: &mut Commit, msg: &[u8], plen: u16) {
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn advance_commit(s: &mut Commit) {
     // Compute quorum match index. If a voter-set update has populated
-    // `current_voters` we use the joint-aware path (RFC §1.2); during
-    // joint mode the effective commit index is the minimum of the two
-    // medians so an entry must be replicated to a majority of BOTH
-    // sets before it counts as committed. Otherwise we fall back to
-    // the legacy fixed-range `voter_count` median.
+    // `current_voters` we use the joint-aware path; during joint mode the
+    // effective commit index is the minimum of the two medians so an entry
+    // must be replicated to a majority of BOTH sets before it counts as
+    // committed. Otherwise we fall back to the legacy fixed-range
+    // `voter_count` median.
     let quorum_match = if s.current_voters.count() > 0 {
         let current_median = quorum_index_for_set(&s.match_indices, s.current_voters);
         if s.joint_active && s.joint_voters.count() > 0 {
@@ -414,12 +484,20 @@ unsafe fn advance_commit(s: &mut Commit) {
     };
 
     // Apply durability mode
-    let effective_mode = if s.strict_fallback { DUR_STRICT } else { s.durability_mode };
+    let effective_mode = if s.strict_fallback {
+        DUR_STRICT
+    } else {
+        s.durability_mode
+    };
 
     let new_commit = match effective_mode {
         DUR_STRICT | DUR_GROUP_FSYNC => {
             // Commit only up to what's durably synced
-            if quorum_match < s.durable_index { quorum_match } else { s.durable_index }
+            if quorum_match < s.durable_index {
+                quorum_match
+            } else {
+                s.durable_index
+            }
         }
         DUR_RELAXED => quorum_match,
         _ => quorum_match,
@@ -430,10 +508,7 @@ unsafe fn advance_commit(s: &mut Commit) {
     // A prior-term entry with quorum can still be legally overwritten by
     // a higher-term leader (Raft Fig. 8); it commits transitively, when
     // the fence entry itself commits.
-    if s.term_fence_index > 0
-        && new_commit > s.committed_index
-        && new_commit < s.term_fence_index
-    {
+    if s.term_fence_index > 0 && new_commit > s.committed_index && new_commit < s.term_fence_index {
         emit_committed(s);
         return;
     }

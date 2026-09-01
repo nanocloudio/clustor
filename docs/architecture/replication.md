@@ -342,21 +342,37 @@ uncommitted-inflight and WAL-unacked gates.
 <a id="compaction-floor"></a>
 ## Compaction
 
-Compaction is snapshot-driven. On each WAL segment rotation the WAL
-emits `MSG_SNAPSHOT_TRIGGER` at the rotation-time high-water. The
-snapshot engine gates the trigger on its retention-floor table — the
-commit tracker publishes `min(match index over the active voter set)`
-as `MSG_COMPACTION_FLOOR`, so a snapshot (and therefore compaction)
-never outruns what the slowest live voter has replicated. Once a
-snapshot is durably installed, `MSG_SNAPSHOT_INSTALLED` reaches raft,
-which emits `MSG_WAL_COMPACT_BEFORE` clamped to the commit index.
+Compaction is snapshot-driven and floor-bounded. On each WAL segment
+rotation the WAL emits `MSG_SNAPSHOT_TRIGGER` at the rotation-time
+high-water; the snapshot is always taken — it is state, and state is
+always safe to capture. Once it is durably installed,
+`MSG_SNAPSHOT_INSTALLED` reaches raft, which emits
+`MSG_WAL_COMPACT_BEFORE` clamped to the commit index.
 
-The WAL applies the floor conservatively
+What a floor protects is the ENTRIES, so the floors are applied where
+entries are retired: `wal::compact_before` clamps the trim point to the
+lowest floor it holds. Two kinds arrive. The commit tracker publishes
+`min(match index over the active voter set)` as `MSG_COMPACTION_FLOOR`
+on `log_maintenance`, so retirement never outruns what the slowest live
+voter has replicated. An application publishes its own floors on the
+`retention_floor` port — a Kafka retention window is the lowest raft
+index a consumer inside the window can still ask for — one per kpg
+(a consumer-side partition group, whose id the substrate treats as
+opaque), partitioned per raft group. `WAL_COMPACT_FLOORED` counts
+trims a floor pulled below the snapshot; a floor table that overflows
+fails closed and retires nothing.
+
+The WAL applies the trim conservatively
 (`modules/app/durability/wal.rs`): only whole segments every one of
-whose entries lies below the floor are deleted, the boundary segment
-is always kept, and the live write segment is never touched. The
-segment floor is durably persisted to a sidecar file **before** the
+whose entries lies below the trim point are deleted, the boundary
+segment is always kept, and the live write segment is never touched.
+The segment floor is durably persisted to a sidecar file **before** the
 first unlink, so replay after a crash mid-compaction still finds the
-surviving log; unlinks are paced a few per step. There is no separate
-compaction-floor computation beyond this — the retention floor, the
-commit clamp, and the whole-segment rule are the entire policy.
+surviving log; unlinks are paced a few per step. Entries below the
+snapshot but above a floor stay on disk and are served by the cold-read
+segment scan. The sidecar also records the segment holding the latest
+snapshot's index, and boot replay starts THERE: raft needs its log only
+from the snapshot on, so the retained segments below are walked by the
+scan on demand rather than by every restart. There is no separate
+compaction-floor computation beyond this — the floors, the commit clamp,
+and the whole-segment rule are the entire policy.

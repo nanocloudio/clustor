@@ -1,11 +1,9 @@
 //! Channel I/O wrappers over fluxor's `SyscallTable`.
 //!
-//! PIC-only companion to `wire.rs`. The cargo crate
-//! `clustor-common` exposes only the pure no_std surface from
-//! `wire.rs` (constants and codecs); the wrappers in this file
-//! touch `SyscallTable` and so live outside that publishable
-//! surface per RFC §6.5.1. Each app module mounts both files
-//! side by side:
+//! PIC-only companion to `wire.rs`. The cargo crate `clustor-common` exposes
+//! only the pure no_std surface from `wire.rs` (constants and codecs); the
+//! wrappers in this file touch `SyscallTable` and so live outside that
+//! publishable surface. Each app module mounts both files side by side:
 //!
 //! ```ignore
 //! #[path = "../../common/wire.rs"]
@@ -20,7 +18,7 @@
 //!
 //! These wrappers are fluxor-adjacent — they only touch
 //! `SyscallTable` and the envelope formats fluxor channels carry —
-//! and a future RFC may move them upstream into `fluxor-sdk`.
+//! so they would sit just as well upstream in `fluxor-sdk`.
 
 use super::wire::{
     decode_header, decode_partitioned_header, encode_header, encode_partitioned_header,
@@ -57,7 +55,14 @@ pub unsafe fn emit_metrics(
             break;
         }
         let mut buf = [0u8; super::wire::METRIC_SAMPLE_LEN];
-        super::wire::encode_metric_sample(&mut buf, source_id, partition_id, metric_id, kind, value);
+        super::wire::encode_metric_sample(
+            &mut buf,
+            source_id,
+            partition_id,
+            metric_id,
+            kind,
+            value,
+        );
         channel_write_msg(sys, chan, super::wire::MSG_METRIC_SAMPLE, &buf);
     }
 }
@@ -172,7 +177,7 @@ pub unsafe fn next_msg(
 /// payload). At saturation a downstream that frees ~one frame per step
 /// keeps the ring in exactly that danger zone, so the tear is the common
 /// case, not a rare one (raft → wal entries silently shredded → garbage
-/// commit_index, RFC §13/§14). A single combined write is atomic against
+/// commit_index). A single combined write is atomic against
 /// that: the whole
 /// frame lands or nothing does, and the return value is a reliable
 /// "did it fit" backpressure signal. Mirrors the fluxor SDK's own

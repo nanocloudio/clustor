@@ -90,7 +90,18 @@ pub const COMMITTED_BATCH_LEN: usize = 16;
 /// follows immediately and can be 0..MAX_COMMAND_BYTES + tagged-prefix
 /// (for proposal batches the per-entry envelope carries the coalesced
 /// batch body produced by `consensus.flush_proposal_batch`).
-pub const COMMITTED_ENTRY_HDR: usize = 16;
+/// `MSG_COMMITTED_ENTRY` header: `[partition_id:u16][term:u64][index:u64]`.
+///
+/// This file is `#[path]`-included into contexts that do NOT have `wire`
+/// in scope (the benches, for one), so it cannot re-export the constant
+/// and must keep its own. That duplication is exactly what let the two
+/// drift when the partition id was added — only the writer changed, and
+/// this decoder then read `index` across the shifted boundary, which
+/// made `session_directory` reject every entry.
+///
+/// `tests/facade.rs::facade_constants_match_wire` asserts the two are
+/// equal, so drift now fails a test instead of corrupting a stream.
+pub const COMMITTED_ENTRY_HDR: usize = 18;
 
 /// MSG_SNAPSHOT_CHUNK envelope prefix size: seq(4) + len(4).
 pub const SNAPSHOT_CHUNK_HDR: usize = 8;
@@ -207,6 +218,10 @@ pub struct CommitAck {
 /// returns a [`CommitAck`] watermark instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommittedEntry<'a> {
+    /// Which raft group produced this entry. One engine hosts K groups
+    /// whose indexes each start at 1, so a cursor is only meaningful
+    /// per partition.
+    pub partition_id: u16,
     pub term: u64,
     pub index: u64,
     /// Opaque command bytes — Clustor never inspects these. A
@@ -215,28 +230,30 @@ pub struct CommittedEntry<'a> {
 }
 
 impl<'a> CommittedEntry<'a> {
-    /// Decode a `MSG_COMMITTED_ENTRY` payload (`[term:u64 LE][index:u64
-    /// LE][body...]`). Returns `None` if the payload is shorter than
-    /// the 16-byte header.
+    /// Decode a `MSG_COMMITTED_ENTRY` payload
+    /// (`[partition_id:u16 LE][term:u64 LE][index:u64 LE][body...]`).
+    /// Returns `None` if the payload is shorter than the header.
     pub fn decode(payload: &'a [u8]) -> Option<Self> {
         if payload.len() < COMMITTED_ENTRY_HDR {
             return None;
         }
+        let partition_id = u16::from_le_bytes([payload[0], payload[1]]);
         let term = u64::from_le_bytes([
-            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-            payload[7],
+            payload[2], payload[3], payload[4], payload[5], payload[6], payload[7], payload[8],
+            payload[9],
         ]);
         let index = u64::from_le_bytes([
-            payload[8],
-            payload[9],
             payload[10],
             payload[11],
             payload[12],
             payload[13],
             payload[14],
             payload[15],
+            payload[16],
+            payload[17],
         ]);
         Some(Self {
+            partition_id,
             term,
             index,
             command: &payload[COMMITTED_ENTRY_HDR..],
@@ -1076,10 +1093,26 @@ mod tests {
         buf
     }
 
+    fn make_committed_entry_pid(
+        partition_id: u16,
+        term: u64,
+        index: u64,
+        body: &[u8],
+    ) -> [u8; 128] {
+        let mut buf = [0u8; 128];
+        buf[0..2].copy_from_slice(&partition_id.to_le_bytes());
+        buf[2..10].copy_from_slice(&term.to_le_bytes());
+        buf[10..18].copy_from_slice(&index.to_le_bytes());
+        assert!(body.len() <= buf.len() - COMMITTED_ENTRY_HDR);
+        buf[COMMITTED_ENTRY_HDR..COMMITTED_ENTRY_HDR + body.len()].copy_from_slice(body);
+        buf
+    }
+
     fn make_committed_entry(term: u64, index: u64, body: &[u8]) -> [u8; 128] {
         let mut buf = [0u8; 128];
-        buf[0..8].copy_from_slice(&term.to_le_bytes());
-        buf[8..16].copy_from_slice(&index.to_le_bytes());
+        buf[0..2].copy_from_slice(&0u16.to_le_bytes());
+        buf[2..10].copy_from_slice(&term.to_le_bytes());
+        buf[10..18].copy_from_slice(&index.to_le_bytes());
         assert!(body.len() <= buf.len() - COMMITTED_ENTRY_HDR);
         buf[COMMITTED_ENTRY_HDR..COMMITTED_ENTRY_HDR + body.len()].copy_from_slice(body);
         buf
@@ -1588,11 +1621,13 @@ mod tests {
     #[test]
     fn committed_entry_decode_roundtrip() {
         let body = b"set foo=bar";
-        let mut buf = [0u8; 128];
-        buf[0..8].copy_from_slice(&7u64.to_le_bytes());
-        buf[8..16].copy_from_slice(&42u64.to_le_bytes());
-        buf[16..16 + body.len()].copy_from_slice(body);
-        let entry = CommittedEntry::decode(&buf[..16 + body.len()]).unwrap();
+        // Built with the shared encoder on purpose: hand-writing the
+        // offsets here is what made this test agree with itself and
+        // disagree with the writer.
+        let buf = make_committed_entry_pid(3, 7, 42, body);
+        let n = COMMITTED_ENTRY_HDR + body.len();
+        let entry = CommittedEntry::decode(&buf[..n]).unwrap();
+        assert_eq!(entry.partition_id, 3);
         assert_eq!(entry.term, 7);
         assert_eq!(entry.index, 42);
         assert_eq!(entry.command, body);
@@ -1612,7 +1647,7 @@ mod tests {
 
         let buf1 = make_committed_entry(1, 1, body1);
         let entry = sub
-            .ingest_committed_entry(&buf1[..16 + body1.len()])
+            .ingest_committed_entry(&buf1[..COMMITTED_ENTRY_HDR + body1.len()])
             .unwrap();
         assert_eq!(
             (entry.term, entry.index, entry.command),
@@ -1623,14 +1658,14 @@ mod tests {
 
         let buf2 = make_committed_entry(1, 2, body2);
         let entry = sub
-            .ingest_committed_entry(&buf2[..16 + body2.len()])
+            .ingest_committed_entry(&buf2[..COMMITTED_ENTRY_HDR + body2.len()])
             .unwrap();
         assert_eq!(entry.index, 2);
         assert_eq!(entry.command, body2.as_slice());
 
         let buf3 = make_committed_entry(2, 3, body3);
         let entry = sub
-            .ingest_committed_entry(&buf3[..16 + body3.len()])
+            .ingest_committed_entry(&buf3[..COMMITTED_ENTRY_HDR + body3.len()])
             .unwrap();
         assert_eq!(
             (entry.term, entry.index, entry.command),
@@ -1645,8 +1680,11 @@ mod tests {
     fn subscriber_per_entry_rejects_duplicate() {
         let mut sub = CommittedSubscriber::new(0);
         let buf = make_committed_entry(1, 1, b"x");
-        sub.ingest_committed_entry(&buf[..17]).unwrap();
-        let err = sub.ingest_committed_entry(&buf[..17]).unwrap_err();
+        sub.ingest_committed_entry(&buf[..COMMITTED_ENTRY_HDR + 1])
+            .unwrap();
+        let err = sub
+            .ingest_committed_entry(&buf[..COMMITTED_ENTRY_HDR + 1])
+            .unwrap_err();
         assert_eq!(
             err,
             CommitOrderError::NonMonotonicIndex {
@@ -1661,10 +1699,13 @@ mod tests {
     fn subscriber_per_entry_rejects_gap() {
         let mut sub = CommittedSubscriber::new(0);
         let buf = make_committed_entry(1, 1, b"x");
-        sub.ingest_committed_entry(&buf[..17]).unwrap();
+        sub.ingest_committed_entry(&buf[..COMMITTED_ENTRY_HDR + 1])
+            .unwrap();
         // Skip index 2 — consensus ring evicted it.
         let buf3 = make_committed_entry(1, 3, b"x");
-        let err = sub.ingest_committed_entry(&buf3[..17]).unwrap_err();
+        let err = sub
+            .ingest_committed_entry(&buf3[..COMMITTED_ENTRY_HDR + 1])
+            .unwrap_err();
         assert_eq!(
             err,
             CommitOrderError::GapInPerEntryStream {
@@ -1681,8 +1722,10 @@ mod tests {
         // Process two entries then a snapshot fast-forwards us.
         let b1 = make_committed_entry(1, 1, b"a");
         let b2 = make_committed_entry(1, 2, b"b");
-        sub.ingest_committed_entry(&b1[..17]).unwrap();
-        sub.ingest_committed_entry(&b2[..17]).unwrap();
+        sub.ingest_committed_entry(&b1[..COMMITTED_ENTRY_HDR + 1])
+            .unwrap();
+        sub.ingest_committed_entry(&b2[..COMMITTED_ENTRY_HDR + 1])
+            .unwrap();
 
         // Snapshot installs at index 100.
         sub.reset_to(100, 5);
@@ -1692,14 +1735,16 @@ mod tests {
         // Next entry must be 101.
         let bad = make_committed_entry(5, 200, b"x");
         assert_eq!(
-            sub.ingest_committed_entry(&bad[..17]).unwrap_err(),
+            sub.ingest_committed_entry(&bad[..COMMITTED_ENTRY_HDR + 1])
+                .unwrap_err(),
             CommitOrderError::GapInPerEntryStream {
                 expected: 101,
                 observed: 200
             }
         );
         let ok = make_committed_entry(5, 101, b"x");
-        sub.ingest_committed_entry(&ok[..17]).unwrap();
+        sub.ingest_committed_entry(&ok[..COMMITTED_ENTRY_HDR + 1])
+            .unwrap();
         assert_eq!(sub.cursor(), 101);
     }
 
@@ -1717,7 +1762,9 @@ mod tests {
         // accept it; the consumer's handler decides what to do.
         let mut sub = CommittedSubscriber::new(0);
         let buf = make_committed_entry(1, 1, b"");
-        let entry = sub.ingest_committed_entry(&buf[..16]).unwrap();
+        let entry = sub
+            .ingest_committed_entry(&buf[..COMMITTED_ENTRY_HDR])
+            .unwrap();
         assert_eq!(entry.command, &[][..]);
         assert_eq!(sub.cursor(), 1);
     }
@@ -1746,7 +1793,7 @@ mod tests {
         let env_b = make_committed_entry(3, 2, body_b);
 
         let entry = sub
-            .ingest_committed_entry(&env_a[..16 + body_a.len()])
+            .ingest_committed_entry(&env_a[..COMMITTED_ENTRY_HDR + body_a.len()])
             .unwrap();
         assert_eq!(entry.command, body_a);
         inflight.record_commit(entry.term, entry.index);
@@ -1754,7 +1801,7 @@ mod tests {
         assert_eq!(drained, (0x11, CommitAck { term: 3, index: 1 }));
 
         let entry = sub
-            .ingest_committed_entry(&env_b[..16 + body_b.len()])
+            .ingest_committed_entry(&env_b[..COMMITTED_ENTRY_HDR + body_b.len()])
             .unwrap();
         assert_eq!(entry.command, body_b);
         inflight.record_commit(entry.term, entry.index);

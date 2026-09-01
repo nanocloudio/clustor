@@ -10,7 +10,7 @@
 //! audit envelope on `audit_events` and is counted by the
 //! [`telemetry`](super::telemetry) component.
 //!
-//! ## Identity binding (RFC §3.2)
+//! ## Identity binding
 //!
 //! When the optional `identity` port is wired and a
 //! `MSG_PEER_IDENTITY` envelope arrives for a connection, the
@@ -183,11 +183,7 @@ pub unsafe fn step(r: &mut Rbac, sys: &SyscallTable) {
 ///
 /// Caller must hold an exclusive `&mut Rbac` and a valid
 /// `&SyscallTable` per the module ABI.
-pub unsafe fn next_wire_command(
-    r: &mut Rbac,
-    sys: &SyscallTable,
-    out: &mut [u8; 1024],
-) -> Pulled {
+pub unsafe fn next_wire_command(r: &mut Rbac, sys: &SyscallTable, out: &mut [u8; 1024]) -> Pulled {
     if r.in_requests < 0 {
         return Pulled::Empty;
     }
@@ -222,12 +218,7 @@ pub unsafe fn next_wire_command(
 ///
 /// Caller must hold an exclusive `&mut Rbac` and a valid
 /// `&SyscallTable` per the module ABI.
-pub unsafe fn evaluate(
-    r: &mut Rbac,
-    sys: &SyscallTable,
-    origin: Origin,
-    payload: &[u8],
-) -> bool {
+pub unsafe fn evaluate(r: &mut Rbac, sys: &SyscallTable, origin: Origin, payload: &[u8]) -> bool {
     if payload.is_empty() {
         return false;
     }
@@ -259,7 +250,12 @@ pub unsafe fn evaluate(
         if origin == Origin::Wire && r.out_denied >= 0 {
             if wire_channels::writable(sys, r.out_denied) {
                 let resp = [conn_id, wire::ADMIN_STATUS_REJECTED];
-                wire_channels::channel_write_msg(sys, r.out_denied, wire::MSG_ADMIN_RESPONSE, &resp);
+                wire_channels::channel_write_msg(
+                    sys,
+                    r.out_denied,
+                    wire::MSG_ADMIN_RESPONSE,
+                    &resp,
+                );
             }
         }
         r.denied_count += 1;

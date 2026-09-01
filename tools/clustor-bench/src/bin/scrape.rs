@@ -1,11 +1,10 @@
 //! `clustor-scrape` — bracketed `/metrics` scrape → JSON baseline record.
 //!
-//! Replaces the throwaway `/tmp/scrape_dut.py` / `cb_delta.py` tooling (RFC
-//! §5.4, §14 item 5) with a checked-in, dependency-free runner so baselines
-//! are reproducible and cross-project comparable. It scrapes the binary
-//! `/metrics` export at window start and end, computes counter deltas + final
-//! gauges, and writes a JSON record carrying the RFC §2.6 provenance: git SHA,
-//! config hash, target, run id, and workload parameters.
+//! A checked-in, dependency-free runner, so baselines are reproducible and
+//! cross-project comparable. It scrapes the binary `/metrics` export at
+//! window start and end, computes counter deltas + final gauges, and writes
+//! a JSON record carrying the provenance a baseline has to be read against:
+//! git SHA, config hash, target, run id, and workload parameters.
 //!
 //! Usage:
 //!   clustor-scrape --host 192.168.1.9:19090 --window 12 \

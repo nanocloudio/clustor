@@ -23,7 +23,7 @@ requires_contract = "fs"
 access = "write"
 
 [observability]
-# L0 NVMe floor benchmark harness (RFC §6): emits its own bench signals
+# L0 NVMe floor benchmark harness: emits its own bench signals
 # (seq/rand throughput, fsync-latency histogram sharing the WAL buckets,
 # bytes/fsync counters) plus `[nvbench] ...` log_net lines. Not
 # data-plane telemetry, so exempt from the data-mover instrumentation

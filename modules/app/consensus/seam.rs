@@ -103,7 +103,11 @@ pub struct HorizonLatch {
 
 impl HorizonLatch {
     pub const fn new() -> Self {
-        Self { term: 0, index: 0, dirty: false }
+        Self {
+            term: 0,
+            index: 0,
+            dirty: false,
+        }
     }
 
     /// Raise the horizon, keeping the max index (and its term).

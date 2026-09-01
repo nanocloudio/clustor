@@ -31,13 +31,25 @@ absent so that "absent here is a bug" stays a checkable claim:
   registered symbol is the row; the derivation belongs in its Reason.
   Current cases: `PENDING_BODY_CAP`, `PROPOSAL_BATCH_CAP`,
   `MEMORY_ENTRY_BODY_CAP`, `PROPOSAL_BUF` and `MSG_BUF` are each
-  `wal_frame::MAX_ENTRY_BODY`; `CMD_MAX` derives from `ENV_BUF`,
-  `EXPORT_BUDGET` from `SAFE_EXPORT_MAX`, `SEND_STAGE_MAX` from
-  `ROUTE_FRAME_MAX`, and `SR_MAX_CMD` from `SR_MAX_WRAPPED_KEY`.
+  `wal_frame::MAX_ENTRY_BODY`, and `CARRY_MAX` is that plus a frame
+  header; `CMD_MAX` derives from `ENV_BUF`, `EXPORT_BUDGET` and
+  `METRICS_CACHE` from `SAFE_EXPORT_MAX` (via the named
+  `METRICS_CACHE_SLACK` delta, kept so the cap has one source rather
+  than a second literal), `SEND_STAGE_MAX` from
+  `ROUTE_FRAME_MAX`, `SR_MAX_CMD` from `SR_MAX_WRAPPED_KEY`,
+  `SNAP_PTR_CANDIDATES` from `SNAP_PTR_SLOTS`, and `EXPORT_TAIL_RECORDS`
+  and `COMP_STEP_BUCKETS` from histogram bucket counts.
 - **Striping and resolution factors.** `DEDUP_SHARDS` picks which of 16
   high-water slots an index consults. Nothing is exhausted at 16; a
   different value changes collision behaviour, not a guarantee.
-- **Opcodes, protocol ids, state tags and timing intervals.**
+- **Opcodes, protocol ids, state tags, sentinels and timing.** Message
+  and op codes, phase and state tags (`PHASE_*`, `SMOKE_*`, `SR_OP_*`,
+  `CACHE_*`), reserved sentinels (`PLACEMENT_UNCHANGED`,
+  `FLOOR_SLOT_EMPTY`), format versions, and every interval, TTL,
+  timeout or retry cadence measured in milliseconds. A timeout changes
+  *when* something happens, not what the deployment can hold; where one
+  changes a guarantee it is registered as semantic instead
+  (`TRUNCATE_HOLD_TIMEOUTS`, `APP_CAPTURE_TIMEOUT_TICKS`).
 
 Modules outside the replicated substrate — the `consensus_bench` and
 `nvme_bench` drivers, `clustor_cli`, `example_consumer` — are also out of
@@ -47,13 +59,17 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 
 | Cap | Symbol | Source | Value | Reason |
 |---|---|---|---|---|
-| App-snapshot body (capture + install accumulation, boot restore) | `MAX_SNAPSHOT_BODY` | modules/app/durability/snapshot.rs | 16384 | Policy: bounds the memory-store worst case (see below). |
 | Snapshot chunk per channel frame | `MAX_CHUNK_BODY` | modules/app/durability/snapshot.rs | 4096 | Wire pacing: one install-transfer chunk per frame; totals are unbounded because the stream is chunked. |
-| Retention-floor table (distinct consumer ids) | `RETENTION_FLOOR_SLOTS` | modules/app/durability/snapshot.rs | 32 | Fail-closed: overflow sets a sticky flag and the compaction trigger stops advancing. |
+| Retention-floor table (distinct kpg ids) | `RETENTION_FLOOR_SLOTS` | modules/app/durability/wal.rs | 32 | Fail-closed: a floor arriving for a kpg the table cannot hold sets a sticky flag, and while it is set the lowest floor answers 0, so compaction retires nothing. Evicting a slot instead would widen the compaction window past a live floor. Recovery is an operator restart with a larger table. |
 | Command body through the replica facade | `MAX_COMMAND_BYTES` | modules/common/replica_facade.rs | 4096 | Policy: clustor orders metadata, not bulk; larger bodies are refused with `ProposeError::CommandTooLarge` (see interaction note below). |
 | WAL entry body | `MAX_ENTRY_BODY` | modules/common/wal_frame.rs | 2048 | Frame contract: an oversize AppendEntries entry is refused as structurally invalid, and replay treats a larger length as a torn frame. |
 | Channel envelope payload | `MAX_PAYLOAD` | modules/common/wire.rs | — | The envelope's u16 length field caps payloads at 0xFFFF; every encoder refuses rather than truncates. |
 | Replicas per partition | `MAX_NODES` | modules/common/types.rs | 7 | Topology policy: `voter_count` is clamped at init and higher replica ids are dropped. |
+| Partition Raft Groups per `consensus` instance | `K_MAX` | modules/app/consensus/mod.rs | 64 | Capacity: compile-time slot array bound. Hosting K groups in one instance keeps the graph's edge count independent of K; the live count comes from the `partitions` param, clamped to `1..=K_MAX` and held in `active_slots`. A graph asking for more gets the ceiling rather than a silent misroute. Slot state is allocated at `K_MAX` whatever `active_slots` is, so the module-state cost is paid unconditionally and is what bounds this number, not the port budget. |
+| Partition Raft Groups per `durability` instance | `K_MAX` | modules/app/durability/mod.rs | 64 | Capacity: mirrors the `consensus` ceiling, and must — a K>1 engine wired to K separate durability instances multiplies edges just the same. Each slot carries a full `wal::Wal`, so `WAL_FOOTPRINT_BUDGET` is a PER-SLOT figure and the module's state is K multiples of it. |
+| Queued frames per slot inbox | `INBOX_DEPTH` | modules/common/frame_inbox.rs | 16 | Backpressure, not loss: the demux holds an unplaceable frame in its per-channel `carry` and stops draining that channel until the inbox has room, so pressure propagates upstream instead of dropping a frame. Components drain up to 16 frames per step, so a full inbox is one step's work. |
+| Per-module frame arena | `ARENA_BYTES` | modules/app/consensus/mod.rs | — | Capacity; typed value 262144 (`256 * 1024`, `u32`). Backs the per-slot inboxes so queued frames cost heap in proportion to what is actually in flight, rather than `K * INBOX_DEPTH * MAX_FRAME` of fixed module state. Exhaustion is backpressure — the demux keeps holding the frame and retries — and is counted in `arena_exhausted`. Without the arena export the kernel grants no heap and every push fails closed. |
+| Per-module frame arena | `ARENA_BYTES` | modules/app/durability/mod.rs | — | Capacity; typed value 262144. Same role and exhaustion contract as the `consensus` arena. |
 | Follower log-matching term ring | `TAIL_TERM_RING` | modules/app/consensus/raft.rs | 64 | Capacity: recent `(index → term)` for follower-side log matching and Raft §5.3 conflict repair. Only the uncommitted tail can diverge, and it is bounded by `MAX_UNCOMMITTED_INFLIGHT` (48), so the ring covers every index a conflict check can legitimately target; indices at or below `commit_index` are trusted without a ring hit. It must stay above the uncommitted window — the two move together. |
 | Commit-latency timestamp ring | `COMMIT_TS_RING` | modules/app/consensus/raft.rs | 64 | Capacity, observability only: append→commit timestamps for the commit-latency histogram. A wrap before commit drops that sample; an equality check keeps a wrapped slot from being attributed to the wrong entry. |
 | Leader ReadIndex probes in flight | `MAX_INFLIGHT_PROBES` | modules/app/consensus/raft.rs | 32 | A full probe table answers unconfirmed, and the read is rejected to the caller for retry. |
@@ -67,6 +83,12 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Client correlation ids in flight | `CORR_RING` | modules/app/gateway/codec.rs | 64 | Lossy capacity: correlation ids held between proposal submission and commit. Overflow evicts the oldest entry; that client's response is then dropped and counted. Fail-open by design — a dropped response never becomes a misrouted one. |
 | Assigned-index → connection map | `IDX_RING` | modules/app/gateway/codec.rs | 64 | Lossy capacity: `wal_index → conn_id` for committed proposals, same eviction and drop-not-misroute contract as `CORR_RING`. |
 | Admin commands awaiting their applied record | `CMD_RING` | modules/app/operations/admin.rs | 16 | Lossy capacity: in-memory predecessors for admin ops in flight through replication. The supported op set is double-apply-safe by construction (FREEZE→FREEZE, etc.), so a lost predecessor at worst re-applies an idempotent op. |
+| Concurrent partition migrations | `MAX_ACTIVE` | modules/app/control_plane/migration.rs | 1 | Semantic: one slot is the enforceable form of MIG-SERIAL. Concurrent migrations across disjoint groups need a per-group lock first — a control-plane design step, not a larger array here. |
+| Conflict-repair truncation hold | `TRUNCATE_HOLD_TIMEOUTS` | modules/app/consensus/raft.rs | — | Semantic; typed value 3 (election timeouts). While held, the node NACKs every AppendEntries, refuses candidacy and suspends the no-op. A WAL that never answers — latched failure, unopenable segment, only one direction of the pair wired — would otherwise take the node out of replication permanently, so the request is abandoned at this bound. Wide enough that ordinary fsync latency and a re-sent request never reach it. |
+| Non-voter auto-promotion lag | `VOTING_LAG_THRESHOLD` | modules/app/consensus/replicator.rs | — | Semantic; typed value 64 entries. How far behind a non-voting peer may be before it promotes to voting, which is when its `match_index` starts counting toward quorum. Smaller completes a joint transition sooner; larger biases toward "the new voter is genuinely caught up". |
+| Cached small HTTP envelopes | `ENVELOPE_CACHE` | modules/app/operations/http.rs | 1024 | Shape: bounds the cached `/readyz` and `/why` envelopes, which carry a single status byte. |
+| Snapshot verify read granularity | `SNAP_VERIFY_CHUNK` | modules/app/durability/snapshot.rs | 1024 | Shape: read granularity for the finalise-time CRC pass and the boot-time integrity check. A stack buffer, not module state — snapshot bodies are streamed, never held whole. |
+| Session-registry snapshot chunk | `SNAP_CHUNK` | modules/app/session_directory/mod.rs | 1024 | Shape: export chunk body. `SessionRegistry::SNAPSHOT_LEN` is ~13 KiB (64 session slots plus the timing section), so an export runs to fourteen chunks. |
 | Peer key fingerprint | `PEER_FP_MAX` | modules/app/peer_router/mod.rs | 32 | Shape: longest key fingerprint `MSG_PEER_IDENTITY` carries (SHA-256). |
 | Peer/client connection staging | `BUF_SIZE` | modules/app/peer_router/mod.rs | 8192 | Shape: per-connection staging, pinned to fluxor's `CHANNEL_BUFFER_SIZE` — nothing larger can transit a channel. Undersizing this drops frames silently at every hop (`channel_read_msg` discards oversized payloads, encoders return 0): followers wedge on the replication path and clients time out on the response path. |
 | `/metrics` export staging | `EXPORT_BUF_LEN` | modules/app/operations/telemetry.rs | 8192 | Capacity: one full channel ring. `SAFE_EXPORT_MAX` is the byte budget actually applied when building the payload, so an export always fits one atomic frame. |
@@ -91,9 +113,10 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Raft metadata path staging | `META_PATH_MAX` | modules/app/consensus/raft.rs | 32 | Bounds internally generated per-partition metadata paths; builders and partition-id formatting must remain within it. |
 | WAL path staging | `WAL_PATH_MAX` | modules/app/durability/wal.rs | 48 | Bounds internally generated segment/index paths; builders must not silently truncate a generated name. |
 | Snapshot path staging | `SNAP_PATH_MAX` | modules/app/durability/snapshot.rs | 64 | Bounds internally generated snapshot/pointer paths; builders must not silently truncate a generated name. |
-| Concurrent peer connections | `MAX_CONNS` | modules/app/peer_router/mod.rs | 64 | A full connection table drops the accept; overflow clients never complete a handshake. |
+| Concurrent peer + client connections | `MAX_CONNS` | modules/app/peer_router/mod.rs | 512 | A full connection table drops the accept; overflow clients never complete a handshake. This is the FIRST ceiling every client connection meets, so it must stay at or above the broker-side per-protocol tables it fronts. |
 | Routed peer/client frame | `ROUTE_FRAME_MAX` | modules/app/peer_router/mod.rs | 4096 | Oversized frames are dropped and counted. All gateway/peer copies must share this bound; undersizing any hop wedges replication or times out clients. |
-| Local partitions per router | `MAX_LOCAL_PARTITIONS` | modules/app/partition_router/mod.rs | 4 | `num_partitions` is clamped at init; larger deployments compose routers. |
+| Per-partition output ports per router | `MAX_LOCAL_PARTITIONS` | modules/app/partition_router/mod.rs | 4 | Capacity: one untagged + one tagged port per partition, so 2N channels against fluxor's port budget. It bounds PORTS, not partitions — `pick_chan` falls back to port 0 for a partition without its own port, and the envelope's partition id is what the multi-slot engine demuxes on. |
+| Partitions a router will route to | `MAX_ROUTED_PARTITIONS` | modules/app/partition_router/mod.rs | 64 | Capacity: tracks the engine's `K_MAX`, and `num_partitions` is clamped to it at init. Deliberately not clamped to the port count — that would silently give a graph asking for 64 partitions four groups and leave sixty idle. |
 | Node-set identifier width | `NODE_SET_CAPACITY` | modules/common/types.rs | — | Typed value 8. This is the bitset envelope; active voters remain capped at `MAX_NODES` (7). |
 | Consumer facade default in-flight requests | `DEFAULT_INFLIGHT_CAPACITY` | modules/common/replica_facade.rs | 64 | Per-consumer backpressure table. Callers may select another capacity but must size correlation state and retry policy together. |
 | Sessions in the session registry | `SR_MAX_SESSIONS` | modules/common/session_registry.rs | 64 | Fixed-size replicated state; a BIND with no free slot is refused `SR_ST_NO_CAPACITY`. |
@@ -108,16 +131,16 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 
 ## Notes
 
-On `MAX_SNAPSHOT_BODY`: bodies are 40 B disk-resident markers for disk
-state stores (the store's manifest-named runs ARE the snapshot);
-full-fidelity bodies exist only for memory stores, whose bounded worst
-case must fit. A body that does not fit is refused at the EXPORT side
-(the app emits no chunks and the WAL stays authoritative) — see the
-denial accounting on the state worker. If a memory-store deployment
-outgrows the cap, size the buffer from the deployment envelope via
-fluxor's elastic resource region rather than raising the const — the
-buffer is per-module state, and the elastic path keeps the envelope
-reviewable on one screen.
+On snapshot bodies: there is no row for one, because there is no cap.
+Bodies stream to and from the snapshot file in `MAX_CHUNK_BODY` wire
+chunks and `SNAP_VERIFY_CHUNK` read slices, and are never resident in
+module state, so capture, install, export and boot restore are bounded
+by the filesystem rather than by a constant here. For a disk state
+store the body is a 40 B marker anyway — the store's manifest-named
+runs ARE the snapshot; full-fidelity bodies exist only for memory
+stores. This is what keeps snapshot install able to close an arbitrary
+catch-up gap, which is the path a replica falls back to once the
+leader's log has been compacted past its position.
 
 Interaction: on the replicated path the tighter ceiling binds first.
 `MAX_ENTRY_BODY` (2048) caps what one WAL entry can carry, so a
@@ -170,7 +193,8 @@ These deliberately defer work rather than refuse a finite workload:
 
 Snapshot chunks are 4096 bytes as registered above. These values must be
 benchmarked with the 48-entry quorum window, the
-`VOLATILE_RETENTION_SLOTS`-entry WAL window, and WAL fence depth. Failure to reschedule deferred work is a correctness defect.
+`VOLATILE_RETENTION_SLOTS`-entry WAL window, and WAL fence depth.
+Failure to reschedule deferred work is a correctness defect.
 
 ## Known risk and maintenance contract
 

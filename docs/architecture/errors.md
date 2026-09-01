@@ -48,9 +48,9 @@ The first payload byte of an admin response is one of:
 
 | Status | Value | When it occurs |
 |---|---|---|
-| `ADMIN_STATUS_OK` | 0x00 | The op applied: freeze, thaw, transfer-leader, durability-mode, snapshot. |
+| `ADMIN_STATUS_OK` | 0x00 | The op applied, or — for a controller-routed op — was accepted by the control-plane controller. |
 | `ADMIN_STATUS_DUPLICATE` | 0x01 | Idempotency collapse of a rapid retransmit — a command byte-identical to its immediate predecessor within the in-flight window. |
-| `ADMIN_STATUS_UNSUPPORTED` | 0x80 | Membership ops (add / remove voter): joint consensus is deliberately gated until union-quorum enforcement lands. |
+| `ADMIN_STATUS_UNSUPPORTED` | 0x80 | The op code is outside the supported set, or it is a controller-routed op (migration, placement, tenant quota, shard map) on a graph with no controller wired or whose controller channel is full. |
 | `ADMIN_STATUS_REJECTED` | 0x81 | The command is too large to stage in the admin envelope buffer. |
 | `ADMIN_STATUS_NOT_LEADER` | 0x82 | Transfer-leader issued on a node that is not the leader. |
 

@@ -19,9 +19,9 @@ fn fp_mul(a: i32, b: i32) -> i32 {
 
 #[repr(C)]
 pub struct Flow {
-    pub in_lag: i32,       // in: LagSignal from replicator
-    pub out_credits: i32,  // out: ThrottleCredits / ThrottleRefill
-    pub out_metrics: i32,  // out: MetricsPayload
+    pub in_lag: i32,      // in: LagSignal from replicator
+    pub out_credits: i32, // out: ThrottleCredits / ThrottleRefill
+    pub out_metrics: i32, // out: MetricsPayload
 
     // PID gains (Q16.16)
     kp: i32,
@@ -98,9 +98,8 @@ pub unsafe fn step(f: &mut Flow, sys: &SyscallTable, now: u64) {
                 break;
             };
             if msg_type == wire::MSG_LAG_SIGNAL && plen >= 4 {
-                f.current_lag = i32::from_le_bytes([
-                    f.msg_buf[0], f.msg_buf[1], f.msg_buf[2], f.msg_buf[3],
-                ]);
+                f.current_lag =
+                    i32::from_le_bytes([f.msg_buf[0], f.msg_buf[1], f.msg_buf[2], f.msg_buf[3]]);
             }
         }
     }
@@ -184,23 +183,32 @@ pub unsafe fn step(f: &mut Flow, sys: &SyscallTable, now: u64) {
                         f.entry_credit_max,
                         f.byte_credit_max,
                     );
-                    wire_channels::channel_write_msg(sys, f.out_credits, wire::MSG_THROTTLE_REFILL, &buf);
+                    wire_channels::channel_write_msg(
+                        sys,
+                        f.out_credits,
+                        wire::MSG_THROTTLE_REFILL,
+                        &buf,
+                    );
                 } else {
                     let mut buf = [0u8; 8];
                     wire::encode_credits(&mut buf, f.entry_credits, f.byte_credits);
-                    wire_channels::channel_write_msg(sys, f.out_credits, wire::MSG_THROTTLE_CREDITS, &buf);
+                    wire_channels::channel_write_msg(
+                        sys,
+                        f.out_credits,
+                        wire::MSG_THROTTLE_CREDITS,
+                        &buf,
+                    );
                 }
             }
         }
     }
 
-    // 4. Periodic credit-pool gauges (RFC §4.2).
+    // 4. Periodic credit-pool gauges.
     emit_metrics(f, sys, now);
 }
 
-/// Emit the entry/byte credit-pool depths as typed gauges (RFC §4.3).
-/// Node-level component, so partition_id is 0. Dropped under
-/// backpressure.
+/// Emit the entry/byte credit-pool depths as typed gauges. Node-level
+/// component, so partition_id is 0. Dropped under backpressure.
 unsafe fn emit_metrics(f: &mut Flow, sys: &SyscallTable, now: u64) {
     if f.out_metrics < 0 {
         return;
@@ -217,8 +225,16 @@ unsafe fn emit_metrics(f: &mut Flow, sys: &SyscallTable, now: u64) {
         wire::SOURCE_ID_FLOW,
         0,
         &[
-            (wire::metric_ids::FLOW_ENTRY_CREDITS, kg, i64::from(f.entry_credits)),
-            (wire::metric_ids::FLOW_BYTE_CREDITS, kg, i64::from(f.byte_credits)),
+            (
+                wire::metric_ids::FLOW_ENTRY_CREDITS,
+                kg,
+                i64::from(f.entry_credits),
+            ),
+            (
+                wire::metric_ids::FLOW_BYTE_CREDITS,
+                kg,
+                i64::from(f.byte_credits),
+            ),
         ],
     );
 }

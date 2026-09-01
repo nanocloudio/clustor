@@ -1,39 +1,50 @@
 //! admin — idempotency-keyed admin workflows.
 //!
-//! Authorized admin commands arrive from the [`rbac`](super::rbac)
-//! component (or pre-authorized on the module's `admin_requests`
-//! port), with the convention `[conn_id:u8][op_code:u8][op_body...]`
-//! (RFC §4.5). Each command is compared byte-for-byte against its
-//! immediate predecessor for idempotency.
+//! Authorized admin commands arrive from the [`rbac`](super::rbac) component
+//! (or pre-authorized on the module's `admin_requests` port), with the
+//! convention `[conn_id:u8][op_code:u8][op_body...]`. Each command is
+//! compared byte-for-byte against its immediate predecessor for idempotency.
 //!
-//! Supported ops are forwarded as a tagged admin envelope
-//! `[command_id:u32][op_code:u8][op_body...]` to
-//! `consensus.admin_proposals`, which applies the op locally and
-//! acks via `MSG_ADMIN_APPLIED`. The component then emits
-//! `MSG_ADMIN_RESPONSE([conn_id, status])` on the module's
-//! `responses` port (§4.5).
+//! An accepted op takes one of three routes, and the choice is a
+//! property of the op rather than of the caller:
 //!
-//! Supported ops (local-only, no Raft replication):
-//!   FREEZE, THAW, TRANSFER_LEADER, DURABILITY_MODE, SNAPSHOT.
+//! - **Replicated** — FREEZE, THAW, DURABILITY_MODE. Emitted to
+//!   `consensus.proposals` as a `MSG_CLIENT_PROPOSAL` whose body is
+//!   `[ADMIN_MAGIC:8][command_id:u32][op_code:u8][op_body...]`, so every
+//!   replica applies the same change at the same log position.
+//! - **Local** — TRANSFER_LEADER, SNAPSHOT, and the membership ops
+//!   ADD_VOTER / REMOVE_VOTER / ADD_LEARNER / REMOVE_LEARNER. Sent as a
+//!   tagged envelope `[command_id:u32][op_code:u8][op_body...]` to
+//!   `consensus.admin_proposals`. Membership travels this way because
+//!   `consensus` turns it into a `CONFIG_CHANGE` entry itself: the
+//!   joint-consensus transition is what must be replicated, not the
+//!   operator's request for it.
+//! - **Controller** — the migration, placement, tenant-quota and
+//!   shard-map ops, sent as `MSG_MIGRATION_COMMAND` on `out_migration`.
+//!   The state machine's own durable phase record is the source of
+//!   truth, so replicating the command as well would be a second
+//!   ordering of the same decision. A graph with no controller wired
+//!   refuses these rather than accepting a command nothing will run.
 //!
-//! Still unsupported (require joint consensus or out-of-band
-//! integration, tracked in RFC §14): ADD_VOTER, REMOVE_VOTER,
-//! anything else.
+//! Either of the first two acks via `MSG_ADMIN_APPLIED`, after which the
+//! component emits `MSG_ADMIN_RESPONSE([conn_id, status])` on the
+//! module's `responses` port. An op outside the supported set is
+//! answered `ADMIN_STATUS_UNSUPPORTED` without being staged.
 //!
-//! Idempotency is in-memory and deliberately narrow: it collapses only
-//! a *rapid retransmit* — a command identical to the one immediately
-//! preceding it within a short in-flight window (`idemp_ttl_ms`). Two
-//! genuinely distinct operations (and any alternating sequence such as
+//! Idempotency is in-memory and deliberately narrow: it collapses only a
+//! *rapid retransmit* — a command identical to the one immediately preceding
+//! it within a short in-flight window (`idemp_ttl_ms`). Two genuinely
+//! distinct operations (and any alternating sequence such as
 //! FREEZE/THAW/FREEZE) each get their own Raft entry. Cross-command and
 //! cross-restart idempotency is not this component's job: the canonical
 //! "this command has been applied" record lives in the WAL via Raft
-//! replication (RFC §3.1), and the supported op set is double-apply-safe
-//! by construction (FREEZE→FREEZE, etc.), so a lost in-memory predecessor
-//! at worst re-applies an idempotent op.
+//! replication, and the supported op set is double-apply-safe by
+//! construction (FREEZE→FREEZE, etc.), so a lost in-memory predecessor at
+//! worst re-applies an idempotent op.
 
 use super::abi::SyscallTable;
-use super::{wire, wire_channels};
 use super::{dev_log, dev_report_step_effect, step_effect};
+use super::{wire, wire_channels};
 
 const CMD_RING: usize = 16;
 
@@ -57,11 +68,22 @@ struct CmdEntry {
 
 #[repr(C)]
 pub struct Admin {
-    pub in_applied: i32,   // in: MSG_ADMIN_APPLIED from consensus
-    pub in_requests: i32,  // in: pre-authorized AdminCommand (direct inject)
-    pub out_raft: i32,     // out: admin envelopes to consensus.admin_proposals (local-only path)
+    pub in_applied: i32,    // in: MSG_ADMIN_APPLIED from consensus
+    pub in_requests: i32,   // in: pre-authorized AdminCommand (direct inject)
+    pub out_raft: i32,      // out: admin envelopes to consensus.admin_proposals (local-only path)
     pub out_responses: i32, // out: MSG_ADMIN_RESPONSE
-    pub out_proposal: i32, // out: ADMIN_MAGIC-prefixed MSG_CLIENT_PROPOSAL for replicable ops
+    pub out_proposal: i32,  // out: ADMIN_MAGIC-prefixed MSG_CLIENT_PROPOSAL for replicable ops
+    /// out: `MSG_MIGRATION_COMMAND` to the controller that owns the
+    /// migration state machine. Optional — a graph without a
+    /// controller leaves it unwired and migration ops are refused.
+    pub out_migration: i32,
+
+    /// Raft group an admin command targets. One consensus engine hosts
+    /// K groups, and every interesting admin op (FREEZE,
+    /// TRANSFER_LEADER, the membership ops) is per-group, so the command
+    /// names its target. Defaults to 0 — a single-group graph behaves
+    /// exactly as before.
+    pub target_partition: u16,
 
     // Idempotency collapses only a *rapid retransmit* — a command
     // identical to the one immediately preceding it within the in-flight
@@ -87,8 +109,10 @@ pub unsafe fn init(a: &mut Admin) {
     a.in_applied = -1;
     a.in_requests = -1;
     a.out_raft = -1;
+    a.target_partition = 0;
     a.out_responses = -1;
     a.out_proposal = -1;
+    a.out_migration = -1;
     // In-flight retransmit window: a duplicate is only collapsed if
     // it lands within this gap of an identical predecessor. Long
     // enough to swallow a client TCP retransmit, short enough that a
@@ -102,7 +126,10 @@ pub unsafe fn init(a: &mut Admin) {
     a.next_command_id = 1;
     a.cmd_head = 0;
     for slot in a.cmd_ring.iter_mut() {
-        *slot = CmdEntry { command_id: 0, conn_id: 0 };
+        *slot = CmdEntry {
+            command_id: 0,
+            conn_id: 0,
+        };
     }
 }
 
@@ -136,9 +163,8 @@ unsafe fn drain_applied(a: &mut Admin, sys: &SyscallTable) {
         if msg_type != wire::MSG_ADMIN_APPLIED || (plen as usize) < 5 {
             continue;
         }
-        let command_id = u32::from_le_bytes([
-            a.msg_buf[0], a.msg_buf[1], a.msg_buf[2], a.msg_buf[3],
-        ]);
+        let command_id =
+            u32::from_le_bytes([a.msg_buf[0], a.msg_buf[1], a.msg_buf[2], a.msg_buf[3]]);
         let status = a.msg_buf[4];
         if let Some(conn_id) = take_cmd(a, command_id) {
             emit_admin_response(a, sys, conn_id, status);
@@ -200,12 +226,11 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     let mut cmd = [0u8; ENV_BUF];
     cmd[..cmd_len].copy_from_slice(&payload[1..pl]);
 
-    // Client-write bridge (RFC §8): ADMIN_OP_PROPOSE carries opaque
-    // application data, not an admin op. Emit it as a RAW (unmarked)
-    // MSG_CLIENT_PROPOSAL to raft and return — NO idempotency collapse
-    // (distinct client writes may legitimately repeat a body), no admin
-    // apply, no admin response. `cmd` is `[op_code][op_body]`, so the
-    // proposal body is `cmd[1..]`.
+    // Client-write bridge: ADMIN_OP_PROPOSE carries opaque application data,
+    // not an admin op. Emit it as a RAW (unmarked) MSG_CLIENT_PROPOSAL to
+    // raft and return — NO idempotency collapse (distinct client writes may
+    // legitimately repeat a body), no admin apply, no admin response. `cmd`
+    // is `[op_code][op_body]`, so the proposal body is `cmd[1..]`.
     if op_code == wire::ADMIN_OP_PROPOSE {
         if a.out_proposal >= 0 && cmd_len > 1 {
             if wire_channels::writable(sys, a.out_proposal) {
@@ -247,19 +272,42 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
         return;
     }
 
-    // Membership ops (ADD_VOTER / REMOVE_VOTER) are intentionally
-    // returned as ADMIN_STATUS_UNSUPPORTED for now. The raft
-    // joint-consensus state machine is in place (it can apply
-    // CONFIG_CHANGE_OP_JOINT/_NEW entries and auto-propose the
-    // second half of the transition), but the quorum-tracking
-    // surfaces (the commit and ledger components) do not yet
-    // enforce *union quorum* during the joint phase — both the
-    // old and new majorities must accept, and right now they
-    // only check the old set. Accepting membership ops without
-    // that enforcement risks losing committed entries across a
-    // reconfiguration. See RFC §14 for the catch-up + learner +
-    // union-quorum work this is gating on. Until that lands the
-    // safe answer is "no".
+    // Membership ops are SUPPORTED as of the union-quorum + learner
+    // work. The safety argument, in the order the pieces land:
+    //
+    // 1. UNION QUORUM. During joint consensus an entry counts only once
+    //    a majority of BOTH configurations has it — enforced in
+    //    `consensus::commit` over match indices AND in
+    //    `durability::ledger` over fsync acks, so neither the commit
+    //    horizon nor the durability proof can run ahead of the new
+    //    configuration. (`tests/union_quorum.rs`)
+    //
+    // 2. LEARNERS. `ADMIN_OP_ADD_LEARNER` attaches a replica that
+    //    receives the log and counts toward nothing, so it can catch up
+    //    without being able to stall or skew a quorum.
+    //    (`tests/learner_semantics.rs`)
+    //
+    // 3. PROMOTION GATE. `ADMIN_OP_ADD_VOTER` is refused unless the
+    //    target is already a learner whose match index is within
+    //    `catchup_lag_max` of the leader's tip. A voter counts from the
+    //    moment the change applies, so promoting a cold replica could
+    //    make the new majority unmeetable and stall commit — and lose
+    //    entries it never held if the leader then failed.
+    //
+    // 4. ONE CHANGE AT A TIME, enforced in `raft::apply_admin_op`: union
+    //    quorum is defined for one pair of configurations, so a second
+    //    transition opened mid-flight is rejected rather than queued.
+    //
+    // Both ops queue a `CONFIG_CHANGE_OP_JOINT` entry; applying it opens
+    // joint consensus and auto-queues the matching C_new, so the whole
+    // transition travels through the log and every replica replays the
+    // same sequence.
+    //
+    // Catch-up relies on the leader still holding the log the learner
+    // needs. Once the log has been compacted past a learner's position
+    // the gap is closed by snapshot install instead, which streams to
+    // and from the snapshot file and so is bounded by the filesystem
+    // rather than by module state.
     let supported = matches!(
         op_code,
         wire::ADMIN_OP_FREEZE
@@ -267,6 +315,16 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
             | wire::ADMIN_OP_TRANSFER_LEADER
             | wire::ADMIN_OP_DURABILITY_MODE
             | wire::ADMIN_OP_SNAPSHOT
+            | wire::ADMIN_OP_ADD_LEARNER
+            | wire::ADMIN_OP_REMOVE_LEARNER
+            | wire::ADMIN_OP_ADD_VOTER
+            | wire::ADMIN_OP_REMOVE_VOTER
+            | wire::ADMIN_OP_MIGRATE_BEGIN
+            | wire::ADMIN_OP_MIGRATE_PHASE_DONE
+            | wire::ADMIN_OP_MIGRATE_ABORT
+            | wire::ADMIN_OP_PLACEMENT_TOPOLOGY
+            | wire::ADMIN_OP_TENANT_QUOTA
+            | wire::ADMIN_OP_SHARD_MAP
     );
     if !supported {
         emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_UNSUPPORTED);
@@ -288,7 +346,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     }
     put_cmd(a, command_id, conn_id);
 
-    // Two paths (RFC §3.1):
+    // Two paths:
     //   FREEZE / THAW / DURABILITY_MODE — replicate through Raft so
     //     every replica's state stays consistent. Send as a
     //     MSG_CLIENT_PROPOSAL with body
@@ -296,6 +354,47 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     //   TRANSFER_LEADER / SNAPSHOT — keep the local-only path; both
     //     have per-leader semantics and don't benefit from
     //     replication.
+    // Migration ops go to the controller, not to Raft. The state
+    // machine's own phase RECORD is the durable source of truth
+    // (MIG-DURABLE), so replicating the COMMAND as well would create a
+    // second, redundant ordering of the same decision — and a command
+    // that outlived its migration could restart one on replay. This is
+    // the same local-only shape TRANSFER_LEADER and SNAPSHOT already
+    // use for per-controller semantics.
+    if matches!(
+        op_code,
+        wire::ADMIN_OP_MIGRATE_BEGIN
+            | wire::ADMIN_OP_MIGRATE_PHASE_DONE
+            | wire::ADMIN_OP_MIGRATE_ABORT
+            | wire::ADMIN_OP_PLACEMENT_TOPOLOGY
+            | wire::ADMIN_OP_TENANT_QUOTA
+            | wire::ADMIN_OP_SHARD_MAP
+    ) {
+        if a.out_migration < 0 {
+            // No controller wired: nothing can own the migration, so
+            // refusing is the honest answer rather than accepting a
+            // command that will never run.
+            emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_UNSUPPORTED);
+            return;
+        }
+        if wire_channels::writable(sys, a.out_migration) {
+            wire_channels::channel_write_msg(
+                sys,
+                a.out_migration,
+                wire::MSG_MIGRATION_COMMAND,
+                &cmd[..cmd_len],
+            );
+            emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_OK);
+        } else {
+            // Back-pressure. The controller decides migrations one at a
+            // time; dropping silently would leave the operator believing
+            // a migration started.
+            emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_UNSUPPORTED);
+        }
+        a.commands_processed += 1;
+        return;
+    }
+
     let replicable = matches!(
         op_code,
         wire::ADMIN_OP_FREEZE | wire::ADMIN_OP_THAW | wire::ADMIN_OP_DURABILITY_MODE
@@ -323,7 +422,26 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
         env[4..4 + cmd_len].copy_from_slice(&cmd[..cmd_len]);
         let total = 4 + cmd_len;
         if wire_channels::writable(sys, a.out_raft) {
-            wire_channels::channel_write_msg(sys, a.out_raft, wire::MSG_ADMIN_COMMAND, &env[..total]);
+            // Partitioned envelope: with one consensus engine hosting K
+            // Raft groups, an admin op has to name the group it acts on
+            // — FREEZE, TRANSFER_LEADER and the membership ops are all
+            // per-group. `target_partition` defaults to 0, which is
+            // exactly today's behaviour on a single-group graph; a
+            // multi-group admin surface sets it per request.
+            //
+            // Deliberately ONE target, not a broadcast: a command
+            // carries a single `command_id` and gets a single
+            // MSG_ADMIN_APPLIED, so fanning one command across K groups
+            // would produce K statuses for one id and the correlation
+            // upstream would mishandle them. Cluster-wide admin needs a
+            // response-aggregation design first.
+            wire_channels::channel_write_partitioned(
+                sys,
+                a.out_raft,
+                a.target_partition,
+                wire::MSG_ADMIN_COMMAND,
+                &env[..total],
+            );
         }
     }
     a.commands_processed += 1;
@@ -345,7 +463,10 @@ unsafe fn emit_admin_response(a: &mut Admin, sys: &SyscallTable, conn_id: u8, st
 
 fn put_cmd(a: &mut Admin, command_id: u32, conn_id: u8) {
     let slot = (a.cmd_head as usize) % CMD_RING;
-    a.cmd_ring[slot] = CmdEntry { command_id, conn_id };
+    a.cmd_ring[slot] = CmdEntry {
+        command_id,
+        conn_id,
+    };
     a.cmd_head = a.cmd_head.wrapping_add(1);
 }
 

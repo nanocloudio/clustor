@@ -1,4 +1,4 @@
-//! Consensus load injector (L2) — `.context/rfc_performance_benchmarking.md` §6.
+//! Consensus load injector (L2)
 //!
 //! Injects `MSG_CLIENT_PROPOSAL` bodies straight into
 //! `consensus.proposals` (the untagged proposal port), bypassing the
@@ -10,12 +10,12 @@
 //! `commit_advances`, the WAL fsync histogram). This module only drives
 //! offered load and reports how much it injected.
 //!
-//! Phased: wait `warmup_ms` for the single node to self-elect leader,
-//! then inject up to `batch_per_step` proposals per step (bounded by
-//! channel backpressure) until `total` is reached, then idle. Offered
-//! load is closed-loop / saturating — for peak throughput. (Open-loop
-//! Poisson arrival for coordinated-omission-free latency is L3 driver
-//! work, off-DUT; see RFC §2.3.)
+//! Phased: wait `warmup_ms` for the single node to self-elect leader, then
+//! inject up to `batch_per_step` proposals per step (bounded by channel
+//! backpressure) until `total` is reached, then idle. Offered load is
+//! closed-loop / saturating — for peak throughput. (Open-loop Poisson
+//! arrival for coordinated-omission-free latency is L3 driver work,
+//! off-DUT.)
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -38,12 +38,12 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+#[path = "../../common/log_fmt.rs"]
+mod log_fmt;
 #[path = "../../common/wire.rs"]
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
-#[path = "../../common/log_fmt.rs"]
-mod log_fmt;
 use log_fmt::log_field;
 
 const METRICS_INTERVAL_MS: u64 = 1000;
@@ -86,7 +86,7 @@ define_params! {
 #[repr(C)]
 struct ModuleState {
     syscalls: *const SyscallTable,
-    in_trigger: i32,   // in[0]: unused start trigger
+    in_trigger: i32,    // in[0]: unused start trigger
     out_proposals: i32, // out[0]: MSG_CLIENT_PROPOSAL → consensus.proposals
     out_metrics: i32,   // out[1]: MSG_METRIC_SAMPLE → operations
 
@@ -110,7 +110,9 @@ struct ModuleState {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 { core::mem::size_of::<ModuleState>() as u32 }
+pub extern "C" fn module_state_size() -> u32 {
+    core::mem::size_of::<ModuleState>() as u32
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -119,15 +121,24 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, _ctrl_chan: i32,
-    params: *const u8, params_len: usize,
-    state: *mut u8, state_size: usize, syscalls: *const c_void,
+    in_chan: i32,
+    out_chan: i32,
+    _ctrl_chan: i32,
+    params: *const u8,
+    params_len: usize,
+    state: *mut u8,
+    state_size: usize,
+    syscalls: *const c_void,
 ) -> i32 {
     // SAFETY: the kernel hands us a live, exclusively-borrowed state of
     // at least module_state_size() bytes and a live syscall table.
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<ModuleState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<ModuleState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut ModuleState);
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
@@ -150,9 +161,15 @@ pub extern "C" fn module_new(
         if s.body_size as usize + wire::TAGGED_PROPOSAL_HDR > BODY_MAX {
             s.body_size = (BODY_MAX - wire::TAGGED_PROPOSAL_HDR) as u16;
         }
-        if s.body_size == 0 { s.body_size = 64; }
-        if s.batch_per_step == 0 { s.batch_per_step = 8; }
-        if s.inject_period == 0 { s.inject_period = 1; }
+        if s.body_size == 0 {
+            s.body_size = 64;
+        }
+        if s.batch_per_step == 0 {
+            s.batch_per_step = 8;
+        }
+        if s.inject_period == 0 {
+            s.inject_period = 1;
+        }
         for (i, b) in s.body_buf.iter_mut().enumerate() {
             *b = (i as u8) ^ 0x3C;
         }
@@ -217,7 +234,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // it as blocked and retry the SAME proposal next step.
                         let frame_len = (wire::ENVELOPE_HDR + payload.len()) as i32;
                         let wrote = wire_channels::channel_write_msg(
-                            sys, s.out_proposals, wire::MSG_CLIENT_PROPOSAL, payload,
+                            sys,
+                            s.out_proposals,
+                            wire::MSG_CLIENT_PROPOSAL,
+                            payload,
                         );
                         // SIGNED compare: a full channel returns CHAN_EAGAIN (-11),
                         // not 0 — `(wrote as usize)` would wrap it to a huge value
@@ -250,22 +270,38 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Emit injector phase + counters as typed samples (RFC §4.3). The
-/// interesting consensus metrics live in the consensus module's raft
-/// and commit components.
+/// Emit injector phase + counters as typed samples. The interesting
+/// consensus metrics live in the consensus module's raft and commit
+/// components.
 ///
 /// # Safety
 /// `sys` must be a live syscall table.
 unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
-    if s.out_metrics < 0 { return; }
-    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    if s.out_metrics < 0 {
+        return;
+    }
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS {
+        return;
+    }
     s.last_metrics_ms = now;
 
     let mid = wire::SOURCE_ID_CONSENSUS_BENCH;
     let samples: [(u16, u8, i64); 3] = [
-        (wire::metric_ids::CBENCH_PHASE, wire::METRIC_KIND_GAUGE, i64::from(s.phase)),
-        (wire::metric_ids::CBENCH_PROPOSALS_SENT, wire::METRIC_KIND_COUNTER, i64::from(s.sent)),
-        (wire::metric_ids::CBENCH_BLOCKED, wire::METRIC_KIND_COUNTER, i64::from(s.blocked)),
+        (
+            wire::metric_ids::CBENCH_PHASE,
+            wire::METRIC_KIND_GAUGE,
+            i64::from(s.phase),
+        ),
+        (
+            wire::metric_ids::CBENCH_PROPOSALS_SENT,
+            wire::METRIC_KIND_COUNTER,
+            i64::from(s.sent),
+        ),
+        (
+            wire::metric_ids::CBENCH_BLOCKED,
+            wire::METRIC_KIND_COUNTER,
+            i64::from(s.blocked),
+        ),
     ];
     wire_channels::emit_metrics(sys, s.out_metrics, mid, 0, &samples);
 }

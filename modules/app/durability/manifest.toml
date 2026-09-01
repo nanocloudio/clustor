@@ -91,6 +91,11 @@ name = "install_request"
 direction = "input"
 content_type = "OctetStream"
 
+# Application retention floors (`MSG_COMPACTION_FLOOR`, partitioned):
+# the lowest index the application can still ask this log for. Bounds
+# segment RETIREMENT in the wal, never the snapshot — a snapshot is
+# state and is always safe to take; the entries below it are content a
+# consumer inside its window may still read from disk.
 [[ports]]
 name = "retention_floor"
 direction = "input"
@@ -188,9 +193,34 @@ metrics = [
   "steps", "current_index", "open_rc", "replayed",
   "replay_hw", "replay_fsize", "entryreq_served", "entryreq_notfound",
   "fault_expected", "fault_got", "segment_mode", "preallocate_failures",
-  "preallocate_errno", "name_fence", "name_unfenced",
+  "preallocate_errno", "name_fence", "name_unfenced", "compact_floored",
   # snapshot
   "snapshots_taken", "chunks_imported", "triggers_deferred", "install_failures",
   "app_bodies_received", "app_captures_timed_out"
 ]
 histograms = ["fsync_latency_ms", "transfer_seconds"]
+
+# Runtime group activation (MSG_SLOT_ACTIVATE), the durability half of a
+# migration's PROVISIONING work. Activating a consensus slot WITHOUT its
+# durability slot gives the new group nowhere to persist: it can never
+# commit, campaigns forever, and its election traffic starves the groups
+# that were working. Appended LAST so no existing port index shifts.
+[[ports]]
+name = "slot_activate"
+direction = "input"
+content_type = "OctetStream"
+
+# Cold-read request: a Kafka Fetch whose offset aged out of the
+# in-memory ring but whose record is still in the WAL. Same wire shape
+# as `entry_request`; a SEPARATE channel because that one is the
+# crash-recovery refetch path and its request_id space is fully
+# allocated. Declared LAST so no existing port index shifts.
+[[ports]]
+name = "cold_read"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "cold_read_reply"
+direction = "output"
+content_type = "OctetStream"

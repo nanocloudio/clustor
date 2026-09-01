@@ -370,7 +370,7 @@ wiring:
     to: consensus.wal_replay_complete
     rate: transaction
     buffer_bytes: 16384
-  - from: consensus.wal_compact
+  - from: consensus.log_maintenance
     to: durability.compact_before
   - from: durability.flushed
     to: consensus.wal_flushed

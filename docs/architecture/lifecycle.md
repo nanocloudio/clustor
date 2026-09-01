@@ -221,7 +221,9 @@ Supported ops and their routes:
 | `DURABILITY_MODE` | Replicated | Records the requested mode (see [Durability modes](#durability-modes)) |
 | `TRANSFER_LEADER` | Local-only envelope to consensus | Leader sends `MSG_TIMEOUT_NOW` to the target and steps down; rejected on followers |
 | `SNAPSHOT` | Local-only | Acknowledged, currently a no-op: snapshots are driven by segment rotation and the external trigger port, not by this op |
-| `ADD_VOTER` / `REMOVE_VOTER` | — | `ADMIN_STATUS_UNSUPPORTED` (see membership below) |
+| `ADD_VOTER` / `REMOVE_VOTER` | Local-only envelope to consensus | Leader-only; queues a `CONFIG_CHANGE_OP_JOINT` entry so the transition itself travels through the log. A promotion must name an existing, caught-up learner, and only one transition may be in flight (see [membership](#membership-changes-and-joint-consensus)) |
+| `ADD_LEARNER` / `REMOVE_LEARNER` | Local-only envelope to consensus | Adds or drops a non-voting replica that receives the log but counts toward no quorum |
+| Migration / placement / tenant-quota / shard-map ops | Controller envelope on `admin.out_migration` | Handed to the control-plane controller, which owns the durable migration state machine; refused when no controller is wired |
 
 Application replies ride `MSG_ADMIN_APPLIED` back through the admin
 component, which answers the originating connection with
@@ -274,19 +276,16 @@ budgets, size targets, or manifest signing.
 
 ## Membership changes and joint consensus
 
-> **Status note.** The current substrate has the joint state machine
-> in `consensus`'s raft component (`CONFIG_CHANGE_OP_JOINT`/`_NEW`,
-> voter-set overlay, auto-`C_new` on commit) and joint-aware quorum
-> logic in its commit component — the voter-set update is delivered
-> between them inside the module, in the same step raft applies the
-> configuration change. One downstream piece is unfinished: the ledger
-> component of `durability` does not consume `MSG_VOTER_SET_UPDATE`
-> and uses the fixed-`voter_count` quorum median, so union quorum is
-> not enforced on the durability side during the joint phase.
->
-> The admin component of `operations` accordingly returns
-> `ADMIN_STATUS_UNSUPPORTED` for `ADD_VOTER` / `REMOVE_VOTER`. The
-> safe gate stays closed until union quorum reaches the ledger.
+Union quorum holds on both sides of the substrate. The joint state
+machine lives in `consensus`'s raft component
+(`CONFIG_CHANGE_OP_JOINT`/`_NEW`, voter-set overlay, auto-`C_new` on
+commit), and the voter-set update reaches its commit component in the
+same step raft applies the configuration change. `durability`'s ledger
+takes the same update as `MSG_VOTER_SET_UPDATE` on the entry stream and
+applies the same rule — the minimum of the two medians while the joint
+config is active — so an index counts as durable only once a majority
+of EACH configuration has fsynced it. The two must stay in step; the
+gate on this is `tests/union_quorum.rs`.
 
 What the implemented state machine does when a configuration entry
 commits (`modules/app/consensus/raft.rs`):

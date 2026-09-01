@@ -22,13 +22,22 @@ content_type = "OctetStream"
 [[ports]]
 name = "client_resp"
 direction = "input"
-content_type = "OctetStream"
+# NetProto, not OctetStream: this port carries wire envelopes
+# `[msg_type:u8][len:u16 LE][payload]` and is fanned (a kernel tee or
+# merge sits on it). A fan typed OctetStream moves bytes, so under
+# pressure one producer's frame is split and another's interleaved —
+# a consumer then reads a header off the middle of a payload. NetProto
+# has that framing, and a NetProto fan moves whole frames only.
+content_type = "NetProto"
+# Transaction-class edges: one record per committed entry or
+# response, never a media stream, whatever NetProto defaults to.
+rate_class_default = "transaction"
 
 # TLS-verified peer identity from foundation/tls (when wired). Carries
 # `MSG_PEER_IDENTITY` envelopes binding `conn_id → replica_id` after
 # the handshake completes. A non-empty SVID is preferred over the
 # legacy plaintext identity handshake; mismatches between the two
-# void the connection's Raft binding. See RFC §5.1.
+# void the connection's Raft binding.
 [[ports]]
 name = "tls_identity"
 direction = "input"
@@ -54,7 +63,7 @@ name = "raft_rpc"
 direction = "output"
 content_type = "OctetStream"
 
-# MSG_METRIC_SAMPLE fan-in to operations.ingest (RFC §4.3). Appended
+# MSG_METRIC_SAMPLE fan-in to operations.ingest. Appended
 # last so net_out/cleartext/peer_rx/raft_rpc keep output indices 0-3.
 [[ports]]
 name = "metrics"
@@ -63,7 +72,7 @@ content_type = "OctetStream"
 
 [observability]
 # Per-peer / per-client envelope routing over TCP. All four emitted as
-# typed MSG_METRIC_SAMPLE (RFC §4.2): connections_open gauge (active
+# typed MSG_METRIC_SAMPLE: connections_open gauge (active
 # conn-table slots), bytes_in counter (NMSG_DATA ingress), bytes_out
 # counter (send_to_conn egress), frames_dropped counter (unroutable or
 # over-budget frames in either direction). Node-level (partition 0).

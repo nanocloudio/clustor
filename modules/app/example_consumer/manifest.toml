@@ -16,7 +16,7 @@ content_type = "OctetStream"
 
 # State-machine snapshot install from durability.export_chunks.
 # Carries `MSG_APP_SNAPSHOT_CHUNK` and `MSG_APP_SNAPSHOT_RESET`. Optional;
-# leave unwired in graphs that don't run snapshot installs. See RFC §2.1.
+# leave unwired in graphs that don't run snapshot installs.
 [[ports]]
 name = "snapshot_chunk"
 direction = "input"
@@ -37,8 +37,7 @@ content_type = "OctetStream"
 
 # State-machine snapshot export to durability.app_snapshot_body.
 # Carries one or more `MSG_APP_SNAPSHOT_CHUNK` envelopes terminated by
-# `done = 1`. Emitted in response to a `MSG_APP_SNAPSHOT_REQUEST`. See
-# RFC §2.1.
+# `done = 1`. Emitted in response to a `MSG_APP_SNAPSHOT_REQUEST`.
 [[ports]]
 name = "snapshot_export"
 direction = "output"

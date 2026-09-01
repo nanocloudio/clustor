@@ -1,11 +1,10 @@
 //! surface — client envelope adapter.
 //!
-//! Routes inbound Clustor wire envelopes from peer_router to the raft
-//! RPC port, the [`codec`](super::codec) component (client traffic)
-//! or the admin port, based on `msg_type`. Returns responses to
-//! peer_router with per-message `[conn_id:u8]` routing tags
-//! (RFC §4.5). This component does NOT parse HTTP — the operations
-//! module owns the HTTP diagnostic surface.
+//! Routes inbound Clustor wire envelopes from peer_router to the raft RPC
+//! port, the [`codec`](super::codec) component (client traffic) or the admin
+//! port, based on `msg_type`. Returns responses to peer_router with
+//! per-message `[conn_id:u8]` routing tags. This component does NOT parse
+//! HTTP — the operations module owns the HTTP diagnostic surface.
 
 use super::abi::SyscallTable;
 use super::{codec, wire, wire_channels};
@@ -17,28 +16,35 @@ use super::{codec, wire, wire_channels};
 pub enum Inbound {
     Empty,
     Handled,
-    Client { msg_type: u8, len: usize },
+    Client {
+        msg_type: u8,
+        len: usize,
+    },
     /// peer_router reported a client connection closed
     /// (`MSG_CONN_CLOSED`, 1-byte `[conn_id]` payload). The dispatch
     /// table purges that conn's correlation state in the codec —
     /// conn_ids are reused, so a stale entry would route a later
     /// client's response to the wrong connection.
-    ConnClosed { conn_id: u8 },
+    ConnClosed {
+        conn_id: u8,
+    },
     /// The record's payload exceeds the proposal cap. Truncating and
     /// forwarding a prefix would commit a corrupted entry while acking
     /// the full write, so the dispatch table sends a
     /// `CLIENT_REJECT_TOO_LARGE` instead (the consume-gate guarantees
     /// the response egress can carry it).
-    Oversize { conn_id: u8 },
+    Oversize {
+        conn_id: u8,
+    },
 }
 
 #[repr(C)]
 pub struct Surface {
-    pub in_requests: i32,        // in: cleartext MSG_CLIENT_FRAME from peer_router
-    pub in_admin_resp: i32,      // in: AdminResponse from operations
-    pub out_raft_rpc: i32,       // out: Raft RPC to consensus
-    pub out_admin_req: i32,      // out: admin requests to operations
-    pub out_responses: i32,      // out: responses back to peer_router
+    pub in_requests: i32,   // in: cleartext MSG_CLIENT_FRAME from peer_router
+    pub in_admin_resp: i32, // in: AdminResponse from operations
+    pub out_raft_rpc: i32,  // out: Raft RPC to consensus
+    pub out_admin_req: i32, // out: admin requests to operations
+    pub out_responses: i32, // out: responses back to peer_router
 
     requests_routed: u32,
     responses_sent: u32,
@@ -128,7 +134,9 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
     // state would never be purged.
     if frame_type == wire::MSG_CONN_CLOSED {
         if plen >= 1 {
-            return Inbound::ConnClosed { conn_id: su.msg_buf[0] };
+            return Inbound::ConnClosed {
+                conn_id: su.msg_buf[0],
+            };
         }
         return Inbound::Handled;
     }
@@ -164,7 +172,11 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
                     // dropped by every raft instance with id != 0.
                     let payload = &su.msg_buf[payload_start..payload_end];
                     wire_channels::channel_write_partitioned(
-                        sys, su.out_raft_rpc, 0, msg_type, payload,
+                        sys,
+                        su.out_raft_rpc,
+                        0,
+                        msg_type,
+                        payload,
                     );
                     su.requests_routed += 1;
                 }
@@ -174,9 +186,8 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
         wire::MSG_ADMIN_COMMAND => {
             if su.out_admin_req >= 0 {
                 if wire_channels::writable(sys, su.out_admin_req) {
-                    // Prepend per-message conn_id so the admin
-                    // consumer can correlate responses back to
-                    // this connection. See RFC §4.5 / §5.8.
+                    // Prepend per-message conn_id so the admin consumer can
+                    // correlate responses back to this connection.
                     let mut framed = [0u8; 2048];
                     if payload_end - payload_start > framed.len() - 1 {
                         su.requests_routed += 1;
@@ -187,7 +198,10 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
                     framed[1..1 + pl]
                         .copy_from_slice(&su.msg_buf[payload_start..payload_start + pl]);
                     wire_channels::channel_write_msg(
-                        sys, su.out_admin_req, msg_type, &framed[..1 + pl],
+                        sys,
+                        su.out_admin_req,
+                        msg_type,
+                        &framed[..1 + pl],
                     );
                     su.requests_routed += 1;
                 }
@@ -200,12 +214,11 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
             // unknown types are treated as proposals (the body
             // is opaque to the substrate).
             //
-            // Substrate-entry forgery guard: bodies carrying a
-            // substrate magic (admin, config-change, timing) are
-            // internal entries proposed by their owning modules only;
-            // a client must not be able to inject a TimeAdvance or
-            // config change through the opaque-proposal path
-            // (rfc_deterministic_timing.md §17).
+            // Substrate-entry forgery guard: bodies carrying a substrate
+            // magic (admin, config-change, timing) are internal entries
+            // proposed by their owning modules only; a client must not be
+            // able to inject a TimeAdvance or config change through the
+            // opaque-proposal path.
             let body = &su.msg_buf[payload_start..payload_end];
             if wire::has_admin_magic(body)
                 || wire::has_config_change_magic(body)
@@ -226,7 +239,10 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
             let pl = payload_end - payload_start;
             out[1..1 + pl].copy_from_slice(&su.msg_buf[payload_start..payload_start + pl]);
             su.requests_routed += 1;
-            Inbound::Client { msg_type: routed_type, len: 1 + pl }
+            Inbound::Client {
+                msg_type: routed_type,
+                len: 1 + pl,
+            }
         }
     }
 }
@@ -261,14 +277,13 @@ pub unsafe fn send_outbound(su: &mut Surface, sys: &SyscallTable, out: &codec::O
     send_response(su, sys, out.msg_type, &out.buf[..out.len as usize])
 }
 
-/// Emit one response to peer_router. `payload` carries the
-/// `[conn_id:u8]` prefix set by the producer; it is stripped and used
-/// as the per-message routing tag (RFC §4.5). Wire bytes written:
-/// `[conn_id:u8][msg_type:u8][len:u16 LE][payload-without-conn-id]`.
-/// Returns whether the frame was written OR retained in the retry
-/// stash (either way the response will reach the wire); false means
-/// it was not accepted and, if a prior frame still occupies the
-/// stash, was dropped and counted.
+/// Emit one response to peer_router. `payload` carries the `[conn_id:u8]`
+/// prefix set by the producer; it is stripped and used as the per-message
+/// routing tag. Wire bytes written: `[conn_id:u8][msg_type:u8][len:u16
+/// LE][payload-without-conn-id]`. Returns whether the frame was written OR
+/// retained in the retry stash (either way the response will reach the
+/// wire); false means it was not accepted and, if a prior frame still
+/// occupies the stash, was dropped and counted.
 ///
 /// # Safety
 ///
@@ -388,7 +403,8 @@ unsafe fn forward_admin_responses(su: &mut Surface, sys: &SyscallTable) {
             break;
         }
 
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, su.in_admin_resp, &mut su.msg_buf);
+        let (msg_type, plen) =
+            wire_channels::channel_read_msg(sys, su.in_admin_resp, &mut su.msg_buf);
         if plen == 0 {
             break;
         }

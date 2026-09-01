@@ -11,13 +11,14 @@
 //!   - `cross_durability_ack` (to durability's `ack`) — a
 //!     synthesized `MSG_FSYNC_ACK` carrying the follower's
 //!     `local_wal_durable_index` so the leader's durability ledger
-//!     can compute quorum-fsync per spec §10.4.1.
+//!     can compute quorum-fsync durability across every voter.
 //!
 //! Per-step bound (Discipline §5): ≤4 AE fan-outs, ≤8 acks, ≤8 WAL
 //! read-back replies, one catch-up sweep over MAX_NODES, ≤4 snapshot
 //! chunk forwards.
 
 use super::abi::SyscallTable;
+use super::inbox;
 use super::seam::SeamRing;
 use super::types::*;
 use super::{dev_log, dev_millis, wire, wire_channels};
@@ -41,6 +42,16 @@ const METRICS_INTERVAL_MS: u64 = 1000;
 /// cannot accumulate unbounded in-flight requests.
 const MAX_PENDING_WAL_REQS: usize = 16;
 
+/// Catch-up AppendEntries a peer may have unacknowledged at once. At
+/// one, catch-up throughput was one entry per round trip: a follower
+/// that lost a single AppendEntries under load (an inbox drop) was fed
+/// one entry per round trip while the leader appended hundreds per
+/// second, never caught up, and the group stopped committing (a
+/// 20000/s QoS 0 run logged `[raft] ae gap` 2930 times against 61
+/// `[repl] ae tx`). Eight keeps a lagging peer's stream pipelined while
+/// bounding what a NACK re-ships.
+const CATCHUP_WINDOW: u8 = 8;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PeerState {
@@ -50,15 +61,17 @@ struct PeerState {
     /// gate deadlocks. ~500 steps ≈ 0.5 s at the 1 kHz metadata
     /// domain, comfortably past a healthy ack round-trip.
     inflight_age: u16,
+    /// Catch-up AppendEntries shipped and not yet answered, capped at
+    /// `CATCHUP_WINDOW`.
     next_index: Index,
     match_index: Index,
     inflight: u8,
     active: bool,
-    /// Joint-consensus catch-up flag (RFC §1.2). When a new voter
-    /// joins via `CONFIG_CHANGE_OP_JOINT`, the leader marks it as
-    /// non-voting so its match_index doesn't count toward quorum
-    /// until it has replicated up to a stable point. Promoted to
-    /// voting once `match_index >= leader.last_log_index - VOTING_LAG`.
+    /// Joint-consensus catch-up flag. When a new voter joins via
+    /// `CONFIG_CHANGE_OP_JOINT`, the leader marks it as non-voting so its
+    /// match_index doesn't count toward quorum until it has replicated up to
+    /// a stable point. Promoted to voting once `match_index >=
+    /// leader.last_log_index - VOTING_LAG`.
     voting: bool,
     /// Last (term, index) we know lives at `next_index - 1` on this
     /// peer. Used as the `prev_log_*` of the next AE. Updated either
@@ -116,7 +129,12 @@ struct PendingWalReq {
 
 impl PendingWalReq {
     const fn zero() -> Self {
-        Self { request_id: 0, peer: 0xFF, wal_index: 0, age: 0 }
+        Self {
+            request_id: 0,
+            peer: 0xFF,
+            wal_index: 0,
+            age: 0,
+        }
     }
 }
 
@@ -130,15 +148,19 @@ const PENDING_WAL_REQ_TTL: u16 = 500;
 #[repr(C)]
 pub struct Repl {
     // Channels
-    pub in_ack: i32,            // in: responses from peers via peer_router
-    pub in_snapshot_rx: i32,    // in: export chunks from the snapshot side
-    pub out_net: i32,           // out: RPC frames to peer_router
-    pub out_lag: i32,           // out: lag signal to admission
-    pub out_snapshot_import: i32, // out: import chunks to the snapshot side
-    pub out_metrics: i32,       // out: metrics (shared module port)
-    pub out_wal_request: i32,   // out: MSG_WAL_ENTRY_REQUEST to wal
-    pub out_snapshot_request: i32, // out: MSG_SNAPSHOT_INSTALL_REQUEST to the snapshot side
-    pub out_cross_durability_ack: i32, // out: synthesized MSG_FSYNC_ACK to durability's ack (§10.4.1)
+    /// Per-slot inbox for peer AppendEntries/vote responses. The
+    /// engine reads the shared `peer_rx` channel once and routes by the
+    /// partitioned envelope's id.
+    pub inbox_ack: inbox::Inbox,
+    pub in_ack: i32,                   // in: responses from peers via peer_router
+    pub in_snapshot_rx: i32,           // in: export chunks from the snapshot side
+    pub out_net: i32,                  // out: RPC frames to peer_router
+    pub out_lag: i32,                  // out: lag signal to admission
+    pub out_snapshot_import: i32,      // out: import chunks to the snapshot side
+    pub out_metrics: i32,              // out: metrics (shared module port)
+    pub out_wal_request: i32,          // out: MSG_WAL_ENTRY_REQUEST to wal
+    pub out_snapshot_request: i32,     // out: MSG_SNAPSHOT_INSTALL_REQUEST to the snapshot side
+    pub out_cross_durability_ack: i32, // out: synthesized MSG_FSYNC_ACK to durability's ack
 
     // ── Seams ───────────────────────────────────────────────
     /// E2: coalesced per-replica max of follower match indices —
@@ -165,7 +187,7 @@ pub struct Repl {
     peers: [PeerState; MAX_NODES],
 
     /// Last `local_wal_durable_index` we forwarded to
-    /// durability's `ack` for each peer (§10.4.1). Used to
+    /// durability's `ack` for each peer. Used to
     /// suppress redundant fsync-ack forwards: AE responses arrive on
     /// every heartbeat round whether or not the follower's durable
     /// index actually advanced, and the ledger already discards
@@ -195,9 +217,9 @@ pub struct Repl {
     /// forward target for snapshot chunks (broadcast only when unknown).
     snapshot_target: Option<u8>,
 
-    /// Current voter set bitmask from raft (RFC §1.2). A peer
-    /// id present here is a current voter; peers not in the set are
-    /// either non-existent or non-voting catch-up.
+    /// Current voter set bitmask from raft. A peer id present here is a
+    /// current voter; peers not in the set are either non-existent or
+    /// non-voting catch-up.
     current_voters: u8,
     /// Joint voter set bitmask. When `joint_active`, peers in
     /// `joint_voters & !current_voters` are the *new* voters that
@@ -242,6 +264,7 @@ pub struct Repl {
 /// and params are assigned by `mod.rs` afterwards; `arm` runs the
 /// post-param boot logic.
 pub fn init(s: &mut Repl) {
+    s.inbox_ack = inbox::Inbox::new();
     s.in_ack = -1;
     s.in_snapshot_rx = -1;
     s.out_net = -1;
@@ -283,7 +306,9 @@ pub fn init(s: &mut Repl) {
     s.backpressure_responses = 0;
     s.catchup_sent = 0;
     s.last_metrics_ms = 0;
-    for b in s.msg_buf.iter_mut() { *b = 0; }
+    for b in s.msg_buf.iter_mut() {
+        *b = 0;
+    }
 }
 
 /// Post-param boot logic: peer activation + init logs. Called by
@@ -372,20 +397,47 @@ pub unsafe fn step(s: &mut Repl, ae: &mut SeamRing<8192>, sys: &SyscallTable) {
 /// `&Repl` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+
+/// Sampled replication timeline line (indexes divisible by 32), so an
+/// entry's send, ack and commit can be read off the log side by side.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn log_idx(sys: &SyscallTable, tag: &[u8], partition: u16, idx: u64, extra: u32) {
+    let mut line = [0u8; 72];
+    let mut pos = super::log_fmt::log_field(&mut line, 0, tag, u32::from(partition));
+    pos = super::log_fmt::log_field(&mut line, pos, b" idx=", idx.min(u32::MAX as u64) as u32);
+    pos = super::log_fmt::log_field(&mut line, pos, b" x=", extra);
+    pos = super::log_fmt::log_field(
+        &mut line,
+        pos,
+        b" ms=",
+        (super::dev_millis(sys) & 0xFFFF_FFFF) as u32,
+    );
+    super::dev_log(sys, 3, line.as_ptr(), pos);
+}
+
 unsafe fn replicate_entries(s: &mut Repl, sys: &SyscallTable, ae: &mut SeamRing<8192>) {
     // Process up to 4 entries per step
     for _ in 0..4 {
-        if ae.is_empty() { break; }
+        if ae.is_empty() {
+            break;
+        }
 
         // Check output readiness (gate kept before each pop so a frame
         // is never consumed from the ring while `net_out` is full).
-        if !wire_channels::writable(sys, s.out_net) { break; }
+        if !wire_channels::writable(sys, s.out_net) {
+            break;
+        }
 
         let (msg_type, plen) = match ae.pop(&mut s.msg_buf) {
             Some(v) => v,
             None => break,
         };
-        if msg_type != wire::MSG_APPEND_ENTRIES || (plen as usize) < wire::AE_HDR_LEN { continue; }
+        if msg_type != wire::MSG_APPEND_ENTRIES || (plen as usize) < wire::AE_HDR_LEN {
+            continue;
+        }
 
         // Snapshot the AE header so we can record the per-peer
         // prev_log_* tip for catch-up retries.
@@ -398,6 +450,9 @@ unsafe fn replicate_entries(s: &mut Repl, sys: &SyscallTable, ae: &mut SeamRing<
                 s.last_emitted_prev_term = prev_term;
                 s.last_emitted_index = ent_idx;
                 s.last_emitted_term = ent_term;
+                if ent_idx & 31 == 0 {
+                    log_idx(sys, b"[repl] ae tx p=", s.partition_id, ent_idx, 0);
+                }
             }
         }
 
@@ -405,11 +460,19 @@ unsafe fn replicate_entries(s: &mut Repl, sys: &SyscallTable, ae: &mut SeamRing<
         // peer_router can demux to the correct connection.
         let payload = &s.msg_buf[..plen as usize];
         for i in 0..MAX_NODES {
-            if !s.peers[i].active { continue; }
-            if i == s.self_id as usize { continue; }
+            if !s.peers[i].active {
+                continue;
+            }
+            if i == s.self_id as usize {
+                continue;
+            }
             let w = wire_channels::channel_write_routed_partitioned(
-                sys, s.out_net, i as u8, s.partition_id,
-                wire::MSG_APPEND_ENTRIES, payload,
+                sys,
+                s.out_net,
+                i as u8,
+                s.partition_id,
+                wire::MSG_APPEND_ENTRIES,
+                payload,
             );
             if w > 0 {
                 s.rpcs_sent += 1;
@@ -427,20 +490,23 @@ unsafe fn replicate_entries(s: &mut Repl, sys: &SyscallTable, ae: &mut SeamRing<
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
-    if s.in_ack < 0 { return; }
+    if s.in_ack < 0 {
+        return;
+    }
 
-    // Inbound shape from peer_router.peer_rx is the 5-byte partitioned
-    // envelope. peer_router fans out a single channel to every per-
-    // partition consensus instance (fluxor inserts a tee), so each
-    // instance sees every ack and filters by its own partition_id.
+    // Acks arrive pre-routed in this slot's inbox: the engine reads the
+    // shared `peer_rx` channel once and matches the 5-byte partitioned
+    // envelope's partition_id, so nothing here belongs to another group.
     for _ in 0..8 {
-        if !wire_channels::readable(sys, s.in_ack) { break; }
-
-        let (partition_id, msg_type, plen) =
-            wire_channels::channel_read_partitioned(sys, s.in_ack, &mut s.msg_buf);
-        if plen == 0 && msg_type == 0 { break; }
-        if partition_id != s.partition_id { continue; }
-        if plen < 17 { continue; }
+        let Some((msg_type, plen)) = s.inbox_ack.next(sys, &mut s.msg_buf) else {
+            break;
+        };
+        if plen == 0 && msg_type == 0 {
+            break;
+        }
+        if plen < 17 {
+            continue;
+        }
 
         match msg_type {
             wire::MSG_APPEND_ENTRIES_RESP => {
@@ -451,6 +517,9 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         Some(v) => v,
                         None => continue,
                     };
+                if success && index & 31 == 0 {
+                    log_idx(sys, b"[repl] ack rx p=", s.partition_id, index, u32::from(replica));
+                }
 
                 // E13: a response term above ours means we are deposed
                 // (Raft §5.1). Latch the highest such term for raft — the
@@ -467,11 +536,11 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
 
                 // Forward the follower's `local_wal_durable_index` to
                 // the leader's durability `ack` as a synthesized
-                // MSG_FSYNC_ACK keyed by the follower's replica id
-                // (spec §10.4.1). Only forward strictly-advancing
-                // values to keep the channel quiet on steady-state
-                // heartbeats — the ledger also drops
-                // regressions, but we'd rather not burn the write.
+                // MSG_FSYNC_ACK keyed by the follower's replica id.
+                // Only strictly-advancing values are forwarded, to keep
+                // the channel quiet on steady-state heartbeats — the
+                // ledger drops regressions too, but there is no reason to
+                // burn the write.
                 if (replica as usize) < MAX_NODES
                     && durable_index > s.last_forwarded_durable[replica as usize]
                     && s.out_cross_durability_ack >= 0
@@ -479,9 +548,10 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                     if wire_channels::writable(sys, s.out_cross_durability_ack) {
                         let mut ack = [0u8; 17];
                         wire::encode_fsync_ack(&mut ack, term, durable_index, replica);
-                        let w = wire_channels::channel_write_msg(
+                        let w = wire_channels::channel_write_partitioned(
                             sys,
                             s.out_cross_durability_ack,
+                            s.partition_id,
                             wire::MSG_FSYNC_ACK,
                             &ack[..17],
                         );
@@ -505,19 +575,20 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         let prev_match = s.peers[replica as usize].match_index;
                         let was_voting = s.peers[replica as usize].voting;
                         let peer = &mut s.peers[replica as usize];
-                        if peer.inflight > 0 { peer.inflight -= 1; }
+                        if peer.inflight > 0 {
+                            peer.inflight -= 1;
+                        }
                         peer.inflight_age = 0;
                         if index > peer.match_index {
                             peer.match_index = index;
                             peer.next_index = index + 1;
                         }
-                        // Forward match update to commit ONLY
-                        // when this peer is currently a voter (RFC §1.2
-                        // non-voting catch-up). New voters joining via
-                        // joint consensus catch up in non-voting state
-                        // first; their match_index doesn't enter the
-                        // quorum median until they're promoted.
-                        // E2 seam: coalesced per-replica max + dirty flag.
+                        // Forward match update to commit ONLY when this peer
+                        // is currently a voter. New voters joining via joint
+                        // consensus catch up in non-voting state first;
+                        // their match_index doesn't enter the quorum median
+                        // until they're promoted. E2 seam: coalesced
+                        // per-replica max + dirty flag.
                         if was_voting && index > prev_match {
                             let r = replica as usize;
                             if index > s.match_out[r] {
@@ -530,17 +601,11 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         // leader's tip becomes a full voter.
                         maybe_promote(s, sys, replica);
                         // Proactive catch-up: if this peer is still behind the
-                        // leader's tip, pipeline the next missing entry NOW via
-                        // a WAL read-back instead of waiting for the periodic
-                        // tip-broadcast to NACK. Converges a lagging follower in
-                        // O(gap) read-backs rather than O(gap) NACK round-trips.
-                        let pn = s.peers[replica as usize].next_index;
-                        if s.peers[replica as usize].active
-                            && pn > 0
-                            && pn <= s.last_emitted_index
-                        {
-                            issue_wal_request(s, sys, replica, pn);
-                        }
+                        // leader's tip, pipeline the next missing entries NOW
+                        // via WAL read-backs instead of waiting for the
+                        // periodic tip-broadcast to NACK. Converges a lagging
+                        // follower in O(gap / window) round trips.
+                        nudge_catchup(s, sys, replica);
                         // Count the ack ONLY on success — failures are counted
                         // below — so the in-flight gauge retires each RPC once.
                         s.acks_received = s.acks_received.saturating_add(1);
@@ -553,7 +618,9 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         // back here would drive needless log repair / snapshot
                         // recovery under load.
                         let peer = &mut s.peers[replica as usize];
-                        if peer.inflight > 0 { peer.inflight -= 1; }
+                        if peer.inflight > 0 {
+                            peer.inflight -= 1;
+                        }
                         peer.inflight_age = 0;
                         s.backpressure_responses = s.backpressure_responses.saturating_add(1);
                     } else {
@@ -569,7 +636,9 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         // already advanced the follower (the periodic send
                         // fans the tip to every peer regardless of next_index).
                         let peer = &mut s.peers[replica as usize];
-                        if peer.inflight > 0 { peer.inflight -= 1; }
+                        if peer.inflight > 0 {
+                            peer.inflight -= 1;
+                        }
                         peer.inflight_age = 0;
                         s.nacks_received = s.nacks_received.saturating_add(1);
                         let new_next = index.saturating_add(1).max(1);
@@ -587,14 +656,19 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                 // input via the peer surface; nothing to do here.
             }
             wire::MSG_INSTALL_SNAPSHOT | wire::MSG_SNAPSHOT_CHUNK => {
-                // Inbound snapshot chunk from leader. Forward to
-                // the snapshot side via out_snapshot_import so it can
-                // accumulate / install (RFC §5.13).
+                // Inbound snapshot chunk from leader. Forward to the
+                // snapshot side via out_snapshot_import so it can accumulate
+                // / install.
                 if s.out_snapshot_import >= 0 {
                     if wire_channels::writable(sys, s.out_snapshot_import) {
-                        wire_channels::channel_write_msg(
-                            sys, s.out_snapshot_import,
-                            msg_type, &s.msg_buf[..plen as usize],
+                        // Partitioned: one durability instance imports
+                        // for K groups, so the chunk names its group.
+                        wire_channels::channel_write_partitioned(
+                            sys,
+                            s.out_snapshot_import,
+                            s.partition_id,
+                            msg_type,
+                            &s.msg_buf[..plen as usize],
                         );
                     }
                 }
@@ -678,7 +752,12 @@ unsafe fn drive_catchup(s: &mut Repl, sys: &SyscallTable) {
         // is clearly not a cold start.
         s.tip_unresolved = s.tip_unresolved.saturating_add(1);
         if s.tip_unresolved == TIP_UNRESOLVED_ALARM {
-            dev_log(sys, 1, b"[repl] tip unresolved - not replicating".as_ptr(), 38);
+            dev_log(
+                sys,
+                1,
+                b"[repl] tip unresolved - not replicating".as_ptr(),
+                38,
+            );
         }
         return;
     }
@@ -690,12 +769,39 @@ unsafe fn drive_catchup(s: &mut Repl, sys: &SyscallTable) {
         if !s.peers[i].active {
             continue;
         }
-        let next = s.peers[i].next_index;
-        // Behind the tip → fetch the first entry it's missing. (`next == 0`
-        // shouldn't happen, but guard so we never request index 0.)
-        if next > 0 && next <= tip {
-            issue_wal_request(s, sys, i as u8, next);
-        }
+        nudge_catchup(s, sys, i as u8);
+    }
+}
+
+/// Ask the WAL for the entries `peer` is missing, from its `next_index`
+/// up to the tip, as many as the catch-up window has room for. Each
+/// reply ships one AppendEntries; the window bounds how many are
+/// unanswered. Idempotent per step — `issue_wal_request` dedups by
+/// `(peer, index)` and refuses past the window — so calling this every
+/// step keeps the pipeline primed without flooding.
+///
+/// # Safety
+///
+/// As `issue_wal_request`.
+unsafe fn nudge_catchup(s: &mut Repl, sys: &SyscallTable, peer: u8) {
+    let Some(state) = s.peers.get(peer as usize) else {
+        return;
+    };
+    if !state.active {
+        return;
+    }
+    let next = state.next_index;
+    let tip = s.last_emitted_index;
+    // `next == 0` is a peer this node has never replicated to (see
+    // `PeerState::zero`); it must not be probed at index 0.
+    if next == 0 || next > tip {
+        return;
+    }
+    let last = tip.min(next + u64::from(CATCHUP_WINDOW) - 1);
+    let mut idx = next;
+    while idx <= last {
+        issue_wal_request(s, sys, peer, idx);
+        idx += 1;
     }
 }
 
@@ -707,20 +813,17 @@ const PROBE_PEER: u8 = 0xFE;
 /// start, and only reached when the WAL genuinely never replies.
 const TIP_UNRESOLVED_ALARM: u32 = 2000;
 
-unsafe fn issue_wal_request(
-    s: &mut Repl,
-    sys: &SyscallTable,
-    peer: u8,
-    wal_index: u64,
-) {
-    if s.out_wal_request < 0 || wal_index == 0 { return; }
-    // Catch-up gating: while a shipped catch-up AE is unacknowledged,
+unsafe fn issue_wal_request(s: &mut Repl, sys: &SyscallTable, peer: u8, wal_index: u64) {
+    if s.out_wal_request < 0 || wal_index == 0 {
+        return;
+    }
+    // Catch-up gating: with a window of catch-up AEs unacknowledged,
     // don't reissue for this peer — the per-step renudge would
-    // otherwise re-read and re-ship the same entry every tick until
-    // the ack round-trips. Probes are exempt (they don't ship).
+    // otherwise re-read and re-ship the same entries every tick until
+    // the acks round-trip. Probes are exempt (they don't ship).
     if peer != PROBE_PEER
         && (peer as usize) < MAX_NODES
-        && s.peers[peer as usize].inflight >= 1
+        && s.peers[peer as usize].inflight >= CATCHUP_WINDOW
     {
         return;
     }
@@ -739,7 +842,10 @@ unsafe fn issue_wal_request(
     }
     let mut slot_idx: Option<usize> = None;
     for (i, slot) in s.pending.iter().enumerate() {
-        if slot.peer == 0xFF { slot_idx = Some(i); break; }
+        if slot.peer == 0xFF {
+            slot_idx = Some(i);
+            break;
+        }
     }
     let slot_idx = match slot_idx {
         Some(i) => i,
@@ -753,7 +859,12 @@ unsafe fn issue_wal_request(
     // on it. An unmasked wrap into that half would misroute every
     // WAL reply until the counter wraps again.
     s.next_request_id = (s.next_request_id.wrapping_add(1) & 0x7FFF_FFFF).max(1);
-    s.pending[slot_idx] = PendingWalReq { request_id, peer, wal_index, age: 0 };
+    s.pending[slot_idx] = PendingWalReq {
+        request_id,
+        peer,
+        wal_index,
+        age: 0,
+    };
 
     if !wire_channels::writable(sys, s.out_wal_request) {
         // Channel full — free the slot so we retry next tick.
@@ -762,7 +873,13 @@ unsafe fn issue_wal_request(
     }
     let mut req = [0u8; wire::WAL_ENTRY_REQUEST_LEN];
     wire::encode_wal_entry_request(&mut req, request_id, wal_index);
-    wire_channels::channel_write_msg(sys, s.out_wal_request, wire::MSG_WAL_ENTRY_REQUEST, &req);
+    wire_channels::channel_write_partitioned(
+        sys,
+        s.out_wal_request,
+        s.partition_id,
+        wire::MSG_WAL_ENTRY_REQUEST,
+        &req,
+    );
 }
 
 /// Deliver a voter-set update from raft (seam E10). Activates new peers in
@@ -778,13 +895,18 @@ pub unsafe fn on_voter_set(
     current: u8,
     joint: u8,
     joint_active: bool,
+    learners: u8,
 ) {
     s.current_voters = current;
     s.joint_voters = joint;
     s.joint_active = joint_active;
-    // Activate any peer that's in either set; deactivate
-    // peers that have been dropped entirely.
-    let union = current | joint;
+    // Activate any peer in either voter set OR the learner set;
+    // deactivate peers dropped from all three. Learners are activated
+    // here and NOWHERE else that matters: this module ships them the
+    // log, and no quorum tally in the graph reads `learners`, so a
+    // learner can never contribute to a commit, a durability proof or
+    // an election.
+    let union = current | joint | learners;
     for id in 0..MAX_NODES as u8 {
         if id == s.self_id {
             continue;
@@ -875,10 +997,16 @@ unsafe fn request_snapshot_install(s: &mut Repl, sys: &SyscallTable, target: u8)
         }
         return;
     }
-    if !wire_channels::writable(sys, s.out_snapshot_request) { return; }
+    if !wire_channels::writable(sys, s.out_snapshot_request) {
+        return;
+    }
     let buf = [target; 1];
-    wire_channels::channel_write_msg(
-        sys, s.out_snapshot_request, wire::MSG_SNAPSHOT_INSTALL_REQUEST, &buf,
+    wire_channels::channel_write_partitioned(
+        sys,
+        s.out_snapshot_request,
+        s.partition_id,
+        wire::MSG_SNAPSHOT_INSTALL_REQUEST,
+        &buf,
     );
 }
 
@@ -912,7 +1040,10 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
             break;
         }
     }
-    let slot_idx = match slot_idx { Some(i) => i, None => return };
+    let slot_idx = match slot_idx {
+        Some(i) => i,
+        None => return,
+    };
     let peer = s.pending[slot_idx].peer;
     s.pending[slot_idx] = PendingWalReq::zero();
     if peer == PROBE_PEER {
@@ -925,12 +1056,14 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
         }
         return;
     }
-    if peer as usize >= MAX_NODES || !s.peers[peer as usize].active { return; }
+    if peer as usize >= MAX_NODES || !s.peers[peer as usize].active {
+        return;
+    }
 
-    // term == 0 (header-only NOT_FOUND reply) means the WAL doesn't have
-    // the index any more — snapshot install is the recovery path. An
-    // empty BODY with a real term is a leader-election no-op entry and
-    // ships like any other. See RFC §4.2.
+    // term == 0 (header-only NOT_FOUND reply) means the WAL doesn't have the
+    // index any more — snapshot install is the recovery path. An empty BODY
+    // with a real term is a leader-election no-op entry and ships like any
+    // other.
     if term == 0 {
         request_snapshot_install(s, sys, peer);
         return;
@@ -949,7 +1082,11 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
     // entry's term and NOT `last_emitted_term` — both go stale after a
     // failover onto an idle log, and a stale term is rejected by followers
     // already at the new term. `entry_term` stays the entry's own.
-    let ae_term = if s.current_term >= term { s.current_term } else { term };
+    let ae_term = if s.current_term >= term {
+        s.current_term
+    } else {
+        term
+    };
     let mut ae_buf = [0u8; 4096];
     let total = wire::encode_append_entries(
         &mut ae_buf,
@@ -965,9 +1102,13 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
         index,
         body,
     );
-    if total == 0 { return; }
+    if total == 0 {
+        return;
+    }
 
-    if !wire_channels::writable(sys, s.out_net) { return; }
+    if !wire_channels::writable(sys, s.out_net) {
+        return;
+    }
     let w = wire_channels::channel_write_routed_partitioned(
         sys,
         s.out_net,
@@ -979,8 +1120,7 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
     if w > 0 {
         s.catchup_sent = s.catchup_sent.saturating_add(1);
         s.rpcs_sent = s.rpcs_sent.saturating_add(1);
-        s.peers[peer as usize].inflight =
-            s.peers[peer as usize].inflight.saturating_add(1);
+        s.peers[peer as usize].inflight = s.peers[peer as usize].inflight.saturating_add(1);
         s.peers[peer as usize].inflight_age = 0;
         let peer_state = &mut s.peers[peer as usize];
         peer_state.prev_log_index = prev_idx;
@@ -995,20 +1135,26 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn forward_snapshots(s: &mut Repl, sys: &SyscallTable) {
-    if s.in_snapshot_rx < 0 { return; }
+    if s.in_snapshot_rx < 0 {
+        return;
+    }
 
     for _ in 0..4 {
         let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_snapshot_rx, &mut s.msg_buf)
         else {
             break;
         };
-        if plen == 0 { continue; }
+        if plen == 0 {
+            continue;
+        }
 
         let pass_through = matches!(
             msg_type,
             wire::MSG_SNAPSHOT_CHUNK | wire::MSG_INSTALL_SNAPSHOT
         );
-        if !pass_through { continue; }
+        if !pass_through {
+            continue;
+        }
 
         // Forward routed to the peer that requested the install;
         // broadcast only when no request is outstanding (a proactive
@@ -1025,8 +1171,12 @@ unsafe fn forward_snapshots(s: &mut Repl, sys: &SyscallTable) {
                 .is_some_and(|(_, _, _, _, done, _)| done);
         if wire_channels::writable(sys, s.out_net) {
             let w = wire_channels::channel_write_routed_partitioned(
-                sys, s.out_net, target, s.partition_id,
-                msg_type, &s.msg_buf[..plen as usize],
+                sys,
+                s.out_net,
+                target,
+                s.partition_id,
+                msg_type,
+                &s.msg_buf[..plen as usize],
             );
             if w > 0 && last_chunk {
                 s.snapshot_target = None;
@@ -1042,37 +1192,70 @@ unsafe fn forward_snapshots(s: &mut Repl, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_metrics(s: &mut Repl, sys: &SyscallTable) {
-    if s.out_metrics < 0 { return; }
+    if s.out_metrics < 0 {
+        return;
+    }
     let now = dev_millis(sys);
-    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS {
+        return;
+    }
     s.last_metrics_ms = now;
 
-    // Typed metric samples (RFC §4.3) so the telemetry export table
-    // carries replicator counters. The MSG_METRICS envelope is
-    // still emitted below for observers that parse it.
+    // Typed metric samples so the telemetry export table carries replicator
+    // counters. The MSG_METRICS envelope is still emitted below for
+    // observers that parse it.
     let mid = wire::SOURCE_ID_REPLICATOR;
     let pid = s.partition_id;
     let kc = wire::METRIC_KIND_COUNTER;
     let kg = wire::METRIC_KIND_GAUGE;
-    // §4.2 saturation gauge: AppendEntries dispatched but not yet
+    // saturation gauge: AppendEntries dispatched but not yet
     // acked/nacked — the in-flight replication depth. A response from an
     // active peer at our term increments exactly one of
     // acks/nacks/backpressure, so subtracting all three retires it once.
     // Responses dropped before that (inactive peer, higher term) leave the
     // gauge biased high; it is a saturation signal, not a ledger.
-    let inflight = s.rpcs_sent
+    let inflight = s
+        .rpcs_sent
         .saturating_sub(s.acks_received)
         .saturating_sub(s.nacks_received)
         .saturating_sub(s.backpressure_responses);
     let samples: [(u16, u8, i64); 8] = [
         (wire::metric_ids::REPL_RPCS_SENT, kc, i64::from(s.rpcs_sent)),
-        (wire::metric_ids::REPL_ACKS_RECEIVED, kc, i64::from(s.acks_received)),
-        (wire::metric_ids::REPL_NACKS_RECEIVED, kc, i64::from(s.nacks_received)),
-        (wire::metric_ids::REPL_CATCHUP_SENT, kc, i64::from(s.catchup_sent)),
-        (wire::metric_ids::REPL_INFLIGHT_DEPTH, kg, i64::from(inflight)),
-        (wire::metric_ids::REPL_BACKPRESSURE, kc, i64::from(s.backpressure_responses)),
-        (wire::metric_ids::REPL_TIP_UNRESOLVED, kg, i64::from(s.tip_unresolved)),
-        (wire::metric_ids::REPL_SNAPSHOT_DROPPED, kc, i64::from(s.snapshot_escalations_dropped)),
+        (
+            wire::metric_ids::REPL_ACKS_RECEIVED,
+            kc,
+            i64::from(s.acks_received),
+        ),
+        (
+            wire::metric_ids::REPL_NACKS_RECEIVED,
+            kc,
+            i64::from(s.nacks_received),
+        ),
+        (
+            wire::metric_ids::REPL_CATCHUP_SENT,
+            kc,
+            i64::from(s.catchup_sent),
+        ),
+        (
+            wire::metric_ids::REPL_INFLIGHT_DEPTH,
+            kg,
+            i64::from(inflight),
+        ),
+        (
+            wire::metric_ids::REPL_BACKPRESSURE,
+            kc,
+            i64::from(s.backpressure_responses),
+        ),
+        (
+            wire::metric_ids::REPL_TIP_UNRESOLVED,
+            kg,
+            i64::from(s.tip_unresolved),
+        ),
+        (
+            wire::metric_ids::REPL_SNAPSHOT_DROPPED,
+            kc,
+            i64::from(s.snapshot_escalations_dropped),
+        ),
     ];
     wire_channels::emit_metrics(sys, s.out_metrics, mid, pid, &samples);
 

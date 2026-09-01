@@ -1,29 +1,28 @@
-// Deterministic replicated timing — the state-machine support
-// component behind `.context/rfc_deterministic_timing.md`.
+// Deterministic replicated timing — the state-machine support component
+// every replicated consumer state machine embeds.
 //
-// Pure no_std, zero-alloc, DETERMINISTIC: every mutation is a pure
-// function of (state, committed input). No clocks, no randomness, no
-// I/O in this file. The consumer state machine embeds `TimingState`
-// so timing and consumer state share one apply and snapshot boundary
-// (RFC §4); the module wrapper owns wall-clock sampling, leader
-// fencing and proposal of `TimeAdvance` / `TimeDrain` entries.
+// Pure no_std, zero-alloc, DETERMINISTIC: every mutation is a pure function
+// of (state, committed input). No clocks, no randomness, no I/O in this
+// file. The consumer state machine embeds `TimingState` so timing and
+// consumer state share one apply and snapshot boundary; the module wrapper
+// owns wall-clock sampling, leader fencing and proposal of `TimeAdvance` /
+// `TimeDrain` entries.
 //
-// The central invariant (RFC §0): a deadline has no effect because a
-// node's local timer elapsed. It has an effect only while applying a
-// committed entry, and every replica applies the same bounded set of
-// due deadlines in the same canonical order.
+// The central invariant: a deadline has no effect because a node's local
+// timer elapsed. It has an effect only while applying a committed entry, and
+// every replica applies the same bounded set of due deadlines in the same
+// canonical order.
 //
-// `ClockGuard` (bottom of file) is the leader-side wall-clock health
-// check (RFC §5.4). It is NOT part of replicated state — it gates
-// what the leader proposes, never what apply does.
+// `ClockGuard` (bottom of file) is the leader-side wall-clock health check.
+// It is NOT part of replicated state — it gates what the leader proposes,
+// never what apply does.
 
-// ── Capacity (RFC §6.2) ─────────────────────────────────────────────
+// ── Capacity ────────────────────────────────────────────────────────
 //
-// Capacity is partitioned per owner, not pooled: one consumer
-// exhausting its allocation cannot starve another owner's
-// registrations. Owner namespaces are compiled constants for now
-// (RFC §22.1); every replica of a PRG must run the same build, which
-// the existing module-artifact discipline already guarantees.
+// Capacity is partitioned per owner, not pooled: one consumer exhausting its
+// allocation cannot starve another owner's registrations. Owner namespaces
+// are compiled constants for now; every replica of a PRG must run the same
+// build, which the existing module-artifact discipline already guarantees.
 
 /// Consumer namespaces the index can host.
 pub const TM_MAX_OWNERS: usize = 4;
@@ -32,17 +31,16 @@ pub const TM_MAX_OWNERS: usize = 4;
 /// exceed this). Fixed so the state and its snapshot have static size.
 pub const TM_MAX_DEADLINES: usize = 64;
 
-/// Opaque deadline identity width (RFC §6.1).
+/// Opaque deadline identity width.
 pub const TM_ID: usize = 16;
 
-/// Maximum due callbacks per applied entry (RFC §6.2
-/// `deadline_batch_max`). Sized against the Fluxor step budget: a due
-/// pass runs at most this many consumer handlers inline during one
-/// apply. Rig-measured per-callback cost must stay under budget for
-/// this batch size (RFC §22.3).
+/// Maximum due callbacks per applied entry.
+/// Sized against the Fluxor step budget: a due pass runs at most this many
+/// consumer handlers inline during one apply. Rig-measured per-callback cost
+/// must stay under budget for this batch size.
 pub const TM_BATCH_MAX: usize = 8;
 
-// ── Deadline and canonical order (RFC §6.1) ─────────────────────────
+// ── Deadline and canonical order ────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
@@ -108,8 +106,8 @@ pub enum RegisterError {
     CapacityExceeded,
     /// Owner outside the configured namespace table.
     BadOwner,
-    /// Replacement carried a generation older than the live entry —
-    /// a stale writer must never rewind a schedule (RFC §9.3).
+    /// Replacement carried a generation older than the live entry — a stale
+    /// writer must never rewind a schedule.
     StaleGeneration,
     /// Generation overflow fails closed; generations never wrap.
     GenerationOverflow,
@@ -119,17 +117,17 @@ pub enum RegisterError {
 pub enum CancelResult {
     /// Exact `(owner, id, generation)` entry removed.
     Cancelled,
-    /// No live entry for `(owner, id)`. The index does not remember
-    /// fired deadlines (it must stay bounded), so this covers both
-    /// already-fired and never-registered — the consumer derives the
-    /// richer result from its own authoritative object (RFC §9.2).
+    /// No live entry for `(owner, id)`. The index does not remember fired
+    /// deadlines (it must stay bounded), so this covers both already-fired
+    /// and never-registered — the consumer derives the richer result from
+    /// its own authoritative object.
     NotFound,
     /// Live entry exists but at a different generation; nothing
     /// removed (cancellation is generation-exact).
     StaleGeneration,
 }
 
-/// What applying one committed time entry did (RFC §8).
+/// What applying one committed time entry did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimeApplied {
     /// Logical time after the entry (unchanged on a rejected
@@ -144,7 +142,7 @@ pub struct TimeApplied {
     pub due_remaining: u16,
 }
 
-// ── Timing state (RFC §6) ───────────────────────────────────────────
+// ── Timing state ────────────────────────────────────────────────────
 
 /// Replicated timing state. Embed in the consumer state machine and
 /// snapshot/restore through [`TimingState::snapshot`] /
@@ -157,7 +155,7 @@ pub struct TimeApplied {
 #[repr(C)]
 pub struct TimingState {
     /// PRG logical time: unsigned milliseconds since the Unix epoch,
-    /// monotone and saturating (RFC §5.1).
+    /// monotone and saturating.
     pub logical_now_ms: u64,
     /// Live entries (occupy `slots[..live]` in canonical order).
     pub live: u16,
@@ -249,8 +247,8 @@ impl TimingState {
         self.owner_live[d.owner as usize] += 1;
     }
 
-    /// Register or atomically replace a deadline (RFC §7, §9.1, §9.3).
-    /// Called only while applying a committed consumer command.
+    /// Register or atomically replace a deadline. Called only while applying
+    /// a committed consumer command.
     pub fn register(
         &mut self,
         owner: u16,
@@ -293,8 +291,8 @@ impl TimingState {
         Ok(RegisterResult::Registered)
     }
 
-    /// Remove exactly `(owner, id, generation)` (RFC §9.2). Called
-    /// only while applying a committed consumer command.
+    /// Remove exactly `(owner, id, generation)`. Called only while applying
+    /// a committed consumer command.
     pub fn cancel(&mut self, owner: u16, id: &[u8; TM_ID], generation: u64) -> CancelResult {
         if owner as usize >= TM_MAX_OWNERS {
             return CancelResult::NotFound;
@@ -309,10 +307,9 @@ impl TimingState {
         CancelResult::Cancelled
     }
 
-    /// Applied rule for `TimeAdvance` (RFC §5.4, §8):
-    /// `logical_now = max(logical_now, proposed)`. A regression or
-    /// duplicate retains the existing time — deterministic and safe.
-    /// Returns true when time moved.
+    /// Applied rule for `TimeAdvance`: `logical_now = max(logical_now,
+    /// proposed)`. A regression or duplicate retains the existing time —
+    /// deterministic and safe. Returns true when time moved.
     pub fn advance(&mut self, proposed_time_ms: u64) -> bool {
         if proposed_time_ms > self.logical_now_ms {
             self.logical_now_ms = proposed_time_ms;
@@ -333,7 +330,7 @@ impl TimingState {
         Some(self.remove_at(0))
     }
 
-    /// Due entries not yet delivered (the drain backlog, RFC §8).
+    /// Due entries not yet delivered (the drain backlog).
     pub fn due_depth(&self) -> u16 {
         let mut n = 0u16;
         let mut i = 0;
@@ -349,7 +346,7 @@ impl TimingState {
 
     /// Earliest pending due time (leader uses it for idle coalescing:
     /// no live deadlines and no pending duration admission → no
-    /// `TimeAdvance` proposals, RFC §5.2).
+    /// `TimeAdvance` proposals).
     pub fn next_due_at(&self) -> Option<u64> {
         if self.live == 0 {
             None
@@ -358,7 +355,7 @@ impl TimingState {
         }
     }
 
-    // ── Snapshot section (RFC §12) ──────────────────────────────────
+    // ── Snapshot section ────────────────────────────────────────────
     //
     // Fixed-size, canonical, versioned. Layout (all LE):
     //   [version:u16][live:u16][logical_now_ms:u64]
@@ -509,7 +506,7 @@ impl TimingState {
     }
 }
 
-// ── Clock guard (leader-side, unreplicated — RFC §5.4) ──────────────
+// ── Clock guard (leader-side, unreplicated —) ───────────────────────
 
 /// Wall-clock health states. Anything but `Healthy` freezes time
 /// production: deadlines become late rather than firing from an
@@ -528,11 +525,10 @@ pub enum ClockHealth {
 }
 
 /// Leader-side clock discipline (`clock_guard` from
-/// `docs/architecture/replication.md`). Pairs each wall-clock sample
-/// with a monotonic sample and checks the deltas agree within
-/// `slew_tolerance_ms`. Forward jumps are NOT an alarm: the producer
-/// advances logical time in `max_step_ms` clamped steps so due work
-/// drains within apply budgets (RFC §5.4).
+/// `docs/architecture/replication.md`). Pairs each wall-clock sample with a
+/// monotonic sample and checks the deltas agree within `slew_tolerance_ms`.
+/// Forward jumps are NOT an alarm: the producer advances logical time in
+/// `max_step_ms` clamped steps so due work drains within apply budgets.
 #[repr(C)]
 pub struct ClockGuard {
     /// Max believable forward movement of logical time per proposed
@@ -575,8 +571,8 @@ impl ClockGuard {
             .anchor_unix_ms
             .saturating_add(mono_ms.saturating_sub(self.anchor_mono_ms));
         if unix_ms.saturating_add(self.slew_tolerance_ms) < expected {
-            // Backward movement: freeze until the wall clock catches
-            // up with the pre-jump extrapolation (RFC §5.4).
+            // Backward movement: freeze until the wall clock catches up with
+            // the pre-jump extrapolation.
             self.alarm = ClockHealth::BackwardJump;
             return self.alarm;
         }

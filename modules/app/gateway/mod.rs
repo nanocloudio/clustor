@@ -65,16 +65,16 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+#[path = "../../common/step_accounting.rs"]
+mod step_accounting;
 #[path = "../../common/types.rs"]
 mod types;
+#[path = "../../common/wal_frame.rs"]
+mod wal_frame;
 #[path = "../../common/wire.rs"]
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
-#[path = "../../common/step_accounting.rs"]
-mod step_accounting;
-#[path = "../../common/wal_frame.rs"]
-mod wal_frame;
 
 mod codec;
 mod surface;
@@ -241,9 +241,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 None => break,
                 Some(0) => {}
                 Some(len) => {
-                    if let Some(env) =
-                        throttle::on_proposal(&mut s.throttle, sys, &frame[..len])
-                    {
+                    if let Some(env) = throttle::on_proposal(&mut s.throttle, sys, &frame[..len]) {
                         reject_chain(s, sys, &env);
                     }
                 }

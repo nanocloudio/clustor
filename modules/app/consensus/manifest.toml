@@ -72,7 +72,6 @@ content_type = "OctetStream"
 
 # Partitioned proposals: 5-byte envelope `[partition_id:u16][msg_type:u8][len:u16]`.
 # The leader rejects misrouted entries (partition_id != self partition).
-# See .context/rfc_partition_groups.md.
 [[ports]]
 name = "proposals_partitioned"
 direction = "input"
@@ -99,7 +98,7 @@ content_type = "OctetStream"
 # MSG_FSYNC_ACK, MSG_WAL_TRUNCATE_ACK and MSG_WAL_REJECT. Followers
 # stamp the resulting `local_wal_durable_index` into every
 # AppendEntriesResponse so the leader's durability ledger can compute
-# quorum-fsync durability across replicas (spec §10.4.1).
+# quorum-fsync durability across replicas.
 #
 # All three MUST stay on this one edge. They are consumed in FIFO
 # order, which is what makes a truncation's durable-watermark clamp
@@ -230,7 +229,7 @@ content_type = "OctetStream"
 # Apply-confirmation feedback for admin commands consumed on
 # `admin_proposals`. Carries `[command_id:u32][status:u8]` so the
 # admin surface can route the response back to the originating
-# conn_id. See RFC §14.
+# conn_id.
 [[ports]]
 name = "admin_applied"
 direction = "output"
@@ -239,13 +238,25 @@ buffer_size = 8192
 max_record = 8
 rate_class_max = "transaction"
 
-# Post-snapshot trim signal. After a snapshot install fast-forwards
-# `commit_index`, raft emits MSG_WAL_COMPACT_BEFORE
-# `[before_index:u64 LE]` so the WAL can drop segments whose max-index
-# is strictly below `before_index`. Also carries MSG_WAL_TRUNCATE_AFTER
-# for §5.3 conflict repair.
+# Log-maintenance control signals, multiplexed by message type. This
+# port already carried two (MSG_WAL_COMPACT_BEFORE
+# `[before_index:u64 LE]`, so the WAL can drop segments whose max-index
+# is strictly below `before_index` after a snapshot install
+# fast-forwards `commit_index`; and MSG_WAL_TRUNCATE_AFTER for §5.3
+# conflict repair), so the min-match retention floor
+# (MSG_COMPACTION_FLOOR) was folded onto it rather than spending a
+# second port slot on a third low-volume signal to the same consumer.
+#
+# MSG_COMPACTION_FLOOR gates snapshot triggers — and therefore WAL
+# compaction — behind the slowest live voter's replicated index, so a
+# leader-local snapshot can never compact entries a lagging follower
+# still needs. Optional; leave unwired on followers and single-voter
+# graphs.
+#
+# The slot this freed pays for `durable_horizon` below. `consensus` sits
+# at fluxor's 16-outputs cap, so a new signal has to be earned.
 [[ports]]
-name = "wal_compact"
+name = "log_maintenance"
 direction = "output"
 content_type = "OctetStream"
 
@@ -268,22 +279,12 @@ direction = "output"
 content_type = "OctetStream"
 
 # Synthesized MSG_FSYNC_ACK frames extracted from AppendEntriesResponse
-# envelopes (spec §10.4.1). The leader's durability ledger consumes
+# envelopes. The leader's durability ledger consumes
 # this fan-in alongside local `wal.flushed` so its per-replica
 # progress array reflects every voter's `local_wal_durable_index`,
 # enabling quorum-fsync `wal_committed_index` computation.
 [[ports]]
 name = "cross_durability_ack"
-direction = "output"
-content_type = "OctetStream"
-
-# Min-match retention floor (MSG_COMPACTION_FLOOR): gates snapshot
-# triggers — and therefore WAL compaction — behind the slowest live
-# voter's replicated index, so a leader-local snapshot can never
-# compact entries a lagging follower still needs. Optional; leave
-# unwired on followers and single-voter graphs.
-[[ports]]
-name = "retention_floor"
 direction = "output"
 content_type = "OctetStream"
 
@@ -300,7 +301,16 @@ content_type = "OctetStream"
 [[ports]]
 name = "committed_entries"
 direction = "output"
-content_type = "OctetStream"
+# NetProto, not OctetStream: this port carries wire envelopes
+# `[msg_type:u8][len:u16 LE][payload]` and is fanned (a kernel tee or
+# merge sits on it). A fan typed OctetStream moves bytes, so under
+# pressure one producer's frame is split and another's interleaved —
+# a consumer then reads a header off the middle of a payload. NetProto
+# has that framing, and a NetProto fan moves whole frames only.
+content_type = "NetProto"
+# Transaction-class edges: one record per committed entry or
+# response, never a media stream, whatever NetProto defaults to.
+rate_class_default = "transaction"
 buffer_size = 8192
 # Envelope (3) + term/index (16) + proposal body (2048).
 max_record = 2067
@@ -309,7 +319,16 @@ rate_class_max = "transaction"
 [[ports]]
 name = "applied"
 direction = "output"
-content_type = "OctetStream"
+# NetProto, not OctetStream: this port carries wire envelopes
+# `[msg_type:u8][len:u16 LE][payload]` and is fanned (a kernel tee or
+# merge sits on it). A fan typed OctetStream moves bytes, so under
+# pressure one producer's frame is split and another's interleaved —
+# a consumer then reads a header off the middle of a payload. NetProto
+# has that framing, and a NetProto fan moves whole frames only.
+content_type = "NetProto"
+# Transaction-class edges: one record per committed entry or
+# response, never a media stream, whatever NetProto defaults to.
+rate_class_default = "transaction"
 buffer_size = 8192
 # Largest ack/reject envelope is bounded well below this 64-byte contract.
 max_record = 64
@@ -327,6 +346,36 @@ rate_class_max = "transaction"
 # separable on the shared `entry_reply` return path.
 [[ports]]
 name = "entry_request"
+direction = "output"
+content_type = "OctetStream"
+
+# Quorum-durable horizon for THIS node's partition, as
+# MSG_DURABILITY_PROOF `[partition_id:u16][term:u64][index:u64]
+# [replica:u8]` — byte-identical to what `durability.quorum_durable`
+# emits, so `flow` consumes both without knowing the difference.
+#
+# WHY THIS EXISTS: ack release is gated on a per-partition durable
+# high-water mark, and `durability.quorum_durable` computes it from the
+# ledger's cross-node fsync acks — which only the LEADER has. A follower
+# therefore had no durable mark at all, so any response-owed write that
+# landed on one (a QoS 1 PUBLISH, an `acks>=1` produce) committed and
+# was never acknowledged. That is not specific to forwarded proposals;
+# it is the same rule with a hole in it.
+#
+# Under DUR_STRICT / DUR_GROUP_FSYNC the commit gate is already
+# `min(quorum_match, durable_index)`, so `commit_index` NEVER runs ahead
+# of quorum durability, and a follower learns it from the leader's
+# AppendEntries. Emitting it here is therefore the same determination,
+# one hop later — not a weaker one.
+#
+# NOT emitted under DUR_RELAXED, where the self match slot seeds on
+# append and commit CAN outrun fsync.
+#
+# `flow`'s mark is a monotonic max, so this and `quorum_durable` may be
+# wired together with no ordering or duplication hazard; on the leader
+# they agree, on a follower only this one fires.
+[[ports]]
+name = "durable_horizon"
 direction = "output"
 content_type = "OctetStream"
 buffer_size = 8192

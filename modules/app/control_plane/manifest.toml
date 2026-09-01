@@ -9,11 +9,43 @@ hardware_targets = ["bcm2712"]
 #
 # Components: cp (periodic CP proofs + tenant records + capability
 # manifests) and placement (placement epochs + kpg-keyed epoch
-# events). Both are pure sources; the module has no inputs.
+# events). `migration_cmd` is the one input: operator migration
+# commands for the state machine. Optional — a graph that never
+# migrates leaves it unwired.
 #
 # tenant_records / capabilities / epoch_events / metrics are optional
 # ports — graphs without tenancy, session fencing, or telemetry
 # aggregation leave them unwired.
+
+[[ports]]
+name = "migration_cmd"
+direction = "input"
+content_type = "OctetStream"
+
+# Committed entries, so the controller can see its own migration phase
+# record come back DURABLE. MIG-DURABLE is satisfied by the commit, not
+# by the proposal, so without this input no phase can ever advance.
+[[ports]]
+name = "committed_entries"
+direction = "input"
+# NetProto, not OctetStream: this port carries wire envelopes
+# `[msg_type:u8][len:u16 LE][payload]` and is fanned (a kernel tee or
+# merge sits on it). A fan typed OctetStream moves bytes, so under
+# pressure one producer's frame is split and another's interleaved —
+# a consumer then reads a header off the middle of a payload. NetProto
+# has that framing, and a NetProto fan moves whole frames only.
+content_type = "NetProto"
+# Transaction-class edges: one record per committed entry or
+# response, never a media stream, whatever NetProto defaults to.
+rate_class_default = "transaction"
+
+# Raft leader hints. Only the leader ACCEPTS migration commands; every
+# node still adopts the committed records, which is how the fence
+# reaches all of them. Leave unwired only in a single-node graph.
+[[ports]]
+name = "leader_state"
+direction = "input"
+content_type = "OctetStream"
 
 [[ports]]
 name = "proof"
@@ -49,3 +81,34 @@ content_type = "OctetStream"
 
 [observability]
 exempt = "pure source components — CP proofs, tenant records, capability manifests, placement epochs; originates no data-plane telemetry (the metrics port carries only §8 per-component step accounting)"
+
+# Appended LAST: port indices follow declaration order, so inserting
+# earlier would renumber every output after it.
+#
+# Migration phase records (MIG-DURABLE). The state machine refuses to
+# advance a phase whose record has not reached this sink, so a graph
+# that leaves it unwired cannot run migrations at all — which is the
+# honest behaviour, not a bug. For the invariant to genuinely hold the
+# sink must be durable (the Raft log); a merely observable sink lets a
+# migration proceed past a record a crash would lose.
+[[ports]]
+name = "migration_record"
+direction = "output"
+content_type = "OctetStream"
+
+# Runtime group activation (MSG_SLOT_ACTIVATE) — the WORK of a
+# migration's PROVISIONING phase. Wire to `consensus.cp_state`, which
+# already demuxes control-plane frames by type; consensus is at
+# fluxor's 16-port ceiling and has no room for a port of its own.
+# Appended LAST so no existing output index shifts.
+[[ports]]
+name = "slot_activate"
+direction = "output"
+content_type = "OctetStream"
+
+
+# NOTE: `MSG_SHARD_MAP_UPDATE` has no port of its own. It rides
+# `routing`, alongside `MSG_PLACEMENT_UPDATE`, because the two answer
+# one question between them — who owns a shard — and separate edges can
+# deliver them out of order, leaving a consumer resolving ownership
+# against a new prg_count and a stale override set.

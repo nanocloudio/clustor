@@ -216,6 +216,37 @@ path = "tests/sdk_primitives.rs"
 name = "wire_codec_truncation"
 path = "tests/wire_codec_truncation.rs"
 
+# Keyed-proposal placement contract: stable partition per routing key,
+# plus the keyed-proposal codec. Same shape as the codec suite above —
+# pure host code over `modules/common/wire.rs`, no prereqs.
+[[test]]
+name = "keyed_routing"
+path = "tests/keyed_routing.rs"
+
+# Union quorum under joint consensus: the safety rule both the commit
+# tracker and the durability ledger must enforce. Pure host code over
+# `modules/common/types.rs`.
+[[test]]
+name = "union_quorum"
+path = "tests/union_quorum.rs"
+
+# Learner semantics: replicated to, counted nowhere.
+[[test]]
+name = "learner_semantics"
+path = "tests/learner_semantics.rs"
+
+# Deficit round-robin over hosted Raft groups: slot 0's reserved share
+# plus rotation fairness across the rest.
+[[test]]
+name = "engine_scheduler"
+path = "tests/engine_scheduler.rs"
+
+# Migration state machine: the fence boundary, transition legality, and
+# the timeout policy either side of it.
+[[test]]
+name = "migration_state_machine"
+path = "tests/migration_state_machine.rs"
+
 [[test]]
 name = "session_registry"
 path = "tests/session_registry.rs"

@@ -81,7 +81,7 @@ second peer producer attaches to `peer_tx` or `repl_tx`.
 | Direction | Ports |
 |---|---|
 | in | `proposals`, `proposals_tagged`, `proposals_partitioned`, `proposals_partitioned_tagged`, `read`, `read_permits`, `admin_proposals`, `rpc`, `ack`, `snapshot_rx` |
-| out | `proposal_assigned`, `committed_entries`, `applied`, `leader_state`, `admin_applied`, `retention_floor`, `snapshot_import`, `snapshot_request`, `rpc_out`, `metrics` |
+| out | `proposal_assigned`, `committed_entries`, `applied`, `leader_state`, `admin_applied`, `log_maintenance`, `durable_horizon`, `snapshot_import`, `snapshot_request`, `rpc_out`, `metrics` |
 
 `committed_entries` is the per-entry replicated stream every
 downstream state machine consumes; `proposals_tagged` +

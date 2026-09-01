@@ -1,13 +1,11 @@
 //! codec — request/response framer and conn_id correlation hub.
 //!
-//! Inbound: raw client requests delivered by the
-//! [`surface`](super::surface) component with a per-message
-//! `[conn_id:u8]` prefix (RFC §4.5 / §5.8). Read requests
-//! (`MSG_CLIENT_READ_REQUEST`) go tagged to `consensus.read`
-//! when the `reads` port is wired, else answer
-//! `CLIENT_REJECT_READ_UNSUPPORTED`. Write proposals are stamped with
-//! a non-zero `correlation_id` and handed to the
-//! [`throttle`](super::throttle) component, which preserves the
+//! Inbound: raw client requests delivered by the [`surface`](super::surface)
+//! component with a per-message `[conn_id:u8]` prefix. Read requests
+//! (`MSG_CLIENT_READ_REQUEST`) go tagged to `consensus.read` when the
+//! `reads` port is wired, else answer `CLIENT_REJECT_READ_UNSUPPORTED`.
+//! Write proposals are stamped with a non-zero `correlation_id` and handed
+//! to the [`throttle`](super::throttle) component, which preserves the
 //! correlation id through to `consensus.proposals_tagged`.
 //!
 //! Outbound: every response is returned through the surface with a
@@ -102,12 +100,12 @@ struct IdxEntry {
 
 #[repr(C)]
 pub struct Codec {
-    pub in_applied: i32,           // in: MSG_CLIENT_RESPONSE / READ_RESPONSE from consensus
-    pub in_placement: i32,         // in: PlacementUpdate
+    pub in_applied: i32,   // in: MSG_CLIENT_RESPONSE / READ_RESPONSE from consensus
+    pub in_placement: i32, // in: PlacementUpdate
     pub in_proposal_assigned: i32, // in: consensus.proposal_assigned
-    pub in_leader_state: i32,      // in: consensus.leader_state (MSG_LEADER_HINT)
-    pub in_client_requests: i32,   // in: pre-demuxed `[conn_id][body]` client traffic
-    pub out_reads: i32,            // out: tagged read submissions to consensus.read
+    pub in_leader_state: i32, // in: consensus.leader_state (MSG_LEADER_HINT)
+    pub in_client_requests: i32, // in: pre-demuxed `[conn_id][body]` client traffic
+    pub out_reads: i32,    // out: tagged read submissions to consensus.read
 
     // Config / params
     pub self_id: u8,
@@ -162,10 +160,19 @@ pub unsafe fn init(c: &mut Codec) {
     c.corr_head = 0;
     c.idx_head = 0;
     for slot in c.corr_ring.iter_mut() {
-        *slot = CorrEntry { corr_id: 0, born_ms: 0, conn_id: 0 };
+        *slot = CorrEntry {
+            corr_id: 0,
+            born_ms: 0,
+            conn_id: 0,
+        };
     }
     for slot in c.idx_ring.iter_mut() {
-        *slot = IdxEntry { partition_id: 0, wal_index: 0, born_ms: 0, conn_id: 0 };
+        *slot = IdxEntry {
+            partition_id: 0,
+            wal_index: 0,
+            born_ms: 0,
+            conn_id: 0,
+        };
     }
 }
 
@@ -249,9 +256,8 @@ unsafe fn drain_placement(c: &mut Codec, sys: &SyscallTable) {
             break;
         };
         if msg_type == wire::MSG_PLACEMENT_UPDATE && plen >= 4 {
-            c.placement_epoch = u32::from_le_bytes([
-                c.msg_buf[0], c.msg_buf[1], c.msg_buf[2], c.msg_buf[3],
-            ]);
+            c.placement_epoch =
+                u32::from_le_bytes([c.msg_buf[0], c.msg_buf[1], c.msg_buf[2], c.msg_buf[3]]);
         }
     }
 }
@@ -261,7 +267,8 @@ unsafe fn drain_leader_state(c: &mut Codec, sys: &SyscallTable) {
         return;
     }
     for _ in 0..8 {
-        let Some((msg_type, plen)) = wire_channels::next_msg(sys, c.in_leader_state, &mut c.msg_buf)
+        let Some((msg_type, plen)) =
+            wire_channels::next_msg(sys, c.in_leader_state, &mut c.msg_buf)
         else {
             break;
         };
@@ -278,7 +285,8 @@ unsafe fn drain_proposal_assigned(c: &mut Codec, sys: &SyscallTable) {
     }
     let now_ms = dev_millis(sys);
     for _ in 0..16 {
-        let Some((msg_type, plen)) = wire_channels::next_msg(sys, c.in_proposal_assigned, &mut c.msg_buf)
+        let Some((msg_type, plen)) =
+            wire_channels::next_msg(sys, c.in_proposal_assigned, &mut c.msg_buf)
         else {
             break;
         };
@@ -383,7 +391,12 @@ pub unsafe fn on_request(
                 // a structured reject.
                 c.reads_rejected += 1;
                 return Route::Respond(build_reject_wire(
-                    conn_id, wire::CLIENT_REJECT_READ_UNSUPPORTED, 0, 0, 0, 0,
+                    conn_id,
+                    wire::CLIENT_REJECT_READ_UNSUPPORTED,
+                    0,
+                    0,
+                    0,
+                    0,
                 ));
             }
             if c.leader_id != LEADER_UNKNOWN && c.leader_id != c.self_id {
@@ -391,7 +404,12 @@ pub unsafe fn on_request(
                 // follower, redirect.
                 c.not_leader_rejected += 1;
                 return Route::Respond(build_reject_wire(
-                    conn_id, wire::CLIENT_REJECT_NOT_LEADER, 0, 0, 0, c.leader_id,
+                    conn_id,
+                    wire::CLIENT_REJECT_NOT_LEADER,
+                    0,
+                    0,
+                    0,
+                    c.leader_id,
                 ));
             }
             let corr_id = next_corr_id(c);
@@ -411,7 +429,10 @@ pub unsafe fn on_request(
             // table slot lingers until TTL/overflow, and the client
             // waits on a reply that can never arrive.
             let wrote = wire_channels::channel_write_msg(
-                sys, c.out_reads, wire::MSG_CLIENT_READ_REQUEST, &framed[..total],
+                sys,
+                c.out_reads,
+                wire::MSG_CLIENT_READ_REQUEST,
+                &framed[..total],
             );
             if wrote > 0 {
                 put_corr(c, corr_id, conn_id, dev_millis(sys));
@@ -426,7 +447,12 @@ pub unsafe fn on_request(
             if c.min_epoch != 0 && (c.placement_epoch as u32) < c.min_epoch {
                 c.stale_epoch_rejected += 1;
                 return Route::Respond(build_reject_wire(
-                    conn_id, wire::CLIENT_REJECT_STALE_EPOCH, 0, 0, 0, 0,
+                    conn_id,
+                    wire::CLIENT_REJECT_STALE_EPOCH,
+                    0,
+                    0,
+                    0,
+                    0,
                 ));
             }
             // Leader-redirect: if we know who the leader is and it
@@ -435,7 +461,12 @@ pub unsafe fn on_request(
             if c.leader_id != LEADER_UNKNOWN && c.leader_id != c.self_id {
                 c.not_leader_rejected += 1;
                 return Route::Respond(build_reject_wire(
-                    conn_id, wire::CLIENT_REJECT_NOT_LEADER, 0, 0, 0, c.leader_id,
+                    conn_id,
+                    wire::CLIENT_REJECT_NOT_LEADER,
+                    0,
+                    0,
+                    0,
+                    c.leader_id,
                 ));
             }
 
@@ -523,7 +554,11 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
                     return next_applied_skip();
                 }
             };
-            let mut out = Outbound { msg_type: wire::MSG_CLIENT_RESPONSE, len: 17, buf: [0u8; 64] };
+            let mut out = Outbound {
+                msg_type: wire::MSG_CLIENT_RESPONSE,
+                len: 17,
+                buf: [0u8; 64],
+            };
             out.buf[0] = conn_id;
             out.buf[1..17].copy_from_slice(&body);
             Some(out)
@@ -537,8 +572,14 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
             // that fence their own state machine; the wire client
             // keeps the empty-body contract below.
             let corr_id = u64::from_le_bytes([
-                c.msg_buf[0], c.msg_buf[1], c.msg_buf[2], c.msg_buf[3],
-                c.msg_buf[4], c.msg_buf[5], c.msg_buf[6], c.msg_buf[7],
+                c.msg_buf[0],
+                c.msg_buf[1],
+                c.msg_buf[2],
+                c.msg_buf[3],
+                c.msg_buf[4],
+                c.msg_buf[5],
+                c.msg_buf[6],
+                c.msg_buf[7],
             ]);
             let conn_id = match take_corr(c, corr_id) {
                 Some(v) => v,
@@ -550,8 +591,11 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
             // Empty-body read response — the substrate guarantees
             // the linearization point has been reached; the
             // state-machine query is the application's job.
-            let mut out =
-                Outbound { msg_type: wire::MSG_CLIENT_READ_RESPONSE, len: 1, buf: [0u8; 64] };
+            let mut out = Outbound {
+                msg_type: wire::MSG_CLIENT_READ_RESPONSE,
+                len: 1,
+                buf: [0u8; 64],
+            };
             out.buf[0] = conn_id;
             Some(out)
         }
@@ -565,7 +609,11 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
 /// A consumed-but-unroutable applied frame: burn the loop slot with a
 /// zero-length sentinel the dispatch table skips without sending.
 fn next_applied_skip() -> Option<Outbound> {
-    Some(Outbound { msg_type: 0, len: 0, buf: [0u8; 64] })
+    Some(Outbound {
+        msg_type: 0,
+        len: 0,
+        buf: [0u8; 64],
+    })
 }
 
 fn build_reject_wire(
@@ -586,8 +634,11 @@ fn build_reject_wire(
         entry_credits,
         byte_credits,
     );
-    let mut out =
-        Outbound { msg_type: wire::MSG_CLIENT_REJECT, len: wire::CLIENT_REJECT_WIRE_LEN as u8, buf: [0u8; 64] };
+    let mut out = Outbound {
+        msg_type: wire::MSG_CLIENT_REJECT,
+        len: wire::CLIENT_REJECT_WIRE_LEN as u8,
+        buf: [0u8; 64],
+    };
     out.buf[..wire::CLIENT_REJECT_WIRE_LEN].copy_from_slice(&env);
     out
 }
@@ -610,7 +661,11 @@ fn next_corr_id(c: &mut Codec) -> u64 {
 
 fn put_corr(c: &mut Codec, corr_id: u64, conn_id: u8, now_ms: u64) {
     let slot = (c.corr_head as usize) % CORR_RING;
-    c.corr_ring[slot] = CorrEntry { corr_id, born_ms: now_ms, conn_id };
+    c.corr_ring[slot] = CorrEntry {
+        corr_id,
+        born_ms: now_ms,
+        conn_id,
+    };
     c.corr_head = c.corr_head.wrapping_add(1);
 }
 
@@ -627,7 +682,12 @@ fn take_corr(c: &mut Codec, corr_id: u64) -> Option<u8> {
 
 fn put_idx(c: &mut Codec, partition_id: u16, wal_index: u64, conn_id: u8, now_ms: u64) {
     let slot = (c.idx_head as usize) % IDX_RING;
-    c.idx_ring[slot] = IdxEntry { partition_id, wal_index, born_ms: now_ms, conn_id };
+    c.idx_ring[slot] = IdxEntry {
+        partition_id,
+        wal_index,
+        born_ms: now_ms,
+        conn_id,
+    };
     c.idx_head = c.idx_head.wrapping_add(1);
 }
 

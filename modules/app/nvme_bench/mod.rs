@@ -1,4 +1,4 @@
-//! NVMe floor benchmark (L0) — `.context/rfc_performance_benchmarking.md` §6.
+//! NVMe floor benchmark (L0)
 //!
 //! Exercises the fluxor `dev_fs` contract directly (FS_OPEN_CREATE,
 //! FS_WRITE, FS_FSYNC, FS_SEEK, FS_CLOSE) with no WAL/Raft above it, to
@@ -59,12 +59,12 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+#[path = "../../common/log_fmt.rs"]
+mod log_fmt;
 #[path = "../../common/wire.rs"]
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
-#[path = "../../common/log_fmt.rs"]
-mod log_fmt;
 use log_fmt::{log_field, log_field_i32};
 
 // dev_fs opcodes (mirror `abi::dev_fs`; see modules/app/wal/mod.rs).
@@ -330,7 +330,9 @@ struct ModuleState {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 { core::mem::size_of::<ModuleState>() as u32 }
+pub extern "C" fn module_state_size() -> u32 {
+    core::mem::size_of::<ModuleState>() as u32
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -339,16 +341,25 @@ pub extern "C" fn module_init(_syscalls: *const c_void) {}
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
 pub extern "C" fn module_new(
-    in_chan: i32, out_chan: i32, _ctrl_chan: i32,
-    params: *const u8, params_len: usize,
-    state: *mut u8, state_size: usize, syscalls: *const c_void,
+    in_chan: i32,
+    out_chan: i32,
+    _ctrl_chan: i32,
+    params: *const u8,
+    params_len: usize,
+    state: *mut u8,
+    state_size: usize,
+    syscalls: *const c_void,
 ) -> i32 {
     // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
     // the kernel passes a valid, exclusively-borrowed `state` of at least
     // `module_state_size()` bytes and a live `syscalls` table.
     unsafe {
-        if syscalls.is_null() || state.is_null() { return -1; }
-        if state_size < core::mem::size_of::<ModuleState>() { return -2; }
+        if syscalls.is_null() || state.is_null() {
+            return -1;
+        }
+        if state_size < core::mem::size_of::<ModuleState>() {
+            return -2;
+        }
         let s = &mut *(state as *mut ModuleState);
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
@@ -391,20 +402,38 @@ pub extern "C" fn module_new(
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
         }
-        if s.block_size as usize > BLOCK_MAX { s.block_size = BLOCK_MAX as u32; }
-        if s.block_size == 0 { s.block_size = 4096; }
-        if s.step_batch == 0 { s.step_batch = 64; }
+        if s.block_size as usize > BLOCK_MAX {
+            s.block_size = BLOCK_MAX as u32;
+        }
+        if s.block_size == 0 {
+            s.block_size = 4096;
+        }
+        if s.step_batch == 0 {
+            s.step_batch = 64;
+        }
         // One fence per block is the floor of the grouping knob in both
         // tiers; 0 would ask the async path to open a fence covering
         // nothing before it has written anything.
-        if s.fsync_every == 0 { s.fsync_every = 1; }
-        if s.fence_depth == 0 { s.fence_depth = 1; }
-        if s.fence_depth as usize > FENCE_RING_MAX { s.fence_depth = FENCE_RING_MAX as u16; }
-        if s.step_budget_us == 0 { s.step_budget_us = DEFAULT_STEP_BUDGET_US; }
-        if s.open_retry_max == 0 { s.open_retry_max = OPEN_RETRY_MAX_DEFAULT; }
+        if s.fsync_every == 0 {
+            s.fsync_every = 1;
+        }
+        if s.fence_depth == 0 {
+            s.fence_depth = 1;
+        }
+        if s.fence_depth as usize > FENCE_RING_MAX {
+            s.fence_depth = FENCE_RING_MAX as u16;
+        }
+        if s.step_budget_us == 0 {
+            s.step_budget_us = DEFAULT_STEP_BUDGET_US;
+        }
+        if s.open_retry_max == 0 {
+            s.open_retry_max = OPEN_RETRY_MAX_DEFAULT;
+        }
         // Durability mode skips create/write and goes straight to the
         // read-back verify of the file a prior write run persisted.
-        if s.verify_only != 0 { s.phase = PH_VERIFY; }
+        if s.verify_only != 0 {
+            s.phase = PH_VERIFY;
+        }
         // Deterministic, non-zero fill so the FS provider can't optimise
         // away an all-zero write.
         for (i, b) in s.data_buf.iter_mut().enumerate() {
@@ -551,7 +580,9 @@ unsafe fn step_seq_async(s: &mut ModuleState, sys: &SyscallTable, step_t0: u64) 
         let head = s.fence_head as usize % FENCE_RING_MAX;
         let mut tb = s.fence_tickets[head].to_le_bytes();
         let rc = (sys.provider_call)(s.fd, FS_FSYNC_POLL, tb.as_mut_ptr(), 8);
-        if rc == 1 { break; } // oldest still in flight; nothing newer can be done
+        if rc == 1 {
+            break;
+        } // oldest still in flight; nothing newer can be done
         if rc != 0 {
             s.io_errors = s.io_errors.saturating_add(1);
             bench_abort(s, sys, b"[nvbench] FAIL fence poll rc=", rc);
@@ -572,8 +603,12 @@ unsafe fn step_seq_async(s: &mut ModuleState, sys: &SyscallTable, step_t0: u64) 
     let mut n = 0u32;
     while n < s.step_batch as u32 && s.blocks_done < s.seq_blocks {
         if s.since_fsync >= s.fsync_every {
-            if (s.fence_count as usize) >= depth { break; } // pipeline full
-            if !fence_submit(s, sys) { break; }
+            if (s.fence_count as usize) >= depth {
+                break;
+            } // pipeline full
+            if !fence_submit(s, sys) {
+                break;
+            }
         }
         // A short count leaves `part` bytes of this block accepted; the
         // remainder is offered again next step at the same file position,
@@ -600,7 +635,9 @@ unsafe fn step_seq_async(s: &mut ModuleState, sys: &SyscallTable, step_t0: u64) 
         s.blocks_done += 1;
         s.since_fsync += 1;
         n += 1;
-        if step_budget_spent(sys, step_t0, s.step_budget_us) { break; }
+        if step_budget_spent(sys, step_t0, s.step_budget_us) {
+            break;
+        }
     }
 
     // ── Drain: fence the tail, then let the ring empty across steps. ──
@@ -655,9 +692,15 @@ unsafe fn seq_complete(s: &mut ModuleState, sys: &SyscallTable) {
 /// Throughput in KB/s = `bytes / elapsed_ms` = `bytes * 1000 / us`.
 /// Saturating, integer-only. Zero elapsed → 0 (not yet measurable).
 fn kbps(bytes: u64, elapsed_us: u64) -> u32 {
-    if elapsed_us == 0 { return 0; }
+    if elapsed_us == 0 {
+        return 0;
+    }
     let v = bytes.saturating_mul(1000) / elapsed_us;
-    if v > u32::MAX as u64 { u32::MAX } else { v as u32 }
+    if v > u32::MAX as u64 {
+        u32::MAX
+    } else {
+        v as u32
+    }
 }
 
 /// Self-driven module: the bench has no input port to wake it, so it must
@@ -668,7 +711,9 @@ fn kbps(bytes: u64, elapsed_us: u64) -> u32 {
 /// (On linux every module is stepped, so this is a no-op there.)
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 { 1 }
+pub extern "C" fn module_deferred_ready() -> u32 {
+    1
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
@@ -732,8 +777,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // Path is ptr+len with NO null terminator (the FS provider
                 // takes exactly `len` bytes — a trailing \0 becomes part of
                 // the filename and the open fails).
-                let path: &[u8] = if s.root_path != 0 { PATH_ROOT } else { PATH_WAL };
-                s.fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_ptr() as *mut u8, path.len());
+                let path: &[u8] = if s.root_path != 0 {
+                    PATH_ROOT
+                } else {
+                    PATH_WAL
+                };
+                s.fd =
+                    (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_ptr() as *mut u8, path.len());
                 s.last_open_rc = s.fd;
                 if s.fd < 0 {
                     // E_AGAIN means the FS provider (fat32 on bare metal) is
@@ -767,7 +817,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     probe_fs_caps(s, sys);
                     if s.io_mode == IO_MODE_ASYNC && s.fs_async == 0 {
                         let p = log_field(
-                            &mut s.log_buf, 0, b"[nvbench] FAIL async unsupported caps=", s.fs_caps,
+                            &mut s.log_buf,
+                            0,
+                            b"[nvbench] FAIL async unsupported caps=",
+                            s.fs_caps,
                         );
                         dev_log(sys, 3, s.log_buf.as_ptr(), p);
                         s.phase = PH_REPORT;
@@ -817,18 +870,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             s.dbg |= DBG_FS_POST;
                             dev_log(sys, 3, b"[nvbench] fsync0 post".as_ptr(), 21);
                         }
-                        if frc != 0 { bench_abort(s, sys, b"[nvbench] FAIL fsync rc=", frc); break; }
+                        if frc != 0 {
+                            bench_abort(s, sys, b"[nvbench] FAIL fsync rc=", frc);
+                            break;
+                        }
                         s.since_fsync = 0;
                     }
                     s.blocks_done += 1;
                     n += 1;
-                    if step_budget_spent(sys, step_t0, s.step_budget_us) { break; }
+                    if step_budget_spent(sys, step_t0, s.step_budget_us) {
+                        break;
+                    }
                 }
                 if s.phase == PH_SEQ && s.blocks_done >= s.seq_blocks {
                     if s.since_fsync > 0 {
                         let frc = fsync_timed(s, sys);
                         s.since_fsync = 0;
-                        if frc != 0 { bench_abort(s, sys, b"[nvbench] FAIL fsync rc=", frc); }
+                        if frc != 0 {
+                            bench_abort(s, sys, b"[nvbench] FAIL fsync rc=", frc);
+                        }
                     }
                 }
                 if s.phase == PH_SEQ && s.blocks_done >= s.seq_blocks {
@@ -860,18 +920,25 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.since_fsync += 1;
                     if s.since_fsync >= s.fsync_every {
                         let frc = fsync_timed(s, sys);
-                        if frc != 0 { bench_abort(s, sys, b"[nvbench] FAIL fsync rc=", frc); break; }
+                        if frc != 0 {
+                            bench_abort(s, sys, b"[nvbench] FAIL fsync rc=", frc);
+                            break;
+                        }
                         s.since_fsync = 0;
                     }
                     s.blocks_done += 1;
                     n += 1;
-                    if step_budget_spent(sys, step_t0, s.step_budget_us) { break; }
+                    if step_budget_spent(sys, step_t0, s.step_budget_us) {
+                        break;
+                    }
                 }
                 if s.phase == PH_RAND && s.blocks_done >= s.rand_blocks {
                     if s.since_fsync > 0 {
                         let frc = fsync_timed(s, sys);
                         s.since_fsync = 0;
-                        if frc != 0 { bench_abort(s, sys, b"[nvbench] FAIL fsync rc=", frc); }
+                        if frc != 0 {
+                            bench_abort(s, sys, b"[nvbench] FAIL fsync rc=", frc);
+                        }
                     }
                 }
                 if s.phase == PH_RAND && s.blocks_done >= s.rand_blocks {
@@ -910,8 +977,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
                         s.fd = -1;
                     }
-                    let path: &[u8] = if s.root_path != 0 { PATH_ROOT } else { PATH_WAL };
-                    let rfd = (sys.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
+                    let path: &[u8] = if s.root_path != 0 {
+                        PATH_ROOT
+                    } else {
+                        PATH_WAL
+                    };
+                    let rfd =
+                        (sys.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
                     s.last_open_rc = rfd;
                     if rfd == FS_E_AGAIN {
                         // Provider not ready — retry next step (don't arm).
@@ -930,7 +1002,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // durability failure in verify_only mode.
                         s.verify_fail = 1;
                         let p = log_field_i32(
-                            &mut s.log_buf, 0, b"[nvbench] verify FAIL open rfd=", s.fd,
+                            &mut s.log_buf,
+                            0,
+                            b"[nvbench] verify FAIL open rfd=",
+                            s.fd,
                         );
                         dev_log(sys, 3, s.log_buf.as_ptr(), p);
                         s.phase = PH_REPORT;
@@ -948,7 +1023,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     let mut bad = false;
                     while s.verify_off < total && read_sectors < VERIFY_SECTORS_PER_STEP {
                         let n = (sys.provider_call)(s.fd, FS_READ, s.vbuf.as_mut_ptr(), 512);
-                        if n <= 0 { bad = true; break; }
+                        if n <= 0 {
+                            bad = true;
+                            break;
+                        }
                         // The written pattern is `data_buf[0..bs]` repeated, so
                         // the file byte at offset `verify_off + i` corresponds
                         // to `data_buf[(verify_off + i) % bs]`. Wrap at the block
@@ -959,10 +1037,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         let base = (s.verify_off % bs_nz) as usize;
                         let mut i = 0usize;
                         while i < n as usize {
-                            if s.vbuf[i] != s.data_buf[(base + i) % bw] { bad = true; break; }
+                            if s.vbuf[i] != s.data_buf[(base + i) % bw] {
+                                bad = true;
+                                break;
+                            }
                             i += 1;
                         }
-                        if bad { break; }
+                        if bad {
+                            break;
+                        }
                         s.verify_off += n as u64;
                         read_sectors += 1;
                     }
@@ -971,7 +1054,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.fd = -1;
                         let mut p = 0usize;
                         if !bad {
-                            p = log_field(&mut s.log_buf, p, b"[nvbench] verify ok blocks=", s.seq_blocks);
+                            p = log_field(
+                                &mut s.log_buf,
+                                p,
+                                b"[nvbench] verify ok blocks=",
+                                s.seq_blocks,
+                            );
                             p = log_field(&mut s.log_buf, p, b" bytes=", total as u32);
                         } else {
                             s.verify_fail = 1;
@@ -1007,14 +1095,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Emit bench counters, throughput gauges, and the fsync-latency
-/// histogram as typed samples (RFC §4.3). Module id 0x16, partition 0.
+/// Emit bench counters, throughput gauges, and the fsync-latency histogram
+/// as typed samples. Module id 0x16, partition 0.
 ///
 /// # Safety
 /// `sys` must be a live syscall table.
 unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
     let now = dev_millis(sys);
-    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS {
+        return;
+    }
     s.last_metrics_ms = now;
 
     // Non-one-shot heartbeat over log_net. One-shot phase-transition lines
@@ -1039,7 +1129,12 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
         // limiter, and a run whose `cap` is 0 measured nothing at all.
         if s.io_mode == IO_MODE_ASYNC {
             let mut p = 0usize;
-            p = log_field(&mut s.log_buf, p, b"[nvbench] async cap=", u32::from(s.fs_async));
+            p = log_field(
+                &mut s.log_buf,
+                p,
+                b"[nvbench] async cap=",
+                u32::from(s.fs_async),
+            );
             p = log_field(&mut s.log_buf, p, b" depth=", u32::from(s.fence_depth));
             p = log_field(&mut s.log_buf, p, b" subm=", s.fences_submitted);
             p = log_field(&mut s.log_buf, p, b" done=", s.fences_done);
@@ -1069,33 +1164,154 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable) {
         }
     }
 
-    if s.out_metrics < 0 { return; }
+    if s.out_metrics < 0 {
+        return;
+    }
     let mid = wire::SOURCE_ID_NVME_BENCH;
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_PHASE, wire::METRIC_KIND_GAUGE, i64::from(s.phase));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_BYTES_WRITTEN, wire::METRIC_KIND_COUNTER, s.bytes_written as i64);
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_SEQ_KBPS, wire::METRIC_KIND_GAUGE, i64::from(s.seq_kbps));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_RAND_KBPS, wire::METRIC_KIND_GAUGE, i64::from(s.rand_kbps));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_FSYNCS, wire::METRIC_KIND_COUNTER, i64::from(s.fsyncs));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_STEPS, wire::METRIC_KIND_COUNTER, s.steps as i64);
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_OPEN_RC, wire::METRIC_KIND_GAUGE, i64::from(s.last_open_rc));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_OPEN_RETRIES, wire::METRIC_KIND_COUNTER, i64::from(s.open_retries));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_VERIFY_FAIL, wire::METRIC_KIND_GAUGE, i64::from(s.verify_fail));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_IO_ERRORS, wire::METRIC_KIND_COUNTER, i64::from(s.io_errors));
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_PHASE,
+        wire::METRIC_KIND_GAUGE,
+        i64::from(s.phase),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_BYTES_WRITTEN,
+        wire::METRIC_KIND_COUNTER,
+        s.bytes_written as i64,
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_SEQ_KBPS,
+        wire::METRIC_KIND_GAUGE,
+        i64::from(s.seq_kbps),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_RAND_KBPS,
+        wire::METRIC_KIND_GAUGE,
+        i64::from(s.rand_kbps),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_FSYNCS,
+        wire::METRIC_KIND_COUNTER,
+        i64::from(s.fsyncs),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_STEPS,
+        wire::METRIC_KIND_COUNTER,
+        s.steps as i64,
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_OPEN_RC,
+        wire::METRIC_KIND_GAUGE,
+        i64::from(s.last_open_rc),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_OPEN_RETRIES,
+        wire::METRIC_KIND_COUNTER,
+        i64::from(s.open_retries),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_VERIFY_FAIL,
+        wire::METRIC_KIND_GAUGE,
+        i64::from(s.verify_fail),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_IO_ERRORS,
+        wire::METRIC_KIND_COUNTER,
+        i64::from(s.io_errors),
+    );
     // Pipeline occupancy: a depth sweep is only interpretable if the
     // scrape can tell a full pipeline from a starved one.
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_IO_MODE, wire::METRIC_KIND_GAUGE, i64::from(s.io_mode));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_FENCES_SUBMITTED, wire::METRIC_KIND_COUNTER, i64::from(s.fences_submitted));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_FENCES_DONE, wire::METRIC_KIND_COUNTER, i64::from(s.fences_done));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_FENCES_OUTSTANDING, wire::METRIC_KIND_GAUGE, i64::from(s.fence_count));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_WRITE_AGAIN, wire::METRIC_KIND_COUNTER, i64::from(s.write_again));
-    emit_sample(s, sys, mid, wire::metric_ids::NVBENCH_FENCE_AGAIN, wire::METRIC_KIND_COUNTER, i64::from(s.fence_again));
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_IO_MODE,
+        wire::METRIC_KIND_GAUGE,
+        i64::from(s.io_mode),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_FENCES_SUBMITTED,
+        wire::METRIC_KIND_COUNTER,
+        i64::from(s.fences_submitted),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_FENCES_DONE,
+        wire::METRIC_KIND_COUNTER,
+        i64::from(s.fences_done),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_FENCES_OUTSTANDING,
+        wire::METRIC_KIND_GAUGE,
+        i64::from(s.fence_count),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_WRITE_AGAIN,
+        wire::METRIC_KIND_COUNTER,
+        i64::from(s.write_again),
+    );
+    emit_sample(
+        s,
+        sys,
+        mid,
+        wire::metric_ids::NVBENCH_FENCE_AGAIN,
+        wire::METRIC_KIND_COUNTER,
+        i64::from(s.fence_again),
+    );
     // Cumulative bucket counts per the wire contract (wire::hist): emit the
     // running prefix sum so bucket i = count of samples <= bound[i].
     let base = wire::hist::HIST_BASE;
     let mut cum: i64 = 0;
     for i in 0..s.fsync_buckets.len() {
         cum += i64::from(s.fsync_buckets[i]);
-        emit_sample(s, sys, mid, base + i as u16, wire::METRIC_KIND_HISTOGRAM, cum);
+        emit_sample(
+            s,
+            sys,
+            mid,
+            base + i as u16,
+            wire::METRIC_KIND_HISTOGRAM,
+            cum,
+        );
     }
 }
 
@@ -1111,7 +1327,9 @@ unsafe fn emit_sample(
     kind: u8,
     value: i64,
 ) {
-    if !wire_channels::writable(sys, s.out_metrics) { return; }
+    if !wire_channels::writable(sys, s.out_metrics) {
+        return;
+    }
     let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
     wire::encode_metric_sample(&mut buf, module_id, 0, metric_id, kind, value);
     wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);

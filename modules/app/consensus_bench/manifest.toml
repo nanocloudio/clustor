@@ -22,7 +22,7 @@ direction = "output"
 content_type = "OctetStream"
 
 [observability]
-# L2 consensus load injector (RFC §6): emits proposals at a saturating
+# L2 consensus load injector: emits proposals at a saturating
 # rate and reports phase / proposals_sent / blocked. The propose→commit
 # latency + throughput it drives are captured by the consensus
 # module's raft (commit_latency_ms) and commit (commit_advances)

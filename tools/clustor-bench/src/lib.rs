@@ -1,4 +1,4 @@
-//! Shared logic for the clustor off-DUT benchmark harness (RFC §5): parsing
+//! Shared logic for the clustor off-DUT benchmark harness: parsing
 //! the binary `/metrics` export, a minimal HTTP/1.1 client, a hand-rolled
 //! JSON writer, and a log-linear latency histogram with
 //! coordinated-omission-aware percentiles. Std-only, no external crates, so it
@@ -459,10 +459,10 @@ pub fn json_str(s: &str) -> String {
     out
 }
 
-/// FNV-1a 64-bit hash — stable config-hash for the JSON baseline metadata
-/// (RFC §2.6). Delegates to `clustor-common`'s `wire::fnv1a_64` — the
-/// same implementation partition routing uses on the DUT, so both sides
-/// of the wire hash identically.
+/// FNV-1a 64-bit hash — stable config-hash for the JSON baseline metadata.
+/// Delegates to `clustor-common`'s `wire::fnv1a_64` — the same
+/// implementation partition routing uses on the DUT, so both sides of the
+/// wire hash identically.
 pub fn fnv1a64(data: &[u8]) -> u64 {
     clustor_common::wire::fnv1a_64(data)
 }

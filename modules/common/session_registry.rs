@@ -1,5 +1,5 @@
 // Session registry — the replicated state machine behind the session
-// directory role (fluxor rfc_protocols.md §8.3, §13.7).
+// directory role (fluxor).
 //
 // Pure no_std, zero-alloc, DETERMINISTIC: `SessionRegistry::apply` is a
 // pure function of (state, committed command body). Every replica that
@@ -10,40 +10,37 @@
 // correlation, and telemetry; the cargo crate `clustor-common` mounts
 // this file for host tests.
 //
-// What the registry is, in RFC terms:
+// What the registry is:
 //
-// - the **single-writer session directory**: one authoritative
-//   (anchor, worker) binding per `(session_id, session_epoch)`;
-//   competing stale writers are rejected (§8.3).
-// - the **reservation authority** for the hot egress counters
-//   (§13.7.2, R2): counter blocks are granted monotonically from a
-//   per-(session, counter) high-water mark and NEVER re-handed out.
-//   The grant reply reaches the proposer only after the command is
-//   quorum-committed (the module replies from the committed-entry
-//   stream, not from proposal submission) — "quorum-durable before
-//   emit" holds by construction.
-// - the **receive-window floor** keeper (§13.7.3, R4): the durable
-//   rx high-water only moves forward.
-// - the **wrapped-key custodian** (§13.7.6, R1): session AEAD keys are
-//   stored only as opaque KEK-wrapped blobs this registry cannot read,
-//   with quorum wipe on teardown. TTL expiry rides the deterministic
-//   replicated timing component (`modules/common/timing.rs`,
-//   rfc_deterministic_timing.md): KEY_PUT with a TTL registers a
-//   generation-fenced deadline in the embedded `TimingState`; the due
-//   handler wipes the key while applying the committed time entry.
-//   There is no second authoritative local timer queue (RFC §19.3).
-// - the **fence-ordering gate** (§13.7.2a/§13.7.4, R3): an anchor
-//   takeover (BIND that changes `anchor_id` on a fence-required
-//   session) is refused until an out-of-band emission fence has been
-//   recorded as CONFIRMED for that session. The registry cannot cut
-//   power itself — enforceability is the fence backend's job (STONITH
-//   / fabric egress cutoff; the fluxor rig's `kasa_local` power
-//   backend is the reference) — but it enforces the ORDERING: no
-//   takeover binding advances past an unconfirmed fence.
-// - the **unsafe-recovery marker** (§13.7.6, R2): RECOVERY_MARK voids
-//   every session's outstanding reservations and blocks further
-//   grants until that session's epoch bumps. This is the consumer-
-//   observable form of "unsafe recovery voids outstanding blocks".
+// - the **single-writer session directory**: one authoritative (anchor,
+//   worker) binding per `(session_id, session_epoch)`; competing stale writers
+//   are rejected.
+// - the **reservation authority** for the hot egress counters: blocks are
+//   granted monotonically from a per-(session, counter) high-water mark and
+//   NEVER re-handed out. The grant reply reaches the proposer only after the
+//   command is quorum-committed (the module replies from the committed-entry
+//   stream, not from proposal submission) — "quorum-durable before emit" holds
+//   by construction.
+// - the **receive-window floor** keeper: the durable rx high-water only
+//   moves forward.
+// - the **wrapped-key custodian** (R1): session AEAD keys are stored only as
+//   opaque KEK-wrapped blobs this registry cannot read, with quorum wipe on
+//   teardown. TTL expiry rides the deterministic replicated timing component
+//   (`modules/common/timing.rs`): KEY_PUT with a TTL registers a
+//   generation-fenced deadline in the embedded `TimingState`; the due handler
+//   wipes the key while applying the committed time entry. There is no second
+//   authoritative local timer queue.
+// - the **fence-ordering gate** (R3): an anchor takeover (BIND that changes
+//   `anchor_id` on a fence-required session) is refused until an out-of-band
+//   emission fence has been recorded as CONFIRMED for that session. The
+//   registry cannot cut power itself — enforceability is the fence backend's
+//   job (STONITH / fabric egress cutoff; the fluxor rig's `kasa_local` power
+//   backend is the reference) — but it enforces the ORDERING: no takeover
+//   binding advances past an unconfirmed fence.
+// - the **unsafe-recovery marker** (R2): RECOVERY_MARK voids every session's
+//   outstanding reservations and blocks further grants until that session's
+//   epoch bumps. This is the consumer-observable form of "unsafe recovery
+//   voids outstanding blocks".
 
 use super::timing::{Deadline, TimingState, TM_BATCH_MAX, TM_MAX_OWNERS};
 
@@ -53,7 +50,7 @@ use super::timing::{Deadline, TimingState, TM_BATCH_MAX, TM_MAX_OWNERS};
 /// its snapshot) has a static size.
 pub const SR_MAX_SESSIONS: usize = 64;
 
-/// Hot counters per session (§13.7.1 tier 3): 0 = egress AEAD nonce,
+/// Hot counters per session: 0 = egress AEAD nonce,
 /// 1 = reliable-ordered send index, 2 = outbound datagram sequence.
 pub const SR_NUM_COUNTERS: usize = 3;
 
@@ -91,13 +88,12 @@ pub const SR_ST_FENCE_REQUIRED: u8 = 6;
 pub const SR_ST_FLOOR_REGRESSION: u8 = 7;
 /// RECOVERY_MARK with a non-advancing recovery epoch.
 pub const SR_ST_RECOVERY_STALE: u8 = 8;
-/// KEY_PUT with a TTL could not register its expiry deadline
-/// (timing-index capacity or generation overflow). The command fails
-/// without storing the key — capacity is checked as part of the same
-/// apply operation (rfc_deterministic_timing.md §6.2).
+/// KEY_PUT with a TTL could not register its expiry deadline (timing-index
+/// capacity or generation overflow). The command fails without storing the
+/// key — capacity is checked as part of the same apply operation.
 pub const SR_ST_DEADLINE_CAPACITY: u8 = 9;
 
-// ── Deterministic timing (rfc_deterministic_timing.md) ──────────────
+// ── Deterministic timing ────────────────────────────────────────────
 
 /// Owner namespace for session-key TTL deadlines in the embedded
 /// timing index. Deadline id = session_id; generation = the slot's
@@ -364,17 +360,16 @@ pub struct SessionSlot {
     /// Anchor the fence was initiated/confirmed against. A takeover
     /// only trusts a fence aimed at the anchor being replaced.
     pub fence_target: [u8; SR_PEER_ID],
-    /// Durable receive-window floor (§13.7.3, R4). Forward-only.
+    /// Durable receive-window floor (R4). Forward-only.
     pub rx_floor: u64,
     /// Exclusive high-water of every counter block ever granted.
     pub high_water: [u64; SR_NUM_COUNTERS],
     /// KEK-wrapped key blob (opaque, R1) + declared TTL metadata.
     pub key_len: u16,
     pub key_ttl_ms: u32,
-    /// Generation of the key's expiry deadline: bumped by every
-    /// KEY_PUT that arms a TTL. A due callback wipes the key only
-    /// when its generation still matches (rfc_deterministic_timing.md
-    /// §9.3 — an old deadline is a deterministic no-op).
+    /// Generation of the key's expiry deadline: bumped by every KEY_PUT that
+    /// arms a TTL. A due callback wipes the key only when its generation
+    /// still matches.
     pub key_gen: u64,
     pub key: [u8; SR_MAX_WRAPPED_KEY],
 }
@@ -420,8 +415,7 @@ pub struct SessionRegistry {
     pub recovery_epoch: u32,
     /// Applied-command counter (diagnostics / metrics only).
     pub applied: u64,
-    /// Embedded deterministic timing state
-    /// (rfc_deterministic_timing.md §4: timing and consumer state
+    /// Embedded deterministic timing state (: timing and consumer state
     /// share one apply and snapshot boundary).
     pub timing: TimingState,
     /// Due callbacks that performed their domain transition (key
@@ -429,7 +423,7 @@ pub struct SessionRegistry {
     pub deadlines_fired: u32,
     /// Due callbacks that were deterministic no-ops (object gone or
     /// generation mismatch). Replicated so a systematic mismatch is
-    /// observable rather than silent (RFC §7).
+    /// observable rather than silent.
     pub deadline_noop: u32,
 }
 
@@ -501,16 +495,15 @@ impl SessionRegistry {
             SR_OP_RECOVERY_MARK => self.apply_recovery_mark(body),
             _ => SessionReply::fail(op, SR_ST_MALFORMED),
         };
-        // Post-command due pass (rfc_deterministic_timing.md §7): a
-        // command that registered an already-due deadline gets the
-        // same bounded pass `TimeAdvance` runs — still a consequence
-        // of the committed entry, never of a local timer. Cheap when
-        // nothing is due (one sorted-front comparison).
+        // Post-command due pass: a command that registered an already-due
+        // deadline gets the same bounded pass `TimeAdvance` runs — still a
+        // consequence of the committed entry, never of a local timer. Cheap
+        // when nothing is due (one sorted-front comparison).
         self.run_due_pass();
         reply
     }
 
-    // ── Deterministic timing (rfc_deterministic_timing.md §7–§8) ────
+    // ── Deterministic timing ────────────────────────────────────────
 
     /// Bounded due pass: pop at most [`TM_BATCH_MAX`] due deadlines in
     /// canonical order and run each owner's due handler inline.
@@ -526,9 +519,9 @@ impl SessionRegistry {
         fired
     }
 
-    /// Deterministic due handler (RFC §7): mutates replicated state
-    /// only. The authoritative object decides the meaning; an absent
-    /// object or generation mismatch is a recorded no-op.
+    /// Deterministic due handler: mutates replicated state only. The
+    /// authoritative object decides the meaning; an absent object or
+    /// generation mismatch is a recorded no-op.
     fn on_deadline_due(&mut self, d: Deadline) {
         match d.owner {
             SR_OWNER_KEY_TTL => {
@@ -548,10 +541,10 @@ impl SessionRegistry {
         }
     }
 
-    /// Apply a committed `TimeAdvance` entry (RFC §8). Regressions
-    /// and duplicates retain the existing logical time — safe and
-    /// deterministic. Returns what happened so the module wrapper can
-    /// emit metrics and the leader can schedule `TimeDrain`.
+    /// Apply a committed `TimeAdvance` entry. Regressions and duplicates
+    /// retain the existing logical time — safe and deterministic. Returns
+    /// what happened so the module wrapper can emit metrics and the leader
+    /// can schedule `TimeDrain`.
     pub fn apply_time_advance(&mut self, proposed_time_ms: u64) -> super::timing::TimeApplied {
         let _ = self.timing.advance(proposed_time_ms);
         let fired = self.run_due_pass();
@@ -562,10 +555,10 @@ impl SessionRegistry {
         }
     }
 
-    /// Apply a committed `TimeDrain` entry (RFC §8). A drain never
-    /// advances time; `through_time_ms` must equal the applied
-    /// logical time or the drain is a deterministic no-op — a stale
-    /// drain request cannot invent a new time fence.
+    /// Apply a committed `TimeDrain` entry. A drain never advances time;
+    /// `through_time_ms` must equal the applied logical time or the drain is
+    /// a deterministic no-op — a stale drain request cannot invent a new
+    /// time fence.
     pub fn apply_time_drain(&mut self, through_time_ms: u64) -> super::timing::TimeApplied {
         let fired = if through_time_ms == self.timing.logical_now_ms() {
             self.run_due_pass()
@@ -631,14 +624,14 @@ impl SessionRegistry {
                 return Self::reply_ok(SR_OP_BIND, &sid, slot.epoch, 0, 0);
             }
             if epoch <= slot.epoch {
-                // Single-writer rule (§8.3): a competing writer at the
+                // Single-writer rule: a competing writer at the
                 // current or an older generation is rejected.
                 return Self::reply_err(SR_OP_BIND, &sid, slot.epoch, SR_ST_STALE_EPOCH);
             }
             // Epoch-advancing rebind. An ANCHOR change is a takeover:
             // on a fence-required session it must not proceed until an
             // enforceable fence against the OLD anchor is confirmed
-            // (R3; §13.7.4 step 1 — fence CONFIRMED before the epoch
+            // (R3 step 1 — fence CONFIRMED before the epoch
             // advances, which is what lets the VIP move).
             let takeover = anchor != slot.anchor_id;
             if takeover
@@ -706,7 +699,7 @@ impl SessionRegistry {
         };
         let slot = &mut self.slots[i];
         if epoch != slot.epoch {
-            // Epoch fencing at block acquisition (§13.7.2): a stale
+            // Epoch fencing at block acquisition: a stale
             // writer — a not-actually-dead old anchor — never gets a
             // fresh block.
             return Self::reply_err(SR_OP_RESERVE, &sid, slot.epoch, SR_ST_STALE_EPOCH);
@@ -767,11 +760,10 @@ impl SessionRegistry {
             let cur = self.slots[i].epoch;
             return Self::reply_err(SR_OP_KEY_PUT, &sid, cur, SR_ST_STALE_EPOCH);
         }
-        // TTL expiry rides the replicated timing index. Registration
-        // happens BEFORE the key is stored: if the owner's deadline
-        // partition is full (or the generation would overflow), the
-        // command fails deterministically without creating its
-        // consumer object (rfc_deterministic_timing.md §6.2, §9.1).
+        // TTL expiry rides the replicated timing index. Registration happens
+        // BEFORE the key is stored: if the owner's deadline partition is
+        // full (or the generation would overflow), the command fails
+        // deterministically without creating its consumer object.
         if ttl_ms > 0 {
             let gen = self.slots[i].key_gen.wrapping_add(1);
             let due = self.timing.logical_now_ms().saturating_add(ttl_ms as u64);
@@ -910,7 +902,7 @@ impl SessionRegistry {
 
     /// Serialized snapshot size: fixed-layout dump of every slot plus
     /// the registry header and the embedded timing section — one
-    /// blob, one applied index (rfc_deterministic_timing.md §12: a
+    /// blob, one applied index (: a
     /// snapshot containing a consumer schedule without its deadline,
     /// or a deadline without its consumer object, is invalid — made
     /// impossible here by construction). Layout (all LE):

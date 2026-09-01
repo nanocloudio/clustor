@@ -29,6 +29,7 @@
 
 use super::abi::SyscallTable;
 use super::collections::Crc32c;
+use super::inbox;
 use super::seam::{HorizonLatch, SeamRing, PROBE_QUEUE_SLOTS};
 use super::types::*;
 use super::{
@@ -40,6 +41,9 @@ use super::{
 /// frame contract so the write path can never exceed what replay
 /// accepts (`wal_frame::MAX_ENTRY_LEN = ENTRY_PROLOGUE + MAX_ENTRY_BODY`).
 const PROPOSAL_BATCH_CAP: usize = wal_frame::MAX_ENTRY_BODY;
+/// `correlation_origin` value meaning "this node's own ring". Not 0,
+/// which is a valid replica id.
+const ORIGIN_LOCAL: u8 = 0xFF;
 
 /// Per-batch correlation slot count. The slot is set non-zero only for
 /// proposals that arrived via the tagged port; legacy proposals from the
@@ -57,9 +61,9 @@ const MAX_INFLIGHT_PROBES: usize = 32;
 /// before we give up and answer the read with fallback. Sized to the
 /// election-timeout floor so a slow follower can't trick us.
 const PROBE_TIMEOUT_MS: u64 = 1500;
-/// Durability-backpressure window (RFC §13/§14). The leader stops pulling
-/// new proposals once its log runs this many entries ahead of `commit_index`
-/// (i.e. ahead of quorum-durable state).
+/// Durability-backpressure window. The leader stops pulling new proposals
+/// once its log runs this many entries ahead of `commit_index` (i.e. ahead
+/// of quorum-durable state).
 ///
 /// The channel alone gives no backpressure here: in WAL group-fsync mode
 /// the WAL absorbs writes faster than they commit, so the raft→wal channel
@@ -99,8 +103,21 @@ const TRUNCATE_HOLD_TIMEOUTS: u64 = 3;
 /// conflict repair. Only the *uncommitted* tail can ever diverge (committed
 /// entries are immutable and identical cluster-wide), and that tail is
 /// bounded by `MAX_UNCOMMITTED_INFLIGHT`, so a small power-of-two ring covers
-/// every index a conflict check can legitimately target. Indices at/below
-/// `commit_index` are trusted to match without a ring hit.
+/// every index a conflict check can legitimately target: a leader's
+/// `prev_log_index` is never more than that many entries below this
+/// node's tip, because the leader holds every committed entry and this
+/// node's tip runs at most the inflight window past commit. Indices
+/// at/below `commit_index` are trusted to match without a ring hit.
+///
+/// The ring is filled from two sources: this node's own appends, and
+/// every fsync ack the WAL raises — which is how a restarted node
+/// recovers the terms of its replayed log. After a restart
+/// `commit_index` is 0, so without the replay fill the whole log reads
+/// as an unverifiable tail. An index the ring cannot answer for is
+/// reported to the leader as unverified, never treated as a conflict:
+/// truncating on ignorance discards entries this node acknowledged, and
+/// does so one entry per round trip, which peels a restarted node's log
+/// to nothing. `tests/raft_fault_matrix.rs` is the gate on that.
 const TAIL_TERM_RING: usize = 64;
 const TAIL_TERM_MASK: u64 = (TAIL_TERM_RING as u64) - 1;
 
@@ -112,9 +129,9 @@ struct TailTerm {
     term: Term,
 }
 
-/// Slots in the append→commit timestamp ring (RFC §4.1 commit latency).
-/// Sized to cover in-flight uncommitted entries on the leader; a wrap
-/// before commit just drops that sample (the equality check guards it).
+/// Slots in the append→commit timestamp ring. Sized to cover in-flight
+/// uncommitted entries on the leader; a wrap before commit just drops that
+/// sample (the equality check guards it).
 const COMMIT_TS_RING: usize = 64;
 
 #[derive(Clone, Copy)]
@@ -204,7 +221,7 @@ enum PersistOutcome {
     Failed,
 }
 
-// Metadata file path scheme (RFC partition_groups):
+// Metadata file path scheme:
 //   single-partition graphs (partition_id = 0):  raft/meta
 //   per-partition graphs   (partition_id = N>0): raft/p<NNNN>/meta
 // Width is enough for u16; we'll never have more than 65k partitions
@@ -278,22 +295,49 @@ const META_PERSIST_STRIDE: Index = 64;
 #[repr(C)]
 pub struct Raft {
     // ── Channels ────────────────────────────────────────────
-    pub in_rpc: i32,                          // in[0]: RPC from peers (via peer_router)
-    pub in_proposals: i32,                    // in[1]: ClientProposal (legacy, untagged)
-    pub in_admin: i32,                        // in[2]: AdminCommand from operations
-    pub in_proposals_tagged: i32,             // in[3]: ClientProposal with 8-byte correlation_id prefix
-    pub in_proposals_partitioned: i32,        // in[4]: ClientProposal in 5-byte partitioned envelope
+    /// Per-slot inbox for peer RPC. The engine reads `in_rpc` once,
+    /// routes each frame by its envelope `partition_id`, and this slot
+    /// drains only its own — so K groups can share the channel without
+    /// one consuming another's frames, and without a backed-up group
+    /// blocking the channel head (see `inbox.rs`).
+    pub inbox_rpc: inbox::Inbox,
+    /// Forwarded proposals from followers, kept apart from the RPC
+    /// inbox. They are held on a full inbox (a write has no retransmit)
+    /// while RPCs are dropped; sharing one inbox let a relay burst of
+    /// sixteen fill it exactly and drop the AppendEntries responses
+    /// behind, so commit waited for the next heartbeat — measured at
+    /// K=64 as a 114 ms QoS 1 round trip on a follower.
+    pub inbox_fwd: inbox::Inbox,
+    /// Same, for partitioned client proposals (untagged / tagged).
+    pub inbox_prop_p: inbox::Inbox,
+    pub inbox_prop_pt: inbox::Inbox,
+    /// Durability's per-partition replies: fsync acks / rejects /
+    /// truncate acks, and the replay-complete handover. These edges
+    /// carry the partitioned envelope: one durability instance serves
+    /// K groups, so the partition cannot be inferred from the wiring
+    /// and the producer states it.
+    pub inbox_flushed: inbox::Inbox,
+    pub inbox_replay: inbox::Inbox,
+    /// Snapshot-install notices from durability, likewise partitioned.
+    pub inbox_snap: inbox::Inbox,
+    /// Admin commands targeted at this group.
+    pub inbox_admin: inbox::Inbox,
+    pub in_rpc: i32,                   // in[0]: RPC from peers (via peer_router)
+    pub in_proposals: i32,             // in[1]: ClientProposal (untagged)
+    pub in_admin: i32,                 // in[2]: AdminCommand from operations
+    pub in_proposals_tagged: i32,      // in[3]: ClientProposal with 8-byte correlation_id prefix
+    pub in_proposals_partitioned: i32, // in[4]: ClientProposal in 5-byte partitioned envelope
     pub in_proposals_partitioned_tagged: i32, // in[5]: partitioned + correlation_id
-    pub in_snapshot_installed: i32,           // in[6]: MSG_SNAPSHOT_INSTALLED from durability
-    pub in_wal_flushed: i32,                  // in[7]: MSG_FSYNC_ACK from local wal.flushed (spec §10.4.1)
-    pub in_wal_replay_complete: i32,          // in[8]: MSG_WAL_REPLAY_COMPLETE (recovery resume)
-    pub out_rpc: i32,                         // out[0]: Vote/Heartbeat RPC to peer_router
-    pub out_log: i32,                         // out[2]: WalEntry to wal
-    pub out_metrics: i32,                     // out[3]: MetricsPayload (shared module port)
-    pub out_proposal_assigned: i32,           // out[4]: MSG_PROPOSAL_ASSIGNED back to proposer
-    pub out_leader_state: i32,                // out[5]: MSG_LEADER_HINT (leader_id, term)
-    pub out_admin_applied: i32,               // out[6]: MSG_ADMIN_APPLIED back to operations
-    pub out_wal_compact: i32,                 // out[7]: MSG_WAL_COMPACT_BEFORE to wal
+    pub in_snapshot_installed: i32,    // in[6]: MSG_SNAPSHOT_INSTALLED from durability
+    pub in_wal_flushed: i32,           // in[7]: MSG_FSYNC_ACK from local wal.flushed
+    pub in_wal_replay_complete: i32,   // in[8]: MSG_WAL_REPLAY_COMPLETE (recovery resume)
+    pub out_rpc: i32,                  // out[0]: Vote/Heartbeat RPC to peer_router
+    pub out_log: i32,                  // out[2]: WalEntry to wal
+    pub out_metrics: i32,              // out[3]: MetricsPayload (shared module port)
+    pub out_proposal_assigned: i32,    // out[4]: MSG_PROPOSAL_ASSIGNED back to proposer
+    pub out_leader_state: i32,         // out[5]: MSG_LEADER_HINT (leader_id, term)
+    pub out_admin_applied: i32,        // out[6]: MSG_ADMIN_APPLIED back to operations
+    pub out_wal_compact: i32,          // out[7]: MSG_WAL_COMPACT_BEFORE to wal
 
     // ── Seams (drained by the mod.rs dispatch table) ────────
     /// E1: AppendEntries outbox → replicator.
@@ -320,7 +364,7 @@ pub struct Raft {
     /// E10: voter-set update → commit + replicator (was
     /// `out_voter_set`). `(current, joint, joint_active)` bitmasks,
     /// delivered in the same step the config change applies.
-    pub voter_out: Option<(u8, u8, u8)>,
+    pub voter_out: Option<(u8, u8, u8, u8)>,
 
     // ── Partition slot (multi-Raft) ─────────────────────────
     // 0 for single-partition graphs. Drives META path and is exposed
@@ -329,23 +373,32 @@ pub struct Raft {
 
     // ── Raft persistent state ───────────────────────────────
     current_term: Term,
-    voted_for: i8,            // -1 = none, 0..6 = replica id
+    voted_for: i8, // -1 = none, 0..6 = replica id
     pub self_id: ReplicaId,
 
     // ── Volatile state ──────────────────────────────────────
-    role: u8,                 // ROLE_FOLLOWER / CANDIDATE / LEADER
-    leader_id: i8,            // -1 = unknown
+    role: u8,      // ROLE_FOLLOWER / CANDIDATE / LEADER
+    leader_id: i8, // -1 = unknown
     pub voter_count: u8,
 
-    /// Current Raft voter set. Initially populated from
-    /// `voter_count` (ids 0..voter_count). Updated as committed
-    /// `CONFIG_CHANGE` entries flow through `drain_admin_committed`.
-    /// See RFC §1.2.
+    /// Current Raft voter set. Initially populated from `voter_count` (ids
+    /// 0..voter_count). Updated as committed `CONFIG_CHANGE` entries flow
+    /// through `drain_admin_committed`.
     current_voters: NodeSet,
     /// Joint-consensus transition set. `Some` only while a
     /// `C_old,new` entry has been committed and `C_new` has not yet.
     /// While `Some`, quorum requires majority over BOTH `current`
     /// and `joint` sets.
+    /// Replicas that receive the log but count toward NO quorum: not
+    /// the commit tally, not the durability tally, not an election.
+    ///
+    /// Deliberately NOT persisted in the meta slot. Meta carries
+    /// election-safety state, and a learner is already barred from
+    /// campaigning by its absence from `current_voters`. The learner
+    /// set is leader-side replication state and is restored by
+    /// replaying `CONFIG_CHANGE_OP_LEARNER` entries from the log, which
+    /// happens before this node can lead.
+    learners: NodeSet,
     joint_voters: NodeSet,
     /// True iff `joint_voters` is the active overlay (so we don't
     /// have to encode "Some via a sentinel" inside a NodeSet bitmask).
@@ -363,22 +416,75 @@ pub struct Raft {
     /// Set on a leader once a `CONFIG_CHANGE_OP_JOINT` entry commits;
     /// the next `step_leader` tick auto-proposes the matching
     /// `CONFIG_CHANGE_OP_NEW` entry to complete the joint-consensus
-    /// transition. Cleared after the proposal is emitted. RFC §1.2.
+    /// transition. Cleared after the proposal is emitted.
     pending_new_voters: NodeSet,
     pending_new_voters_set: bool,
-    /// Learner mode (RFC §1.2): this replica is not in the current
-    /// voter set — typically because a `CONFIG_CHANGE_OP_NEW` committed
-    /// that removed `self_id`. While in learner mode the node still
-    /// replicates the log and serves reads, but does NOT trigger
-    /// election timeouts or grant votes. The flag clears if a later
-    /// config change re-adds the node to the voter set.
+    /// Learner set an admin op asked for, awaiting its own log entry.
+    /// Same shape as `pending_new_voters`: the admin op does not mutate
+    /// state, it queues a config entry, so every replica applies the
+    /// change from the committed log and replay is deterministic.
+    pending_learners: NodeSet,
+    pending_learners_set: bool,
+    /// Voter set an ADD_VOTER / REMOVE_VOTER asked for, awaiting its
+    /// `CONFIG_CHANGE_OP_JOINT` entry. Applying that entry starts joint
+    /// consensus and auto-queues the matching C_new.
+    pending_joint_voters: NodeSet,
+    pending_joint_set: bool,
+    /// Per-replica match index, mirrored from the replicator's coalesced
+    /// E2 array (the same values `commit` tallies).
+    ///
+    /// Raft needs these for exactly one decision: whether a learner has
+    /// caught up enough to be promoted to voter. Promotion is the moment
+    /// a replica starts counting toward quorum, so it must not happen
+    /// while the replica is far behind — a cold voter can make the new
+    /// majority unmeetable and stall commit.
+    peer_match: [Index; MAX_NODES],
+    /// Maximum log lag, in entries, at which a learner may be promoted.
+    /// Operator-tunable; the default is deliberately tight because the
+    /// window between the gate check and the C_new apply is short.
+    pub catchup_lag_max: u64,
+    /// Learner mode: this replica is not in the current voter set —
+    /// typically because a `CONFIG_CHANGE_OP_NEW` committed that removed
+    /// `self_id`. While in learner mode the node still replicates the log
+    /// and serves reads, but does NOT trigger election timeouts or grant
+    /// votes. The flag clears if a later config change re-adds the node to
+    /// the voter set.
     learner_mode: bool,
+    /// Opt-in (param 20). When set, a FOLLOWER relays untagged client
+    /// proposals to the leader instead of leaving them to stall in the
+    /// channel. Default off: without it `drain_proposals` runs only from
+    /// `step_leader`, so a proposal that lands on a follower is never
+    /// drained at all.
+    pub forward_proposals: bool,
 
     // ── Election ────────────────────────────────────────────
     pub election_timeout_ms: u16,
     election_deadline_ms: u64,
     pub heartbeat_interval_ms: u16,
     last_heartbeat_ms: u64,
+    /// Commit index the followers were last told about; a heartbeat
+    /// goes out as soon as `commit_index` passes it.
+    commit_announced: u64,
+    /// Clock at the last AppendEntries accepted from a leader, so an
+    /// election start can say how long this group went unheard-from.
+    last_ae_ms: u64,
+    /// Heartbeats a leader could not send because `out_rpc` was full.
+    /// A skipped heartbeat is a follower timeout waiting to happen.
+    pub heartbeats_skipped: u32,
+    /// RPC writes `out_rpc` refused. `writable` promises one free byte,
+    /// not a frame, so only the write's own result says whether a vote,
+    /// a heartbeat or a response actually left this group. Measured at
+    /// K=64: a channel sized for one group refused whole rounds of
+    /// heartbeats with every guard in the path reporting success.
+    pub rpc_refused: u32,
+    /// RPC frames this group has taken off its inbox, any type. Logged
+    /// at each election start so "no AppendEntries for a second" can be
+    /// told apart from "no frames at all for a second".
+    rpc_total: u32,
+    /// AppendEntries rejected as stale (`term < current_term`), counted
+    /// and logged sparsely: a follower whose term ran ahead of its
+    /// leader rejects every heartbeat while looking, to itself, deaf.
+    ae_stale: u32,
     votes_granted: NodeSet,
     votes_rejected: NodeSet,
     pre_vote_active: bool,
@@ -459,14 +565,26 @@ pub struct Raft {
     /// `prev_log_*` matched — a leader shipping a mis-sequenced entry. Steady
     /// state 0; non-zero means log repair ran instead of a WAL hole.
     ae_noncontiguous: u32,
+    /// AppendEntries answered without a verdict because the tail ring
+    /// holds no term for the index the leader named. The response
+    /// carries our tip and truncates nothing; the leader's next entry
+    /// past our tip resolves it. Steady state 0.
+    ae_unverified: u32,
+    /// Highest index verified against the current leader's log: the
+    /// index of the last AppendEntries this node answered with success.
+    /// Everything at or below it is known to agree with the leader, so
+    /// a durability report may name it; the tip may not, because after
+    /// a restart or a leader change the tip can carry a suffix the
+    /// leader will overwrite. Reset to `commit_index` when the leader
+    /// or the term changes.
+    matched_index: Index,
 
-    /// Replica-local WAL-durable watermark (spec §10.4.1
-    /// `local_wal_durable_index`). Tracked from MSG_FSYNC_ACK on the
-    /// local `wal.flushed` port. On followers, this value is stamped
-    /// into every AppendEntriesResponse so the leader's
-    /// durability ledger can compute quorum-fsync durability across
-    /// replicas without each follower owning a peer-bound side
-    /// channel.
+    /// Replica-local WAL-durable watermark (`local_wal_durable_index`),
+    /// tracked from MSG_FSYNC_ACK on the local `wal.flushed` port. On
+    /// followers this value is stamped into every AppendEntriesResponse,
+    /// so the leader's durability ledger can compute quorum-fsync
+    /// durability across replicas without each follower owning a
+    /// peer-bound side channel.
     local_durable_index: Index,
     /// Term of the entry AT `local_durable_index`, taken from the WAL's
     /// own fsync ack / replay high-water. The metadata record must pair
@@ -592,15 +710,14 @@ pub struct Raft {
     proposal_batch_start_ms: u64,
     pub proposal_batch_timeout_ms: u16,
 
-    /// Durability backpressure (RFC §13/§14). Set true when
-    /// `flush_proposal_batch` could not write to `out_log` (the WAL is
-    /// mid-fsync or overloaded). While true, the batch is held pending —
-    /// `last_log_index` is NOT advanced, so raft's log never diverges from
-    /// the WAL — and proposal intake is suspended (`drain_proposals`
-    /// returns early), leaving proposals queued in their input channels so
-    /// the upstream proposer backpressures rather than loses them. Cleared
-    /// on the next successful flush, and on every role transition (the
-    /// batch it describes is discarded there).
+    /// Durability backpressure. Set true when `flush_proposal_batch` could
+    /// not write to `out_log` (the WAL is mid-fsync or overloaded). While
+    /// true, the batch is held pending — `last_log_index` is NOT advanced,
+    /// so raft's log never diverges from the WAL — and proposal intake is
+    /// suspended (`drain_proposals` returns early), leaving proposals queued
+    /// in their input channels so the upstream proposer backpressures rather
+    /// than loses them. Cleared on the next successful flush, and on every
+    /// role transition (the batch it describes is discarded there).
     flush_deferred: bool,
     /// Count of flush deferrals — emitted as RAFT_FLUSHES_DEFERRED.
     flushes_deferred: u32,
@@ -610,6 +727,11 @@ pub struct Raft {
     /// is the per-proposal correlation_id supplied by the proposer on the
     /// tagged input port.
     correlation_ids: [u64; MAX_BATCH_PROPOSALS],
+    /// Which node's proposer ring owns `correlation_ids[i]`.
+    /// `ORIGIN_LOCAL` for our own proposals (the overwhelming case);
+    /// a replica id for one relayed to us by a follower, whose
+    /// assignment must travel back there rather than be emitted here.
+    correlation_origin: [u8; MAX_BATCH_PROPOSALS],
 
     // ── Strict fallback ─────────────────────────────────────
     strict_fallback: bool,
@@ -618,7 +740,7 @@ pub struct Raft {
     probes: [ProbeSlot; MAX_INFLIGHT_PROBES],
     next_probe_id: u64,
 
-    // ── Admin-induced state (RFC §14) ───────────────────────
+    // ── Admin-induced state ─────────────────────────────────
     /// Set by `ADMIN_OP_FREEZE`; cleared by `ADMIN_OP_THAW`. While
     /// frozen, the proposal-intake paths drop new client proposals
     /// silently (client times out via the codec retry). Existing
@@ -635,6 +757,11 @@ pub struct Raft {
     /// Cluster-wide durability mode hint (Strict=0 / GroupFsync=1 / Relaxed=2).
     /// Currently informational — not yet plumbed through the commit component.
     durability_mode: u8,
+    /// out[15]: this node's quorum-durable horizon, as
+    /// MSG_DURABILITY_PROOF. See the manifest for why consensus emits a
+    /// signal `durability` already produces: the ledger's version exists
+    /// only on the leader.
+    pub out_durable_horizon: i32,
     /// When non-zero, target of a pending `TimeoutNow` leadership
     /// transfer. The leader emits MSG_TIMEOUT_NOW once it next reaches
     /// the heartbeat path, then clears this slot.
@@ -651,11 +778,11 @@ pub struct Raft {
     /// operators can tell admin freeze vs control-plane fallback apart.
     proposals_dropped_strict: u32,
     last_metrics_ms: u64,
-    /// Append→commit timestamp ring for `clustor.raft.commit_latency_ms`
-    /// (RFC §4.1). Keyed by `log_index % COMMIT_TS_RING`; the parallel
-    /// `commit_ts_us` array holds the leader-local `dev_micros` stamp
-    /// taken when the entry was appended. On commit-advance the matching
-    /// slot's age is folded into `commit_latency_buckets` and cleared.
+    /// Append→commit timestamp ring for `clustor.raft.commit_latency_ms`.
+    /// Keyed by `log_index % COMMIT_TS_RING`; the parallel `commit_ts_us`
+    /// array holds the leader-local `dev_micros` stamp taken when the entry
+    /// was appended. On commit-advance the matching slot's age is folded
+    /// into `commit_latency_buckets` and cleared.
     commit_ts_index: [Index; COMMIT_TS_RING],
     commit_ts_us: [u64; COMMIT_TS_RING],
     commit_latency_buckets: [u32; wire::hist::COMMIT_LATENCY_US.len() + 1],
@@ -674,7 +801,9 @@ pub struct Raft {
 // ── Simple PRNG for election jitter (xorshift32) ────────────
 fn xorshift32(state: &mut u32) -> u32 {
     let mut x = *state;
-    if x == 0 { x = 0xDEAD_BEEF; }
+    if x == 0 {
+        x = 0xDEAD_BEEF;
+    }
     x ^= x << 13;
     x ^= x >> 17;
     x ^= x << 5;
@@ -686,6 +815,14 @@ fn xorshift32(state: &mut u32) -> u32 {
 /// and params are assigned by `mod.rs` afterwards; `arm` runs the
 /// post-param boot logic.
 pub fn init(s: &mut Raft) {
+    s.inbox_rpc = inbox::Inbox::new();
+    s.inbox_fwd = inbox::Inbox::new();
+    s.inbox_prop_p = inbox::Inbox::new();
+    s.inbox_prop_pt = inbox::Inbox::new();
+    s.inbox_flushed = inbox::Inbox::new();
+    s.inbox_replay = inbox::Inbox::new();
+    s.inbox_snap = inbox::Inbox::new();
+    s.inbox_admin = inbox::Inbox::new();
     s.in_rpc = -1;
     s.in_proposals = -1;
     s.in_admin = -1;
@@ -721,17 +858,31 @@ pub fn init(s: &mut Raft) {
     s.probes = [ProbeSlot::empty(); MAX_INFLIGHT_PROBES];
     s.next_probe_id = 1;
     s.current_voters = NodeSet::empty();
+    s.learners = NodeSet::empty();
     s.joint_voters = NodeSet::empty();
     s.joint_active = false;
     s.noop_pending = false;
     s.commit_fence_out = None;
     s.pending_new_voters = NodeSet::empty();
     s.pending_new_voters_set = false;
+    s.pending_learners = NodeSet::empty();
+    s.pending_learners_set = false;
+    s.pending_joint_voters = NodeSet::empty();
+    s.pending_joint_set = false;
+    s.peer_match = [0; MAX_NODES];
+    s.catchup_lag_max = 64;
     s.learner_mode = false;
+    s.forward_proposals = false;
     s.election_timeout_ms = 1000;
     s.election_deadline_ms = 0;
     s.heartbeat_interval_ms = 150;
     s.last_heartbeat_ms = 0;
+    s.commit_announced = 0;
+    s.last_ae_ms = 0;
+    s.heartbeats_skipped = 0;
+    s.rpc_refused = 0;
+    s.rpc_total = 0;
+    s.ae_stale = 0;
     s.votes_granted = NodeSet::empty();
     s.votes_rejected = NodeSet::empty();
     s.pre_vote_active = false;
@@ -756,6 +907,8 @@ pub fn init(s: &mut Raft) {
     s.wal_resyncs = 0;
     s.wal_unacked_holds = 0;
     s.ae_noncontiguous = 0;
+    s.ae_unverified = 0;
+    s.matched_index = 0;
     s.local_durable_index = 0;
     s.local_durable_term = 0;
     s.meta_root_path = 0;
@@ -794,11 +947,13 @@ pub fn init(s: &mut Raft) {
     s.flush_deferred = false;
     s.flushes_deferred = 0;
     s.correlation_ids = [0u64; MAX_BATCH_PROPOSALS];
+    s.correlation_origin = [ORIGIN_LOCAL; MAX_BATCH_PROPOSALS];
     s.strict_fallback = false;
     s.voted_for = REPLICA_NONE as i8;
     s.frozen = false;
     s.meta_fs_step = false;
     s.durability_mode = 0;
+    s.out_durable_horizon = -1;
     s.pending_transfer_to = 0;
     s.proposals_received = 0;
     s.entries_appended = 0;
@@ -811,7 +966,9 @@ pub fn init(s: &mut Raft) {
     s.commit_latency_buckets = [0u32; wire::hist::COMMIT_LATENCY_US.len() + 1];
     s.last_hint_leader_id = -2;
     s.last_hint_term = 0;
-    for b in s.msg_buf.iter_mut() { *b = 0; }
+    for b in s.msg_buf.iter_mut() {
+        *b = 0;
+    }
 }
 
 /// Post-param boot logic: clamps, initial voter seed, recovery hold,
@@ -829,6 +986,15 @@ pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
     // would index out of range; at 0 the voter set is empty and no
     // quorum — election, ReadIndex or commit — can ever be reached.
     if (s.voter_count as usize) > MAX_NODES {
+        // Said out loud: a cluster larger than the replica-id space is
+        // a misconfiguration, and silently running seven voters of the
+        // eight configured is a quorum the operator did not ask for.
+        dev_log(
+            sys,
+            1,
+            b"[raft] voter_count above MAX_NODES; clamped".as_ptr(),
+            41,
+        );
         s.voter_count = MAX_NODES as u8;
     }
     if s.voter_count == 0 {
@@ -846,10 +1012,9 @@ pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
         s.proposal_batch_max = MAX_BATCH_PROPOSALS as u16;
     }
 
-    // Initial voter set (RFC §1.2). `voter_count` came from
-    // the param table; seed `current_voters` with ids
-    // 0..voter_count. Joint state is inactive at startup; it
-    // activates only when a `CONFIG_CHANGE_OP_JOINT` entry
+    // Initial voter set. `voter_count` came from the param table; seed
+    // `current_voters` with ids 0..voter_count. Joint state is inactive at
+    // startup; it activates only when a `CONFIG_CHANGE_OP_JOINT` entry
     // commits via `drain_admin_committed`.
     for i in 0..s.voter_count {
         s.current_voters.insert(i);
@@ -897,10 +1062,13 @@ pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
         s.meta_load_pending = load_metadata(s, sys);
     }
 
-    // Set initial election deadline, jittered per node: an unjittered
-    // first deadline synchronises the first election wave whenever a
-    // whole cluster (re)boots together.
-    let mut seed = (now as u32) ^ ((s.self_id as u32) << 16) ^ 0xBEEF;
+    // Set initial election deadline, jittered per node AND per hosted
+    // group: an unjittered first deadline synchronises the first
+    // election wave whenever a whole cluster (re)boots together, and an
+    // engine hosting K groups would otherwise start K elections on the
+    // same tick.
+    let mut seed =
+        (now as u32) ^ ((s.self_id as u32) << 16) ^ ((s.partition_id as u32) << 8) ^ 0xBEEF;
     let half_timeout = (s.election_timeout_ms as u32 / 2).max(1);
     let jitter = (xorshift32(&mut seed) & (half_timeout.next_power_of_two() - 1)) as u64;
     s.election_deadline_ms = now + s.election_timeout_ms as u64 + jitter;
@@ -937,13 +1105,33 @@ pub fn leader_hint(s: &Raft) -> (bool, Term, Index) {
 /// followers, but not the new leader, stays "leader" forever and
 /// black-holes proposals.
 ///
+/// Mirror one replica's match index. Fed from the same coalesced E2
+/// array the commit tracker tallies, so raft's promotion gate and the
+/// commit horizon read the same progress. Monotone: match indices only
+/// advance.
+pub fn on_match(s: &mut Raft, replica: u8, index: Index) {
+    let i = replica as usize;
+    if i < MAX_NODES && index > s.peer_match[i] {
+        s.peer_match[i] = index;
+    }
+}
+
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn on_peer_term(s: &mut Raft, sys: &SyscallTable, term: Term) {
     if term > s.current_term {
-        dev_log(sys, 2, b"[raft] deposed by resp term".as_ptr(), 27);
+        log_p(
+            sys,
+            2,
+            b"[raft] deposed p=",
+            s.partition_id,
+            b" t=",
+            s.current_term.min(u32::MAX as u64) as u32,
+            b" resp_t=",
+            term.min(u32::MAX as u64) as u32,
+        );
         become_follower(s, sys, term);
     }
 }
@@ -1038,7 +1226,7 @@ pub unsafe fn step(
     // 2. The fallback signal is delivered by the dispatch table's
     //    cp_state demux via `on_fallback` before this step runs.
 
-    // 3. Process admin commands (local effects only — see RFC §14)
+    // 3. Process admin commands (local effects only)
     drain_admin(s, sys, now);
 
     // 3a. Absorb quorum-commit feedback from the commit component so the
@@ -1053,15 +1241,15 @@ pub unsafe fn step(
     drain_read_probes(s, sys, probes_in, probes_count, now);
     expire_probes(s, sys, now);
 
-    // 3d. Apply committed admin entries (RFC §3.1). On every
+    // 3d. Apply committed admin entries. On every
     //     replica, when a Raft-replicated admin entry passes commit,
     //     apply echoes the body here and we run the op.
     drain_admin_committed(s, sys, admin_in);
 
     // 3e. Track local WAL fsync acks so followers can stamp their
-    //     `local_wal_durable_index` into every AppendEntriesResponse
-    //     (spec §10.4.1). Cheap drain — leader and follower both
-    //     run it but only the follower's value flows over the wire.
+    //     `local_wal_durable_index` into every AppendEntriesResponse.
+    //     Cheap drain — leader and follower both run it, but only the
+    //     follower's value flows over the wire.
     drain_wal_flushed(s, sys);
 
     // 3f. Boot-time recovery resume: if the WAL has finished replay and
@@ -1134,19 +1322,23 @@ pub unsafe fn step(
 /// leader for the whole of this term, and nothing would correct it until
 /// the next leadership change.
 unsafe fn emit_leader_hint(s: &mut Raft, sys: &SyscallTable) {
-    if s.out_leader_state < 0 { return; }
+    if s.out_leader_state < 0 {
+        return;
+    }
     if s.leader_id == s.last_hint_leader_id && s.current_term == s.last_hint_term {
         return;
     }
     let mut buf = [0u8; 9];
-    buf[0] = if s.leader_id < 0 { 0xFFu8 } else { s.leader_id as u8 };
+    buf[0] = if s.leader_id < 0 {
+        0xFFu8
+    } else {
+        s.leader_id as u8
+    };
     buf[1..9].copy_from_slice(&s.current_term.to_le_bytes());
     // No poll pre-check: it reports >=1 byte free, not room for this
     // frame. A refused write leaves the latch alone, so the next step
     // re-offers the same hint.
-    let n = wire_channels::channel_write_msg(
-        sys, s.out_leader_state, wire::MSG_LEADER_HINT, &buf,
-    );
+    let n = wire_channels::channel_write_msg(sys, s.out_leader_state, wire::MSG_LEADER_HINT, &buf);
     if n > 0 {
         s.last_hint_leader_id = s.leader_id;
         s.last_hint_term = s.current_term;
@@ -1161,21 +1353,54 @@ unsafe fn emit_leader_hint(s: &mut Raft, sys: &SyscallTable) {
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// Drain forwarded proposals from their own inbox. Leader-only work —
+/// the handlers refuse on a follower — bounded by one inbox depth per
+/// step, matching what a follower relays per step.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn process_forwards(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    for _ in 0..inbox::INBOX_DEPTH {
+        let Some((msg_type, plen)) = s.inbox_fwd.next(sys, &mut s.msg_buf) else {
+            break;
+        };
+        if plen == 0 && msg_type == 0 {
+            break;
+        }
+        s.rpc_total = s.rpc_total.wrapping_add(1);
+        match msg_type {
+            wire::MSG_PROPOSAL_FORWARD => handle_proposal_forward(s, sys, plen, now),
+            wire::MSG_PROPOSAL_FORWARD_TAGGED => handle_proposal_forward_tagged(s, sys, plen, now),
+            _ => {}
+        }
+    }
+}
+
 unsafe fn process_rpc(s: &mut Raft, sys: &SyscallTable, now: u64) {
-    // Process up to 8 RPCs per step to bound step time. Inbound shape is
+    process_forwards(s, sys, now);
+    // Process up to one inbox depth of RPCs per step, so an inbox the
+    // engine filled this step is empty by the next and a burst — a
+    // catch-up run of AppendEntries, forwarded proposals from two
+    // followers — cannot pile up across steps. Inbound shape is
     // the 5-byte partitioned envelope (`[partition_id:u16 LE][msg_type:u8]
     // [len:u16 LE]`); peer_router fans the channel out to every per-
     // partition consensus instance and each instance filters by its own
     // partition_id, so cross-partition RPCs from peers (and stray
     // client frames stamped with the wrong partition) are dropped
     // here.
-    for _ in 0..8 {
-        if !wire_channels::readable(sys, s.in_rpc) { break; }
-
-        let (partition_id, msg_type, plen) =
-            wire_channels::channel_read_partitioned(sys, s.in_rpc, &mut s.msg_buf);
-        if plen == 0 && msg_type == 0 { break; }
-        if partition_id != s.partition_id { continue; }
+    for _ in 0..inbox::INBOX_DEPTH {
+        // Frames arrive pre-routed in this slot's inbox: the engine has
+        // already read the shared channel and matched the envelope's
+        // partition_id, so nothing here can belong to another group.
+        let Some((msg_type, plen)) = s.inbox_rpc.next(sys, &mut s.msg_buf) else {
+            break;
+        };
+        if plen == 0 && msg_type == 0 {
+            break;
+        }
+        s.rpc_total = s.rpc_total.wrapping_add(1);
 
         match msg_type {
             wire::MSG_REQUEST_VOTE | wire::MSG_PRE_VOTE => {
@@ -1192,6 +1417,15 @@ unsafe fn process_rpc(s: &mut Raft, sys: &SyscallTable, now: u64) {
             wire::MSG_APPEND_ENTRIES_RESP => {
                 // Handled by the replicator component, not raft. Shouldn't
                 // arrive here but ignore gracefully.
+            }
+            wire::MSG_PROPOSAL_FORWARD => {
+                handle_proposal_forward(s, sys, plen, now);
+            }
+            wire::MSG_PROPOSAL_FORWARD_TAGGED => {
+                handle_proposal_forward_tagged(s, sys, plen, now);
+            }
+            wire::MSG_PROPOSAL_ASSIGNED_REMOTE => {
+                handle_proposal_assigned_remote(s, sys, plen);
             }
             wire::MSG_TIMEOUT_NOW => {
                 handle_timeout_now(s, sys, plen, now);
@@ -1225,16 +1459,23 @@ unsafe fn handle_read_index_probe(s: &mut Raft, sys: &SyscallTable, plen: u16) {
     if term > s.current_term {
         become_follower(s, sys, term);
     }
-    if term < s.current_term { return; }
-    if s.out_rpc < 0 { return; }
-    if !wire_channels::writable(sys, s.out_rpc) { return; }
+    if term < s.current_term {
+        return;
+    }
+    if s.out_rpc < 0 {
+        return;
+    }
+    if !wire_channels::writable(sys, s.out_rpc) {
+        return;
+    }
     let mut resp = [0u8; 17];
     wire::encode_read_index_probe_resp(&mut resp, probe_id, s.current_term, s.self_id);
-    let target = if s.leader_id >= 0 { s.leader_id as u8 } else { wire::TARGET_BROADCAST };
-    wire_channels::channel_write_routed_partitioned(
-        sys, s.out_rpc, target, s.partition_id,
-        wire::MSG_READ_INDEX_PROBE_RESP, &resp,
-    );
+    let target = if s.leader_id >= 0 {
+        s.leader_id as u8
+    } else {
+        wire::TARGET_BROADCAST
+    };
+    rpc_send(s, sys, target, wire::MSG_READ_INDEX_PROBE_RESP, &resp);
 }
 
 /// # Safety
@@ -1244,31 +1485,42 @@ unsafe fn handle_read_index_probe(s: &mut Raft, sys: &SyscallTable, plen: u16) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn handle_read_index_probe_resp(s: &mut Raft, sys: &SyscallTable, plen: u16) {
-    if s.role != ROLE_LEADER { return; }
+    if s.role != ROLE_LEADER {
+        return;
+    }
     let pl = plen as usize;
-    let (probe_id, term, replica) =
-        match wire::decode_read_index_probe_resp(&s.msg_buf[..pl]) {
-            Some(v) => v,
-            None => return,
-        };
+    let (probe_id, term, replica) = match wire::decode_read_index_probe_resp(&s.msg_buf[..pl]) {
+        Some(v) => v,
+        None => return,
+    };
     if term > s.current_term {
         become_follower(s, sys, term);
         return;
     }
-    if (replica as usize) >= MAX_NODES { return; }
+    if (replica as usize) >= MAX_NODES {
+        return;
+    }
     // Same ballot rule as elections: only active voters confirm a
     // ReadIndex fence (and both sets must confirm while joint).
-    if !s.current_voters.contains(replica)
-        && !(s.joint_active && s.joint_voters.contains(replica))
+    if !s.current_voters.contains(replica) && !(s.joint_active && s.joint_voters.contains(replica))
     {
         return;
     }
     for i in 0..MAX_INFLIGHT_PROBES {
         let probe_id_slot = s.probes[i].probe_id;
-        if probe_id_slot == 0 || probe_id_slot != probe_id { continue; }
-        if s.probes[i].term != s.current_term { continue; }
+        if probe_id_slot == 0 || probe_id_slot != probe_id {
+            continue;
+        }
+        if s.probes[i].term != s.current_term {
+            continue;
+        }
         s.probes[i].votes.insert(replica);
-        if set_majority(s.probes[i].votes, s.current_voters, s.joint_voters, s.joint_active) {
+        if set_majority(
+            s.probes[i].votes,
+            s.current_voters,
+            s.joint_voters,
+            s.joint_active,
+        ) {
             let corr = s.probes[i].correlation_id;
             let commit = s.probes[i].snapshot_commit;
             emit_read_probe_reply(s, sys, corr, commit, true);
@@ -1294,14 +1546,18 @@ unsafe fn drain_read_probes(
     now: u64,
 ) {
     for _ in 0..4 {
-        if *probes_count == 0 { break; }
+        if *probes_count == 0 {
+            break;
+        }
         let correlation_id = probes_in[0];
         let n = *probes_count as usize;
         for i in 1..n {
             probes_in[i - 1] = probes_in[i];
         }
         *probes_count -= 1;
-        if correlation_id == 0 { continue; }
+        if correlation_id == 0 {
+            continue;
+        }
         start_probe(s, sys, correlation_id, now);
     }
 }
@@ -1312,12 +1568,7 @@ unsafe fn drain_read_probes(
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn start_probe(
-    s: &mut Raft,
-    sys: &SyscallTable,
-    correlation_id: u64,
-    now: u64,
-) {
+unsafe fn start_probe(s: &mut Raft, sys: &SyscallTable, correlation_id: u64, now: u64) {
     // Not the leader: immediately reply with confirmed=0 so the apply
     // pipeline can fall back to rejecting the read.
     if s.role != ROLE_LEADER {
@@ -1328,7 +1579,10 @@ unsafe fn start_probe(
     // Allocate an empty slot.
     let mut slot_idx: Option<usize> = None;
     for (i, slot) in s.probes.iter().enumerate() {
-        if slot.probe_id == 0 { slot_idx = Some(i); break; }
+        if slot.probe_id == 0 {
+            slot_idx = Some(i);
+            break;
+        }
     }
     let slot_idx = match slot_idx {
         Some(i) => i,
@@ -1370,15 +1624,21 @@ unsafe fn start_probe(
 /// Attempt the routed peer broadcast for probe slot `i`; marks the slot
 /// sent on success. Safe to call repeatedly.
 unsafe fn broadcast_probe(s: &mut Raft, sys: &SyscallTable, i: usize) -> bool {
-    if s.out_rpc < 0 { return false; }
-    if !wire_channels::writable(sys, s.out_rpc) { return false; }
+    if s.out_rpc < 0 {
+        return false;
+    }
+    if !wire_channels::writable(sys, s.out_rpc) {
+        return false;
+    }
     let mut buf = [0u8; 16];
     wire::encode_read_index_probe(&mut buf, s.probes[i].probe_id, s.probes[i].term);
-    let n = wire_channels::channel_write_routed_partitioned(
-        sys, s.out_rpc, wire::TARGET_BROADCAST, s.partition_id,
-        wire::MSG_READ_INDEX_PROBE, &buf,
-    );
-    if n > 0 {
+    if rpc_send(
+        s,
+        sys,
+        wire::TARGET_BROADCAST,
+        wire::MSG_READ_INDEX_PROBE,
+        &buf,
+    ) {
         s.probes[i].broadcast_sent = true;
         true
     } else {
@@ -1395,7 +1655,9 @@ unsafe fn broadcast_probe(s: &mut Raft, sys: &SyscallTable, i: usize) -> bool {
 unsafe fn expire_probes(s: &mut Raft, sys: &SyscallTable, now: u64) {
     for i in 0..MAX_INFLIGHT_PROBES {
         let slot = s.probes[i];
-        if slot.probe_id == 0 { continue; }
+        if slot.probe_id == 0 {
+            continue;
+        }
         if now >= slot.deadline_ms {
             emit_read_probe_reply(s, sys, slot.correlation_id, 0, false);
             s.probes[i] = ProbeSlot::empty();
@@ -1422,7 +1684,9 @@ unsafe fn emit_read_probe_reply(
     confirmed_commit: u64,
     confirmed: bool,
 ) {
-    if (s.probe_reply_count as usize) >= PROBE_QUEUE_SLOTS { return; }
+    if (s.probe_reply_count as usize) >= PROBE_QUEUE_SLOTS {
+        return;
+    }
     s.probe_reply_out[s.probe_reply_count as usize] =
         (correlation_id, confirmed_commit, confirmed as u8);
     s.probe_reply_count += 1;
@@ -1439,12 +1703,22 @@ unsafe fn emit_read_probe_reply(
 /// behind ours.
 unsafe fn handle_timeout_now(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u64) {
     let plen = plen as usize;
-    if plen < 8 { return; }
+    if plen < 8 {
+        return;
+    }
     let caller_term = u64::from_le_bytes([
-        s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3],
-        s.msg_buf[4], s.msg_buf[5], s.msg_buf[6], s.msg_buf[7],
+        s.msg_buf[0],
+        s.msg_buf[1],
+        s.msg_buf[2],
+        s.msg_buf[3],
+        s.msg_buf[4],
+        s.msg_buf[5],
+        s.msg_buf[6],
+        s.msg_buf[7],
     ]);
-    if caller_term < s.current_term { return; }
+    if caller_term < s.current_term {
+        return;
+    }
     // A transfer cannot make an unrecovered tip safe to campaign on.
     // Refused here as well as in `start_election` so the deadline is
     // never pulled into the past on this node's behalf: leaving it
@@ -1469,20 +1743,25 @@ unsafe fn handle_timeout_now(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
-    if s.in_snapshot_installed < 0 { return; }
+    if s.in_snapshot_installed < 0 {
+        return;
+    }
     for _ in 0..4 {
-        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_snapshot_installed, &mut s.msg_buf)
-        else {
+        let Some((msg_type, plen)) = s.inbox_snap.next(sys, &mut s.msg_buf) else {
             break;
         };
-        if msg_type != wire::MSG_SNAPSHOT_INSTALLED { continue; }
+        if msg_type != wire::MSG_SNAPSHOT_INSTALLED {
+            continue;
+        }
         let (term, last_idx, last_term) =
             match wire::decode_snapshot_installed(&s.msg_buf[..plen as usize]) {
                 Some(t) => t,
                 None => continue,
             };
         // Stale snapshot from an old term: ignore.
-        if term < s.current_term { continue; }
+        if term < s.current_term {
+            continue;
+        }
         // At or past this snapshot point already → this is a LOCAL
         // snapshot of our own log (the leader/steady-state path: wal's
         // rotation trigger → snapshot component → installed_local), not a
@@ -1497,7 +1776,11 @@ unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
         // `compact_before` is idempotent/monotonic, so duplicate or
         // out-of-order installs are harmless here.
         if last_idx <= s.last_log_index {
-            let floor = if last_idx < s.commit_index { last_idx } else { s.commit_index };
+            let floor = if last_idx < s.commit_index {
+                last_idx
+            } else {
+                s.commit_index
+            };
             if floor > 0 {
                 dev_log(sys, 3, b"[raft] snap local".as_ptr(), 17);
                 emit_wal_compact_before(s, sys, floor);
@@ -1526,8 +1809,8 @@ unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
             advance_follower_commit(s, sys, last_idx);
         }
         save_metadata(s, sys);
-        // Emit the apply-pipeline reset (§2.3) and the WAL compact-before
-        // signal (§2.2). Both are post-snapshot housekeeping; ignore
+        // Emit the apply-pipeline reset and the WAL compact-before
+        // signal. Both are post-snapshot housekeeping; ignore
         // unwired ports.
         emit_apply_reset(s, sys, last_term, last_idx);
         emit_wal_compact_before(s, sys, last_idx);
@@ -1552,7 +1835,9 @@ unsafe fn emit_apply_reset(s: &mut Raft, _sys: &SyscallTable, term: u64, index: 
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_wal_compact_before(s: &mut Raft, sys: &SyscallTable, before_index: u64) {
-    if s.out_wal_compact < 0 { return; }
+    if s.out_wal_compact < 0 {
+        return;
+    }
     if before_index > s.compact_before_pending {
         s.compact_before_pending = before_index;
     }
@@ -1568,10 +1853,15 @@ unsafe fn emit_wal_compact_before(s: &mut Raft, sys: &SyscallTable, before_index
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn flush_wal_compact_before(s: &mut Raft, sys: &SyscallTable) {
-    if s.compact_before_pending == 0 || s.out_wal_compact < 0 { return; }
+    if s.compact_before_pending == 0 || s.out_wal_compact < 0 {
+        return;
+    }
     let buf = s.compact_before_pending.to_le_bytes();
     let n = wire_channels::channel_write_msg(
-        sys, s.out_wal_compact, wire::MSG_WAL_COMPACT_BEFORE, &buf,
+        sys,
+        s.out_wal_compact,
+        wire::MSG_WAL_COMPACT_BEFORE,
+        &buf,
     );
     if n > 0 {
         s.compact_before_pending = 0;
@@ -1594,7 +1884,9 @@ unsafe fn flush_wal_compact_before(s: &mut Raft, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Raft` and a `&SyscallTable` whose
 /// function pointers reach live kernel routines per the module ABI.
 unsafe fn emit_wal_truncate_after(s: &mut Raft, sys: &SyscallTable) {
-    if !s.truncate_pending || s.out_wal_compact < 0 { return; }
+    if !s.truncate_pending || s.out_wal_compact < 0 {
+        return;
+    }
     if !wire_channels::writable(sys, s.out_wal_compact) {
         s.truncate_emit_pending = true;
         return;
@@ -1653,10 +1945,7 @@ unsafe fn apply_truncate_ack(
     req_id: u32,
     durable: bool,
 ) {
-    if !s.truncate_pending
-        || req_id != s.truncate_req_id
-        || keep_through != s.truncate_keep
-    {
+    if !s.truncate_pending || req_id != s.truncate_req_id || keep_through != s.truncate_keep {
         return;
     }
     if !durable {
@@ -1714,7 +2003,9 @@ unsafe fn apply_truncate_ack(
 /// `last_log_index` advances).
 #[inline]
 fn record_tail_term(s: &mut Raft, index: Index, term: Term) {
-    if index == 0 { return; }
+    if index == 0 {
+        return;
+    }
     let slot = (index & TAIL_TERM_MASK) as usize;
     s.tail_terms[slot] = TailTerm { index, term };
 }
@@ -1723,22 +2014,46 @@ fn record_tail_term(s: &mut Raft, index: Index, term: Term) {
 /// the index is not in the ring window (too old / never seen).
 #[inline]
 fn ring_term_at(s: &Raft, index: Index) -> Option<Term> {
-    if index == 0 { return Some(0); }
+    if index == 0 {
+        return Some(0);
+    }
     let slot = (index & TAIL_TERM_MASK) as usize;
     let t = s.tail_terms[slot];
-    if t.index == index { Some(t.term) } else { None }
+    if t.index == index {
+        Some(t.term)
+    } else {
+        None
+    }
 }
 
-/// True iff our log holds an entry at `index` whose term equals `term`.
+/// Verdict of a log-matching check (Raft §5.3).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LogMatch {
+    /// Our entry at the index has the leader's term.
+    Same,
+    /// Our entry at the index has a different term: a divergent suffix
+    /// starts at or before it.
+    Conflict,
+    /// We hold the index but the tail ring has no term for it. Not a
+    /// conflict — nothing is known either way — so nothing may be
+    /// truncated on it.
+    Unverified,
+}
+
+/// Compare the entry we hold at `index` with the leader's `term`.
 /// Index 0 (before the log) and committed indices match by definition —
 /// committed entries are immutable and identical across the cluster, so a
 /// disagreement there is impossible in correct Raft.
 #[inline]
-fn log_term_matches(s: &Raft, index: Index, term: Term) -> bool {
+fn log_term_match(s: &Raft, index: Index, term: Term) -> LogMatch {
     if index == 0 || index <= s.commit_index {
-        return true;
+        return LogMatch::Same;
     }
-    ring_term_at(s, index) == Some(term)
+    match ring_term_at(s, index) {
+        Some(t) if t == term => LogMatch::Same,
+        Some(_) => LogMatch::Conflict,
+        None => LogMatch::Unverified,
+    }
 }
 
 /// Discard the divergent suffix: keep entries through `keep_through`, drop the
@@ -1794,7 +2109,9 @@ unsafe fn truncate_log_after(s: &mut Raft, sys: &SyscallTable, keep_through: Ind
 /// `&SyscallTable` per the module ABI in
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_commit_in(s: &mut Raft, sys: &SyscallTable) {
-    if !s.commit_in.dirty { return; }
+    if !s.commit_in.dirty {
+        return;
+    }
     s.commit_in.dirty = false;
     let term = s.commit_in.term;
     let index = s.commit_in.index;
@@ -1804,11 +2121,15 @@ unsafe fn drain_commit_in(s: &mut Raft, sys: &SyscallTable) {
         // Fold the append→commit age of EVERY entry in this newly-committed
         // range, not just the batch high-water — a group fsync commits many
         // entries at once, so recording only `index` biases the latency
-        // histogram (RFC §4.1). Bounded to the ring depth: only the most
-        // recent COMMIT_TS_RING stamps survive, so entries below that
-        // window have no live timestamp and are skipped.
+        // histogram. Bounded to the ring depth: only the most recent
+        // COMMIT_TS_RING stamps survive, so entries below that window have
+        // no live timestamp and are skipped.
         let ring_lo = index.saturating_sub(COMMIT_TS_RING as Index - 1);
-        let lo = if prev + 1 > ring_lo { prev + 1 } else { ring_lo };
+        let lo = if prev + 1 > ring_lo {
+            prev + 1
+        } else {
+            ring_lo
+        };
         let now = dev_micros(sys);
         let mut e = lo;
         while e <= index {
@@ -1818,6 +2139,20 @@ unsafe fn drain_commit_in(s: &mut Raft, sys: &SyscallTable) {
                 let b = wire::hist::bucket(&wire::hist::COMMIT_LATENCY_US, lat);
                 s.commit_latency_buckets[b] = s.commit_latency_buckets[b].saturating_add(1);
                 s.commit_ts_index[ts_slot] = 0;
+                // One in 32, so the append-to-commit age is readable off
+                // the log under load without decoding the histogram.
+                if e & 31 == 0 {
+                    log_p(
+                        sys,
+                        3,
+                        b"[raft] commit age p=",
+                        s.partition_id,
+                        b" idx=",
+                        e.min(u32::MAX as u64) as u32,
+                        b" us=",
+                        lat.min(u32::MAX as u64) as u32,
+                    );
+                }
             }
             e += 1;
         }
@@ -1829,6 +2164,10 @@ unsafe fn drain_commit_in(s: &mut Raft, sys: &SyscallTable) {
             // term after a restart.
             become_follower(s, sys, term);
         }
+        // Leader path. Redundant with `durability.quorum_durable`, which
+        // agrees here by construction — emitted anyway so the signal is
+        // uniform across roles rather than a follower-only special case.
+        emit_durable_horizon(s, sys);
     }
 }
 
@@ -1858,7 +2197,7 @@ unsafe fn resync_to_wal(s: &mut Raft, sys: &SyscallTable, expected_index: Index)
     }
     // DELIBERATELY NOT a log rollback. Apply has already consumed the
     // entries above the WAL's tip, so rewinding re-delivers them, and
-    // evicting the tail-ring slots makes `log_term_matches` disown entries
+    // evicting the tail-ring slots makes `log_term_match` disown entries
     // the leader still holds (AE-conflict storms on healthy nodes).
     //
     // The divergence is prevented at its source — the boot-handshake gate in
@@ -1872,10 +2211,12 @@ unsafe fn resync_to_wal(s: &mut Raft, sys: &SyscallTable, expected_index: Index)
 }
 
 unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
-    if s.in_wal_flushed < 0 { return; }
+    if s.in_wal_flushed < 0 {
+        return;
+    }
+    let mut durable_advanced = false;
     for _ in 0..8 {
-        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_wal_flushed, &mut s.msg_buf)
-        else {
+        let Some((msg_type, plen)) = s.inbox_flushed.next(sys, &mut s.msg_buf) else {
             break;
         };
         if msg_type == wire::MSG_WAL_REJECT {
@@ -1898,18 +2239,43 @@ unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
             }
             continue;
         }
-        if msg_type != wire::MSG_FSYNC_ACK || (plen as usize) < 17 { continue; }
+        if msg_type != wire::MSG_FSYNC_ACK || (plen as usize) < 17 {
+            continue;
+        }
         // The ack's term is the term of the entry AT `index`. It is the
         // only source that pairs the two, and the metadata record needs
         // exactly that pair.
-        let Some((ack_term, index, _replica)) =
-            wire::decode_fsync_ack(&s.msg_buf[..plen as usize])
+        let Some((ack_term, index, _replica)) = wire::decode_fsync_ack(&s.msg_buf[..plen as usize])
         else {
             continue;
         };
+        // The WAL names the term of the entry it fsynced, so the ack is
+        // also how the tail ring learns the terms of a replayed log (see
+        // `TAIL_TERM_RING`). Own appends recorded the same pair already.
+        if ack_term != 0 {
+            record_tail_term(s, index, ack_term);
+        }
         if index > s.local_durable_index {
             s.local_durable_index = index;
             s.local_durable_term = ack_term;
+            durable_advanced = true;
+        }
+    }
+    // Tell the leader the moment the durable index moves past what it
+    // has heard. The leader learns follower durability only from
+    // AppendEntries responses, and this node answers an AppendEntries
+    // BEFORE its WAL fsyncs — so with nothing else in flight the advance
+    // rode the next heartbeat, and a commit gated on quorum durability
+    // waited up to an interval for it (measured at K=64: 5 ms to ack,
+    // 120 ms to commit). The report is a success response at
+    // `min(durable, matched)`: the durable index alone can name a
+    // suffix the leader is about to overwrite (a restarted node's WAL
+    // holds its old tail), and a success at such an index is quorum
+    // evidence for an entry the leader never sent us.
+    if durable_advanced && s.role == ROLE_FOLLOWER && s.leader_id >= 0 {
+        let at = s.local_durable_index.min(s.matched_index);
+        if at > 0 {
+            send_append_response_at(s, sys, true, false, at);
         }
     }
     // Persist the advanced durable watermark (term/vote/durable index) on the
@@ -1944,16 +2310,18 @@ unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_wal_replay_complete(s: &mut Raft, sys: &SyscallTable) {
-    if s.in_wal_replay_complete < 0 { return; }
+    if s.in_wal_replay_complete < 0 {
+        return;
+    }
     for _ in 0..4 {
-        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_wal_replay_complete, &mut s.msg_buf)
-        else {
+        let Some((msg_type, plen)) = s.inbox_replay.next(sys, &mut s.msg_buf) else {
             break;
         };
-        if msg_type != wire::MSG_WAL_REPLAY_COMPLETE { continue; }
+        if msg_type != wire::MSG_WAL_REPLAY_COMPLETE {
+            continue;
+        }
         // Slice to the declared payload — see `handle_vote_request`.
-        let Some((hw_term, high_water)) =
-            wire::decode_term_index(&s.msg_buf[..plen as usize])
+        let Some((hw_term, high_water)) = wire::decode_term_index(&s.msg_buf[..plen as usize])
         else {
             continue;
         };
@@ -2012,16 +2380,10 @@ unsafe fn drain_admin_committed(s: &mut Raft, sys: &SyscallTable, admin_in: &mut
                 if pl < 5 {
                     continue;
                 }
-                let command_id = u32::from_le_bytes([
-                    s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3],
-                ]);
+                let command_id =
+                    u32::from_le_bytes([s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3]]);
                 let op_code = s.msg_buf[4];
-                let status = apply_admin_op(
-                    s,
-                    op_code,
-                    &s.msg_buf as *const _ as *const u8,
-                    pl,
-                );
+                let status = apply_admin_op(s, op_code, &s.msg_buf as *const _ as *const u8, pl);
                 emit_admin_applied(s, sys, command_id, status);
             }
             wire::MSG_CONFIG_COMMITTED => {
@@ -2039,11 +2401,10 @@ unsafe fn drain_admin_committed(s: &mut Raft, sys: &SyscallTable, admin_in: &mut
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
-    let (op_code, voters_off, voter_count) =
-        match wire::decode_config_change(&s.msg_buf[..plen]) {
-            Some(v) => v,
-            None => return,
-        };
+    let (op_code, voters_off, voter_count) = match wire::decode_config_change(&s.msg_buf[..plen]) {
+        Some(v) => v,
+        None => return,
+    };
     let mut new_set = NodeSet::empty();
     for i in 0..voter_count {
         let id = s.msg_buf[voters_off + i];
@@ -2063,7 +2424,7 @@ unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
             // as joint. Subsequent quorum checks require both.
             s.joint_voters = new_set;
             s.joint_active = true;
-            // RFC §1.2 completeness: the leader queues the C_new
+            // Joint-consensus completeness: the leader queues the C_new
             // proposal so the next `step_leader` tick emits it
             // automatically. Followers ignore this slot — they only
             // see the C_new entry once the leader replicates it.
@@ -2085,6 +2446,15 @@ unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
             s.current_voters = new_set;
             s.joint_voters = NodeSet::empty();
             s.joint_active = false;
+            // A promoted replica stops being a learner: it now receives
+            // the log AS a voter and counts toward quorum, and leaving it
+            // in both sets would only duplicate it in the replicator's
+            // activation union.
+            for id in 0..MAX_NODES as u8 {
+                if s.current_voters.contains(id) {
+                    s.learners.remove(id);
+                }
+            }
             // Pending was satisfied by the entry we just applied.
             s.pending_new_voters = NodeSet::empty();
             s.pending_new_voters_set = false;
@@ -2105,6 +2475,28 @@ unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
                 }
             }
         }
+        wire::CONFIG_CHANGE_OP_LEARNER => {
+            // The body carries the COMPLETE learner set, so a replayed
+            // entry is idempotent and an identical set is a no-op.
+            if s.learners.0 == new_set.0 {
+                return;
+            }
+            // A voter is never simultaneously a learner: voters already
+            // receive the log and DO count, so listing one here could
+            // only confuse the replicator's activation union. Drop the
+            // overlap rather than reject the entry — the entry is
+            // committed and must apply deterministically on every
+            // replica.
+            let mut set = new_set;
+            for id in 0..MAX_NODES as u8 {
+                if s.current_voters.contains(id) || (s.joint_active && s.joint_voters.contains(id))
+                {
+                    set.remove(id);
+                }
+            }
+            s.learners = set;
+            dev_log(sys, 3, b"[raft] learners".as_ptr(), 15);
+        }
         _ => return,
     }
     // Push new voter_count to local quorum logic plus downstream
@@ -2124,7 +2516,12 @@ unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
 ///
 /// Caller must hold an exclusive `&mut Raft` per the module ABI.
 unsafe fn emit_voter_set_update(s: &mut Raft, _sys: &SyscallTable) {
-    s.voter_out = Some((s.current_voters.0, s.joint_voters.0, s.joint_active as u8));
+    s.voter_out = Some((
+        s.current_voters.0,
+        s.joint_voters.0,
+        s.joint_active as u8,
+        s.learners.0,
+    ));
 }
 
 /// # Safety
@@ -2134,18 +2531,25 @@ unsafe fn emit_voter_set_update(s: &mut Raft, _sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_admin(s: &mut Raft, sys: &SyscallTable, _now: u64) {
-    if s.in_admin < 0 { return; }
+    if s.in_admin < 0 {
+        return;
+    }
     for _ in 0..4 {
-        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_admin, &mut s.msg_buf)
-        else {
+        let Some((msg_type, plen)) = s.inbox_admin.next(sys, &mut s.msg_buf) else {
             break;
         };
-        if msg_type != wire::MSG_ADMIN_COMMAND || (plen as usize) < 5 { continue; }
-        let command_id = u32::from_le_bytes([
-            s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3],
-        ]);
+        if msg_type != wire::MSG_ADMIN_COMMAND || (plen as usize) < 5 {
+            continue;
+        }
+        let command_id =
+            u32::from_le_bytes([s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3]]);
         let op_code = s.msg_buf[4];
-        let status = apply_admin_op(s, op_code, &s.msg_buf as *const _ as *const u8, plen as usize);
+        let status = apply_admin_op(
+            s,
+            op_code,
+            &s.msg_buf as *const _ as *const u8,
+            plen as usize,
+        );
         emit_admin_applied(s, sys, command_id, status);
     }
 }
@@ -2156,23 +2560,28 @@ unsafe fn drain_admin(s: &mut Raft, sys: &SyscallTable, _now: u64) {
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn apply_admin_op(
-    s: &mut Raft,
-    op_code: u8,
-    buf_ptr: *const u8,
-    plen: usize,
-) -> u8 {
+unsafe fn apply_admin_op(s: &mut Raft, op_code: u8, buf_ptr: *const u8, plen: usize) -> u8 {
     // Safety: drain_admin owns the buffer for this iteration; this view
     // is read-only.
     let buf = core::slice::from_raw_parts(buf_ptr, plen);
     match op_code {
-        wire::ADMIN_OP_FREEZE => { s.frozen = true; wire::ADMIN_STATUS_OK }
-        wire::ADMIN_OP_THAW => { s.frozen = false; wire::ADMIN_STATUS_OK }
+        wire::ADMIN_OP_FREEZE => {
+            s.frozen = true;
+            wire::ADMIN_STATUS_OK
+        }
+        wire::ADMIN_OP_THAW => {
+            s.frozen = false;
+            wire::ADMIN_STATUS_OK
+        }
         wire::ADMIN_OP_TRANSFER_LEADER => {
             // Body: `[target_replica_id:u8]` at offset 5 (after command_id+op_code).
-            if plen < 6 { return wire::ADMIN_STATUS_REJECTED; }
+            if plen < 6 {
+                return wire::ADMIN_STATUS_REJECTED;
+            }
             // Only the leader can transfer; followers reject.
-            if s.role != ROLE_LEADER { return wire::ADMIN_STATUS_NOT_LEADER; }
+            if s.role != ROLE_LEADER {
+                return wire::ADMIN_STATUS_NOT_LEADER;
+            }
             let target = buf[5];
             if target == s.self_id || target as i8 == -1 {
                 return wire::ADMIN_STATUS_REJECTED;
@@ -2181,8 +2590,123 @@ unsafe fn apply_admin_op(
             wire::ADMIN_STATUS_OK
         }
         wire::ADMIN_OP_DURABILITY_MODE => {
-            if plen < 6 { return wire::ADMIN_STATUS_REJECTED; }
+            if plen < 6 {
+                return wire::ADMIN_STATUS_REJECTED;
+            }
             s.durability_mode = buf[5];
+            wire::ADMIN_STATUS_OK
+        }
+        wire::ADMIN_OP_ADD_VOTER | wire::ADMIN_OP_REMOVE_VOTER => {
+            // Body: `[replica_id:u8]` at offset 5.
+            if plen < 6 {
+                return wire::ADMIN_STATUS_REJECTED;
+            }
+            if s.role != ROLE_LEADER {
+                return wire::ADMIN_STATUS_NOT_LEADER;
+            }
+            let target = buf[5];
+            if target as usize >= MAX_NODES {
+                return wire::ADMIN_STATUS_REJECTED;
+            }
+
+            // One config change in flight at a time. A second transition
+            // opened while the first is mid-flight would apply against a
+            // voter set about to change underneath it, and union quorum
+            // is only defined for ONE pair of configurations.
+            if s.joint_active
+                || s.pending_new_voters_set
+                || s.pending_joint_set
+                || s.pending_learners_set
+            {
+                return wire::ADMIN_STATUS_REJECTED;
+            }
+
+            let adding = op_code == wire::ADMIN_OP_ADD_VOTER;
+            let mut next = s.current_voters;
+            if adding {
+                if s.current_voters.contains(target) {
+                    return wire::ADMIN_STATUS_OK; // already a voter
+                }
+                // PROMOTION GATE. A voter counts toward quorum from the
+                // moment the change applies, so a cold one can make the
+                // new majority unmeetable and stall commit — and if the
+                // leader then fails, entries it never held can be lost.
+                //
+                // Two conditions, both necessary:
+                //
+                // 1. The target must already be a LEARNER. That is what
+                //    has been shipping it the log; a replica the leader
+                //    has never replicated to has no progress to judge.
+                // 2. Its match index must be within `catchup_lag_max` of
+                //    the leader's tip, so promotion happens at the end of
+                //    catch-up rather than at the start of it.
+                if !s.learners.contains(target) {
+                    return wire::ADMIN_STATUS_REJECTED;
+                }
+                let m = s.peer_match[target as usize];
+                if s.last_log_index.saturating_sub(m) > s.catchup_lag_max {
+                    return wire::ADMIN_STATUS_REJECTED;
+                }
+                next.insert(target);
+            } else {
+                if !s.current_voters.contains(target) {
+                    return wire::ADMIN_STATUS_OK; // already not a voter
+                }
+                // Never shrink below a set that can still form a quorum
+                // of one. Removing the last voter leaves a group that can
+                // elect nobody and commit nothing.
+                if s.current_voters.count() <= 1 {
+                    return wire::ADMIN_STATUS_REJECTED;
+                }
+                next.remove(target);
+            }
+            s.pending_joint_voters = next;
+            s.pending_joint_set = true;
+            wire::ADMIN_STATUS_OK
+        }
+        wire::ADMIN_OP_ADD_LEARNER | wire::ADMIN_OP_REMOVE_LEARNER => {
+            // Body: `[replica_id:u8]` at offset 5 (after command_id +
+            // op_code), matching ADMIN_OP_TRANSFER_LEADER's shape.
+            if plen < 6 {
+                return wire::ADMIN_STATUS_REJECTED;
+            }
+            if s.role != ROLE_LEADER {
+                return wire::ADMIN_STATUS_NOT_LEADER;
+            }
+            let target = buf[5];
+            if target as usize >= MAX_NODES || target == s.self_id {
+                return wire::ADMIN_STATUS_REJECTED;
+            }
+            let adding = op_code == wire::ADMIN_OP_ADD_LEARNER;
+            // A voter is never also a learner: it already receives the
+            // log AND counts, so listing it here would only confuse the
+            // replicator's activation union. Demoting a voter is
+            // ADMIN_OP_REMOVE_VOTER's job.
+            if adding
+                && (s.current_voters.contains(target)
+                    || (s.joint_active && s.joint_voters.contains(target)))
+            {
+                return wire::ADMIN_STATUS_REJECTED;
+            }
+            // One config change in flight at a time: a learner entry
+            // racing a joint transition would apply against a voter set
+            // about to change underneath it.
+            if s.pending_new_voters_set || s.joint_active || s.pending_learners_set {
+                return wire::ADMIN_STATUS_REJECTED;
+            }
+            let mut next = s.learners;
+            if adding {
+                next.insert(target);
+            } else {
+                next.remove(target);
+            }
+            if next.0 == s.learners.0 {
+                // Already in the requested state — idempotent success,
+                // no entry needed.
+                return wire::ADMIN_STATUS_OK;
+            }
+            s.pending_learners = next;
+            s.pending_learners_set = true;
             wire::ADMIN_STATUS_OK
         }
         wire::ADMIN_OP_SNAPSHOT => {
@@ -2203,7 +2727,9 @@ unsafe fn apply_admin_op(
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_admin_applied(s: &mut Raft, sys: &SyscallTable, command_id: u32, status: u8) {
-    if s.out_admin_applied < 0 { return; }
+    if s.out_admin_applied < 0 {
+        return;
+    }
     s.admin_ack_pending = true;
     s.admin_ack_id = command_id;
     s.admin_ack_status = status;
@@ -2220,7 +2746,9 @@ unsafe fn emit_admin_applied(s: &mut Raft, sys: &SyscallTable, command_id: u32, 
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn flush_admin_applied(s: &mut Raft, sys: &SyscallTable) -> bool {
-    if !s.admin_ack_pending { return true; }
+    if !s.admin_ack_pending {
+        return true;
+    }
     if s.out_admin_applied < 0 {
         s.admin_ack_pending = false;
         return true;
@@ -2228,9 +2756,8 @@ unsafe fn flush_admin_applied(s: &mut Raft, sys: &SyscallTable) -> bool {
     let mut buf = [0u8; 5];
     buf[0..4].copy_from_slice(&s.admin_ack_id.to_le_bytes());
     buf[4] = s.admin_ack_status;
-    let n = wire_channels::channel_write_msg(
-        sys, s.out_admin_applied, wire::MSG_ADMIN_APPLIED, &buf,
-    );
+    let n =
+        wire_channels::channel_write_msg(sys, s.out_admin_applied, wire::MSG_ADMIN_APPLIED, &buf);
     if n > 0 {
         s.admin_ack_pending = false;
     }
@@ -2244,22 +2771,24 @@ unsafe fn flush_admin_applied(s: &mut Raft, sys: &SyscallTable) -> bool {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_timeout_now_if_pending(s: &mut Raft, sys: &SyscallTable) {
-    if s.pending_transfer_to == 0 { return; }
-    if s.role != ROLE_LEADER { s.pending_transfer_to = 0; return; }
-    if s.out_rpc < 0 { return; }
-    if !wire_channels::writable(sys, s.out_rpc) { return; }
+    if s.pending_transfer_to == 0 {
+        return;
+    }
+    if s.role != ROLE_LEADER {
+        s.pending_transfer_to = 0;
+        return;
+    }
+    if s.out_rpc < 0 {
+        return;
+    }
+    if !wire_channels::writable(sys, s.out_rpc) {
+        return;
+    }
     let target = s.pending_transfer_to;
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&s.current_term.to_le_bytes());
     // Use the partitioned envelope so peer_router can route by partition.
-    wire_channels::channel_write_routed_partitioned(
-        sys,
-        s.out_rpc,
-        target,
-        s.partition_id,
-        wire::MSG_TIMEOUT_NOW,
-        &buf,
-    );
+    rpc_send(s, sys, target, wire::MSG_TIMEOUT_NOW, &buf);
     dev_log(sys, 3, b"[raft] timeout_now tx".as_ptr(), 21);
     // The transfer attempt is fire-and-forget; if the target doesn't
     // actually take over we keep being leader. The op_response was
@@ -2341,13 +2870,31 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
     //    grant — an ex-voter's vote counted toward a majority is exactly
     //    how a post-downsize cluster elects two leaders.
     let term_ok = term >= s.current_term;
-    let vote_ok = is_pre_vote
-        || s.voted_for == REPLICA_NONE as i8
-        || s.voted_for == candidate as i8;
+    let vote_ok =
+        is_pre_vote || s.voted_for == REPLICA_NONE as i8 || s.voted_for == candidate as i8;
     let log_ok = last_term > s.last_log_term
         || (last_term == s.last_log_term && last_index >= s.last_log_index);
 
     let mut granted = term_ok && vote_ok && log_ok && !s.learner_mode;
+
+    // Pre-vote liveness (Raft dissertation §9.6): a server that is in
+    // contact with a leader — it IS the leader, or it has heard an
+    // AppendEntries within the election timeout — denies pre-votes. A
+    // candidate that timed out because its OWN intake stalled would
+    // otherwise depose a leader the rest of the cluster can hear
+    // perfectly well, and a node whose groups all stall at once turns
+    // into a node-wide re-election. The candidate keeps re-campaigning
+    // and gets its pre-vote the moment the leader really is gone.
+    if granted && is_pre_vote {
+        let now = dev_millis(sys);
+        let leader_live = s.role == ROLE_LEADER
+            || (s.role == ROLE_FOLLOWER
+                && s.leader_id >= 0
+                && now.wrapping_sub(s.last_ae_ms) < s.election_timeout_ms as u64);
+        if leader_live {
+            granted = false;
+        }
+    }
 
     // Log comparison is only as good as our knowledge of our own log.
     // See `replay_hold`: until the WAL reports its high-water, `log_ok`
@@ -2381,7 +2928,11 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
     // after a term advance leaves the term adopted in memory (the
     // become_follower liveness exception) with the vote unset.
     if !is_pre_vote && (granted || term_advanced) {
-        let vote = if granted { candidate as i8 } else { s.voted_for };
+        let vote = if granted {
+            candidate as i8
+        } else {
+            s.voted_for
+        };
         let current = s.current_term;
         match persist_meta_record(s, sys, current, vote) {
             PersistOutcome::Persisted => {
@@ -2396,12 +2947,16 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
     }
 
     // Send response routed to the specific candidate
-    let resp_type = if is_pre_vote { wire::MSG_PRE_VOTE_RESP } else { wire::MSG_REQUEST_VOTE_RESP };
+    let resp_type = if is_pre_vote {
+        wire::MSG_PRE_VOTE_RESP
+    } else {
+        wire::MSG_REQUEST_VOTE_RESP
+    };
     let mut resp = [0u8; 10];
     wire::encode_vote_response(&mut resp, s.current_term, granted, s.self_id);
 
     if wire_channels::writable(sys, s.out_rpc) {
-        wire_channels::channel_write_routed_partitioned(sys, s.out_rpc, candidate, s.partition_id, resp_type, &resp[..10]);
+        rpc_send(s, sys, candidate, resp_type, &resp[..10]);
     }
 }
 
@@ -2412,9 +2967,10 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn handle_vote_response(s: &mut Raft, sys: &SyscallTable, msg_type: u8, plen: u16) {
-    if s.role != ROLE_CANDIDATE { return; }
-    let Some((term, granted, voter)) =
-        wire::decode_vote_response(&s.msg_buf[..plen as usize])
+    if s.role != ROLE_CANDIDATE {
+        return;
+    }
+    let Some((term, granted, voter)) = wire::decode_vote_response(&s.msg_buf[..plen as usize])
     else {
         return;
     };
@@ -2426,7 +2982,9 @@ unsafe fn handle_vote_response(s: &mut Raft, sys: &SyscallTable, msg_type: u8, p
 
     let is_pre_vote_resp = msg_type == wire::MSG_PRE_VOTE_RESP;
 
-    if is_pre_vote_resp != s.pre_vote_active { return; }
+    if is_pre_vote_resp != s.pre_vote_active {
+        return;
+    }
 
     // A real grant is only valid for the election it answered: the granter
     // adopts our term before responding, so its response echoes it. A
@@ -2435,15 +2993,17 @@ unsafe fn handle_vote_response(s: &mut Raft, sys: &SyscallTable, msg_type: u8, p
     // voter. Pre-vote responses carry the granter's own (unbumped) term, so
     // they are exempt — a stale one can at worst trigger a real,
     // term-checked election.
-    if !is_pre_vote_resp && term != s.current_term { return; }
+    if !is_pre_vote_resp && term != s.current_term {
+        return;
+    }
 
-    if voter as usize >= MAX_NODES { return; }
+    if voter as usize >= MAX_NODES {
+        return;
+    }
 
     // Only ballots from the active voter set(s) count: a learner or an
     // ex-voter that missed its revoke must not move the tally.
-    if !s.current_voters.contains(voter)
-        && !(s.joint_active && s.joint_voters.contains(voter))
-    {
+    if !s.current_voters.contains(voter) && !(s.joint_active && s.joint_voters.contains(voter)) {
         return;
     }
 
@@ -2454,17 +3014,20 @@ unsafe fn handle_vote_response(s: &mut Raft, sys: &SyscallTable, msg_type: u8, p
     }
 }
 
-/// Quorum rule shared by elections and ReadIndex probes: `votes` ∩
-/// current voter set must reach a majority of it, and — while a joint
-/// config is active — a majority of the joint set too. Election-side
-/// mirror of commit's dual-median rule: a joint-phase leader must win
-/// both configs (RFC §1.2).
+/// Quorum rule shared by elections and ReadIndex probes: `votes` ∩ current
+/// voter set must reach a majority of it, and — while a joint config is
+/// active — a majority of the joint set too. Election-side mirror of
+/// commit's dual-median rule: a joint-phase leader must win both configs.
 fn set_majority(votes: NodeSet, current: NodeSet, joint: NodeSet, joint_active: bool) -> bool {
     let cur_needed = (current.count() / 2) + 1;
-    if NodeSet(votes.0 & current.0).count() < cur_needed { return false; }
+    if NodeSet(votes.0 & current.0).count() < cur_needed {
+        return false;
+    }
     if joint_active && joint.count() > 0 {
         let joint_needed = (joint.count() / 2) + 1;
-        if NodeSet(votes.0 & joint.0).count() < joint_needed { return false; }
+        if NodeSet(votes.0 & joint.0).count() < joint_needed {
+            return false;
+        }
     }
     true
 }
@@ -2477,7 +3040,9 @@ fn set_majority(votes: NodeSet, current: NodeSet, joint: NodeSet, joint_active: 
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u64) {
     let pl = plen as usize;
-    if pl < wire::AE_HDR_LEN { return; }
+    if pl < wire::AE_HDR_LEN {
+        return;
+    }
     let (term, leader, prev_log_index, prev_log_term, leader_commit, entry_term, entry_index) =
         match wire::decode_append_entries(&s.msg_buf[..pl]) {
             Some(t) => t,
@@ -2490,6 +3055,19 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
     if term < s.current_term {
         // Reject: stale term. Send response with our term and current
         // last-log so the leader can decide what to do.
+        s.ae_stale = s.ae_stale.wrapping_add(1);
+        if s.ae_stale & 0x1F == 1 {
+            log_p(
+                sys,
+                2,
+                b"[raft] ae stale p=",
+                s.partition_id,
+                b" t=",
+                s.current_term.min(u32::MAX as u64) as u32,
+                b" ae_t=",
+                term.min(u32::MAX as u64) as u32,
+            );
+        }
         send_append_response(s, sys, false, false);
         return;
     }
@@ -2507,7 +3085,13 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
         // and the persisted record is unchanged — so no metadata write.
         step_down_same_term(s);
     }
+    if s.leader_id != leader as i8 {
+        // A different leader's log may disagree with ours above commit;
+        // what the previous one verified no longer stands.
+        s.matched_index = s.commit_index;
+    }
     s.leader_id = leader as i8;
+    s.last_ae_ms = now;
     reset_election_deadline(s, now);
 
     // Boot handshake gate — the follower half of the rule `step_leader`
@@ -2542,19 +3126,48 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
     //     response carries our last_log_index so the leader (replicator)
     //     backs next_index up to it instead of decrementing one at a time.
     if prev_log_index > s.last_log_index {
-        dev_log(sys, 3, b"[raft] ae gap".as_ptr(), 13);
+        log_p(
+            sys,
+            3,
+            b"[raft] ae gap p=",
+            s.partition_id,
+            b" prev=",
+            prev_log_index.min(u32::MAX as u64) as u32,
+            b" last=",
+            s.last_log_index.min(u32::MAX as u64) as u32,
+        );
         send_append_response(s, sys, false, false);
         return;
     }
     // (2) Term conflict at prev_log_index: our entry there disagrees with the
     //     leader's. Discard everything from prev_log_index onward (uncommitted
-    //     by construction — see `log_term_matches`) and NACK so the leader
+    //     by construction — see `log_term_match`) and NACK so the leader
     //     backs up and resends from an agreed point.
-    if !log_term_matches(s, prev_log_index, prev_log_term) {
-        truncate_log_after(s, sys, prev_log_index.saturating_sub(1), now);
-        dev_log(sys, 3, b"[raft] ae conflict".as_ptr(), 18);
-        send_append_response(s, sys, false, false);
-        return;
+    // (3) Unverified: we hold prev_log_index but not its term. NACK with
+    //     our tip and keep the log: the leader's next append past our
+    //     tip carries a `prev` at the tip, which the ring always holds.
+    match log_term_match(s, prev_log_index, prev_log_term) {
+        LogMatch::Same => {}
+        LogMatch::Conflict => {
+            truncate_log_after(s, sys, prev_log_index.saturating_sub(1), now);
+            log_p(
+                sys,
+                3,
+                b"[raft] ae conflict p=",
+                s.partition_id,
+                b" prev=",
+                prev_log_index.min(u32::MAX as u64) as u32,
+                b" last=",
+                s.last_log_index.min(u32::MAX as u64) as u32,
+            );
+            send_append_response(s, sys, false, false);
+            return;
+        }
+        LogMatch::Unverified => {
+            note_unverified(s, sys, prev_log_index);
+            send_append_response(s, sys, false, false);
+            return;
+        }
     }
 
     // prev_log_* agrees. Accept the carried entry, if any.
@@ -2565,23 +3178,43 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
         // on a later AE, after the WAL has applied the truncate — the resend
         // and the truncate must not race within one WAL step).
         if entry_index <= s.last_log_index {
-            if log_term_matches(s, entry_index, entry_term) {
-                advance_follower_commit(s, sys, leader_commit);
-                // Ack AT the retransmitted index, not our tip: this AE
-                // verified the log only up to `entry_index`, and a tip
-                // that still carries an old-term divergent suffix must
-                // not be quorum-counted off the back of it.
-                send_append_response_at(s, sys, true, false, entry_index);
-                return;
+            match log_term_match(s, entry_index, entry_term) {
+                LogMatch::Same => {
+                    advance_follower_commit(s, sys, leader_commit);
+                    // Ack AT the retransmitted index, not our tip: this AE
+                    // verified the log only up to `entry_index`, and a tip
+                    // that still carries an old-term divergent suffix must
+                    // not be quorum-counted off the back of it.
+                    if entry_index > s.matched_index {
+                        s.matched_index = entry_index;
+                    }
+                    send_append_response_at(s, sys, true, false, entry_index);
+                    return;
+                }
+                LogMatch::Unverified => {
+                    note_unverified(s, sys, entry_index);
+                    send_append_response(s, sys, false, false);
+                    return;
+                }
+                LogMatch::Conflict => {}
             }
             truncate_log_after(s, sys, entry_index.saturating_sub(1), now);
-            dev_log(sys, 3, b"[raft] ae conflict".as_ptr(), 18);
+            log_p(
+                sys,
+                3,
+                b"[raft] ae conflict p=",
+                s.partition_id,
+                b" at=",
+                entry_index.min(u32::MAX as u64) as u32,
+                b" last=",
+                s.last_log_index.min(u32::MAX as u64) as u32,
+            );
             send_append_response(s, sys, false, false);
             return;
         }
 
-        // Durability bound (the other half of RFC §13/§14's fail-closed
-        // contract). `channel_write_msg` succeeding below proves only that the
+        // Durability bound, the other half of the fail-closed contract.
+        // `channel_write_msg` succeeding below proves only that the
         // frame entered the WAL's input channel — never that the WAL ACCEPTED
         // it. Unbounded, our log runs arbitrarily far ahead of what is
         // persisted, and once commit passes that point the divergence covers
@@ -2637,16 +3270,21 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
                 .copy_from_slice(&s.msg_buf[entry_payload_start..entry_payload_start + copy_len]);
         }
 
-        // Fail closed on the follower too (RFC §13/§14): attempt the WAL
-        // write first and only advance `last_log_index` if the whole entry
-        // landed. `channel_write_msg` is a single atomic frame write, so a
-        // `<= 0` return means the channel was full and NOTHING was written
-        // — do NOT advance (else our log would claim an entry the WAL never
-        // persisted and diverge). Respond with failure so the leader
-        // retries this AE once our WAL drains; normal Raft log-repair,
-        // driven by local durability backpressure instead of a log mismatch.
-        let written =
-            wire_channels::channel_write_msg(sys, s.out_log, wire::MSG_WAL_ENTRY, &wal_buf[..16 + copy_len]);
+        // Fail closed on the follower too: attempt the WAL write first and
+        // only advance `last_log_index` if the whole entry landed.
+        // `channel_write_msg` is a single atomic frame write, so a `<= 0`
+        // return means the channel was full and NOTHING was written — do NOT
+        // advance (else our log would claim an entry the WAL never persisted
+        // and diverge). Respond with failure so the leader retries this AE
+        // once our WAL drains; normal Raft log-repair, driven by local
+        // durability backpressure instead of a log mismatch.
+        let written = wire_channels::channel_write_partitioned(
+            sys,
+            s.out_log,
+            s.partition_id,
+            wire::MSG_WAL_ENTRY,
+            &wal_buf[..16 + copy_len],
+        );
         if written <= 0 {
             s.flushes_deferred = s.flushes_deferred.saturating_add(1);
             // Local WAL backpressure, NOT a log mismatch: signal `busy` so the
@@ -2658,7 +3296,9 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
 
         // E5 seam: fan the accepted body out to
         // apply's body ring. Fail-open drop-on-full preserved.
-        let _ = s.outbox_bodies.push(wire::MSG_WAL_ENTRY, &wal_buf[..16 + copy_len]);
+        let _ = s
+            .outbox_bodies
+            .push(wire::MSG_WAL_ENTRY, &wal_buf[..16 + copy_len]);
 
         s.last_log_index = entry_index;
         s.last_log_term = entry_term;
@@ -2666,12 +3306,37 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
         s.entries_appended += 1;
     }
 
-    // Follower commit advance: clamp leader_commit to what we actually
-    // have. When the follower's commit_index moves, fan it out so the
-    // apply pipeline can advance. See RFC §5.1.
+    // Follower commit advance: clamp leader_commit to what we actually have.
+    // When the follower's commit_index moves, fan it out so the apply
+    // pipeline can advance.
     advance_follower_commit(s, sys, leader_commit);
 
+    // `prev_log_*` agreed and any carried entry is appended: the log
+    // through the tip is the leader's.
+    s.matched_index = s.last_log_index;
     send_append_response(s, sys, true, false);
+}
+
+/// Count and (sampled) log an AppendEntries the tail ring could not
+/// judge.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn note_unverified(s: &mut Raft, sys: &SyscallTable, index: Index) {
+    s.ae_unverified = s.ae_unverified.saturating_add(1);
+    if s.ae_unverified & 0x1F == 1 {
+        log_p(
+            sys,
+            2,
+            b"[raft] ae unverified p=",
+            s.partition_id,
+            b" at=",
+            index.min(u32::MAX as u64) as u32,
+            b" last=",
+            s.last_log_index.min(u32::MAX as u64) as u32,
+        );
+    }
 }
 
 /// # Safety
@@ -2680,13 +3345,52 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn advance_follower_commit(s: &mut Raft, _sys: &SyscallTable, leader_commit: u64) {
+/// Publish this node's quorum-durable horizon so `flow` can release
+/// acknowledgements here, whether or not this node is the leader.
+///
+/// Under DUR_STRICT / DUR_GROUP_FSYNC the commit gate is already
+/// `min(quorum_match, durable_index)`, so `commit_index` cannot run ahead
+/// of quorum durability and a follower inherits the leader's
+/// determination through AppendEntries. Under DUR_RELAXED the self match
+/// slot seeds on append and commit CAN outrun fsync, so nothing is
+/// emitted and relaxed compositions keep their existing behaviour.
+///
+/// Best-effort: `flow` holds a monotonic max, so a dropped frame is
+/// recovered by the next commit advance.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per the module ABI.
+unsafe fn emit_durable_horizon(s: &Raft, sys: &SyscallTable) {
+    if s.out_durable_horizon < 0 || s.durability_mode == DUR_RELAXED {
+        return;
+    }
+    if !wire_channels::writable(sys, s.out_durable_horizon) {
+        return;
+    }
+    let mut buf = [0u8; wire::DURABILITY_PROOF_LEN];
+    wire::encode_durability_proof(
+        &mut buf,
+        s.partition_id,
+        s.current_term,
+        s.commit_index,
+        s.self_id,
+    );
+    wire_channels::channel_write_msg(sys, s.out_durable_horizon, wire::MSG_DURABILITY_PROOF, &buf);
+}
+
+unsafe fn advance_follower_commit(s: &mut Raft, sys: &SyscallTable, leader_commit: u64) {
     let new_commit = leader_commit.min(s.last_log_index);
-    if new_commit <= s.commit_index { return; }
+    if new_commit <= s.commit_index {
+        return;
+    }
     s.commit_index = new_commit;
     // E6 seam (was MSG_COMMITTED_BATCH on `commit_advanced`): raise the
     // apply-horizon latch — always deliverable, no writability gate.
     s.apply_horizon_out.raise(s.current_term, new_commit);
+    emit_durable_horizon(s, sys);
 }
 
 /// # Safety
@@ -2695,7 +3399,7 @@ unsafe fn advance_follower_commit(s: &mut Raft, _sys: &SyscallTable, leader_comm
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn send_append_response(s: &Raft, sys: &SyscallTable, success: bool, busy: bool) {
+unsafe fn send_append_response(s: &mut Raft, sys: &SyscallTable, success: bool, busy: bool) {
     send_append_response_at(s, sys, success, busy, s.last_log_index);
 }
 
@@ -2707,7 +3411,7 @@ unsafe fn send_append_response(s: &Raft, sys: &SyscallTable, success: bool, busy
 ///
 /// As `send_append_response`.
 unsafe fn send_append_response_at(
-    s: &Raft,
+    s: &mut Raft,
     sys: &SyscallTable,
     success: bool,
     busy: bool,
@@ -2725,13 +3429,117 @@ unsafe fn send_append_response_at(
     );
 
     // Route back to leader
-    let target = if s.leader_id >= 0 { s.leader_id as u8 } else { wire::TARGET_BROADCAST };
+    let target = if s.leader_id >= 0 {
+        s.leader_id as u8
+    } else {
+        wire::TARGET_BROADCAST
+    };
     if wire_channels::writable(sys, s.out_rpc) {
-        wire_channels::channel_write_routed_partitioned(sys, s.out_rpc, target, s.partition_id, wire::MSG_APPEND_ENTRIES_RESP, &resp);
+        rpc_send(s, sys, target, wire::MSG_APPEND_ENTRIES_RESP, &resp);
     }
 }
 
 // ── Follower step ───────────────────────────────────────────
+
+/// Write one routed RPC for this group on `out_rpc`, and count a
+/// refusal. Every RPC send goes through here so a full channel is a
+/// number on a dashboard rather than a follower that "randomly" timed
+/// out. Raft re-covers a lost RPC on its own — the next heartbeat, the
+/// next campaign, the replicator's retry — so nothing is retained.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn rpc_send(
+    s: &mut Raft,
+    sys: &SyscallTable,
+    target: u8,
+    msg_type: u8,
+    payload: &[u8],
+) -> bool {
+    rpc_send_on(
+        sys,
+        s.out_rpc,
+        s.partition_id,
+        &mut s.rpc_refused,
+        target,
+        msg_type,
+        payload,
+    )
+}
+
+/// `rpc_send` over the fields it touches, for a payload that lives in
+/// `s.msg_buf`: the counter and the buffer are disjoint borrows of the
+/// same state, which the whole-struct form cannot express.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn rpc_send_on(
+    sys: &SyscallTable,
+    out_rpc: i32,
+    partition_id: u16,
+    refused: &mut u32,
+    target: u8,
+    msg_type: u8,
+    payload: &[u8],
+) -> bool {
+    if out_rpc < 0 {
+        return false;
+    }
+    let n = wire_channels::channel_write_routed_partitioned(
+        sys,
+        out_rpc,
+        target,
+        partition_id,
+        msg_type,
+        payload,
+    );
+    if n > 0 {
+        return true;
+    }
+    *refused = refused.wrapping_add(1);
+    if *refused & 0x3F == 1 {
+        log_p(
+            sys,
+            2,
+            b"[raft] rpc refused p=",
+            partition_id,
+            b" n=",
+            *refused,
+            b" mt=",
+            u32::from(msg_type),
+        );
+    }
+    false
+}
+
+/// One partition-tagged, two-field log line:
+/// `<tag><partition><f1><v1><f2><v2>`. Every raft log line that marks a
+/// role change or a log-matching failure goes through this, because at
+/// K>1 a line without its partition cannot be attributed to a group and
+/// an election storm cannot be read off the log at all.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn log_p(
+    sys: &SyscallTable,
+    level: u8,
+    tag: &[u8],
+    partition: u16,
+    f1: &[u8],
+    v1: u32,
+    f2: &[u8],
+    v2: u32,
+) {
+    let mut line = [0u8; 80];
+    let mut pos = super::log_fmt::log_field(&mut line, 0, tag, partition as u32);
+    pos = super::log_fmt::log_field(&mut line, pos, f1, v1);
+    pos = super::log_fmt::log_field(&mut line, pos, f2, v2);
+    dev_log(sys, level, line.as_ptr(), pos);
+}
 
 /// # Safety
 ///
@@ -2746,6 +3554,14 @@ unsafe fn step_follower(s: &mut Raft, sys: &SyscallTable, now: u64) {
     if s.learner_mode {
         reset_election_deadline(s, now);
         return;
+    }
+    // Relay client proposals to the leader before considering an
+    // election: a follower never calls `drain_proposals`, so without
+    // this they sit in the channel until this node happens to win a
+    // term. Only runs when the leader is known — with no leader there
+    // is nowhere to send, and the election below is the right response.
+    if s.forward_proposals && s.leader_id >= 0 {
+        forward_proposals_to_leader(s, sys);
     }
     if now >= s.election_deadline_ms {
         // Election timeout — start pre-vote
@@ -2762,7 +3578,12 @@ unsafe fn step_follower(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn step_candidate(s: &mut Raft, sys: &SyscallTable, now: u64) {
-    if set_majority(s.votes_granted, s.current_voters, s.joint_voters, s.joint_active) {
+    if set_majority(
+        s.votes_granted,
+        s.current_voters,
+        s.joint_voters,
+        s.joint_active,
+    ) {
         if s.pre_vote_active {
             // Pre-vote succeeded — start real election
             start_election(s, sys, now, false);
@@ -2798,6 +3619,26 @@ unsafe fn step_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
         emit_pending_c_new(s, sys, now);
     }
 
+    // 0a. Learner-set change requested by an admin op. Same empty-batch
+    //     condition as the C_new path, and ordered after it so a
+    //     membership transition already in flight completes first.
+    if s.pending_learners_set && !s.pending_new_voters_set && s.proposal_batch_count == 0 {
+        emit_pending_learners(s, sys, now);
+    }
+
+    // 0b. Membership change requested by ADD_VOTER / REMOVE_VOTER. The
+    //     JOINT entry is what starts the transition; applying it enters
+    //     joint consensus and auto-queues the matching C_new, so both
+    //     halves of the change go through the log and every replica sees
+    //     the same sequence.
+    if s.pending_joint_set
+        && !s.pending_new_voters_set
+        && !s.pending_learners_set
+        && s.proposal_batch_count == 0
+    {
+        emit_pending_joint(s, sys, now);
+    }
+
     // 0b. Current-term no-op (§5.4.2). Must precede proposal intake so
     //     the fence index lands as the first entry of this term; a full
     //     WAL channel just retries next tick (`noop_pending` stays set).
@@ -2811,7 +3652,7 @@ unsafe fn step_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     }
 
     // 1. Drain proposals into batch — gated by two durability-backpressure
-    //    conditions (RFC §13/§14):
+    //    conditions:
     //    (a) not holding a WAL-deferred batch (`flush_deferred`): a prior
     //        flush couldn't write to `out_log`; reading more would coalesce
     //        onto the held index or drop it.
@@ -2851,10 +3692,37 @@ unsafe fn step_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
         flush_proposal_batch(s, sys);
     }
 
-    // 3. Send heartbeats
-    if now.wrapping_sub(s.last_heartbeat_ms) >= s.heartbeat_interval_ms as u64 {
+    // 3. Send heartbeats on the interval, and the moment the commit
+    //    index moves. The empty AppendEntries is how followers learn
+    //    `leader_commit`, and a follower serving a response-owed write
+    //    acks it only once its own commit passes the entry; waiting for
+    //    the scheduled interval taxed every such ack by up to one
+    //    interval (measured at K=64 as 235 ms against 9 ms on the
+    //    leader). An empty AppendEntries at the tip is a log-match probe
+    //    as well, so this relies on a follower answering an index it
+    //    cannot judge with `unverified` rather than a truncation (see
+    //    `TAIL_TERM_RING`).
+    let since_hb = now.wrapping_sub(s.last_heartbeat_ms);
+    if since_hb >= s.heartbeat_interval_ms as u64 || s.commit_index > s.commit_announced {
+        // A leader that reaches this point late has not been STEPPED:
+        // the interval check runs every step, so a gap of two
+        // intervals means the engine did not visit this slot, which
+        // the follower will read as a dead leader.
+        if since_hb >= 2 * s.heartbeat_interval_ms as u64 {
+            log_p(
+                sys,
+                2,
+                b"[raft] hb late p=",
+                s.partition_id,
+                b" gap=",
+                since_hb.min(u32::MAX as u64) as u32,
+                b" t=",
+                s.current_term.min(u32::MAX as u64) as u32,
+            );
+        }
         send_heartbeat(s, sys);
         s.last_heartbeat_ms = now;
+        s.commit_announced = s.commit_index;
     }
 }
 
@@ -2878,14 +3746,40 @@ unsafe fn emit_pending_c_new(s: &mut Raft, sys: &SyscallTable, now: u64) {
             n += 1;
         }
     }
-    let mut body = [0u8; 3 + MAX_NODES];
-    let body_len = wire::encode_config_change(
-        &mut body,
-        wire::CONFIG_CHANGE_OP_NEW,
-        &voter_ids[..n],
-    );
+    if queue_config_entry(s, sys, now, wire::CONFIG_CHANGE_OP_NEW, &voter_ids[..n]) {
+        // Clear the pending slot — flush_proposal_batch will append
+        // the C_new entry to the log next time it runs.
+        s.pending_new_voters_set = false;
+        s.pending_new_voters = NodeSet::empty();
+        dev_log(sys, 3, b"[raft] c_new queued".as_ptr(), 19);
+    }
+}
+
+/// Stage a config-change entry into the proposal batch. Shared by the
+/// C_new completion path and the learner-set path so both produce
+/// byte-identical entry framing.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn queue_config_entry(
+    s: &mut Raft,
+    sys: &SyscallTable,
+    now: u64,
+    op: u8,
+    ids: &[u8],
+) -> bool {
+    // `encode_config_change` writes `10 + n` bytes: the 8-byte magic,
+    // the op code, the count, then one id per voter. Sizing this
+    // `3 + MAX_NODES` (= 10) made the encode fail for ANY non-empty id
+    // list, returning 0 and silently dropping the entry — so a joint
+    // transition could never complete. It went unnoticed because the
+    // only caller ran behind ADD_VOTER, which is unsupported.
+    let mut body = [0u8; wire::CONFIG_CHANGE_HDR + MAX_NODES];
+    let body_len = wire::encode_config_change(&mut body, op, ids);
     if body_len == 0 {
-        return;
+        return false;
     }
     // append_to_batch copies from `s.msg_buf[off..off+len]`, so stage
     // the body there. Use an offset past anything drain_proposals
@@ -2893,12 +3787,54 @@ unsafe fn emit_pending_c_new(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // is plentiful.
     let stage_off = 1024usize;
     s.msg_buf[stage_off..stage_off + body_len].copy_from_slice(&body[..body_len]);
-    if append_to_batch(s, sys, stage_off, body_len, 0, now) {
-        // Clear the pending slot — flush_proposal_batch will append
-        // the C_new entry to the log next time it runs.
-        s.pending_new_voters_set = false;
-        s.pending_new_voters = NodeSet::empty();
-        dev_log(sys, 3, b"[raft] c_new queued".as_ptr(), 19);
+    append_to_batch(s, sys, stage_off, body_len, 0, ORIGIN_LOCAL, now)
+}
+
+/// Append the `CONFIG_CHANGE_OP_JOINT` entry that opens a membership
+/// change. Called from `step_leader` only.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn emit_pending_joint(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    let mut ids = [0u8; MAX_NODES];
+    let mut n = 0usize;
+    for id in 0..MAX_NODES as u8 {
+        if s.pending_joint_voters.contains(id) {
+            ids[n] = id;
+            n += 1;
+        }
+    }
+    if queue_config_entry(s, sys, now, wire::CONFIG_CHANGE_OP_JOINT, &ids[..n]) {
+        s.pending_joint_set = false;
+        s.pending_joint_voters = NodeSet::empty();
+        dev_log(sys, 3, b"[raft] joint queued".as_ptr(), 19);
+    }
+}
+
+/// Append a `CONFIG_CHANGE_OP_LEARNER` entry carrying the complete
+/// learner set an admin op requested. Called from `step_leader` only,
+/// on the same empty-batch condition as the C_new path so the entry
+/// gets a clean log slot.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn emit_pending_learners(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    let mut ids = [0u8; MAX_NODES];
+    let mut n = 0usize;
+    for id in 0..MAX_NODES as u8 {
+        if s.pending_learners.contains(id) {
+            ids[n] = id;
+            n += 1;
+        }
+    }
+    if queue_config_entry(s, sys, now, wire::CONFIG_CHANGE_OP_LEARNER, &ids[..n]) {
+        s.pending_learners_set = false;
+        s.pending_learners = NodeSet::empty();
+        dev_log(sys, 3, b"[raft] learners queued".as_ptr(), 22);
     }
 }
 
@@ -2908,6 +3844,304 @@ unsafe fn emit_pending_c_new(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// Relay a follower's queued client proposals to the leader.
+///
+/// Scope is deliberately fire-and-forget: only the UNTAGGED channel
+/// (`in_proposals`) is drained, so nothing here owes a response. The
+/// tagged channels carry a correlation id that identifies a slot in the
+/// ORIGIN node's ring; forwarding one would commit the entry on the
+/// leader and leave the origin's caller waiting forever, because the
+/// assignment comes back addressed to the leader's ring, not the
+/// origin's. Response-owed writes (MQTT QoS 1+, Kafka acks>=1) therefore
+/// still require a leader connection until that tag is plumbed.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per the module ABI.
+unsafe fn forward_proposals_to_leader(s: &mut Raft, sys: &SyscallTable) {
+    // Only the RPC output is required. The untagged input is optional
+    // — a graph that routes every proposal through `partition_router`
+    // never wires it — and gating the whole relay on it silently
+    // forwarded NOTHING once the last untagged edge left the graphs.
+    if s.out_rpc < 0 {
+        return;
+    }
+    // A frozen or strict-fallback node must not launder writes past its
+    // own gate by relaying them to a leader that would accept them.
+    if s.frozen || s.strict_fallback {
+        return;
+    }
+    let target = s.leader_id as u8;
+    // One inbox depth per step ACROSS the four sources: the leader
+    // drains that many per step per group, so a burst relayed faster
+    // than that only fills its inbox and stalls the shared channel
+    // behind it. What this does not relay this step stays queued
+    // upstream, which is where the client's backpressure belongs.
+    let mut budget = inbox::INBOX_DEPTH;
+
+    // Direct, untagged proposals (`in_proposals`).
+    while budget > 0 && s.in_proposals >= 0 {
+        budget -= 1;
+        if !wire_channels::writable(sys, s.out_rpc) {
+            return;
+        }
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_proposals, &mut s.msg_buf)
+        else {
+            break;
+        };
+        let plen = plen as usize;
+        let body_off = match msg_type {
+            wire::MSG_CLIENT_PROPOSAL => 0,
+            wire::MSG_CLIENT_PROPOSAL_KEYED => wire::KEYED_PROPOSAL_HDR,
+            _ => continue,
+        };
+        if plen <= body_off {
+            continue;
+        }
+        rpc_send_on(
+            sys,
+            s.out_rpc,
+            s.partition_id,
+            &mut s.rpc_refused,
+            target,
+            wire::MSG_PROPOSAL_FORWARD,
+            &s.msg_buf[body_off..plen],
+        );
+    }
+
+    // Response-owed proposals (`in_proposals_tagged`). The correlation id
+    // names a slot in THIS node's ring, so it travels with the frame and
+    // the leader addresses its assignment back here.
+    if s.in_proposals_tagged >= 0 {
+        while budget > 0 {
+            budget -= 1;
+            if !wire_channels::writable(sys, s.out_rpc) {
+                return;
+            }
+            let Some((msg_type, plen)) =
+                wire_channels::next_msg(sys, s.in_proposals_tagged, &mut s.msg_buf)
+            else {
+                break;
+            };
+            let plen = plen as usize;
+            let key_off = match msg_type {
+                wire::MSG_CLIENT_PROPOSAL => 0,
+                wire::MSG_CLIENT_PROPOSAL_KEYED => wire::KEYED_PROPOSAL_HDR,
+                _ => continue,
+            };
+            if plen < key_off + wire::TAGGED_PROPOSAL_HDR {
+                continue;
+            }
+            let (correlation_id, rel_off) =
+                match wire::decode_tagged_proposal(&s.msg_buf[key_off..plen]) {
+                    Some(v) => v,
+                    None => continue,
+                };
+            let body_off = key_off + rel_off;
+            if plen <= body_off {
+                continue;
+            }
+            forward_tagged(s, sys, target, correlation_id, body_off, plen);
+        }
+    }
+
+    // Proposals that arrived through `partition_router`
+    // (`in_proposals_partitioned`), already demuxed to this slot. This is
+    // the channel a partitioned node graph actually uses — it wires
+    // `session_processor.proposals -> partition_router ->
+    // consensus.proposals_partitioned` — so a relay that skipped it would
+    // forward nothing at all in the configuration relaying exists for.
+    if s.in_proposals_partitioned >= 0 {
+        while budget > 0 {
+            budget -= 1;
+            if !wire_channels::writable(sys, s.out_rpc) {
+                return;
+            }
+            let Some((msg_type, plen)) = s.inbox_prop_p.next(sys, &mut s.msg_buf) else {
+                break;
+            };
+            if msg_type != wire::MSG_CLIENT_PROPOSAL || plen == 0 {
+                continue;
+            }
+            rpc_send_on(
+                sys,
+                s.out_rpc,
+                s.partition_id,
+                &mut s.rpc_refused,
+                target,
+                wire::MSG_PROPOSAL_FORWARD,
+                &s.msg_buf[..plen as usize],
+            );
+        }
+    }
+
+    // Partitioned + tagged (`in_proposals_partitioned_tagged`).
+    if s.in_proposals_partitioned_tagged >= 0 {
+        while budget > 0 {
+            budget -= 1;
+            if !wire_channels::writable(sys, s.out_rpc) {
+                return;
+            }
+            let Some((msg_type, plen)) = s.inbox_prop_pt.next(sys, &mut s.msg_buf) else {
+                break;
+            };
+            let plen = plen as usize;
+            let key_off = match msg_type {
+                wire::MSG_CLIENT_PROPOSAL => 0,
+                wire::MSG_CLIENT_PROPOSAL_KEYED => wire::KEYED_PROPOSAL_HDR,
+                _ => continue,
+            };
+            if plen < key_off + wire::TAGGED_PROPOSAL_HDR {
+                continue;
+            }
+            let (correlation_id, rel_off) =
+                match wire::decode_tagged_proposal(&s.msg_buf[key_off..plen]) {
+                    Some(v) => v,
+                    None => continue,
+                };
+            let body_off = key_off + rel_off;
+            if plen <= body_off {
+                continue;
+            }
+            forward_tagged(s, sys, target, correlation_id, body_off, plen);
+        }
+    }
+}
+
+/// Relay one response-owed proposal body, prefixed with this node's id
+/// and the caller's correlation id.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per the module ABI.
+unsafe fn forward_tagged(
+    s: &mut Raft,
+    sys: &SyscallTable,
+    target: u8,
+    correlation_id: u64,
+    body_off: usize,
+    body_end: usize,
+) {
+    let body_len = body_end - body_off;
+    let mut buf = [0u8; PROPOSAL_BATCH_CAP + wire::FORWARD_TAGGED_HDR];
+    if body_len > PROPOSAL_BATCH_CAP {
+        return;
+    }
+    buf[0] = s.self_id;
+    buf[1..9].copy_from_slice(&correlation_id.to_le_bytes());
+    buf[9..9 + body_len].copy_from_slice(&s.msg_buf[body_off..body_end]);
+    rpc_send(
+        s,
+        sys,
+        target,
+        wire::MSG_PROPOSAL_FORWARD_TAGGED,
+        &buf[..wire::FORWARD_TAGGED_HDR + body_len],
+    );
+}
+
+/// Accept a RESPONSE-OWED proposal relayed by a follower, remembering
+/// whose ring owes the answer.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per the module ABI.
+unsafe fn handle_proposal_forward_tagged(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u64) {
+    if !is_leader(s) || s.frozen || s.strict_fallback {
+        return;
+    }
+    if s.flush_deferred
+        || s.last_log_index.saturating_sub(s.commit_index) >= MAX_UNCOMMITTED_INFLIGHT
+    {
+        return;
+    }
+    let plen = plen as usize;
+    if plen <= wire::FORWARD_TAGGED_HDR {
+        return;
+    }
+    let origin = s.msg_buf[0];
+    // Our own id would make the assignment loop back here; a relay can
+    // only come from another node.
+    if origin == s.self_id || origin == ORIGIN_LOCAL {
+        return;
+    }
+    let mut cid = [0u8; 8];
+    cid.copy_from_slice(&s.msg_buf[1..9]);
+    let correlation_id = u64::from_le_bytes(cid);
+    append_to_batch(
+        s,
+        sys,
+        wire::FORWARD_TAGGED_HDR,
+        plen - wire::FORWARD_TAGGED_HDR,
+        correlation_id,
+        origin,
+        now,
+    );
+}
+
+/// Re-emit an assignment the leader addressed to this node, for a
+/// proposal we relayed. The correlation id names a slot in OUR ring, so
+/// from the proposer's point of view this is indistinguishable from
+/// having been the leader all along.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per the module ABI.
+unsafe fn handle_proposal_assigned_remote(s: &mut Raft, sys: &SyscallTable, plen: u16) {
+    if s.out_proposal_assigned < 0 || (plen as usize) < wire::PROPOSAL_ASSIGNED_LEN {
+        return;
+    }
+    if !wire_channels::writable(sys, s.out_proposal_assigned) {
+        return;
+    }
+    let buf = s.msg_buf;
+    wire_channels::channel_write_msg(
+        sys,
+        s.out_proposal_assigned,
+        wire::MSG_PROPOSAL_ASSIGNED,
+        &buf[..wire::PROPOSAL_ASSIGNED_LEN],
+    );
+}
+
+/// Accept a proposal relayed by a follower.
+///
+/// Ignored unless this node is the leader: a stale forward arriving after
+/// leadership moved must not be appended by a follower, and dropping it
+/// is correct — the sender re-forwards to whoever it now believes leads.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per the module ABI.
+unsafe fn handle_proposal_forward(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u64) {
+    if !is_leader(s) {
+        return;
+    }
+    if s.frozen || s.strict_fallback {
+        return;
+    }
+    // Same durability-backpressure gates the local drain honours; a
+    // relayed proposal is an ordinary client write once it lands.
+    if s.flush_deferred
+        || s.last_log_index.saturating_sub(s.commit_index) >= MAX_UNCOMMITTED_INFLIGHT
+    {
+        return;
+    }
+    let plen = plen as usize;
+    if plen == 0 {
+        return;
+    }
+    append_to_batch(s, sys, 0, plen, 0, ORIGIN_LOCAL, now);
+}
+
 unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // Admin freeze OR strict-fallback: drop every incoming proposal
     // silently. The client path (codec → throttle) will
@@ -2918,17 +4152,23 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // operators can tell admin-driven from CP-driven gating apart.
     if s.frozen || s.strict_fallback {
         let frozen = s.frozen;
-        for chan in [s.in_proposals, s.in_proposals_tagged,
-                     s.in_proposals_partitioned, s.in_proposals_partitioned_tagged] {
-            if chan < 0 { continue; }
+        for chan in [
+            s.in_proposals,
+            s.in_proposals_tagged,
+            s.in_proposals_partitioned,
+            s.in_proposals_partitioned_tagged,
+        ] {
+            if chan < 0 {
+                continue;
+            }
             for _ in 0..16 {
                 let Some((msg_type, plen)) = wire_channels::next_msg(sys, chan, &mut s.msg_buf)
                 else {
                     break;
                 };
-                // Replicable admin envelopes (ADMIN_MAGIC-prefixed, spec
-                // §3.1) are exempt from the FREEZE gate: freeze blocks
-                // client writes, and the THAW that lifts it rides this
+                // Replicable admin envelopes (ADMIN_MAGIC-prefixed) are
+                // exempt from the FREEZE gate: freeze blocks client
+                // writes, and the THAW that lifts it rides this
                 // very path — dropping it would make freeze permanent by
                 // construction. They arrive untagged only, and remain
                 // subject to the durability backpressure gates. The
@@ -2943,7 +4183,7 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
                     && !s.flush_deferred
                     && s.last_log_index.saturating_sub(s.commit_index) < MAX_UNCOMMITTED_INFLIGHT
                 {
-                    if append_to_batch(s, sys, 0, plen as usize, 0, now) {
+                    if append_to_batch(s, sys, 0, plen as usize, 0, ORIGIN_LOCAL, now) {
                         continue;
                     }
                 }
@@ -2960,10 +4200,26 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // Legacy / untagged proposals (in[1]). The whole payload is the body;
     // the correlation slot stays zero so flush_proposal_batch emits no
     // MSG_PROPOSAL_ASSIGNED for these.
+    //
+    // MSG_CLIENT_PROPOSAL_KEYED is accepted here too, and its 4-byte
+    // shard prefix is discarded. A keyed proposal is normally consumed
+    // by `partition_router`, which strips the prefix and rewrites the
+    // type — but plenty of graphs wire a proposer straight to
+    // `consensus` (no router, one partition), and some wire the untagged
+    // path through a router while the tagged path goes direct.
+    // Tolerating the prefix here lets a proposer emit keyed proposals
+    // unconditionally, without a config flag that has to agree with the
+    // graph's shape and silently drops proposals when it doesn't.
+    //
+    // This is not consensus routing on the shard: the value is read past
+    // and never used. Placement remains `partition_router`'s alone. The
+    // strip happens before batching, so the body reaching the WAL is
+    // byte-identical either way — the same discipline as the tagged
+    // correlation prefix below.
     if s.in_proposals >= 0 {
         for _ in 0..16 {
             // Stop pulling proposals the moment either durability-backpressure
-            // gate closes (RFC §13/§14): a deferred WAL flush, or the
+            // gate closes: a deferred WAL flush, or the
             // uncommitted-inflight window reaching its cap. Checking inside the
             // loop (not just once per step) bounds the per-step append burst —
             // without it a single drain pass can append dozens of entries past
@@ -2974,13 +4230,24 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
             {
                 return;
             }
-            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_proposals, &mut s.msg_buf)
+            let Some((msg_type, plen)) =
+                wire_channels::next_msg(sys, s.in_proposals, &mut s.msg_buf)
             else {
                 break;
             };
-            if msg_type != wire::MSG_CLIENT_PROPOSAL || plen == 0 { continue; }
+            let plen = plen as usize;
+            let body_off = match msg_type {
+                wire::MSG_CLIENT_PROPOSAL => 0,
+                wire::MSG_CLIENT_PROPOSAL_KEYED => wire::KEYED_PROPOSAL_HDR,
+                _ => continue,
+            };
+            if plen <= body_off {
+                continue;
+            }
 
-            if !append_to_batch(s, sys, 0, plen as usize, 0, now) { break; }
+            if !append_to_batch(s, sys, body_off, plen - body_off, 0, ORIGIN_LOCAL, now) {
+                break;
+            }
         }
     }
 
@@ -2994,24 +4261,46 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
             {
                 return;
             }
-            let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_proposals_tagged, &mut s.msg_buf)
+            let Some((msg_type, plen)) =
+                wire_channels::next_msg(sys, s.in_proposals_tagged, &mut s.msg_buf)
             else {
                 break;
             };
-            if msg_type != wire::MSG_CLIENT_PROPOSAL { continue; }
+            // As on the untagged path, a keyed proposal's shard prefix
+            // is discarded here so a proposer need not know whether its
+            // output reaches a router.
             let plen = plen as usize;
-            if plen < wire::TAGGED_PROPOSAL_HDR { continue; }
-
-            let (correlation_id, body_off) = match wire::decode_tagged_proposal(&s.msg_buf[..plen]) {
-                Some(v) => v,
-                None => continue,
+            let key_off = match msg_type {
+                wire::MSG_CLIENT_PROPOSAL => 0,
+                wire::MSG_CLIENT_PROPOSAL_KEYED => wire::KEYED_PROPOSAL_HDR,
+                _ => continue,
             };
+            if plen < key_off + wire::TAGGED_PROPOSAL_HDR {
+                continue;
+            }
+
+            let (correlation_id, rel_off) =
+                match wire::decode_tagged_proposal(&s.msg_buf[key_off..plen]) {
+                    Some(v) => v,
+                    None => continue,
+                };
+            let body_off = key_off + rel_off;
             // correlation_id == 0 is reserved as "untagged"; if a producer
             // sends zero we still batch the body so the proposal isn't
             // lost, but no MSG_PROPOSAL_ASSIGNED will be emitted — same as
             // the legacy path.
             let body_len = plen - body_off;
-            if !append_to_batch(s, sys, body_off, body_len, correlation_id, now) { break; }
+            if !append_to_batch(
+                s,
+                sys,
+                body_off,
+                body_len,
+                correlation_id,
+                ORIGIN_LOCAL,
+                now,
+            ) {
+                break;
+            }
         }
     }
 
@@ -3027,18 +4316,15 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
             {
                 return;
             }
-            if !wire_channels::readable(sys, s.in_proposals_partitioned) { break; }
-
-            let (partition_id, msg_type, plen) =
-                wire_channels::channel_read_partitioned(sys, s.in_proposals_partitioned, &mut s.msg_buf);
-            if msg_type != wire::MSG_CLIENT_PROPOSAL || plen == 0 { continue; }
-            if partition_id != s.partition_id {
-                // Misrouted proposal — skip rather than corrupt this
-                // partition's log. The partition-routing contract is
-                // "out[i] only ever carries partition_id = i".
+            let Some((msg_type, plen)) = s.inbox_prop_p.next(sys, &mut s.msg_buf) else {
+                break;
+            };
+            if msg_type != wire::MSG_CLIENT_PROPOSAL || plen == 0 {
                 continue;
             }
-            if !append_to_batch(s, sys, 0, plen as usize, 0, now) { break; }
+            if !append_to_batch(s, sys, 0, plen as usize, 0, ORIGIN_LOCAL, now) {
+                break;
+            }
         }
     }
 
@@ -3052,25 +4338,37 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
             {
                 return;
             }
-            if !wire_channels::readable(sys, s.in_proposals_partitioned_tagged) { break; }
-
-            let (partition_id, msg_type, plen) = wire_channels::channel_read_partitioned(
-                sys,
-                s.in_proposals_partitioned_tagged,
-                &mut s.msg_buf,
-            );
-            if msg_type != wire::MSG_CLIENT_PROPOSAL { continue; }
+            let Some((msg_type, plen)) = s.inbox_prop_pt.next(sys, &mut s.msg_buf) else {
+                break;
+            };
             let plen = plen as usize;
-            if plen < wire::TAGGED_PROPOSAL_HDR { continue; }
-            if partition_id != s.partition_id { continue; }
+            let key_off = match msg_type {
+                wire::MSG_CLIENT_PROPOSAL => 0,
+                wire::MSG_CLIENT_PROPOSAL_KEYED => wire::KEYED_PROPOSAL_HDR,
+                _ => continue,
+            };
+            if plen < key_off + wire::TAGGED_PROPOSAL_HDR {
+                continue;
+            }
 
-            let (correlation_id, body_off) =
-                match wire::decode_tagged_proposal(&s.msg_buf[..plen]) {
+            let (correlation_id, rel_off) =
+                match wire::decode_tagged_proposal(&s.msg_buf[key_off..plen]) {
                     Some(v) => v,
                     None => continue,
                 };
+            let body_off = key_off + rel_off;
             let body_len = plen - body_off;
-            if !append_to_batch(s, sys, body_off, body_len, correlation_id, now) { break; }
+            if !append_to_batch(
+                s,
+                sys,
+                body_off,
+                body_len,
+                correlation_id,
+                ORIGIN_LOCAL,
+                now,
+            ) {
+                break;
+            }
         }
     }
 }
@@ -3098,19 +4396,30 @@ unsafe fn append_to_batch(
     off: usize,
     len: usize,
     correlation_id: u64,
+    origin: u8,
     now: u64,
 ) -> bool {
-    if len == 0 { return true; }
+    if len == 0 {
+        return true;
+    }
     let space = PROPOSAL_BATCH_CAP - s.proposal_batch_len as usize;
-    if len > space { return false; }
+    if len > space {
+        return false;
+    }
     let count = s.proposal_batch_count as usize;
-    if count >= MAX_BATCH_PROPOSALS { return false; }
+    if count >= MAX_BATCH_PROPOSALS {
+        return false;
+    }
 
     let start = s.proposal_batch_len as usize;
-    s.proposal_batch[start..start + len]
-        .copy_from_slice(&s.msg_buf[off..off + len]);
+    s.proposal_batch[start..start + len].copy_from_slice(&s.msg_buf[off..off + len]);
     s.proposal_batch_len += len as u16;
     s.correlation_ids[count] = correlation_id;
+    // Must be recorded HERE, not by the caller after the call: the
+    // count-based flush at the end of this function can emit the
+    // assignment before control ever returns (`proposal_batch_max`
+    // defaults to 1, so every proposal flushes inline).
+    s.correlation_origin[count] = origin;
     s.proposal_batch_count += 1;
     s.proposals_received += 1;
     // Acceptance signal — single choke point for all four proposal
@@ -3149,13 +4458,22 @@ unsafe fn append_to_batch(
 /// `&SyscallTable` per the module ABI.
 unsafe fn append_noop(s: &mut Raft, sys: &SyscallTable) {
     let prev_log_index = s.last_log_index;
-    let prev_log_term = if prev_log_index == 0 { 0 } else { s.last_log_term };
+    let prev_log_term = if prev_log_index == 0 {
+        0
+    } else {
+        s.last_log_term
+    };
     let new_index = s.last_log_index + 1;
 
     let mut wal_buf = [0u8; 16];
     wire::encode_term_index(&mut wal_buf, s.current_term, new_index);
-    let written =
-        wire_channels::channel_write_msg(sys, s.out_log, wire::MSG_WAL_ENTRY, &wal_buf);
+    let written = wire_channels::channel_write_partitioned(
+        sys,
+        s.out_log,
+        s.partition_id,
+        wire::MSG_WAL_ENTRY,
+        &wal_buf,
+    );
     if written <= 0 {
         return; // WAL busy — `noop_pending` stays set, retry next tick
     }
@@ -3201,9 +4519,11 @@ unsafe fn append_noop(s: &mut Raft, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
-    if s.proposal_batch_count == 0 { return; }
+    if s.proposal_batch_count == 0 {
+        return;
+    }
 
-    // ── Durability backpressure: fail closed (RFC §13/§14) ──────────
+    // ── Durability backpressure: fail closed ────────────────────────
     // `last_log_index` must never advance past what the WAL accepts, so the
     // frame for the NEXT index is written FIRST and the index advance is
     // gated on that write. `channel_write_msg` is a single atomic frame
@@ -3213,7 +4533,11 @@ unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
     // proposals that would have filled this batch stay queued upstream
     // (proposer backpressure) rather than being dropped.
     let prev_log_index = s.last_log_index;
-    let prev_log_term = if prev_log_index == 0 { 0 } else { s.last_log_term };
+    let prev_log_term = if prev_log_index == 0 {
+        0
+    } else {
+        s.last_log_term
+    };
     let new_index = s.last_log_index + 1;
     let batch_len = s.proposal_batch_len as usize;
 
@@ -3221,8 +4545,12 @@ unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
     wire::encode_term_index(&mut wal_buf, s.current_term, new_index);
     wal_buf[16..16 + batch_len].copy_from_slice(&s.proposal_batch[..batch_len]);
 
-    let written = wire_channels::channel_write_msg(
-        sys, s.out_log, wire::MSG_WAL_ENTRY, &wal_buf[..16 + batch_len],
+    let written = wire_channels::channel_write_partitioned(
+        sys,
+        s.out_log,
+        s.partition_id,
+        wire::MSG_WAL_ENTRY,
+        &wal_buf[..16 + batch_len],
     );
     if written <= 0 {
         if !s.flush_deferred {
@@ -3239,8 +4567,8 @@ unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
     s.last_log_term = s.current_term;
     record_tail_term(s, new_index, s.current_term);
 
-    // Stamp the append time for this index so commit-advance can fold
-    // its age into clustor.raft.commit_latency_ms (RFC §4.1).
+    // Stamp the append time for this index so commit-advance can fold its
+    // age into clustor.raft.commit_latency_ms.
     let ts_slot = (s.last_log_index as usize) % COMMIT_TS_RING;
     s.commit_ts_index[ts_slot] = s.last_log_index;
     s.commit_ts_us[ts_slot] = dev_micros(sys);
@@ -3254,15 +4582,17 @@ unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
         // is non-load-bearing for consensus, so a stuck observer must
         // never block the WAL hot path. Observer consumers MUST cope with
         // gaps and recover via the per-entry sequence numbers.
-        let _ = s.outbox_bodies.push(wire::MSG_WAL_ENTRY, &wal_buf[..16 + batch_len]);
+        let _ = s
+            .outbox_bodies
+            .push(wire::MSG_WAL_ENTRY, &wal_buf[..16 + batch_len]);
     }
 
-    // Send to replicator (E1 seam) using the
-    // extended envelope with prev_log_{index,term} so followers can
-    // verify log matching (RFC §5.1). The "prev" for this entry is the
-    // index we held BEFORE this flush — `last_log_index - 1` and the
-    // term we knew for that index. The leader has just bumped
-    // `last_log_*`, so we recover them by subtracting the increment.
+    // Send to replicator (E1 seam) using the extended envelope with
+    // prev_log_{index,term} so followers can verify log matching. The "prev"
+    // for this entry is the index we held BEFORE this flush —
+    // `last_log_index - 1` and the term we knew for that index. The leader
+    // has just bumped `last_log_*`, so we recover them by subtracting the
+    // increment.
     {
         let mut ae_buf = [0u8; PROPOSAL_BATCH_CAP + wire::AE_HDR_LEN];
         let total = wire::encode_append_entries(
@@ -3308,14 +4638,39 @@ unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
-    if s.out_proposal_assigned < 0 { return; }
+    if s.out_proposal_assigned < 0 {
+        return;
+    }
     let count = s.proposal_batch_count as usize;
     let assigned_index = s.last_log_index;
     let pid = s.partition_id;
     for i in 0..count {
         let cid = s.correlation_ids[i];
+        let origin = s.correlation_origin[i];
         s.correlation_ids[i] = 0;
-        if cid == 0 { continue; }
+        s.correlation_origin[i] = ORIGIN_LOCAL;
+        if cid == 0 {
+            continue;
+        }
+
+        // Relayed proposal: the waiting inflight slot lives on the
+        // ORIGIN's ring, so the assignment goes back over the peer path
+        // instead of to our own proposer, which knows nothing about it.
+        if origin != ORIGIN_LOCAL && origin != s.self_id {
+            if s.out_rpc >= 0 && wire_channels::writable(sys, s.out_rpc) {
+                let mut buf = [0u8; wire::PROPOSAL_ASSIGNED_LEN];
+                wire::encode_proposal_assigned(&mut buf, cid, pid, assigned_index);
+                wire_channels::channel_write_routed_partitioned(
+                    sys,
+                    s.out_rpc,
+                    origin,
+                    pid,
+                    wire::MSG_PROPOSAL_ASSIGNED_REMOTE,
+                    &buf,
+                );
+            }
+            continue;
+        }
 
         if !wire_channels::writable(sys, s.out_proposal_assigned) {
             // Channel full — drop the assignment. The proposer either
@@ -3325,7 +4680,12 @@ unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
         }
         let mut buf = [0u8; wire::PROPOSAL_ASSIGNED_LEN];
         wire::encode_proposal_assigned(&mut buf, cid, pid, assigned_index);
-        wire_channels::channel_write_msg(sys, s.out_proposal_assigned, wire::MSG_PROPOSAL_ASSIGNED, &buf);
+        wire_channels::channel_write_msg(
+            sys,
+            s.out_proposal_assigned,
+            wire::MSG_PROPOSAL_ASSIGNED,
+            &buf,
+        );
     }
 }
 
@@ -3335,7 +4695,7 @@ unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn send_heartbeat(s: &Raft, sys: &SyscallTable) {
+unsafe fn send_heartbeat(s: &mut Raft, sys: &SyscallTable) {
     // Heartbeats are AppendEntries with an empty body (entry_index = 0).
     // They double as log-matching probes: a follower whose tail
     // disagrees with prev_log_* rejects the AE, prompting the
@@ -3354,13 +4714,24 @@ unsafe fn send_heartbeat(s: &Raft, sys: &SyscallTable) {
     );
 
     if wire_channels::writable(sys, s.out_rpc) {
-        wire_channels::channel_write_routed_partitioned(
+        rpc_send(
+            s,
             sys,
-            s.out_rpc,
             wire::TARGET_BROADCAST,
-            s.partition_id,
             wire::MSG_APPEND_ENTRIES,
             &hb,
+        );
+    } else {
+        s.heartbeats_skipped = s.heartbeats_skipped.wrapping_add(1);
+        log_p(
+            sys,
+            2,
+            b"[raft] hb skipped p=",
+            s.partition_id,
+            b" n=",
+            s.heartbeats_skipped,
+            b" t=",
+            s.current_term.min(u32::MAX as u64) as u32,
         );
     }
 }
@@ -3477,13 +4848,23 @@ fn build_meta_path_ex(partition_id: u16, root: bool) -> ([u8; META_PATH_MAX], us
     let mut buf = [0u8; META_PATH_MAX];
     if root {
         let mut i = 0usize;
-        for &b in b"RAFT" { buf[i] = b; i += 1; }
-        for digit in (0..4).rev() {
-            let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
-            buf[i] = if nibble < 10 { b'0' + nibble } else { b'A' + nibble - 10 };
+        for &b in b"RAFT" {
+            buf[i] = b;
             i += 1;
         }
-        for &b in b".MET" { buf[i] = b; i += 1; }
+        for digit in (0..4).rev() {
+            let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
+            buf[i] = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'A' + nibble - 10
+            };
+            i += 1;
+        }
+        for &b in b".MET" {
+            buf[i] = b;
+            i += 1;
+        }
         return (buf, i);
     }
     if partition_id == 0 {
@@ -3494,14 +4875,24 @@ fn build_meta_path_ex(partition_id: u16, root: bool) -> ([u8; META_PATH_MAX], us
     // "raft/p" + 4 hex digits + "/meta"
     let prefix = b"raft/p";
     let mut i = 0usize;
-    for &b in prefix { buf[i] = b; i += 1; }
+    for &b in prefix {
+        buf[i] = b;
+        i += 1;
+    }
     for digit in (0..4).rev() {
         let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
-        buf[i] = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+        buf[i] = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
         i += 1;
     }
     let suffix = b"/meta";
-    for &b in suffix { buf[i] = b; i += 1; }
+    for &b in suffix {
+        buf[i] = b;
+        i += 1;
+    }
     (buf, i)
 }
 
@@ -3607,12 +4998,11 @@ unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
             }
             dev_log(sys, 3, b"[raft] meta ok".as_ptr(), 14);
         }
-        // Joint-consensus fields (RFC §1.2). A zero `current_voters`
-        // is NOT a valid persisted set — it is a record whose voter
-        // bytes were never written — and adopting it would leave every
-        // quorum test (elections, ReadIndex, commit) permanently
-        // unsatisfiable. Keep the `voter_count` defaults seeded in
-        // `arm` in that case.
+        // Joint-consensus fields. A zero `current_voters` is NOT a valid
+        // persisted set — it is a record whose voter bytes were never
+        // written — and adopting it would leave every quorum test
+        // (elections, ReadIndex, commit) permanently unsatisfiable. Keep the
+        // `voter_count` defaults seeded in `arm` in that case.
         if rec.current_voters != 0 {
             s.current_voters = NodeSet(rec.current_voters);
             s.joint_voters = NodeSet(rec.joint_voters);
@@ -4115,7 +5505,10 @@ fn become_follower_mem(s: &mut Raft, term: Term) {
     s.flush_deferred = false;
     // Drop any pending correlation ids — proposals from a prior term are
     // discarded, so the proposer will time out and retry.
-    for i in 0..MAX_BATCH_PROPOSALS { s.correlation_ids[i] = 0; }
+    for i in 0..MAX_BATCH_PROPOSALS {
+        s.correlation_ids[i] = 0;
+        s.correlation_origin[i] = ORIGIN_LOCAL;
+    }
 }
 
 /// Same-term step-down (a candidate observing the term's elected
@@ -4157,9 +5550,21 @@ unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // See `become_follower`: the discarded batch takes its deferral flag with
     // it, or leadership starts with intake permanently suspended.
     s.flush_deferred = false;
-    for i in 0..MAX_BATCH_PROPOSALS { s.correlation_ids[i] = 0; }
+    for i in 0..MAX_BATCH_PROPOSALS {
+        s.correlation_ids[i] = 0;
+        s.correlation_origin[i] = ORIGIN_LOCAL;
+    }
 
-    dev_log(sys, 3, b"[raft] leader".as_ptr(), 13);
+    log_p(
+        sys,
+        3,
+        b"[raft] leader p=",
+        s.partition_id,
+        b" t=",
+        s.current_term.min(u32::MAX as u64) as u32,
+        b" last=",
+        s.last_log_index.min(u32::MAX as u64) as u32,
+    );
 
     // Owe the log a current-term no-op (Raft §5.4.2): committing it is
     // the only safe way prior-term entries become committed.
@@ -4245,13 +5650,19 @@ unsafe fn start_election(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: b
     s.elections_started += 1;
 
     // Randomize election timeout with jitter
-    let mut seed = (now as u32) ^ ((s.self_id as u32) << 16) ^ 0xCAFE;
+    let mut seed =
+        (now as u32) ^ ((s.self_id as u32) << 16) ^ ((s.partition_id as u32) << 8) ^ 0xCAFE;
     let half_timeout = (s.election_timeout_ms as u32 / 2).max(1);
     let jitter = (xorshift32(&mut seed) & (half_timeout.next_power_of_two() - 1)) as u64;
     s.election_deadline_ms = now + s.election_timeout_ms as u64 + jitter;
 
     // Check for single-node cluster: already have quorum
-    if set_majority(s.votes_granted, s.current_voters, s.joint_voters, s.joint_active) {
+    if set_majority(
+        s.votes_granted,
+        s.current_voters,
+        s.joint_voters,
+        s.joint_active,
+    ) {
         if pre_vote {
             start_election(s, sys, now, false);
         } else {
@@ -4261,16 +5672,49 @@ unsafe fn start_election(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: b
     }
 
     // Send vote requests to all peers via routed broadcast
-    let msg_type = if pre_vote { wire::MSG_PRE_VOTE } else { wire::MSG_REQUEST_VOTE };
+    let msg_type = if pre_vote {
+        wire::MSG_PRE_VOTE
+    } else {
+        wire::MSG_REQUEST_VOTE
+    };
     let mut req = [0u8; 25];
-    let req_term = if pre_vote { s.current_term + 1 } else { s.current_term };
-    wire::encode_vote_request(&mut req, req_term, s.self_id, s.last_log_index, s.last_log_term);
+    let req_term = if pre_vote {
+        s.current_term + 1
+    } else {
+        s.current_term
+    };
+    wire::encode_vote_request(
+        &mut req,
+        req_term,
+        s.self_id,
+        s.last_log_index,
+        s.last_log_term,
+    );
 
     if wire_channels::writable(sys, s.out_rpc) {
-        wire_channels::channel_write_routed_partitioned(sys, s.out_rpc, wire::TARGET_BROADCAST, s.partition_id, msg_type, &req[..25]);
+        rpc_send(s, sys, wire::TARGET_BROADCAST, msg_type, &req[..25]);
     }
 
-    dev_log(sys, 3, b"[raft] elect".as_ptr(), 12);
+    log_p(
+        sys,
+        3,
+        b"[raft] elect p=",
+        s.partition_id,
+        b" since_ae=",
+        now.wrapping_sub(s.last_ae_ms).min(u32::MAX as u64) as u32,
+        b" t=",
+        req_term.min(u32::MAX as u64) as u32,
+    );
+    log_p(
+        sys,
+        3,
+        b"[raft] elect rx p=",
+        s.partition_id,
+        b" rpc=",
+        s.rpc_total,
+        b" stale=",
+        s.ae_stale,
+    );
 }
 
 /// # Safety
@@ -4280,11 +5724,31 @@ unsafe fn start_election(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: b
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn reset_election_deadline(s: &mut Raft, now: u64) {
-    // Fold self_id into the seed: co-timed followers (heartbeat-
-    // synchronised deadlines) must not draw correlated jitter, or a
-    // leader loss degenerates into repeated split votes.
-    let mut seed = (now as u32) ^ ((s.self_id as u32) << 16) ^ 0xBEEF;
+    // Fold self_id AND partition_id into the seed. Two independent
+    // correlations have to be broken:
+    //
+    //   - co-timed followers (heartbeat-synchronised deadlines) across
+    //     NODES, or a leader loss degenerates into repeated split votes;
+    //   - co-hosted groups within ONE engine, which share `self_id` and
+    //     step on the same tick, so without the partition term every
+    //     group this node hosts would draw the same jitter and campaign
+    //     together — the election storm the multi-tenant engine exists
+    //     to avoid.
+    //
+    // Both ids are spread over the whole word by an odd multiplier, and
+    // the generator is run TWICE before the mask is applied. One round
+    // is not enough: the jitter keeps only the low bits, and a single
+    // xorshift round carries `self_id`'s bit 16 no further down than
+    // bits 12, 17, 21 and 29. Two followers whose deadlines were reset
+    // by the same heartbeat would then draw identical jitter and split
+    // every vote. The second round is what puts each id in the kept
+    // bits.
+    let mut seed = (now as u32)
+        ^ (s.self_id as u32).wrapping_mul(0x9E37_79B9)
+        ^ (s.partition_id as u32).wrapping_mul(0x85EB_CA6B)
+        ^ 0xBEEF;
     let half_timeout2 = (s.election_timeout_ms as u32 / 2).max(1);
+    xorshift32(&mut seed);
     let jitter = (xorshift32(&mut seed) & (half_timeout2.next_power_of_two() - 1)) as u64;
     s.election_deadline_ms = now + s.election_timeout_ms as u64 + jitter;
 }
@@ -4309,21 +5773,24 @@ pub fn on_fallback(s: &mut Raft, msg: &[u8], plen: u16) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
-    if s.out_metrics < 0 { return; }
-    if now.wrapping_sub(s.last_metrics_ms) < 1000 { return; }
+    if s.out_metrics < 0 {
+        return;
+    }
+    if now.wrapping_sub(s.last_metrics_ms) < 1000 {
+        return;
+    }
     s.last_metrics_ms = now;
 
-    // Typed metric samples (RFC §4.3). Replaces the prior packed-into-
-    // one-envelope shape so the telemetry component can aggregate without
-    // a module-specific parser. Each metric goes out as its own
-    // `MSG_METRIC_SAMPLE`; the legacy `MSG_METRICS` envelope is still
-    // sent at the end for tools that haven't migrated yet, so this
-    // is fully backwards-compatible.
+    // Typed metric samples: each metric goes out as its own
+    // `MSG_METRIC_SAMPLE`, so the telemetry component aggregates them
+    // without a module-specific parser. The packed `MSG_METRICS`
+    // envelope follows at the end, carrying the same values in one
+    // frame for consumers that read that shape.
     let mod_id = wire::SOURCE_ID_RAFT;
     let pid = s.partition_id;
     let kg = wire::METRIC_KIND_GAUGE;
     let kc = wire::METRIC_KIND_COUNTER;
-    // Readiness sub-signal (RFC: real /readyz): boot replay done, metadata
+    // Readiness sub-signal behind `/readyz`: boot replay done, metadata
     // loaded, and consensus established (we lead, or we know the leader).
     // A node holding an unacknowledged truncation NACKs every
     // AppendEntries, so it is not carrying replication and must not
@@ -4332,59 +5799,156 @@ unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
         && !s.meta_load_pending
         && !s.truncate_pending
         && (s.role == ROLE_LEADER || s.leader_id >= 0)) as i64;
-    let samples: [(u16, u8, i64); 26] = [
+    let samples: [(u16, u8, i64); 27] = [
         // RAFT_READY leads the array: the emit loop stops at a full
         // metrics channel, so readiness must be the last casualty under
         // backpressure, not the first.
         (wire::metric_ids::RAFT_READY, kg, raft_ready),
-        (wire::metric_ids::RAFT_LAST_LOG_INDEX, kg, s.last_log_index as i64),
-        (wire::metric_ids::RAFT_COMMIT_INDEX, kg, s.commit_index as i64),
+        (
+            wire::metric_ids::RAFT_LAST_LOG_INDEX,
+            kg,
+            s.last_log_index as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_COMMIT_INDEX,
+            kg,
+            s.commit_index as i64,
+        ),
         (wire::metric_ids::RAFT_ROLE, kg, s.role as i64),
-        (wire::metric_ids::RAFT_CURRENT_TERM, kg, s.current_term as i64),
-        (wire::metric_ids::RAFT_PROPOSALS_RECEIVED, kc, s.proposals_received as i64),
-        (wire::metric_ids::RAFT_ENTRIES_APPENDED, kc, s.entries_appended as i64),
-        (wire::metric_ids::RAFT_ELECTIONS_STARTED, kc, s.elections_started as i64),
-        (wire::metric_ids::RAFT_PROPOSALS_DROPPED_FROZEN, kc, s.proposals_dropped_frozen as i64),
-        (wire::metric_ids::RAFT_PROPOSALS_DROPPED_STRICT, kc, s.proposals_dropped_strict as i64),
+        (
+            wire::metric_ids::RAFT_CURRENT_TERM,
+            kg,
+            s.current_term as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_PROPOSALS_RECEIVED,
+            kc,
+            s.proposals_received as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_ENTRIES_APPENDED,
+            kc,
+            s.entries_appended as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_ELECTIONS_STARTED,
+            kc,
+            s.elections_started as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_PROPOSALS_DROPPED_FROZEN,
+            kc,
+            s.proposals_dropped_frozen as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_PROPOSALS_DROPPED_STRICT,
+            kc,
+            s.proposals_dropped_strict as i64,
+        ),
         (wire::metric_ids::RAFT_FROZEN_FLAG, kg, s.frozen as i64),
-        (wire::metric_ids::RAFT_STRICT_FALLBACK_FLAG, kg, s.strict_fallback as i64),
-        (wire::metric_ids::RAFT_FLUSHES_DEFERRED, kc, s.flushes_deferred as i64),
+        (
+            wire::metric_ids::RAFT_STRICT_FALLBACK_FLAG,
+            kg,
+            s.strict_fallback as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_FLUSHES_DEFERRED,
+            kc,
+            s.flushes_deferred as i64,
+        ),
         (
             wire::metric_ids::RAFT_UNCOMMITTED_INFLIGHT,
             kg,
             s.last_log_index.saturating_sub(s.commit_index) as i64,
         ),
-        (wire::metric_ids::RAFT_AWAITING_REPLAY, kg, s.awaiting_replay as i64),
-        (wire::metric_ids::RAFT_REPLAY_HW, kg, s.replay_hw_received as i64),
-        (wire::metric_ids::RAFT_META_HINT, kg, s.meta_hint_loaded as i64),
-        (wire::metric_ids::RAFT_LOG_TRUNCATIONS, kc, s.log_truncations as i64),
+        (
+            wire::metric_ids::RAFT_AWAITING_REPLAY,
+            kg,
+            s.awaiting_replay as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_REPLAY_HW,
+            kg,
+            s.replay_hw_received as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_META_HINT,
+            kg,
+            s.meta_hint_loaded as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_LOG_TRUNCATIONS,
+            kc,
+            s.log_truncations as i64,
+        ),
         (wire::metric_ids::RAFT_WAL_RESYNCS, kc, s.wal_resyncs as i64),
-        (wire::metric_ids::RAFT_WAL_UNACKED_HOLDS, kc, s.wal_unacked_holds as i64),
-        (wire::metric_ids::RAFT_AE_NONCONTIGUOUS, kc, s.ae_noncontiguous as i64),
-        (wire::metric_ids::RAFT_META_WRITE_ERRORS, kc, s.meta_write_errors as i64),
-        (wire::metric_ids::RAFT_NAME_FENCE, kg, i64::from(s.name_fence_probe)),
-        (wire::metric_ids::RAFT_NAME_UNFENCED, kc, s.name_unfenced as i64),
-        (wire::metric_ids::RAFT_TRUNCATE_HOLDS, kc, s.truncate_holds as i64),
-        (wire::metric_ids::RAFT_TRUNCATE_NACKS, kc, s.truncate_nacks as i64),
+        (
+            wire::metric_ids::RAFT_WAL_UNACKED_HOLDS,
+            kc,
+            s.wal_unacked_holds as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_AE_NONCONTIGUOUS,
+            kc,
+            s.ae_noncontiguous as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_AE_UNVERIFIED,
+            kc,
+            s.ae_unverified as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_META_WRITE_ERRORS,
+            kc,
+            s.meta_write_errors as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_NAME_FENCE,
+            kg,
+            i64::from(s.name_fence_probe),
+        ),
+        (
+            wire::metric_ids::RAFT_NAME_UNFENCED,
+            kc,
+            s.name_unfenced as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_TRUNCATE_HOLDS,
+            kc,
+            s.truncate_holds as i64,
+        ),
+        (
+            wire::metric_ids::RAFT_TRUNCATE_NACKS,
+            kc,
+            s.truncate_nacks as i64,
+        ),
     ];
     wire_channels::emit_metrics(sys, s.out_metrics, mod_id, pid, &samples);
 
-    // commit_latency_ms histogram buckets (RFC §4.1), kind=histogram.
-    // Cumulative per the wire contract (wire::hist): bucket i carries the
-    // count of samples <= bound[i], so emit the running prefix sum.
+    // commit_latency_ms histogram buckets, kind=histogram. Cumulative per
+    // the wire contract (wire::hist): bucket i carries the count of samples
+    // <= bound[i], so emit the running prefix sum.
     let base = wire::hist::HIST_BASE;
     let mut cum: i64 = 0;
     for i in 0..s.commit_latency_buckets.len() {
         cum += i64::from(s.commit_latency_buckets[i]);
-        if !wire_channels::writable(sys, s.out_metrics) { break; }
+        if !wire_channels::writable(sys, s.out_metrics) {
+            break;
+        }
         let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
-        wire::encode_metric_sample(&mut buf, mod_id, pid, base + i as u16, wire::METRIC_KIND_HISTOGRAM, cum);
+        wire::encode_metric_sample(
+            &mut buf,
+            mod_id,
+            pid,
+            base + i as u16,
+            wire::METRIC_KIND_HISTOGRAM,
+            cum,
+        );
         wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);
     }
 
-    // Legacy MSG_METRICS shape — still emitted so observers that parse
-    // it (test scaffolding, the e2e harness) keep working. Same byte
-    // layout per RFC §4.3.
+    // Legacy MSG_METRICS shape — still emitted so observers that parse it
+    // (test scaffolding, the e2e harness) keep working. Same byte layout.
     let mut buf = [0u8; 30];
     buf[0] = s.role;
     buf[1..9].copy_from_slice(&s.current_term.to_le_bytes());
@@ -4394,8 +5958,12 @@ unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
     buf[21..25].copy_from_slice(&s.proposals_dropped_frozen.to_le_bytes());
     buf[25..29].copy_from_slice(&s.proposals_dropped_strict.to_le_bytes());
     let mut flags = 0u8;
-    if s.frozen { flags |= 0x01; }
-    if s.strict_fallback { flags |= 0x02; }
+    if s.frozen {
+        flags |= 0x01;
+    }
+    if s.strict_fallback {
+        flags |= 0x02;
+    }
     buf[29] = flags;
 
     if wire_channels::writable(sys, s.out_metrics) {

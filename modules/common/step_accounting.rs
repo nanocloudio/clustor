@@ -36,7 +36,9 @@ pub struct CompStepHist {
 
 impl CompStepHist {
     pub const fn new() -> Self {
-        Self { buckets: [0; COMP_STEP_BUCKETS] }
+        Self {
+            buckets: [0; COMP_STEP_BUCKETS],
+        }
     }
 
     /// Classify one component step's elapsed time.

@@ -69,8 +69,8 @@ pub unsafe fn step(p: &mut ProofCache, sys: &SyscallTable, now: u64) -> Option<u
     //    defaults), jumping Fresh→Stale at exactly the fresh threshold
     //    and blocking linearizable reads instead of degrading.
     let age = now.wrapping_sub(p.last_proof_ms);
-    let cached_until_ms = p.fresh_threshold_ms
-        + p.grace_period_ms.saturating_sub(p.fresh_threshold_ms) / 2;
+    let cached_until_ms =
+        p.fresh_threshold_ms + p.grace_period_ms.saturating_sub(p.fresh_threshold_ms) / 2;
     let new_state = if age < p.fresh_threshold_ms {
         types::CP_FRESH
     } else if age < cached_until_ms {
@@ -103,7 +103,12 @@ pub unsafe fn step(p: &mut ProofCache, sys: &SyscallTable, now: u64) -> Option<u
             let fallback = new_state >= types::CP_STALE;
             if wire_channels::writable(sys, p.out_fallback) {
                 let buf = [fallback as u8];
-                wire_channels::channel_write_msg(sys, p.out_fallback, wire::MSG_FALLBACK_SIGNAL, &buf[..1]);
+                wire_channels::channel_write_msg(
+                    sys,
+                    p.out_fallback,
+                    wire::MSG_FALLBACK_SIGNAL,
+                    &buf[..1],
+                );
             }
         }
         return Some(new_state);
@@ -117,8 +122,7 @@ unsafe fn drain_proofs(p: &mut ProofCache, sys: &SyscallTable, now: u64, which: 
         return;
     }
     for _ in 0..8 {
-        let Some((msg_type, plen)) = wire_channels::next_msg(sys, chan, &mut p.msg_buf)
-        else {
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, chan, &mut p.msg_buf) else {
             break;
         };
         if msg_type == wire::MSG_CP_PROOF && plen >= 8 {

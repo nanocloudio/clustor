@@ -1,15 +1,14 @@
 version = "0.1.0"
 # Cadence: throttles (metrics heartbeat, time-producer cadence) are
 # dev_millis-based, not step-counted — safe on variable-cadence
-# domains (RFC adaptive_tick §8).
+# domains.
 timer_class = "wall_clock"
 type = "Transformer"
 entry = "mod.rs"
 hardware_targets = ["bcm2712"]
 
 # Session directory / reservation authority — the durable single-writer
-# role from fluxor's rfc_protocols.md §8.3 / §13.7, backed by the
-# replica group. State machine: modules/common/session_registry.rs;
+# role fluxor's session protocol defines, backed by the replica group. State machine: modules/common/session_registry.rs;
 # gate tests: tests/session_registry.rs; doc:
 # docs/architecture/session_directory.md.
 #
@@ -75,7 +74,7 @@ content_type = "OctetStream"
 # MSG_LEADER_HINT from consensus ([leader_id:u8][term:u64 LE]) — fences
 # the leader-only deterministic-timing producer: only the node that is
 # the current PRG leader samples wall time and proposes TimeAdvance /
-# TimeDrain entries (rfc_deterministic_timing.md §10). Optional; a
+# TimeDrain entries. Optional; a
 # graph without it never produces time (deadlines stay pending).
 [[ports]]
 name = "leader_state"
@@ -122,6 +121,6 @@ metrics = [
   "stream_gaps",
   "recovery_epoch",
 ]
-# Deterministic-timing series (MSG_METRIC_SAMPLE, source_id 0x19,
-# rfc_deterministic_timing.md §16): logical time, lag, advance/drain
+# Deterministic-timing series (MSG_METRIC_SAMPLE, source_id 0x19):
+# logical time, lag, advance/drain
 # totals, live deadlines, due depth, fired/no-op totals, pause reason.

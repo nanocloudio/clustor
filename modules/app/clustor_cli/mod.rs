@@ -1,7 +1,7 @@
-//! The clustor operator CLI as a fluxor cli-applet fmod
-//! (rfc_cli_execution.md): ONE PIC module dispatches clustor subcommands over
-//! the cli host surface. The `cli` stack injects cli_in/cli_out; this module
-//! reads argv (NUL-separated, from `args`), routes on the subcommand, writes
+//! The clustor operator CLI as a fluxor cli-applet fmod: ONE PIC module
+//! dispatches clustor subcommands over the cli host surface. The `cli`
+//! stack injects cli_in/cli_out; this module reads argv (NUL-separated,
+//! from `args`), routes on the subcommand, writes
 //! output to `stdout` (→ cli_out.bytes_in), latches an exit code on `exit`
 //! (→ cli_out.exit_in), and returns Done so the run-to-completion CLI exits.
 //!

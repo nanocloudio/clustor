@@ -4,7 +4,7 @@ entry            = "mod.rs"
 hardware_targets = ["bcm2712"]
 timer_class      = "agnostic"
 
-# The clustor operator CLI as a fluxor cli-applet (rfc_cli_execution.md):
+# The clustor operator CLI as a fluxor cli-applet.
 # ONE PIC module dispatches clustor subcommands over the cli host surface.
 # Run: `fluxor exec clustor -- <cmd>`.
 #

@@ -26,8 +26,8 @@ use super::collections::Crc32c;
 use super::types::{Index, Term};
 use super::wal_frame;
 use super::{
-    dev_input_flow_budget, dev_log, dev_micros, dev_millis, dev_report_step_effect,
-    fmt_u32_raw, step_effect, wire, wire_channels, POLL_IN, POLL_OUT,
+    dev_input_flow_budget, dev_log, dev_micros, dev_millis, dev_report_step_effect, fmt_u32_raw,
+    step_effect, wire, wire_channels, POLL_IN, POLL_OUT,
 };
 
 /// Frame header size, as `u32` for the cursor/offset arithmetic in
@@ -103,7 +103,11 @@ const VOLATILE_RETENTION_SLOTS: usize = 256;
 /// full window on that build would cost a disk replica 514 KiB of
 /// module state no code path can reach. See `memory_slot` for the
 /// accessor that keeps the two sizings honest.
-const MEMORY_RING_SIZE: usize = if VOLATILE { VOLATILE_RETENTION_SLOTS } else { 1 };
+const MEMORY_RING_SIZE: usize = if VOLATILE {
+    VOLATILE_RETENTION_SLOTS
+} else {
+    1
+};
 const MEMORY_RING_MASK: u64 = (MEMORY_RING_SIZE as u64) - 1;
 
 /// Per-body cap, taken from the graph-wide entry-body cap rather than
@@ -137,7 +141,11 @@ const MEMORY_ENTRY_BODY_CAP: usize = wal_frame::MAX_ENTRY_BODY;
 /// build: 248 KiB less module state, and the two floors coincide, which
 /// makes `entry_ring_min_index` the single honest retention edge rather
 /// than one that under-reports what is actually servable.
-const ENTRY_LOC_RING_SIZE: usize = if VOLATILE { VOLATILE_RETENTION_SLOTS } else { 8192 };
+const ENTRY_LOC_RING_SIZE: usize = if VOLATILE {
+    VOLATILE_RETENTION_SLOTS
+} else {
+    8192
+};
 const ENTRY_LOC_RING_MASK: u64 = (ENTRY_LOC_RING_SIZE as u64) - 1;
 
 /// Footprint budget for `Wal`, enforced at compile time.
@@ -196,7 +204,13 @@ struct EntryLoc {
 
 impl EntryLoc {
     const fn zero() -> Self {
-        Self { index: 0, term: 0, seg_seq: 0, payload_offset: 0, payload_len: 0 }
+        Self {
+            index: 0,
+            term: 0,
+            seg_seq: 0,
+            payload_offset: 0,
+            payload_len: 0,
+        }
     }
 }
 
@@ -210,7 +224,11 @@ struct MemoryEntry {
 
 impl MemoryEntry {
     const fn zero() -> Self {
-        Self { index: 0, body_len: 0, body: [0; MEMORY_ENTRY_BODY_CAP] }
+        Self {
+            index: 0,
+            body_len: 0,
+            body: [0; MEMORY_ENTRY_BODY_CAP],
+        }
     }
 }
 
@@ -329,17 +347,102 @@ const REPLAY_FRAMES_PER_STEP: usize = 4;
 /// the whole droppable range inside one step.
 const COMPACT_UNLINKS_PER_STEP: usize = 4;
 
+/// Per-kpg retention-floor table capacity. A downstream consumer emits
+/// one `MSG_COMPACTION_FLOOR` per active kpg it cares about, however it
+/// arrives at that floor. 32 slots covers any realistic per-partition
+/// kpg count; on overflow the engine fails closed (see
+/// `retention_floor_overflow`) — evicting a slot would silently widen
+/// the compaction window past a live floor, and fail-open would do the
+/// same for the unrecorded one.
+const RETENTION_FLOOR_SLOTS: usize = 32;
+
+/// Empty-slot sentinel for the retention-floor table. `0xFFFF` is
+/// wire-reserved as "never a real kpg id" so this value can mark vacant
+/// slots without colliding with `kpg_id = 0`.
+const FLOOR_SLOT_EMPTY: u16 = u16::MAX;
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct RetentionFloorSlot {
+    kpg_id: u16,
+    floor_revision: u64,
+}
+
+impl RetentionFloorSlot {
+    const fn empty() -> Self {
+        Self {
+            kpg_id: FLOOR_SLOT_EMPTY,
+            floor_revision: 0,
+        }
+    }
+}
+
 #[repr(C)]
 pub struct Wal {
     // Channels (composite indices per `mod.rs::module_new`)
-    pub in_entries: i32,        // in[0]: WalEntry from consensus
-    pub in_entry_request: i32,  // in[1]: MSG_WAL_ENTRY_REQUEST (replicator NACK path)
+    pub in_entries: i32, // in[0]: WalEntry from consensus
+    /// Voter-set update lifted off the entry stream for the dispatch
+    /// table to hand to `ledger` (components never call each other —
+    /// see the module header). Mirrors raft's `voter_out` latch.
+    /// Latest-wins: only the newest configuration matters.
+    pub voter_out: Option<(u8, u8, bool, u8)>,
+    /// Per-slot inboxes. The module reads each shared channel once and
+    /// routes by the partitioned envelope's id; this slot drains only
+    /// its own. Without this a slot's destructive read would consume —
+    /// and discard — frames addressed to its siblings.
+    pub inbox_entries: super::inbox::Inbox,
+    pub inbox_entry_req: super::inbox::Inbox,
+    pub in_entry_request: i32, // in[1]: MSG_WAL_ENTRY_REQUEST (replicator NACK path)
     pub in_compact_before: i32, // in[2]: MSG_WAL_COMPACT_BEFORE (post-snapshot trim)
-    pub out_flushed: i32,       // out[0]: FsyncAck (external consumers; ledger is fed in-module)
+    /// in[7]: `MSG_COMPACTION_FLOOR` from the application — the lowest
+    /// index it can still ask this log for (a Kafka retention window).
+    pub in_retention_floor: i32,
+    pub inbox_retention: super::inbox::Inbox,
+    /// Application retention floors, per kpg. A floor bounds segment
+    /// RETIREMENT, not the snapshot: a snapshot is state and is always
+    /// safe to take, while the entries below it are content a consumer
+    /// may still read from disk. Linear scans — small enough that the
+    /// scan fits in one tick.
+    retention_floors: [RetentionFloorSlot; RETENTION_FLOOR_SLOTS],
+    /// Sticky bit set when a floor arrived for a kpg the table could not
+    /// hold. Compaction fails closed (retires nothing) while set: the
+    /// picture of what is still needed is incomplete. Recovery is an
+    /// operator restart with a larger `RETENTION_FLOOR_SLOTS`.
+    retention_floor_overflow: bool,
+    /// Consensus's own floor: the slowest voter's match index, carried
+    /// as `MSG_COMPACTION_FLOOR` on `compact_before`. Retiring below it
+    /// would strand a follower that still needs those entries. Latest
+    /// wins; `None` until the first one arrives.
+    match_floor: Option<u64>,
+    /// Compactions whose trim point a floor pulled down. Rising means
+    /// retention (or a lagging voter) is what bounds disk, not the
+    /// snapshot cadence.
+    compact_floored: u32,
+    pub out_flushed: i32,      // out[0]: FsyncAck (external consumers; ledger is fed in-module)
     pub out_replay_complete: i32, // out[1]: MSG_WAL_REPLAY_COMPLETE to consensus
-    pub out_entry_reply: i32,   // out[2]: MSG_WAL_ENTRY_REPLY back to requester
-    pub out_compaction: i32,    // out[3]: SnapshotTrigger for downstream coordinators
-    pub out_metrics: i32,       // out[4]: MetricsPayload to operations.telemetry
+    pub out_entry_reply: i32,  // out[2]: MSG_WAL_ENTRY_REPLY back to requester
+    /// Cold-read request/reply: a SECOND, independent entry read-back
+    /// path for consumers that address the log by content rather than by
+    /// replication position — today, a Kafka Fetch whose offset has aged
+    /// out of the in-memory ring but whose record is still in the WAL.
+    ///
+    /// Its own channel pair rather than sharing `entry_request`: that one
+    /// is the crash-recovery refetch path, its `request_id` space is
+    /// fully allocated (bit 31 splits `replicator` from `apply`), and a
+    /// client-driven read has no business sharing a queue with log
+    /// rebuild.
+    pub in_cold_read: i32,
+    pub out_cold_reply: i32,
+    /// Per-slot inbox for `in_cold_read`, filled by the module's intake
+    /// demux from the partitioned envelope.
+    pub inbox_cold_read: super::inbox::Inbox,
+    /// Cold reads served and refused, for the operator view: refusals
+    /// rising means consumers are falling further behind than the log
+    /// can still locate.
+    pub cold_served: u32,
+    pub cold_notfound: u32,
+    pub out_compaction: i32,   // out[3]: SnapshotTrigger for downstream coordinators
+    pub out_metrics: i32,      // out[4]: MetricsPayload to operations.telemetry
 
     // WAL state
     pub partition_id: u16,
@@ -347,7 +450,7 @@ pub struct Wal {
     current_term: Term,
     current_index: Index,
     segment_seq: u32,
-    cursor: u32,            // bytes written in current logical segment
+    cursor: u32, // bytes written in current logical segment
     /// Furthest byte ever written in the CURRENT segment. After a
     /// truncation rewinds `cursor` below this, stale frames live in
     /// `[cursor, seg_high_water)`; until fresh appends overwrite past it,
@@ -361,7 +464,7 @@ pub struct Wal {
     /// triggers the snapshot-install fallback on the leader.
     oldest_segment_seq: u32,
     pub dek_epoch: u32,
-    pub encoding: u8,           // 0=binary
+    pub encoding: u8, // 0=binary
 
     /// Ring buffer of recent entry locations for random-access lookup
     /// (replicator NACK retry, apply gap refetch, crash recovery).
@@ -381,7 +484,7 @@ pub struct Wal {
     entry_ring_min_index: u64,
 
     // File I/O
-    fd: i32,                    // file descriptor for current segment, -1 = not open
+    fd: i32, // file descriptor for current segment, -1 = not open
     /// One-shot guard for the `[wal] open fail` hard-error log.
     no_fs_logged: bool,
     /// In-memory retention marker. Set ONLY by the `volatile` build
@@ -489,18 +592,18 @@ pub struct Wal {
     retire_keep_term: Term,
     retire_req: u32,
     last_metrics_ms: u64,
-    /// `clustor.wal.fsync_latency_ms` cumulative bucket counts
-    /// (RFC §4.1). One slot per `wire::hist::FSYNC_LATENCY_US` bound
-    /// plus a trailing `+Inf` overflow bucket. Measured in µs at each
-    /// `FS_FSYNC` call site; emitted as `METRIC_KIND_HISTOGRAM` samples.
+    /// `clustor.wal.fsync_latency_ms` cumulative bucket counts. One slot per
+    /// `wire::hist::FSYNC_LATENCY_US` bound plus a trailing `+Inf` overflow
+    /// bucket. Measured in µs at each `FS_FSYNC` call site; emitted as
+    /// `METRIC_KIND_HISTOGRAM` samples.
     fsync_buckets: [u32; wire::hist::FSYNC_LATENCY_US.len() + 1],
 
     // Replay state
-    phase: u8,              // PHASE_REPLAY or PHASE_NORMAL
-    replay_seg: u32,        // current segment being replayed
-    replay_fd: i32,         // fd for replay segment, -1 = none
-    replay_file_size: u32,  // total bytes in replay segment
-    replay_pos: u32,        // current read position
+    phase: u8,             // PHASE_REPLAY or PHASE_NORMAL
+    replay_seg: u32,       // current segment being replayed
+    replay_fd: i32,        // fd for replay segment, -1 = none
+    replay_file_size: u32, // total bytes in replay segment
+    replay_pos: u32,       // current read position
     /// Consecutive `FS_OPEN` failures while scanning for the next
     /// existing segment. Replay walks from `replay_seg = 1` and
     /// tolerates gaps up to `REPLAY_GAP_TOLERANCE`, which lets it
@@ -700,6 +803,18 @@ pub struct Wal {
     /// sidecar file; deletion never runs ahead of a durable floor, so a
     /// crash mid-compaction can't strand replay behind the gap tolerance.
     floor_persisted: u32,
+    /// Segment replay starts from, persisted beside the floor: the one
+    /// holding the latest durable snapshot's index. Segments between the
+    /// floor and it are retained content — a Kafka window a consumer may
+    /// still read from disk — but raft rebuilds its log only from the
+    /// snapshot on, so boot replay skips them and the cold-read scan
+    /// serves them on demand. Without this, boot cost would scale with
+    /// the retention window rather than with the log above the snapshot.
+    replay_start_persisted: u32,
+    /// First index replay recorded, so the ring's floor can be raised to
+    /// it when replay started above the segment floor: indexes below it
+    /// are on disk but not in the ring, and the scan must serve them.
+    replay_first_index: u64,
 
     // ── In-module delivery latches (composite seams) ─────────
     /// Highest durable (term, index) this step, for the ledger
@@ -726,7 +841,32 @@ pub struct Wal {
     msg_buf: [u8; 4096],
 }
 
+/// Write a frame to a consensus-facing channel in the 5-byte
+/// partitioned envelope, stamped with this WAL's partition.
+///
+/// One durability instance hosts K groups, so the consumer cannot infer
+/// the partition from the wiring and has to be told — which is what the
+/// partitioned envelope is for. A non-partitioned graph uses the same
+/// 5-byte form with `partition_id = 0`, so there is one code path.
+///
+/// # Safety
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+#[inline]
+unsafe fn write_part(s: &Wal, sys: &SyscallTable, chan: i32, msg_type: u8, payload: &[u8]) -> i32 {
+    wire_channels::channel_write_partitioned(sys, chan, s.partition_id, msg_type, payload)
+}
+
 pub unsafe fn init(s: &mut Wal) {
+    s.voter_out = None;
+    s.inbox_entries = super::inbox::Inbox::new();
+    s.inbox_entry_req = super::inbox::Inbox::new();
+    s.inbox_cold_read = super::inbox::Inbox::new();
+    s.inbox_retention = super::inbox::Inbox::new();
+    s.in_retention_floor = -1;
+    s.retention_floors = [RetentionFloorSlot::empty(); RETENTION_FLOOR_SLOTS];
+    s.retention_floor_overflow = false;
+    s.match_floor = None;
+    s.compact_floored = 0;
     s.in_entries = -1;
     s.in_entry_request = -1;
     s.in_compact_before = -1;
@@ -734,6 +874,10 @@ pub unsafe fn init(s: &mut Wal) {
     s.out_compaction = -1;
     s.out_metrics = -1;
     s.out_entry_reply = -1;
+    s.in_cold_read = -1;
+    s.out_cold_reply = -1;
+    s.cold_served = 0;
+    s.cold_notfound = 0;
     s.out_replay_complete = -1;
     s.partition_id = 0;
     s.self_id = 0;
@@ -860,6 +1004,8 @@ pub unsafe fn init(s: &mut Wal) {
     s.replay_tainted = false;
     s.compact_pending_to = 0;
     s.floor_persisted = 0;
+    s.replay_start_persisted = 0;
+    s.replay_first_index = 0;
     s.entry_ring = [EntryLoc::zero(); ENTRY_LOC_RING_SIZE];
     s.memory_entries = [MemoryEntry::zero(); MEMORY_RING_SIZE];
     s.entryreq_floor_logged = false;
@@ -1014,16 +1160,15 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
             break;
         }
         records += 1;
-        consumed = consumed.saturating_add(
-            s.bytes_written.wrapping_sub(before_bytes).saturating_add(8),
-        );
+        consumed =
+            consumed.saturating_add(s.bytes_written.wrapping_sub(before_bytes).saturating_add(8));
         if grant == 0 {
             break;
         }
     }
     s.pump_records = records as u8;
     if records > 0 {
-        let effect = if wire_channels::readable(sys, s.in_entries) {
+        let effect = if !s.inbox_entries.is_empty() {
             step_effect::RUNNABLE_BACKLOG
         } else {
             step_effect::WORK_DONE
@@ -1034,6 +1179,9 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     // 3. Service random-access read-back requests (replicator NACK retry),
     //    then advance the bounded below-floor segment scan (if pending).
     drain_entry_requests(s, sys);
+    // Cold reads AFTER replication read-back: a lagging consumer must
+    // never delay the path a rebuilding replica depends on.
+    drain_cold_reads(s, sys);
     step_entry_scan(s, sys);
 
     // 4. Emit metrics periodically
@@ -1042,7 +1190,11 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     // Physical segment removal is synchronous provider work (unlink +
     // directory fence per file), well above a steady-state step even at
     // the paced budget. Burst classifies that interval correctly.
-    if retired { STEP_BURST } else { 0 }
+    if retired {
+        STEP_BURST
+    } else {
+        0
+    }
 }
 
 /// Emit the one-shot MSG_WAL_REPLAY_COMPLETE to consensus, carrying the
@@ -1057,7 +1209,9 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn maybe_emit_replay_complete(s: &mut Wal, sys: &SyscallTable) {
-    if !s.replay_complete_pending { return; }
+    if !s.replay_complete_pending {
+        return;
+    }
     // Re-seed the ledger with the locally recovered durable high-water.
     // The ledger only advances through `on_ack`, which fires on the fsync
     // of a NEW write; replay produces no such ack, so without this seed a
@@ -1079,16 +1233,20 @@ unsafe fn maybe_emit_replay_complete(s: &mut Wal, sys: &SyscallTable) {
     // handshake message can be lost across the cross-domain bridge if the
     // consumer port is not yet live, permanently wedging raft's intake.
     let now = dev_millis(sys);
-    if s.replay_emit_attempts > 0
-        && now.wrapping_sub(s.last_replay_emit_ms) < REPLAY_REEMIT_MS
-    {
+    if s.replay_emit_attempts > 0 && now.wrapping_sub(s.last_replay_emit_ms) < REPLAY_REEMIT_MS {
         return;
     }
-    if !wire_channels::writable(sys, s.out_replay_complete) { return; }
+    if !wire_channels::writable(sys, s.out_replay_complete) {
+        return;
+    }
     let mut buf = [0u8; 16];
     wire::encode_term_index(&mut buf, s.current_term, s.current_index);
-    let w = wire_channels::channel_write_msg(
-        sys, s.out_replay_complete, wire::MSG_WAL_REPLAY_COMPLETE, &buf,
+    let w = write_part(
+        s,
+        sys,
+        s.out_replay_complete,
+        wire::MSG_WAL_REPLAY_COMPLETE,
+        &buf,
     );
     s.replay_emit_attempts = s.replay_emit_attempts.saturating_add(1);
     if w > 0 {
@@ -1136,9 +1294,17 @@ unsafe fn record_entry_loc(
     payload_offset: u32,
     payload_len: u32,
 ) {
-    if index == 0 { return; }
+    if index == 0 {
+        return;
+    }
     let slot = (index & ENTRY_LOC_RING_MASK) as usize;
-    s.entry_ring[slot] = EntryLoc { index, term, seg_seq, payload_offset, payload_len };
+    s.entry_ring[slot] = EntryLoc {
+        index,
+        term,
+        seg_seq,
+        payload_offset,
+        payload_len,
+    };
     if index > s.entry_ring_max_index {
         s.entry_ring_max_index = index;
     }
@@ -1159,11 +1325,17 @@ unsafe fn record_entry_loc(
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn lookup_entry_loc(s: &Wal, index: u64) -> Option<EntryLoc> {
-    if index == 0 || index > s.entry_ring_max_index { return None; }
-    if index < s.entry_ring_min_index { return None; }
+    if index == 0 || index > s.entry_ring_max_index {
+        return None;
+    }
+    if index < s.entry_ring_min_index {
+        return None;
+    }
     let slot = (index & ENTRY_LOC_RING_MASK) as usize;
     let loc = s.entry_ring[slot];
-    if loc.index != index { return None; }
+    if loc.index != index {
+        return None;
+    }
     Some(loc)
 }
 
@@ -1174,13 +1346,16 @@ unsafe fn lookup_entry_loc(s: &Wal, index: u64) -> Option<EntryLoc> {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn drain_entry_requests(s: &mut Wal, sys: &SyscallTable) {
-    if s.in_entry_request < 0 || s.out_entry_reply < 0 { return; }
+    if s.in_entry_request < 0 || s.out_entry_reply < 0 {
+        return;
+    }
     for _ in 0..8 {
-        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_entry_request, &mut s.msg_buf)
-        else {
+        let Some((msg_type, plen)) = s.inbox_entry_req.next(sys, &mut s.msg_buf) else {
             break;
         };
-        if msg_type != wire::MSG_WAL_ENTRY_REQUEST { continue; }
+        if msg_type != wire::MSG_WAL_ENTRY_REQUEST {
+            continue;
+        }
         let pl = plen as usize;
         let (request_id, wal_index) = match wire::decode_wal_entry_request(&s.msg_buf[..pl]) {
             Some(v) => v,
@@ -1196,13 +1371,28 @@ unsafe fn drain_entry_requests(s: &mut Wal, sys: &SyscallTable) {
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn serve_entry_request(
+/// Serve one WAL entry read-back on `reply_chan`.
+///
+/// `allow_scan` gates the bounded forward segment scan for an index that
+/// has aged out of the location ring. Crash recovery refetches the WHOLE
+/// log through this path and a NOT_FOUND there permanently wedges the
+/// rebuild, so the replication caller passes `true`. The COLD-READ
+/// caller passes `false`: a Kafka consumer that cannot be served from
+/// the ring is answered NOT_FOUND and falls back to
+/// OFFSET_OUT_OF_RANGE, which is exactly today's behaviour — strictly
+/// better than putting a client-driven scan on the same machinery the
+/// log rebuild depends on.
+unsafe fn serve_entry_request_on(
     s: &mut Wal,
     sys: &SyscallTable,
     request_id: u32,
     wal_index: u64,
+    reply_chan: i32,
+    allow_scan: bool,
 ) {
-    if !wire_channels::writable(sys, s.out_entry_reply) { return; }
+    if reply_chan < 0 || !wire_channels::writable(sys, reply_chan) {
+        return;
+    }
 
     let loc = match lookup_entry_loc(s, wal_index) {
         Some(l) => l,
@@ -1214,7 +1404,8 @@ unsafe fn serve_entry_request(
             // crash recovery refetches the WHOLE log through this path,
             // and a NOT_FOUND there permanently wedges the rebuild
             // (there is no snapshot to fall through to).
-            if wal_index > 0
+            if allow_scan
+                && wal_index > 0
                 && wal_index < s.entry_ring_min_index
                 && wal_index >= s.compact_floor
                 && !s.no_fs
@@ -1233,13 +1424,16 @@ unsafe fn serve_entry_request(
             // ring). Fail loudly — snapshot install is the only way back.
             if wal_index < s.entry_ring_min_index && !s.entryreq_unservable_logged {
                 s.entryreq_unservable_logged = true;
-                dev_log(sys, 2, b"[wal] entry req unservable (compacted)".as_ptr(), 38);
+                dev_log(
+                    sys,
+                    2,
+                    b"[wal] entry req unservable (compacted)".as_ptr(),
+                    38,
+                );
             }
             let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
             wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
-            wire_channels::channel_write_msg(
-                sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr,
-            );
+            write_part(s, sys, reply_chan, wire::MSG_WAL_ENTRY_REPLY, &hdr);
             return;
         }
     };
@@ -1251,9 +1445,7 @@ unsafe fn serve_entry_request(
             s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
             let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
             wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
-            wire_channels::channel_write_msg(
-                sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr,
-            );
+            write_part(s, sys, reply_chan, wire::MSG_WAL_ENTRY_REPLY, &hdr);
             return;
         }
         let prev_term = if loc.index > 1 {
@@ -1265,13 +1457,15 @@ unsafe fn serve_entry_request(
         let total = wire::WAL_ENTRY_REPLY_HDR + body_len;
         let mut reply = [0u8; 4096];
         let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
-        wire::encode_wal_entry_reply_hdr(
-            &mut hdr, request_id, loc.term, loc.index, prev_term,
-        );
+        wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, loc.term, loc.index, prev_term);
         reply[..wire::WAL_ENTRY_REPLY_HDR].copy_from_slice(&hdr);
         reply[wire::WAL_ENTRY_REPLY_HDR..total].copy_from_slice(&mem.body[..body_len]);
-        wire_channels::channel_write_msg(
-            sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &reply[..total],
+        write_part(
+            s,
+            sys,
+            reply_chan,
+            wire::MSG_WAL_ENTRY_REPLY,
+            &reply[..total],
         );
         s.entryreq_served = s.entryreq_served.saturating_add(1);
         return;
@@ -1303,7 +1497,7 @@ unsafe fn serve_entry_request(
         s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
         let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
         wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
-        wire_channels::channel_write_msg(sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr);
+        write_part(s, sys, reply_chan, wire::MSG_WAL_ENTRY_REPLY, &hdr);
         return;
     }
 
@@ -1324,7 +1518,7 @@ unsafe fn serve_entry_request(
                 s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
                 let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
                 wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
-                wire_channels::channel_write_msg(sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr);
+                write_part(s, sys, reply_chan, wire::MSG_WAL_ENTRY_REPLY, &hdr);
                 return;
             }
             let rest_len = payload_len.saturating_sub(16);
@@ -1349,8 +1543,12 @@ unsafe fn serve_entry_request(
                     rest_len,
                 );
             }
-            wire_channels::channel_write_msg(
-                sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &reply[..total],
+            write_part(
+                s,
+                sys,
+                reply_chan,
+                wire::MSG_WAL_ENTRY_REPLY,
+                &reply[..total],
             );
             s.entryreq_served = s.entryreq_served.saturating_add(1);
             return;
@@ -1377,7 +1575,7 @@ unsafe fn serve_entry_request(
             s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
             let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
             wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
-            wire_channels::channel_write_msg(sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr);
+            write_part(s, sys, reply_chan, wire::MSG_WAL_ENTRY_REPLY, &hdr);
             return;
         }
         fd
@@ -1388,8 +1586,7 @@ unsafe fn serve_entry_request(
     // corrupt sector propagates cluster-wide as a valid entry.
     let hdr_off = loc.payload_offset.saturating_sub(FRAME_HDR);
     let seek_arg = (hdr_off as i32).to_le_bytes();
-    let seek_rc =
-        (sys.provider_call)(read_fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, 4);
+    let seek_rc = (sys.provider_call)(read_fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, 4);
     let mut ok = seek_rc >= 0;
     let mut frame_hdr = [0u8; FRAME_HDR as usize];
     if ok {
@@ -1427,14 +1624,18 @@ unsafe fn serve_entry_request(
         s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
         let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
         wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
-        wire_channels::channel_write_msg(sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr);
+        write_part(s, sys, reply_chan, wire::MSG_WAL_ENTRY_REPLY, &hdr);
         return;
     }
 
     // Body is [term:u64][index:u64][rest...]; strip the 16-byte header
     // when forming the reply so the wire format matches the doc-comment
     // on MSG_WAL_ENTRY_REPLY (`[request_id][term][index][body...]`).
-    let rest = if payload_len > 16 { &body[16..payload_len] } else { &[][..] };
+    let rest = if payload_len > 16 {
+        &body[16..payload_len]
+    } else {
+        &[][..]
+    };
     let total = wire::WAL_ENTRY_REPLY_HDR + rest.len();
     let mut reply = [0u8; 4096];
     let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
@@ -1451,10 +1652,57 @@ unsafe fn serve_entry_request(
     wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, loc.term, loc.index, prev_term);
     reply[..wire::WAL_ENTRY_REPLY_HDR].copy_from_slice(&hdr);
     reply[wire::WAL_ENTRY_REPLY_HDR..total].copy_from_slice(rest);
-    wire_channels::channel_write_msg(
-        sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &reply[..total],
+    write_part(
+        s,
+        sys,
+        reply_chan,
+        wire::MSG_WAL_ENTRY_REPLY,
+        &reply[..total],
     );
     s.entryreq_served = s.entryreq_served.saturating_add(1);
+}
+
+/// Drain cold-read requests. Same wire shape as the replication
+/// read-back, its own channels, and NO forward segment scan — an index
+/// the location ring has forgotten is answered NOT_FOUND and the caller
+/// falls back to the error it would have returned anyway.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn drain_cold_reads(s: &mut Wal, sys: &SyscallTable) {
+    if s.in_cold_read < 0 || s.out_cold_reply < 0 {
+        return;
+    }
+    // Bounded per step, like every other drain here: a consumer that has
+    // fallen a long way behind must not be able to spend the whole tick.
+    for _ in 0..4 {
+        // Pre-routed by the intake demux: only this partition's requests.
+        let Some((msg_type, plen)) = s.inbox_cold_read.next(sys, &mut s.msg_buf) else {
+            break;
+        };
+        if msg_type != wire::MSG_WAL_ENTRY_REQUEST {
+            continue;
+        }
+        let Some((request_id, wal_index)) =
+            wire::decode_wal_entry_request(&s.msg_buf[..plen as usize])
+        else {
+            continue;
+        };
+        let before = s.entryreq_served;
+        serve_entry_request_on(s, sys, request_id, wal_index, s.out_cold_reply, false);
+        if s.entryreq_served != before {
+            s.cold_served = s.cold_served.wrapping_add(1);
+        } else {
+            s.cold_notfound = s.cold_notfound.wrapping_add(1);
+        }
+    }
+}
+
+/// Replication read-back: the original entry-request path, unchanged.
+unsafe fn serve_entry_request(s: &mut Wal, sys: &SyscallTable, request_id: u32, wal_index: u64) {
+    serve_entry_request_on(s, sys, request_id, wal_index, s.out_entry_reply, true);
 }
 
 // ── Below-floor segment-scan fallback ───────────────────────
@@ -1514,7 +1762,12 @@ unsafe fn begin_entry_scan(s: &mut Wal, sys: &SyscallTable, request_id: u32, wal
     // the segment scan. The loud path is `entry req unservable`.
     if !s.entryreq_floor_logged {
         s.entryreq_floor_logged = true;
-        dev_log(sys, 3, b"[wal] entry req below floor: seg scan".as_ptr(), 37);
+        dev_log(
+            sys,
+            3,
+            b"[wal] entry req below floor: seg scan".as_ptr(),
+            37,
+        );
     }
 }
 
@@ -1555,12 +1808,17 @@ unsafe fn fail_entry_scan(s: &mut Wal, sys: &SyscallTable) {
     s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
     if !s.entryreq_unservable_logged {
         s.entryreq_unservable_logged = true;
-        dev_log(sys, 2, b"[wal] entry req unservable (compacted)".as_ptr(), 38);
+        dev_log(
+            sys,
+            2,
+            b"[wal] entry req unservable (compacted)".as_ptr(),
+            38,
+        );
     }
     if wire_channels::writable(sys, s.out_entry_reply) {
         let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
         wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
-        wire_channels::channel_write_msg(sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr);
+        write_part(s, sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &hdr);
     }
     // Channel full: the NOT_FOUND is dropped; the requester's retry
     // re-attaches and fails again (idempotent, still loud-once).
@@ -1581,7 +1839,9 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
         deliver_scan_reply(s, sys);
         return;
     }
-    if !s.scan_active { return; }
+    if !s.scan_active {
+        return;
+    }
 
     // Open the segment under the cursor. One provider open per step —
     // a cold open can pay the directory-scan penalty (see step_replay).
@@ -1594,7 +1854,9 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
         let mut path = [0u8; WAL_PATH_MAX];
         let plen = encode_segment_path(s.partition_id, s.scan_seg, s.root_path != 0, &mut path);
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
-        if fd == FS_E_AGAIN { return; } // provider initialising — retry
+        if fd == FS_E_AGAIN {
+            return;
+        } // provider initialising — retry
         if fd < 0 {
             // Missing segment: tolerate gaps exactly like replay.
             s.scan_misses = s.scan_misses.saturating_add(1);
@@ -1607,7 +1869,9 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
         }
         let mut stat_buf = [0u8; 8];
         let stat_rc = (sys.provider_call)(fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
-        let size = if stat_rc < 0 { 0 } else {
+        let size = if stat_rc < 0 {
+            0
+        } else {
             u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
         };
         if size == 0 {
@@ -1720,13 +1984,17 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
 /// `&SyscallTable` per the module ABI in
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
-    if !s.scan_found { return; }
+    if !s.scan_found {
+        return;
+    }
     if s.out_entry_reply < 0 {
         s.scan_found = false;
         s.scan_target = 0;
         return;
     }
-    if !wire_channels::writable(sys, s.out_entry_reply) { return; } // retry next step
+    if !wire_channels::writable(sys, s.out_entry_reply) {
+        return;
+    } // retry next step
 
     let loc = s.scan_loc;
     let payload_len = loc.payload_len as usize;
@@ -1741,7 +2009,12 @@ unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
         ok = (sys.provider_call)(s.scan_fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, 4) >= 0;
     }
     if ok {
-        let n = (sys.provider_call)(s.scan_fd, FS_READ, frame_hdr.as_mut_ptr(), FRAME_HDR as usize);
+        let n = (sys.provider_call)(
+            s.scan_fd,
+            FS_READ,
+            frame_hdr.as_mut_ptr(),
+            FRAME_HDR as usize,
+        );
         ok = n >= FRAME_HDR as i32;
     }
     if ok {
@@ -1775,17 +2048,29 @@ unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
     // Reply wire shape matches the ring-served path: strip the 16-byte
     // [term][index] payload prefix; prev_term was captured while the
     // scan walked the preceding record.
-    let rest = if payload_len > 16 { &body[16..payload_len] } else { &[][..] };
+    let rest = if payload_len > 16 {
+        &body[16..payload_len]
+    } else {
+        &[][..]
+    };
     let total = wire::WAL_ENTRY_REPLY_HDR + rest.len();
     let mut reply = [0u8; 4096];
     let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
     wire::encode_wal_entry_reply_hdr(
-        &mut hdr, s.scan_request_id, loc.term, loc.index, s.scan_prev_term,
+        &mut hdr,
+        s.scan_request_id,
+        loc.term,
+        loc.index,
+        s.scan_prev_term,
     );
     reply[..wire::WAL_ENTRY_REPLY_HDR].copy_from_slice(&hdr);
     reply[wire::WAL_ENTRY_REPLY_HDR..total].copy_from_slice(rest);
-    wire_channels::channel_write_msg(
-        sys, s.out_entry_reply, wire::MSG_WAL_ENTRY_REPLY, &reply[..total],
+    write_part(
+        s,
+        sys,
+        s.out_entry_reply,
+        wire::MSG_WAL_ENTRY_REPLY,
+        &reply[..total],
     );
     s.entryreq_served = s.entryreq_served.saturating_add(1);
     s.entryreq_scan_served = s.entryreq_scan_served.saturating_add(1);
@@ -1809,7 +2094,12 @@ unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) -> bool {
     // anything else: the requester holds its old tip until it arrives,
     // so a dropped ack is a wedge, not a lost notification.
     flush_truncate_ack(s, sys);
-    if s.in_compact_before < 0 { return false; }
+    // Floors before trims: a floor declared this step bounds a trim
+    // requested this step.
+    drain_retention_floors(s, sys);
+    if s.in_compact_before < 0 {
+        return false;
+    }
 
     // Continue any unlink work a previous compaction left pending
     // (paced COMPACT_UNLINKS_PER_STEP per step).
@@ -1825,34 +2115,67 @@ unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) -> bool {
         && (s.has_batch || s.fence_pending || s.fence_ring_count > 0)
     {
         flush_batch(s, sys);
-        if s.has_batch || s.fence_pending || s.fence_ring_count > 0 { return retired; }
+        if s.has_batch || s.fence_pending || s.fence_ring_count > 0 {
+            return retired;
+        }
     }
 
     for _ in 0..4 {
-        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_compact_before, &mut s.msg_buf)
+        let Some((msg_type, plen)) =
+            wire_channels::next_msg(sys, s.in_compact_before, &mut s.msg_buf)
         else {
             break;
         };
-        if (plen as usize) < 8 { continue; }
+        if (plen as usize) < 8 {
+            continue;
+        }
         let index = u64::from_le_bytes([
-            s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3],
-            s.msg_buf[4], s.msg_buf[5], s.msg_buf[6], s.msg_buf[7],
+            s.msg_buf[0],
+            s.msg_buf[1],
+            s.msg_buf[2],
+            s.msg_buf[3],
+            s.msg_buf[4],
+            s.msg_buf[5],
+            s.msg_buf[6],
+            s.msg_buf[7],
         ]);
         match msg_type {
             wire::MSG_WAL_COMPACT_BEFORE => compact_before(s, sys, index),
+            wire::MSG_COMPACTION_FLOOR => {
+                // `[kpg_id:u16][floor:u64]`: consensus's min-match floor
+                // for this group. The kpg id is the partition, which is
+                // this slot by construction; the value is what matters.
+                if (plen as usize) >= 10 {
+                    let floor = u64::from_le_bytes([
+                        s.msg_buf[2],
+                        s.msg_buf[3],
+                        s.msg_buf[4],
+                        s.msg_buf[5],
+                        s.msg_buf[6],
+                        s.msg_buf[7],
+                        s.msg_buf[8],
+                        s.msg_buf[9],
+                    ]);
+                    s.match_floor = Some(floor);
+                }
+            }
             wire::MSG_WAL_TRUNCATE_AFTER => {
                 let req_id = match wire::decode_wal_truncate_after(&s.msg_buf[..plen as usize]) {
                     Some((_, id)) => id,
                     None => continue,
                 };
-                if truncate_after(s, sys, index, req_id) { retired = true; }
+                if truncate_after(s, sys, index, req_id) {
+                    retired = true;
+                }
                 // One truncation may leave state the next one in this
                 // drain would destroy: an ack the channel could not take
                 // yet (the park slot holds exactly one answer) or a
                 // segment range still being retired (whose write state
                 // is parked, not published). End the drain and let the
                 // next step resume — the frames stay queued.
-                if s.trunc_ack_pending || s.retire_active { break; }
+                if s.trunc_ack_pending || s.retire_active {
+                    break;
+                }
             }
             _ => continue,
         }
@@ -1928,7 +2251,13 @@ unsafe fn truncate_after(
         // one — a rewind of the current segment alone would leave the
         // suffix on disk for replay to resurrect.
         return begin_cross_segment_truncate(
-            s, sys, keep_seg, new_cursor, keep_through_index, new_term, req_id,
+            s,
+            sys,
+            keep_seg,
+            new_cursor,
+            keep_through_index,
+            new_term,
+            req_id,
         );
     }
     if !truncate_current_segment(s, sys, new_cursor) {
@@ -1964,7 +2293,9 @@ unsafe fn publish_truncation(
         let span = s.entry_ring_max_index - keep_through_index;
         if span >= ENTRY_LOC_RING_SIZE as u64 {
             for slot in s.entry_ring.iter_mut() {
-                if slot.index > keep_through_index { slot.index = 0; }
+                if slot.index > keep_through_index {
+                    slot.index = 0;
+                }
             }
         } else {
             let mut i = keep_through_index + 1;
@@ -2106,7 +2437,9 @@ unsafe fn send_truncate_ack(
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn flush_truncate_ack(s: &mut Wal, sys: &SyscallTable) {
-    if !s.trunc_ack_pending { return; }
+    if !s.trunc_ack_pending {
+        return;
+    }
     if s.out_flushed < 0 {
         // No path back to the requester: it never entered the pending
         // state on this graph (truncation is opt-in via wiring), so
@@ -2114,7 +2447,9 @@ unsafe fn flush_truncate_ack(s: &mut Wal, sys: &SyscallTable) {
         s.trunc_ack_pending = false;
         return;
     }
-    if !wire_channels::writable(sys, s.out_flushed) { return; }
+    if !wire_channels::writable(sys, s.out_flushed) {
+        return;
+    }
     let mut buf = [0u8; wire::WAL_TRUNCATE_ACK_LEN];
     wire::encode_wal_truncate_ack(
         &mut buf,
@@ -2122,7 +2457,7 @@ unsafe fn flush_truncate_ack(s: &mut Wal, sys: &SyscallTable) {
         s.trunc_ack_req,
         s.trunc_ack_durable,
     );
-    if wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_WAL_TRUNCATE_ACK, &buf) > 0 {
+    if write_part(s, sys, s.out_flushed, wire::MSG_WAL_TRUNCATE_ACK, &buf) > 0 {
         s.trunc_ack_pending = false;
     }
 }
@@ -2190,7 +2525,9 @@ unsafe fn begin_cross_segment_truncate(
         }
         let mut stat_buf = [0u8; 8];
         let stat_rc = (sys.provider_call)(fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
-        let size = if stat_rc < 0 { 0 } else {
+        let size = if stat_rc < 0 {
+            0
+        } else {
             u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
         };
         let seek = (new_cursor as i32).to_le_bytes();
@@ -2251,7 +2588,9 @@ unsafe fn begin_cross_segment_truncate(
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn continue_retirement(s: &mut Wal, sys: &SyscallTable) -> bool {
-    if !s.retire_active { return false; }
+    if !s.retire_active {
+        return false;
+    }
     let mut retired = 0usize;
     while s.retire_from <= s.retire_through && retired < COMPACT_UNLINKS_PER_STEP {
         if !invalidate_segment(s, sys, s.retire_from) {
@@ -2294,7 +2633,13 @@ unsafe fn continue_retirement(s: &mut Wal, sys: &SyscallTable) -> bool {
     s.retire_fd = -1;
     s.retire_active = false;
     s.retire_partial = false;
-    publish_truncation(s, sys, s.retire_keep_index, s.retire_keep_term, s.retire_req);
+    publish_truncation(
+        s,
+        sys,
+        s.retire_keep_index,
+        s.retire_keep_term,
+        s.retire_req,
+    );
     retired > 0
 }
 
@@ -2377,7 +2722,31 @@ unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> bool 
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
-    if before_index == 0 { return; }
+    if before_index == 0 {
+        return;
+    }
+    // `before_index` is the snapshot's index. Whatever the floors keep
+    // below it, replay after a restart can start at the segment that
+    // holds it: the snapshot covers the state, and the older segments
+    // are content the scan path reads on demand.
+    if let Some(loc) = lookup_entry_loc(s, before_index) {
+        persist_replay_start(s, sys, loc.seg_seq);
+    }
+    // The floors bound the trim, not the snapshot that requested it.
+    // Entries at or above the lowest floor are still wanted — by a
+    // consumer inside its retention window, or by a voter that has not
+    // matched them — so the trim point comes down to the floor and the
+    // snapshot above it stands.
+    let before_index = match retention_floor_index(s) {
+        Some(floor) if floor < before_index => {
+            s.compact_floored = s.compact_floored.wrapping_add(1);
+            floor
+        }
+        _ => before_index,
+    };
+    if before_index == 0 {
+        return;
+    }
     // Bump the floor index in the in-memory ring so we stop serving
     // entries below it even if the ring slots still hold them.
     if before_index > s.entry_ring_min_index {
@@ -2407,7 +2776,9 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
     let mut max_below: u32 = 0;
     let mut min_keep_seq: u32 = u32::MAX;
     for slot in s.entry_ring.iter() {
-        if slot.index == 0 { continue; }
+        if slot.index == 0 {
+            continue;
+        }
         if slot.index < before_index {
             if slot.seg_seq > max_below {
                 max_below = slot.seg_seq;
@@ -2420,7 +2791,9 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
     if min_keep_seq != u32::MAX && max_safe_seq_to_drop >= min_keep_seq {
         max_safe_seq_to_drop = min_keep_seq.saturating_sub(1);
     }
-    if max_safe_seq_to_drop == 0 { return; }
+    if max_safe_seq_to_drop == 0 {
+        return;
+    }
     // Segments are about to be deleted: the scan cursor (and any
     // located-but-undelivered reply) may reference one of them. Drop
     // the cursor and re-point it at the post-trim oldest segment; an
@@ -2435,6 +2808,114 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
         s.compact_pending_to = max_safe_seq_to_drop;
     }
     continue_compaction(s, sys);
+}
+
+/// Drain application retention floors from this slot's inbox.
+///
+/// Wire shape (10 bytes): `[kpg_id:u16 LE][floor_revision:u64 LE]`,
+/// declared by `wire::MSG_COMPACTION_FLOOR`. Idempotent: a floor
+/// re-sent unchanged updates a slot in place.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn drain_retention_floors(s: &mut Wal, sys: &SyscallTable) {
+    if s.in_retention_floor < 0 {
+        return;
+    }
+    for _ in 0..4 {
+        let Some((msg_type, plen)) = s.inbox_retention.next(sys, &mut s.msg_buf) else {
+            break;
+        };
+        if msg_type != wire::MSG_COMPACTION_FLOOR || (plen as usize) < 10 {
+            continue;
+        }
+        let kpg_id = u16::from_le_bytes([s.msg_buf[0], s.msg_buf[1]]);
+        // The wire reserves `0xFFFF` as "never a real kpg id"; it is
+        // also this table's empty-slot sentinel. Drop loudly.
+        if kpg_id == FLOOR_SLOT_EMPTY {
+            dev_log(sys, 3, b"[wal] kpg sentinel".as_ptr(), 18);
+            continue;
+        }
+        let floor_revision = u64::from_le_bytes([
+            s.msg_buf[2],
+            s.msg_buf[3],
+            s.msg_buf[4],
+            s.msg_buf[5],
+            s.msg_buf[6],
+            s.msg_buf[7],
+            s.msg_buf[8],
+            s.msg_buf[9],
+        ]);
+        upsert_retention_floor(s, sys, kpg_id, floor_revision);
+    }
+}
+
+/// Insert or update the floor for `kpg_id`. Table full → latch the
+/// sticky overflow flag (compaction retires nothing until restart) and
+/// say so, rather than evicting a floor and retiring what it guards.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn upsert_retention_floor(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    kpg_id: u16,
+    floor_revision: u64,
+) {
+    for slot in &mut s.retention_floors {
+        if slot.kpg_id == kpg_id {
+            slot.floor_revision = floor_revision;
+            return;
+        }
+    }
+    for slot in &mut s.retention_floors {
+        if slot.kpg_id == FLOOR_SLOT_EMPTY {
+            slot.kpg_id = kpg_id;
+            slot.floor_revision = floor_revision;
+            // First floor for this kpg. Low volume by construction — a
+            // publisher re-sends only when its floor MOVES — and it is
+            // the only external evidence that an application's retention
+            // window bounds compaction here, rather than being computed
+            // and dropped somewhere on the way.
+            let mut line = [0u8; 64];
+            let mut pos = emit_field(line.as_mut_ptr(), 0, b"[wal] floor p=", u32::from(s.partition_id));
+            pos += emit_field(line.as_mut_ptr(), pos, b" kpg=", u32::from(kpg_id));
+            pos += emit_field(
+                line.as_mut_ptr(),
+                pos,
+                b" idx=",
+                floor_revision.min(u64::from(u32::MAX)) as u32,
+            );
+            dev_log(sys, 3, line.as_ptr(), pos);
+            return;
+        }
+    }
+    s.retention_floor_overflow = true;
+    dev_log(sys, 3, b"[wal] floor full".as_ptr(), 16);
+}
+
+/// The lowest index any floor still wants kept, or `None` when no
+/// floor has been declared (nothing bounds compaction but the
+/// snapshot). An overflowed table answers 0: nothing may be retired
+/// when the set of floors is known to be incomplete.
+fn retention_floor_index(s: &Wal) -> Option<u64> {
+    if s.retention_floor_overflow {
+        return Some(0);
+    }
+    let mut lowest = s.match_floor;
+    for slot in &s.retention_floors {
+        if slot.kpg_id == FLOOR_SLOT_EMPTY {
+            continue;
+        }
+        lowest = Some(match lowest {
+            Some(cur) if cur <= slot.floor_revision => cur,
+            _ => slot.floor_revision,
+        });
+    }
+    lowest
 }
 
 /// Paced physical side of compaction. Two invariants:
@@ -2462,10 +2943,10 @@ unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) -> bool {
-    if s.compact_pending_to == 0 { return false; }
-    if s.oldest_segment_seq > s.compact_pending_to
-        || s.oldest_segment_seq >= s.segment_seq
-    {
+    if s.compact_pending_to == 0 {
+        return false;
+    }
+    if s.oldest_segment_seq > s.compact_pending_to || s.oldest_segment_seq >= s.segment_seq {
         s.compact_pending_to = 0;
         return false;
     }
@@ -2480,7 +2961,12 @@ unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) -> bool {
     {
         if fs_unlink_supported(s, sys) {
             let mut path = [0u8; WAL_PATH_MAX];
-            let plen = encode_segment_path(s.partition_id, s.oldest_segment_seq, s.root_path != 0, &mut path);
+            let plen = encode_segment_path(
+                s.partition_id,
+                s.oldest_segment_seq,
+                s.root_path != 0,
+                &mut path,
+            );
             let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
             if rc == 0 {
                 if publish_name(s, sys, &mut path, plen) {
@@ -2499,9 +2985,7 @@ unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) -> bool {
         unlinks += 1;
         s.oldest_segment_seq += 1;
     }
-    if s.oldest_segment_seq > s.compact_pending_to
-        || s.oldest_segment_seq >= s.segment_seq
-    {
+    if s.oldest_segment_seq > s.compact_pending_to || s.oldest_segment_seq >= s.segment_seq {
         s.compact_pending_to = 0;
     }
     // Restart any surviving in-flight scan at the new oldest segment.
@@ -2641,16 +3125,30 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             let mut path = [0u8; WAL_PATH_MAX];
             let plen = encode_floor_path(s.partition_id, s.root_path != 0, &mut path);
             let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
-            if fd == FS_E_AGAIN { return 0; } // provider initialising — retry
+            if fd == FS_E_AGAIN {
+                return 0;
+            } // provider initialising — retry
             if fd >= 0 {
-                let mut val = [0u8; 4];
-                let n = (sys.provider_call)(fd, FS_READ, val.as_mut_ptr(), 4);
+                // `[floor:u32][replay_start:u32]`; a 4-byte file from an
+                // earlier layout carries the floor alone.
+                let mut val = [0u8; 8];
+                let n = (sys.provider_call)(fd, FS_READ, val.as_mut_ptr(), 8);
                 (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-                if n == 4 {
-                    let floor = u32::from_le_bytes(val);
-                    if floor > s.replay_seg { s.replay_seg = floor; }
+                if n >= 4 {
+                    let floor = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
+                    if floor > s.replay_seg {
+                        s.replay_seg = floor;
+                    }
                     s.floor_persisted = floor;
                     dev_log(sys, 3, b"[wal] replay floor".as_ptr(), 18);
+                }
+                if n >= 8 {
+                    let start = u32::from_le_bytes([val[4], val[5], val[6], val[7]]);
+                    if start > s.replay_seg {
+                        s.replay_seg = start;
+                        dev_log(sys, 3, b"[wal] replay from snapshot".as_ptr(), 26);
+                    }
+                    s.replay_start_persisted = start;
                 }
             }
             s.replay_floor_checked = true;
@@ -2696,14 +3194,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             s.replay_recovered_index = s.current_index;
             s.replay_recovered_term = s.current_term;
             dev_log(sys, 3, b"[wal] replay done".as_ptr(), 17);
-            if s.replay_last_found == 0 {
-                // No segments found: start writes at seq 1.
-                s.segment_seq = 1;
-                s.oldest_segment_seq = 1;
-            } else {
-                s.segment_seq = s.replay_last_found.saturating_add(1);
-                s.oldest_segment_seq = s.replay_first_found;
-            }
+            settle_after_replay(s);
             s.phase = PHASE_NORMAL;
             // Burst (forgive any cold-scan this open paid); harmlessly
             // re-steps once into PHASE_NORMAL, which returns Continue.
@@ -2716,7 +3207,9 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         // FS_STAT writes [size:u32 LE][mtime:u32 LE] into the supplied buffer.
         let mut stat_buf = [0u8; 8];
         let stat_rc = (sys.provider_call)(fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
-        let size = if stat_rc < 0 { 0 } else {
+        let size = if stat_rc < 0 {
+            0
+        } else {
             u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
         };
         if size == 0 {
@@ -2726,14 +3219,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             s.replay_recovered_term = s.current_term;
             dev_log(sys, 3, b"[wal] replay done".as_ptr(), 17);
             s.phase = PHASE_NORMAL;
-            if s.replay_last_found == 0 {
-                // Empty very first segment file: start at seq 1.
-                s.segment_seq = 1;
-                s.oldest_segment_seq = 1;
-            } else {
-                s.segment_seq = s.replay_last_found.saturating_add(1);
-                s.oldest_segment_seq = s.replay_first_found;
-            }
+            settle_after_replay(s);
             // Burst (forgive any cold-scan this open paid).
             return STEP_BURST;
         }
@@ -2773,6 +3259,14 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
     // already got its Burst); any segment transition or fault ends the step.
     let mut frames = 0usize;
     while frames < REPLAY_FRAMES_PER_STEP {
+        // Every replayed entry is re-acked to consensus, and the ack is
+        // how a restarted node learns the terms of the log it holds — a
+        // missing one leaves an index it cannot judge. Wait for room
+        // before consuming the frame rather than replaying past an ack
+        // the channel could not take.
+        if s.out_flushed >= 0 && !wire_channels::writable(sys, s.out_flushed) {
+            return 0;
+        }
         frames += 1;
         let remaining = s.replay_file_size - s.replay_pos;
         if remaining < FRAME_HDR {
@@ -2805,7 +3299,9 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             // (fixed segments end every rotated segment with one) — so it
             // does not taint. A nonzero-but-impossible length is a torn
             // header, which does.
-            if entry_len32 != 0 { s.replay_tainted = true; }
+            if entry_len32 != 0 {
+                s.replay_tainted = true;
+            }
             (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
             s.replay_fd = -1;
             s.replay_seg += 1;
@@ -2845,7 +3341,6 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
 
         // Parse: first 16 bytes are term(8) + index(8)
         if let Some((term, index)) = wire::decode_term_index(&s.msg_buf[..entry_len]) {
-
             // An index jump means the records between the last replayed
             // entry and this one are gone. Acking across that hole would
             // assert a durable high-water over missing records, which is
@@ -2865,16 +3360,26 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
                 s.current_index = index;
                 s.current_term = term;
             }
-            record_entry_loc(s, index, term, s.replay_seg, entry_payload_offset, entry_len as u32);
+            if s.replay_first_index == 0 {
+                s.replay_first_index = index;
+            }
+            record_entry_loc(
+                s,
+                index,
+                term,
+                s.replay_seg,
+                entry_payload_offset,
+                entry_len as u32,
+            );
             note_ledger_ack(s, term, index);
 
             // Re-emit as FsyncAck — entry is already durable on disk.
-            // Best-effort: the ledger latch above carries the high-water
-            // even when the external ack channel is momentarily full.
-            if wire_channels::writable(sys, s.out_flushed) {
+            // Room was checked before the frame was consumed; the ledger
+            // latch above carries the high-water regardless.
+            if s.out_flushed >= 0 {
                 let mut ack = [0u8; 17];
                 wire::encode_fsync_ack(&mut ack, term, index, s.self_id);
-                wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack[..17]);
+                write_part(s, sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack[..17]);
                 dev_log(sys, 3, b"[wal] replayed".as_ptr(), 14);
             }
 
@@ -2925,32 +3430,63 @@ fn encode_segment_path(partition_id: u16, seq: u32, root: bool, out: &mut [u8]) 
         // names longer than 8.3. 1 partition nibble + 7 seq nibbles covers
         // 16 partitions × 268M segments — ample for any real log.
         let p = (partition_id & 0xF) as u8;
-        out[i] = if p < 10 { b'0' + p } else { b'a' + p - 10 }; i += 1;
+        out[i] = if p < 10 { b'0' + p } else { b'a' + p - 10 };
+        i += 1;
         for digit in (0..7).rev() {
             let nibble = ((seq >> (digit * 4)) & 0xF) as u8;
-            let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-            if i < cap { out[i] = ch; i += 1; }
+            let ch = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            };
+            if i < cap {
+                out[i] = ch;
+                i += 1;
+            }
         }
         for &b in b".WAL" {
-            if i < cap { out[i] = b; i += 1; }
+            if i < cap {
+                out[i] = b;
+                i += 1;
+            }
         }
         return i;
     }
     for &b in b"wal/p" {
-        if i < cap { out[i] = b; i += 1; }
+        if i < cap {
+            out[i] = b;
+            i += 1;
+        }
     }
     for digit in (0..4).rev() {
         let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
-        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-        if i < cap { out[i] = ch; i += 1; }
+        let ch = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+        if i < cap {
+            out[i] = ch;
+            i += 1;
+        }
     }
     for &b in b"_seg_" {
-        if i < cap { out[i] = b; i += 1; }
+        if i < cap {
+            out[i] = b;
+            i += 1;
+        }
     }
     for digit in (0..8).rev() {
         let nibble = ((seq >> (digit * 4)) & 0xF) as u8;
-        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-        if i < cap { out[i] = ch; i += 1; }
+        let ch = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+        if i < cap {
+            out[i] = ch;
+            i += 1;
+        }
     }
     i
 }
@@ -2967,20 +3503,36 @@ fn encode_floor_path(partition_id: u16, root: bool, out: &mut [u8]) -> usize {
         out[i] = if p < 10 { b'0' + p } else { b'a' + p - 10 };
         i += 1;
         for &b in b"FLOOR.WAL" {
-            if i < cap { out[i] = b; i += 1; }
+            if i < cap {
+                out[i] = b;
+                i += 1;
+            }
         }
         return i;
     }
     for &b in b"wal/p" {
-        if i < cap { out[i] = b; i += 1; }
+        if i < cap {
+            out[i] = b;
+            i += 1;
+        }
     }
     for digit in (0..4).rev() {
         let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
-        let ch = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
-        if i < cap { out[i] = ch; i += 1; }
+        let ch = if nibble < 10 {
+            b'0' + nibble
+        } else {
+            b'a' + nibble - 10
+        };
+        if i < cap {
+            out[i] = ch;
+            i += 1;
+        }
     }
     for &b in b"_floor" {
-        if i < cap { out[i] = b; i += 1; }
+        if i < cap {
+            out[i] = b;
+            i += 1;
+        }
     }
     i
 }
@@ -2996,20 +3548,81 @@ fn encode_floor_path(partition_id: u16, root: bool, out: &mut [u8]) -> usize {
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn persist_segment_floor(s: &mut Wal, sys: &SyscallTable, new_oldest: u32) -> bool {
-    if s.floor_persisted >= new_oldest { return true; }
+    if s.floor_persisted >= new_oldest {
+        return true;
+    }
+    // Replay never starts below the floor: a start the trim overtakes
+    // moves up with it.
+    let start = s.replay_start_persisted.max(new_oldest);
+    persist_sidecar(s, sys, new_oldest, start)
+}
+
+/// Record that replay may start at `seg` — the segment holding the
+/// latest durable snapshot's index. Monotone; a refused write is
+/// retried by the next snapshot's trim request.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn persist_replay_start(s: &mut Wal, sys: &SyscallTable, seg: u32) -> bool {
+    if seg <= s.replay_start_persisted {
+        return true;
+    }
+    let floor = s.floor_persisted;
+    persist_sidecar(s, sys, floor, seg)
+}
+
+/// Write the sidecar `[floor:u32][replay_start:u32]` durably and
+/// publish its name. Both values are adopted only on success.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn persist_sidecar(s: &mut Wal, sys: &SyscallTable, floor: u32, start: u32) -> bool {
     let mut path = [0u8; WAL_PATH_MAX];
     let plen = encode_floor_path(s.partition_id, s.root_path != 0, &mut path);
     let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
-    if fd < 0 { return false; }
-    let val = new_oldest.to_le_bytes();
-    let w = (sys.provider_call)(fd, FS_WRITE, val.as_ptr() as *mut u8, 4);
+    if fd < 0 {
+        return false;
+    }
+    let mut val = [0u8; 8];
+    val[..4].copy_from_slice(&floor.to_le_bytes());
+    val[4..].copy_from_slice(&start.to_le_bytes());
+    let w = (sys.provider_call)(fd, FS_WRITE, val.as_ptr() as *mut u8, 8);
     let fr = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
     (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    if w == 4 && fr == 0 && publish_name(s, sys, &mut path, plen) {
-        s.floor_persisted = new_oldest;
+    if w == 8 && fr == 0 && publish_name(s, sys, &mut path, plen) {
+        s.floor_persisted = floor;
+        s.replay_start_persisted = start;
         true
     } else {
         false
+    }
+}
+
+/// Set the segment bounds once replay has walked what it needs. The
+/// oldest segment on disk is the persisted floor when replay started
+/// above it — the segments between are retained content the scan
+/// serves — else the first segment replay found; and in the former case
+/// the ring's floor rises to the first replayed index, so a request
+/// below it goes to the scan rather than reading as "not in the ring,
+/// so compacted".
+fn settle_after_replay(s: &mut Wal) {
+    if s.replay_last_found == 0 {
+        s.segment_seq = 1;
+        s.oldest_segment_seq = 1;
+        return;
+    }
+    s.segment_seq = s.replay_last_found.saturating_add(1);
+    if s.floor_persisted > 0 && s.floor_persisted < s.replay_first_found {
+        s.oldest_segment_seq = s.floor_persisted;
+        if s.replay_first_index > s.entry_ring_min_index {
+            s.entry_ring_min_index = s.replay_first_index;
+        }
+    } else {
+        s.oldest_segment_seq = s.replay_first_found;
     }
 }
 
@@ -3032,7 +3645,7 @@ unsafe fn emit_wal_reject(s: &mut Wal, sys: &SyscallTable, expected: u64) {
     }
     let mut buf = [0u8; 8];
     wire::encode_wal_reject(&mut buf, expected);
-    wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_WAL_REJECT, &buf);
+    write_part(s, sys, s.out_flushed, wire::MSG_WAL_REJECT, &buf);
 }
 
 unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
@@ -3054,16 +3667,25 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     // Pipelined mode (`fence_depth > 1`) lifts this: each in-flight fence
     // snapshots its own covered high-water into `fence_ring`, so staging past
     // an outstanding fence is safe. Backpressure only when the ring is full.
-    if s.fence_failed { return; } // latched fail-stop: hold intake, no acks
+    if s.fence_failed {
+        return;
+    } // latched fail-stop: hold intake, no acks
     if s.fs_async && s.fence_depth > 1 {
         let depth = (s.fence_depth as usize).min(FENCE_RING_MAX);
-        if (s.fence_ring_count as usize) >= depth { return; }
+        if (s.fence_ring_count as usize) >= depth {
+            return;
+        }
     } else if s.fence_pending {
         return;
     }
 
-    // Check input readiness
-    if !wire_channels::readable(sys, s.in_entries) { return; }
+    // Check input readiness. The frames live in THIS slot's inbox, not
+    // on the channel — the module's intake demux drains the channel
+    // into per-slot inboxes before any slot steps, so gating on the
+    // channel here would see it already empty and never pop the inbox.
+    if s.stashed_len == 0 && s.inbox_entries.is_empty() {
+        return;
+    }
 
     // Output back-pressure: only block when out_flushed is wired AND
     // currently not writable. An unwired output (`out_flushed < 0`,
@@ -3073,7 +3695,9 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     // optimisation. Skipping the ack is fine; skipping the write
     // would silently drop committed log entries.
     if s.out_flushed >= 0 {
-        if !wire_channels::writable(sys, s.out_flushed) { return; }
+        if !wire_channels::writable(sys, s.out_flushed) {
+            return;
+        }
     }
 
     // Read entry — unless `msg_buf` still holds one we consumed but could not
@@ -3084,8 +3708,25 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         s.stashed_len = 0;
         n
     } else {
-        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_entries, &mut s.msg_buf);
-        if msg_type != wire::MSG_WAL_ENTRY { return; }
+        // Pre-routed by the module's intake demux into THIS slot's
+        // inbox, so nothing here belongs to another group.
+        let Some((msg_type, plen)) = s.inbox_entries.next(sys, &mut s.msg_buf) else {
+            return;
+        };
+        // The entry stream is multiplexed: raft also publishes voter-set
+        // updates here so the ledger's union-quorum tally sees a
+        // configuration change in FIFO order with the entries whose
+        // acks it governs. Lift it to the latch and yield the step —
+        // the next step reads the following entry.
+        if msg_type == wire::MSG_VOTER_SET_UPDATE {
+            if let Some(v) = wire::decode_voter_set_update(&s.msg_buf[..plen as usize]) {
+                s.voter_out = Some((v.0, v.1, v.2, v.3));
+            }
+            return;
+        }
+        if msg_type != wire::MSG_WAL_ENTRY {
+            return;
+        }
         plen
     };
 
@@ -3182,9 +3823,7 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
             if s.out_flushed >= 0 {
                 let mut ack_buf = [0u8; 17];
                 wire::encode_fsync_ack(&mut ack_buf, term, index, s.self_id);
-                wire_channels::channel_write_msg(
-                    sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf,
-                );
+                write_part(s, sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf);
                 // Ephemeral mode has no fsync barrier — the ack above
                 // IS the durability point (there is no disk state to
                 // wait on). Same external signal as the disk path in
@@ -3244,7 +3883,14 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     s.cursor += FRAME_HDR + payload_len as u32;
     s.entries_written += 1;
     s.bytes_written += payload_len as u64;
-    record_entry_loc(s, index, term, s.segment_seq, entry_payload_offset, payload_len as u32);
+    record_entry_loc(
+        s,
+        index,
+        term,
+        s.segment_seq,
+        entry_payload_offset,
+        payload_len as u32,
+    );
 
     if !s.has_batch {
         s.batch_start_ms = dev_millis(sys);
@@ -3285,10 +3931,7 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         s.seg_high_water = s.cursor;
     }
 
-    if s.fsync_mode == 0
-        || s.pending_count >= s.group_max_pending
-        || s.staged_terminator
-    {
+    if s.fsync_mode == 0 || s.pending_count >= s.group_max_pending || s.staged_terminator {
         flush_batch(s, sys);
     }
 
@@ -3297,7 +3940,9 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     if s.cursor >= s.segment_limit {
         if s.has_batch {
             flush_batch(s, sys);
-            if s.has_batch { return; }
+            if s.has_batch {
+                return;
+            }
         }
         rotate_segment(s, sys);
     }
@@ -3320,7 +3965,12 @@ unsafe fn rotate_segment(s: &mut Wal, sys: &SyscallTable) {
     if s.out_compaction >= 0 {
         let mut trig = [0u8; 16];
         wire::encode_term_index(&mut trig, s.current_term, s.current_index);
-        wire_channels::channel_write_msg(sys, s.out_compaction, wire::MSG_SNAPSHOT_TRIGGER, &trig[..16]);
+        wire_channels::channel_write_msg(
+            sys,
+            s.out_compaction,
+            wire::MSG_SNAPSHOT_TRIGGER,
+            &trig[..16],
+        );
     }
     s.segment_seq += 1;
     s.cursor = 0;
@@ -3362,7 +4012,12 @@ unsafe fn flush_batch_pipelined(s: &mut Wal, sys: &SyscallTable) {
             // `fence_failed`); the flush entry point holds all further work.
             s.fence_failed = true;
             s.write_errors = s.write_errors.saturating_add(1);
-            dev_log(sys, 1, b"[wal] FATAL async durable-write failed".as_ptr(), 38);
+            dev_log(
+                sys,
+                1,
+                b"[wal] FATAL async durable-write failed".as_ptr(),
+                38,
+            );
             return;
         }
         // Durable — deliver to the ledger component, then emit this
@@ -3374,9 +4029,7 @@ unsafe fn flush_batch_pipelined(s: &mut Wal, sys: &SyscallTable) {
             }
             let mut ack_buf = [0u8; 17];
             wire::encode_fsync_ack(&mut ack_buf, max_term, max_index, s.self_id);
-            wire_channels::channel_write_msg(
-                sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17],
-            );
+            write_part(s, sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17]);
         }
         s.fence_ring_head = ((s.fence_ring_head as usize + 1) % FENCE_RING_MAX) as u8;
         s.fence_ring_count -= 1;
@@ -3434,7 +4087,10 @@ unsafe fn flush_batch_pipelined(s: &mut Wal, sys: &SyscallTable) {
         if s.staged_terminator {
             let logical_end = (s.cursor as i32).to_le_bytes();
             let seek_rc = (sys.provider_call)(
-                s.fd, FS_SEEK, logical_end.as_ptr() as *mut u8, logical_end.len(),
+                s.fd,
+                FS_SEEK,
+                logical_end.as_ptr() as *mut u8,
+                logical_end.len(),
             );
             if seek_rc < 0 {
                 s.write_errors = s.write_errors.saturating_add(1);
@@ -3493,7 +4149,9 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
 
     // A fence failure is a durability gap — latched fail-stop. No further
     // writes, fences, or acks; only a restart recovers (see `fence_failed`).
-    if s.fence_failed { return; }
+    if s.fence_failed {
+        return;
+    }
 
     // Fence-pipelined async path (config `fence_depth > 1`): keeps multiple
     // fences outstanding so throughput is device-bandwidth-bound rather than
@@ -3503,7 +4161,9 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
         return;
     }
 
-    if !s.has_batch { return; }
+    if !s.has_batch {
+        return;
+    }
 
     if !s.batch_fsynced {
         // ── Async fence poll ──────────────────────────────────────────
@@ -3528,7 +4188,12 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
                 // outstanding so we do not re-write and mask it.
                 s.fence_failed = true;
                 s.write_errors = s.write_errors.saturating_add(1);
-                dev_log(sys, 1, b"[wal] FATAL async durable-write failed".as_ptr(), 38);
+                dev_log(
+                    sys,
+                    1,
+                    b"[wal] FATAL async durable-write failed".as_ptr(),
+                    38,
+                );
                 return;
             }
         }
@@ -3560,7 +4225,10 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
                 let batch_start = s.cursor.saturating_sub(logical_len as u32);
                 let seek_arg = (batch_start as i32).to_le_bytes();
                 let seek_rc = (sys.provider_call)(
-                    s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len(),
+                    s.fd,
+                    FS_SEEK,
+                    seek_arg.as_ptr() as *mut u8,
+                    seek_arg.len(),
                 );
                 if seek_rc < 0 {
                     s.write_errors = s.write_errors.saturating_add(1);
@@ -3572,9 +4240,8 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
                 // into device DMA slots so `write_buf` is free on return);
                 // durability is proven later by the FSYNC_SUBMIT/POLL fence.
                 let write_op = if s.fs_async { FS_WRITE_ASYNC } else { FS_WRITE };
-                let written = (sys.provider_call)(
-                    s.fd, write_op, s.write_buf.as_mut_ptr(), staged_len,
-                );
+                let written =
+                    (sys.provider_call)(s.fd, write_op, s.write_buf.as_mut_ptr(), staged_len);
                 if written == FS_E_AGAIN || (written >= 0 && (written as usize) < staged_len) {
                     // BACKPRESSURE (async ring full mid-batch), NOT an error.
                     // Rewind and retry the whole batch next step; in-flight
@@ -3582,14 +4249,20 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
                     // staged (`write_pos` not reset). No error count, no
                     // durability impact — nothing was acked.
                     (sys.provider_call)(
-                        s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len(),
+                        s.fd,
+                        FS_SEEK,
+                        seek_arg.as_ptr() as *mut u8,
+                        seek_arg.len(),
                     );
                     return;
                 }
                 if written < 0 {
                     // A genuine write error. Rewind, count, and surface it.
                     (sys.provider_call)(
-                        s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, seek_arg.len(),
+                        s.fd,
+                        FS_SEEK,
+                        seek_arg.as_ptr() as *mut u8,
+                        seek_arg.len(),
                     );
                     s.write_errors = s.write_errors.saturating_add(1);
                     dev_log(sys, 1, b"[wal] FATAL group write failed".as_ptr(), 30);
@@ -3599,7 +4272,10 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
                 if s.staged_terminator {
                     let logical_end = (s.cursor as i32).to_le_bytes();
                     let seek_rc = (sys.provider_call)(
-                        s.fd, FS_SEEK, logical_end.as_ptr() as *mut u8, logical_end.len(),
+                        s.fd,
+                        FS_SEEK,
+                        logical_end.as_ptr() as *mut u8,
+                        logical_end.len(),
                     );
                     if seek_rc < 0 {
                         s.write_errors = s.write_errors.saturating_add(1);
@@ -3659,9 +4335,12 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
         }
         let mut ack_buf = [0u8; 17];
         wire::encode_fsync_ack(
-            &mut ack_buf, s.pending_max_term, s.pending_max_index, s.self_id,
+            &mut ack_buf,
+            s.pending_max_term,
+            s.pending_max_index,
+            s.self_id,
         );
-        wire_channels::channel_write_msg(sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17]);
+        write_part(s, sys, s.out_flushed, wire::MSG_FSYNC_ACK, &ack_buf[..17]);
         // Group mode only. Per-entry mode flushes a singleton batch per
         // append, so its durability signal is already `[wal] entry ok` at
         // stage time; the test suite keys on that dichotomy.
@@ -3695,7 +4374,9 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn ensure_segment_open(s: &mut Wal, sys: &SyscallTable) {
-    if s.fd >= 0 { return; }
+    if s.fd >= 0 {
+        return;
+    }
     if VOLATILE {
         // The volatile variant selects in-memory retention by
         // design, never as a fallback, so no failure signal.
@@ -3738,11 +4419,16 @@ unsafe fn ensure_segment_open(s: &mut Wal, sys: &SyscallTable) {
     // a hard negative = no/failed FS provider; >=0 = disk-backed).
     if s.fd != s.dbg_last_open_rc {
         s.dbg_last_open_rc = s.fd;
-        let mut m = [0u8; 32]; let p = m.as_mut_ptr();
-        let tag = b"[wal] open rc="; core::ptr::copy_nonoverlapping(tag.as_ptr(), p, tag.len());
+        let mut m = [0u8; 32];
+        let p = m.as_mut_ptr();
+        let tag = b"[wal] open rc=";
+        core::ptr::copy_nonoverlapping(tag.as_ptr(), p, tag.len());
         let neg = s.fd < 0;
         let mut q = tag.len();
-        if neg { *p.add(q) = b'-'; q += 1; }
+        if neg {
+            *p.add(q) = b'-';
+            q += 1;
+        }
         q += fmt_u32_raw(p.add(q), (s.fd as i64).unsigned_abs() as u32);
         dev_log(sys, 3, p, q);
     }
@@ -3795,18 +4481,25 @@ enum OpenOutcome {
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn open_segment_attempt(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
-    s.fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), s.path_len as usize);
-    if s.fd == FS_E_AGAIN { return OpenOutcome::Settling; }
-    if s.fd < 0 { return OpenOutcome::OpenFailed; }
+    s.fd = (sys.provider_call)(
+        -1,
+        FS_OPEN_CREATE,
+        s.path_buf.as_mut_ptr(),
+        s.path_len as usize,
+    );
+    if s.fd == FS_E_AGAIN {
+        return OpenOutcome::Settling;
+    }
+    if s.fd < 0 {
+        return OpenOutcome::OpenFailed;
+    }
     if s.fixed_segment != 0 {
         // Reserve four bytes beyond the configured record limit for the live
         // tail terminator. PREALLOCATE persists physical capacity + fixed file
         // size and leaves the descriptor at offset zero.
         let capacity = s.segment_limit.saturating_add(4);
         let cap = capacity.to_le_bytes();
-        let prc = (sys.provider_call)(
-            s.fd, FS_PREALLOCATE, cap.as_ptr() as *mut u8, cap.len(),
-        );
+        let prc = (sys.provider_call)(s.fd, FS_PREALLOCATE, cap.as_ptr() as *mut u8, cap.len());
         if prc == 0 {
             // Establish a durable empty-log terminator before admission. A
             // crash after preallocation but before the first client append
@@ -3818,8 +4511,8 @@ unsafe fn open_segment_attempt(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
             let fr = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
             if w == 4 && sr == 0 && fr == 0 {
                 s.fixed_segment_active = true;
-                s.preallocate_ready_at_ms = dev_millis(sys)
-                    .saturating_add(s.preallocate_settle_ms as u64);
+                s.preallocate_ready_at_ms =
+                    dev_millis(sys).saturating_add(s.preallocate_settle_ms as u64);
             } else {
                 (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
                 s.fd = -1;
@@ -3942,7 +4635,9 @@ pub fn on_snapshot_installed(s: &mut Wal, term: Term, index: Index) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn flush_block(s: &mut Wal, sys: &SyscallTable) {
-    if s.write_pos == 0 { return; }
+    if s.write_pos == 0 {
+        return;
+    }
 
     ensure_segment_open(s, sys);
 
@@ -3969,10 +4664,14 @@ unsafe fn flush_block(s: &mut Wal, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn fsync_segment(s: &mut Wal, sys: &SyscallTable) -> i32 {
-    if s.fd < 0 { return -1; }
+    if s.fd < 0 {
+        return -1;
+    }
     let start = dev_micros(sys);
     let rc = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
-    if rc != 0 { return rc; }
+    if rc != 0 {
+        return rc;
+    }
     let elapsed = dev_micros(sys).wrapping_sub(start);
     let b = wire::hist::bucket(&wire::hist::FSYNC_LATENCY_US, elapsed);
     s.fsync_buckets[b] = s.fsync_buckets[b].saturating_add(1);
@@ -4002,7 +4701,9 @@ unsafe fn close_segment(s: &mut Wal, sys: &SyscallTable) {
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
     let now = dev_millis(sys);
-    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS { return; }
+    if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS {
+        return;
+    }
     s.last_metrics_ms = now;
 
     // `[wal] hb` — steady-state liveness on the foundation-module
@@ -4024,48 +4725,147 @@ unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
     pos += emit_field(hb.as_mut_ptr(), pos, b" pending=", s.pending_count as u32);
     dev_log(sys, 3, hb.as_ptr(), pos);
 
-    if s.out_metrics < 0 { return; }
+    if s.out_metrics < 0 {
+        return;
+    }
 
-    // Typed metric samples (RFC §4.3): scalar counters/gauges plus the
-    // fsync-latency histogram. Each sample is its own MSG_METRIC_SAMPLE
-    // so the telemetry component aggregates without a per-module parser. The
-    // legacy MSG_METRICS envelope is still emitted below for observers
-    // that parse it.
+    // Typed metric samples: scalar counters/gauges plus the fsync-latency
+    // histogram. Each sample is its own MSG_METRIC_SAMPLE so the telemetry
+    // component aggregates without a per-module parser. The legacy
+    // MSG_METRICS envelope is still emitted below for observers that parse
+    // it.
     let mid = wire::SOURCE_ID_WAL;
     let pid = s.partition_id;
     let kc = wire::METRIC_KIND_COUNTER;
     let kg = wire::METRIC_KIND_GAUGE;
     let kh = wire::METRIC_KIND_HISTOGRAM;
-    let scalars: [(u16, u8, i64); 27] = [
-        (wire::metric_ids::WAL_ENTRIES_WRITTEN, kc, i64::from(s.entries_written)),
-        (wire::metric_ids::WAL_WRITE_ERRORS, kc, i64::from(s.write_errors)),
-        (wire::metric_ids::WAL_CHECKSUM_FAILURES, kc, i64::from(s.checksum_failures)),
-        (wire::metric_ids::WAL_TRUNCATIONS, kc, i64::from(s.truncations)),
-        (wire::metric_ids::WAL_BYTES_WRITTEN, kc, s.bytes_written as i64),
-        (wire::metric_ids::WAL_SEGMENT_SEQ, kg, i64::from(s.segment_seq)),
-        // §4.2 saturation gauge: entries written but not yet group-fsynced.
-        (wire::metric_ids::WAL_PENDING_DEPTH, kg, i64::from(s.pending_count)),
+    let scalars: [(u16, u8, i64); 28] = [
+        (
+            wire::metric_ids::WAL_ENTRIES_WRITTEN,
+            kc,
+            i64::from(s.entries_written),
+        ),
+        (
+            wire::metric_ids::WAL_WRITE_ERRORS,
+            kc,
+            i64::from(s.write_errors),
+        ),
+        (
+            wire::metric_ids::WAL_CHECKSUM_FAILURES,
+            kc,
+            i64::from(s.checksum_failures),
+        ),
+        (
+            wire::metric_ids::WAL_TRUNCATIONS,
+            kc,
+            i64::from(s.truncations),
+        ),
+        (
+            wire::metric_ids::WAL_BYTES_WRITTEN,
+            kc,
+            s.bytes_written as i64,
+        ),
+        (
+            wire::metric_ids::WAL_SEGMENT_SEQ,
+            kg,
+            i64::from(s.segment_seq),
+        ),
+        // saturation gauge: entries written but not yet group-fsynced.
+        (
+            wire::metric_ids::WAL_PENDING_DEPTH,
+            kg,
+            i64::from(s.pending_count),
+        ),
         // Diagnostic: last FS_OPEN_CREATE rc (>=0 disk, <0 in-memory fallback).
-        (wire::metric_ids::WAL_OPEN_RC, kg, i64::from(s.dbg_last_open_rc)),
+        (
+            wire::metric_ids::WAL_OPEN_RC,
+            kg,
+            i64::from(s.dbg_last_open_rc),
+        ),
         (wire::metric_ids::WAL_STEPS, kc, s.dbg_steps as i64),
         (wire::metric_ids::WAL_REPLAY_HW, kg, s.replay_hw_sent as i64),
-        (wire::metric_ids::WAL_REPLAYED, kc, i64::from(s.replayed_count)),
-        (wire::metric_ids::WAL_REPLAY_FSIZE, kg, i64::from(s.replay_first_size)),
-        (wire::metric_ids::WAL_ENTRYREQ_SERVED, kc, i64::from(s.entryreq_served)),
-        (wire::metric_ids::WAL_ENTRYREQ_NOTFOUND, kc, i64::from(s.entryreq_notfound)),
-        (wire::metric_ids::WAL_INPUT_BUDGET_BYTES, kg, i64::from(s.input_budget_bytes)),
-        (wire::metric_ids::WAL_PUMP_RECORDS, kg, i64::from(s.pump_records)),
-        (wire::metric_ids::WAL_CONTINUITY_ERRORS, kc, i64::from(s.continuity_errors)),
-        (wire::metric_ids::WAL_STASHED_HOLDS, kc, i64::from(s.stashed_holds)),
-        (wire::metric_ids::WAL_CURRENT_INDEX, kg, s.current_index as i64),
-        (wire::metric_ids::WAL_FAULT_EXPECTED, kg, s.fault_expected as i64),
+        (
+            wire::metric_ids::WAL_REPLAYED,
+            kc,
+            i64::from(s.replayed_count),
+        ),
+        (
+            wire::metric_ids::WAL_REPLAY_FSIZE,
+            kg,
+            i64::from(s.replay_first_size),
+        ),
+        (
+            wire::metric_ids::WAL_ENTRYREQ_SERVED,
+            kc,
+            i64::from(s.entryreq_served),
+        ),
+        (
+            wire::metric_ids::WAL_ENTRYREQ_NOTFOUND,
+            kc,
+            i64::from(s.entryreq_notfound),
+        ),
+        (
+            wire::metric_ids::WAL_INPUT_BUDGET_BYTES,
+            kg,
+            i64::from(s.input_budget_bytes),
+        ),
+        (
+            wire::metric_ids::WAL_PUMP_RECORDS,
+            kg,
+            i64::from(s.pump_records),
+        ),
+        (
+            wire::metric_ids::WAL_CONTINUITY_ERRORS,
+            kc,
+            i64::from(s.continuity_errors),
+        ),
+        (
+            wire::metric_ids::WAL_STASHED_HOLDS,
+            kc,
+            i64::from(s.stashed_holds),
+        ),
+        (
+            wire::metric_ids::WAL_CURRENT_INDEX,
+            kg,
+            s.current_index as i64,
+        ),
+        (
+            wire::metric_ids::WAL_FAULT_EXPECTED,
+            kg,
+            s.fault_expected as i64,
+        ),
         (wire::metric_ids::WAL_FAULT_GOT, kg, s.fault_got as i64),
-        (wire::metric_ids::WAL_TRUNCATE_FAILURES, kc, s.truncate_failures as i64),
+        (
+            wire::metric_ids::WAL_TRUNCATE_FAILURES,
+            kc,
+            s.truncate_failures as i64,
+        ),
         (wire::metric_ids::WAL_SEGMENT_MODE, kg, segment_mode(s)),
-        (wire::metric_ids::WAL_PREALLOCATE_FAILURES, kc, i64::from(s.preallocate_failures)),
-        (wire::metric_ids::WAL_PREALLOCATE_ERRNO, kg, i64::from(s.preallocate_errno)),
-        (wire::metric_ids::WAL_NAME_FENCE, kg, i64::from(s.name_fence_probe)),
-        (wire::metric_ids::WAL_NAME_UNFENCED, kc, i64::from(s.name_unfenced)),
+        (
+            wire::metric_ids::WAL_PREALLOCATE_FAILURES,
+            kc,
+            i64::from(s.preallocate_failures),
+        ),
+        (
+            wire::metric_ids::WAL_PREALLOCATE_ERRNO,
+            kg,
+            i64::from(s.preallocate_errno),
+        ),
+        (
+            wire::metric_ids::WAL_NAME_FENCE,
+            kg,
+            i64::from(s.name_fence_probe),
+        ),
+        (
+            wire::metric_ids::WAL_NAME_UNFENCED,
+            kc,
+            i64::from(s.name_unfenced),
+        ),
+        (
+            wire::metric_ids::WAL_COMPACT_FLOORED,
+            kc,
+            i64::from(s.compact_floored),
+        ),
     ];
     for &(metric_id, kind, value) in scalars.iter() {
         emit_sample(s, sys, mid, pid, metric_id, kind, value);
@@ -4105,7 +4905,9 @@ unsafe fn emit_sample(
     kind: u8,
     value: i64,
 ) {
-    if !wire_channels::writable(sys, s.out_metrics) { return; }
+    if !wire_channels::writable(sys, s.out_metrics) {
+        return;
+    }
     let mut buf = [0u8; wire::METRIC_SAMPLE_LEN];
     wire::encode_metric_sample(&mut buf, module_id, partition_id, metric_id, kind, value);
     wire_channels::channel_write_msg(sys, s.out_metrics, wire::MSG_METRIC_SAMPLE, &buf);

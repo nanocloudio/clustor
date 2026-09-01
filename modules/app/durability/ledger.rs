@@ -10,7 +10,7 @@
 //!
 //! Maintains a per-replica `progress[]` array and emits
 //! `MSG_DURABILITY_PROOF` whenever the quorum-durable index advances
-//! (spec §10.4.1 `wal_committed_index`). Followers see only their own
+//! `wal_committed_index`. Followers see only their own
 //! slot advance and therefore never emit a proof — the proof is a
 //! leader-side artifact that gates `consensus.committed_entries`.
 //!
@@ -19,11 +19,16 @@
 //! structurally incapable of emitting a durability proof.
 
 use super::abi::SyscallTable;
-use super::types::{quorum_index, Index, ReplicaId, Term, MAX_NODES};
+use super::types::{
+    quorum_index, quorum_index_for_set, Index, NodeSet, ReplicaId, Term, MAX_NODES,
+};
 use super::{dev_log, wire, wire_channels};
 
 #[repr(C)]
 pub struct Ledger {
+    /// Per-slot inbox for cross-node fsync acks, filled by the
+    /// module's intake demux.
+    pub inbox_ack: super::inbox::Inbox,
     pub in_ack: i32,     // in: FsyncAck from replicator (cross-node)
     pub out_quorum: i32, // out: 19-byte DurabilityProof
 
@@ -31,6 +36,24 @@ pub struct Ledger {
     pub self_id: ReplicaId,
     pub voter_count: u8,
     pub partition_id: u16,
+
+    /// Voter sets for the durability tally, mirrored from raft's
+    /// voter-set latch via `MSG_VOTER_SET_UPDATE` on the entry stream.
+    ///
+    /// The ledger must run the SAME union quorum `commit` runs. During
+    /// joint consensus an entry is durable only when a majority of BOTH
+    /// `C_old` and `C_new` have fsynced it: `commit` takes
+    /// `min(quorum_match, durable_index)`, so a durable_index computed
+    /// over `C_old` alone would let an entry commit that survives only
+    /// on the old configuration — exactly the committed-entry loss a
+    /// membership change must not permit.
+    ///
+    /// Empty until the first update lands, which is why the tally falls
+    /// back to the `voter_count` median: a graph that never changes
+    /// membership behaves exactly as before.
+    current_voters: NodeSet,
+    joint_voters: NodeSet,
+    joint_active: bool,
 
     // Per-replica durable index tracking
     progress: [Index; MAX_NODES],
@@ -55,11 +78,15 @@ pub struct Ledger {
 }
 
 pub unsafe fn init(l: &mut Ledger) {
+    l.inbox_ack = super::inbox::Inbox::new();
     l.in_ack = -1;
     l.out_quorum = -1;
     l.self_id = 0;
     l.voter_count = 1;
     l.partition_id = 0;
+    l.current_voters = NodeSet::empty();
+    l.joint_voters = NodeSet::empty();
+    l.joint_active = false;
     l.progress = [0; MAX_NODES];
     l.term_at = [0; MAX_NODES];
     l.committed_index = 0;
@@ -73,6 +100,43 @@ pub unsafe fn init(l: &mut Ledger) {
 pub fn clamp_voters(l: &mut Ledger) {
     if (l.voter_count as usize) > MAX_NODES {
         l.voter_count = MAX_NODES as u8;
+    }
+}
+
+/// Adopt a new voter configuration for the durability tally. Mirrors
+/// `consensus::commit::on_voter_set`; the two must stay in step or the
+/// union-quorum guarantee is only half-enforced.
+pub fn on_voter_set(l: &mut Ledger, current: u8, joint: u8, joint_active: bool) {
+    l.current_voters = NodeSet(current);
+    l.joint_voters = NodeSet(joint);
+    l.joint_active = joint_active;
+    let n = l.current_voters.count();
+    if n > 0 {
+        l.voter_count = n;
+    }
+}
+
+/// The durable high-water across the effective configuration.
+///
+/// Single config: the median over `current_voters`. Joint consensus:
+/// the MINIMUM of the two medians, so an index counts as durable only
+/// once a majority of each configuration has fsynced it.
+fn durable_quorum(l: &Ledger) -> Index {
+    if l.current_voters.count() == 0 {
+        // No voter-set update yet — median over the fixed `0..voter_count`
+        // range.
+        return quorum_index(&l.progress, l.voter_count);
+    }
+    let current = quorum_index_for_set(&l.progress, l.current_voters);
+    if l.joint_active && l.joint_voters.count() > 0 {
+        let joint = quorum_index_for_set(&l.progress, l.joint_voters);
+        if current < joint {
+            current
+        } else {
+            joint
+        }
+    } else {
+        current
     }
 }
 
@@ -104,8 +168,9 @@ pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
     // Drain cross-node acks
     if l.in_ack >= 0 {
         for _ in 0..32 {
-            let Some((msg_type, plen)) = wire_channels::next_msg(sys, l.in_ack, &mut l.msg_buf)
-            else {
+            // Pre-routed into this slot's inbox by the module's intake
+            // demux, so every ack here is this group's.
+            let Some((msg_type, plen)) = l.inbox_ack.next(sys, &mut l.msg_buf) else {
                 break;
             };
             if msg_type != wire::MSG_FSYNC_ACK {
@@ -115,8 +180,7 @@ pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
             // Slice to the declared payload: `msg_buf` is reused
             // across messages, so a short frame must not read the
             // previous one's tail.
-            let Some((term, index, replica)) =
-                wire::decode_fsync_ack(&l.msg_buf[..plen as usize])
+            let Some((term, index, replica)) = wire::decode_fsync_ack(&l.msg_buf[..plen as usize])
             else {
                 continue;
             };
@@ -128,7 +192,7 @@ pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
 
     // If any progress changed, recompute quorum
     if advanced {
-        let new_quorum = quorum_index(&l.progress, l.voter_count);
+        let new_quorum = durable_quorum(l);
 
         if new_quorum > l.committed_index {
             l.committed_index = new_quorum;
@@ -168,8 +232,17 @@ pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
                     l.committed_index,
                     l.self_id,
                 );
+                // Bare envelope, deliberately: the proof's own payload
+                // already carries `partition_id` (see
+                // `encode_durability_proof` above), so consumers filter
+                // on that. Wrapping it in the partitioned envelope too
+                // would duplicate the field AND break `quantum`'s
+                // `flow` module, which reads this same channel.
                 let w = wire_channels::channel_write_msg(
-                    sys, l.out_quorum, wire::MSG_DURABILITY_PROOF, &proof,
+                    sys,
+                    l.out_quorum,
+                    wire::MSG_DURABILITY_PROOF,
+                    &proof,
                 );
                 if w > 0 {
                     l.proof_pending = false;

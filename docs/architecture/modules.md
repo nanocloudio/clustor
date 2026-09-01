@@ -95,7 +95,7 @@ feedback, the same shape a channel edge has.
 | | |
 |---|---|
 | Inputs | `rpc`, `proposals`, `admin_proposals`, `proposals_tagged`, `proposals_partitioned`, `proposals_partitioned_tagged`, `snapshot_installed`, `wal_flushed`, `wal_replay_complete`, `ack`, `snapshot_rx`, `durable`, `cp_state`, `read_permits`, `read`, `entry_reply` |
-| Outputs | `rpc_out`, `net_out`, `log_append`, `metrics`, `proposal_assigned`, `leader_state`, `admin_applied`, `wal_compact`, `lag_signal`, `snapshot_import`, `snapshot_request`, `cross_durability_ack`, `retention_floor`, `committed_entries`, `applied`, `entry_request` |
+| Outputs | `rpc_out`, `net_out`, `log_append`, `metrics`, `proposal_assigned`, `leader_state`, `admin_applied`, `log_maintenance`, `lag_signal`, `snapshot_import`, `snapshot_request`, `cross_durability_ack`, `committed_entries`, `applied`, `entry_request`, `durable_horizon` |
 | Params | `self_id`, `voter_count`, `election_timeout_ms`, `heartbeat_interval_ms`, `proposal_batch_max`, `proposal_batch_timeout_ms`, `partition_id`, `root_path`, `peer_count`, `pipeline_depth`, `durability_mode`, `persist_meta`, `name_fence` |
 
 Two inputs and one output are shared handles with an in-module
@@ -129,9 +129,9 @@ epochs.
 
 | Component | Responsibility |
 |---|---|
-| `wal` | Segment-file WAL: CRC32C framing, replay, group/async-fenced fsync, truncation, compaction, gap-refetch serving. |
+| `wal` | Segment-file WAL: CRC32C framing, replay, group/async-fenced fsync, truncation, compaction bounded by the retention floors, gap-refetch and cold-read serving. |
 | `ledger` | Per-replica durable indices → quorum durability proofs. |
-| `snapshot` | Manifest persistence, chunked install transfer, retention floors, app-snapshot round trip. |
+| `snapshot` | Manifest persistence, chunked install transfer, app-snapshot round trip. |
 | `keys` | DEK epoch rotation; hands the current epoch to `wal` and `snapshot`. |
 
 Dispatch order is `keys → wal → ledger → snapshot`. `wal`'s
@@ -262,7 +262,7 @@ HTTP diagnostic surface.
 | Component | Responsibility |
 |---|---|
 | `rbac` | Evaluates RBAC roles (Operator / TenantAdmin / Observer / BreakGlass) by SPIFFE-SVID prefix match against `admin_svid_prefix` / `observer_svid_prefix` — an admin match grants Operator plus BreakGlass; writes the audit stream on `audit_events`. |
-| `admin` | Idempotency-keyed admin envelope. Routes `FREEZE` / `THAW` / `TRANSFER_LEADER` / `DURABILITY_MODE` / `SNAPSHOT` to `consensus` and replies `ADMIN_STATUS_OK` / `ADMIN_STATUS_DUPLICATE`. `ADD_VOTER` / `REMOVE_VOTER` return `ADMIN_STATUS_UNSUPPORTED`; the joint-consensus path is documented in [lifecycle.md](lifecycle.md#membership-changes-and-joint-consensus). |
+| `admin` | Idempotency-keyed admin envelope. Routes `FREEZE` / `THAW` / `DURABILITY_MODE` through the log, `TRANSFER_LEADER` / `SNAPSHOT` and the membership ops directly to `consensus`, and the migration / placement / tenant-quota / shard-map ops to the control-plane controller. Replies `ADMIN_STATUS_OK` / `ADMIN_STATUS_DUPLICATE`; the joint-consensus path is documented in [lifecycle.md](lifecycle.md#membership-changes-and-joint-consensus). |
 | `telemetry` | Metrics fan-in with fixed histogram buckets, incident correlation under a storm guard, feature-gate state, and the `/readyz` / `/why` / `/metrics` payloads. |
 | `http` | Owns what each request means: serves `/readyz`, `/why`, `/metrics`, `POST /admin/<op>` and `POST /propose` over wave `HttpRequest`/`HttpResponse` envelopes. HTTP mechanics live in wave's `http` module on a dedicated listener — by convention `LISTEN_PORT + 10000`. See [../net_http.md](../guides/net_http.md). |
 

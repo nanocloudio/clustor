@@ -8,8 +8,8 @@
 //! the `rejected` port for external observers.
 
 use super::abi::SyscallTable;
-use super::{wire, wire_channels};
 use super::dev_millis;
+use super::{wire, wire_channels};
 
 const METRICS_INTERVAL_MS: u64 = 1000;
 
@@ -154,13 +154,12 @@ pub unsafe fn step_metrics(t: &mut Throttle, sys: &SyscallTable) {
 
 /// Admit or reject one tagged proposal `[correlation_id:u64 LE][body]`.
 /// Every delivered proposal gets a terminal route: an atomic write to
-/// `proposals_tagged`, or a rejection — teed on `rejected` here and
-/// returned as the internal envelope for the dispatch table to hand
-/// to the codec (which resolves conn_id and frames the wire-facing
-/// reject). A `<= 0` admitted write means raft's channel filled and
-/// NOTHING was written — the proposal falls through to a throttled
-/// reject rather than being dropped silently, so the client retries
-/// (RFC §13/§14).
+/// `proposals_tagged`, or a rejection — teed on `rejected` here and returned
+/// as the internal envelope for the dispatch table to hand to the codec
+/// (which resolves conn_id and frames the wire-facing reject). A `<= 0`
+/// admitted write means raft's channel filled and NOTHING was written — the
+/// proposal falls through to a throttled reject rather than being dropped
+/// silently, so the client retries.
 ///
 /// # Safety
 ///
@@ -172,10 +171,10 @@ pub unsafe fn on_proposal(
     frame: &[u8],
 ) -> Option<[u8; wire::CLIENT_REJECT_INTERNAL_LEN]> {
     let payload_len = frame.len();
-    // Tagged-proposal convention (RFC §5.8): the codec stamps every
-    // proposal with `[correlation_id:u64 LE][body]`. We need the
-    // correlation_id so rejections map back to a conn_id; drop frames
-    // that are too short to be tagged.
+    // Tagged-proposal convention: the codec stamps every proposal with
+    // `[correlation_id:u64 LE][body]`. We need the correlation_id so
+    // rejections map back to a conn_id; drop frames that are too short to be
+    // tagged.
     if payload_len < wire::TAGGED_PROPOSAL_HDR {
         return None;
     }
@@ -193,8 +192,12 @@ pub unsafe fn on_proposal(
         && t.out_admitted >= 0
     {
         if wire_channels::writable(sys, t.out_admitted) {
-            let written =
-                wire_channels::channel_write_msg(sys, t.out_admitted, wire::MSG_CLIENT_PROPOSAL, frame);
+            let written = wire_channels::channel_write_msg(
+                sys,
+                t.out_admitted,
+                wire::MSG_CLIENT_PROPOSAL,
+                frame,
+            );
             if written > 0 {
                 if !unlimited {
                     t.entry_credits -= 1;
@@ -243,8 +246,8 @@ pub fn work_count(t: &Throttle) -> u32 {
     t.admitted_count.wrapping_add(t.rejected_count)
 }
 
-/// Emit admit/reject counters as typed samples (RFC §4.3). Node-level
-/// component, so partition_id is 0. Dropped under backpressure.
+/// Emit admit/reject counters as typed samples. Node-level component, so
+/// partition_id is 0. Dropped under backpressure.
 unsafe fn emit_metrics(t: &mut Throttle, sys: &SyscallTable) {
     if t.out_metrics < 0 {
         return;
@@ -263,8 +266,16 @@ unsafe fn emit_metrics(t: &mut Throttle, sys: &SyscallTable) {
         mid,
         0,
         &[
-            (wire::metric_ids::THROTTLE_ADMITTED, kc, i64::from(t.admitted_count)),
-            (wire::metric_ids::THROTTLE_REJECTED, kc, i64::from(t.rejected_count)),
+            (
+                wire::metric_ids::THROTTLE_ADMITTED,
+                kc,
+                i64::from(t.admitted_count),
+            ),
+            (
+                wire::metric_ids::THROTTLE_REJECTED,
+                kc,
+                i64::from(t.rejected_count),
+            ),
         ],
     );
 }

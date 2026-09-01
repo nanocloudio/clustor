@@ -210,6 +210,28 @@ pub const MSG_APPEND_ENTRIES: u8 = 0x01;
 pub const MSG_APPEND_ENTRIES_RESP: u8 = 0x02;
 pub const MSG_REQUEST_VOTE: u8 = 0x03;
 pub const MSG_REQUEST_VOTE_RESP: u8 = 0x04;
+/// A proposal a FOLLOWER received on its client-proposal channel and
+/// relayed to the leader, so a client connected to a non-leader is not
+/// silently stalled. Payload is the raw proposal body — no correlation
+/// tag, so this carries fire-and-forget writes only (MQTT QoS 0,
+/// Kafka acks=0). Response-owed proposals still need the origin tag
+/// plumbed back and are NOT forwarded.
+pub const MSG_PROPOSAL_FORWARD: u8 = 0x0F;
+
+/// A RESPONSE-OWED proposal relayed by a follower (QoS 1+, `acks>=1`).
+/// Payload is `[origin:u8][correlation_id:u64 LE][body]`. The origin is
+/// carried explicitly because the leader must send the resulting
+/// `MSG_PROPOSAL_ASSIGNED` back to the ring that holds the waiting
+/// inflight slot — its own ring is the wrong one.
+pub const MSG_PROPOSAL_FORWARD_TAGGED: u8 = 0x1D;
+/// The leader's answer to `MSG_PROPOSAL_FORWARD_TAGGED`, addressed to
+/// the ORIGIN node: `[correlation_id:u64 LE][partition_id:u16 LE]
+/// [wal_index:u64 LE]`, the same shape as `MSG_PROPOSAL_ASSIGNED`,
+/// which the origin re-emits locally to its proposer.
+pub const MSG_PROPOSAL_ASSIGNED_REMOTE: u8 = 0x1E;
+/// `[origin:u8][correlation_id:u64 LE]` prefix on a forwarded tagged
+/// proposal.
+pub const FORWARD_TAGGED_HDR: usize = 9;
 pub const MSG_PRE_VOTE: u8 = 0x05;
 pub const MSG_PRE_VOTE_RESP: u8 = 0x06; // reuse slot: high bit unused
 pub const MSG_HEARTBEAT: u8 = 0x07;
@@ -300,13 +322,11 @@ pub const MSG_ADMIN_RESPONSE: u8 = 0x13;
 /// `[conn_id:u8][status:u8][reserved:u8][retry_after_ms:u16 LE][entry_credits:i16 LE][byte_credits:i32 LE]`
 /// Surfaced when a request is denied before it can be replicated —
 /// throttle rejection, NotLeader, stale-epoch, read-unsupported, etc.
-/// See RFC §5.8/§5.9.
 pub const MSG_CLIENT_REJECT: u8 = 0x15;
-/// Linearizable read request from a client. Payload after the conn_id
-/// prefix supplied by gateway: `[read_id:u64 LE][body]`. The
-/// substrate does not yet implement linearizable reads end-to-end —
-/// gateway answers every read with `CLIENT_REJECT_READ_UNSUPPORTED`.
-/// See RFC §4.3.
+/// Linearizable read request from a client. Payload after the conn_id prefix
+/// supplied by gateway: `[read_id:u64 LE][body]`. The substrate does not yet
+/// implement linearizable reads end-to-end — gateway answers every read with
+/// `CLIENT_REJECT_READ_UNSUPPORTED`.
 pub const MSG_CLIENT_READ_REQUEST: u8 = 0x16;
 /// Internal rejection envelope used between the gateway's throttle
 /// reject path and its response egress. Carries the correlation_id assigned
@@ -315,13 +335,12 @@ pub const MSG_CLIENT_READ_REQUEST: u8 = 0x16;
 /// `[correlation_id:u64 LE][status:u8][reserved:u8][retry_after_ms:u16 LE][entry_credits:i16 LE][byte_credits:i32 LE]`
 pub const MSG_CLIENT_REJECT_INTERNAL: u8 = 0x17;
 /// Linearizable read response from `consensus.applied` to
-/// `gateway.responses`. Emitted when a queued read has reached its
-/// ReadIndex linearization point (apply_index ≥ submission-time commit
-/// horizon) AND the CP cache is still Fresh/Cached. The body is empty —
-/// downstream consumers MUST query their state machine via the per-entry
-/// `committed_entries` stream once they observe the matching index. See
-/// RFC §4.3.
-/// Payload: `[correlation_id:u64 LE]` (8 bytes).
+/// `gateway.responses`. Emitted when a queued read has reached its ReadIndex
+/// linearization point (apply_index ≥ submission-time commit horizon) AND
+/// the CP cache is still Fresh/Cached. The body is empty — downstream
+/// consumers MUST query their state machine via the per-entry
+/// `committed_entries` stream once they observe the matching index. Payload:
+/// `[correlation_id:u64 LE]` (8 bytes).
 pub const MSG_CLIENT_READ_RESPONSE: u8 = 0x18;
 /// Admin-command apply confirmation from `consensus.admin_applied` to
 /// the admin component's `applied` input. Carries the per-admin command_id that
@@ -330,11 +349,9 @@ pub const MSG_CLIENT_READ_RESPONSE: u8 = 0x18;
 /// `[command_id:u32 LE][status:u8]`.
 pub const MSG_ADMIN_APPLIED: u8 = 0x19;
 
-/// `MSG_ADMIN_RESPONSE` payload status codes (first byte).
-///
-/// `OK` and `DUPLICATE` are reserved for the day admin commands actually
-/// apply through Raft. Until then the admin component returns `UNSUPPORTED`
-/// for every request — see RFC §4.4 / §5.12 and `operations/admin.rs`.
+/// `MSG_ADMIN_RESPONSE` payload status codes (first byte). The admin
+/// component chooses one per command; see `operations/admin.rs` for which
+/// op takes which route and therefore which status it can return.
 pub const ADMIN_STATUS_OK: u8 = 0x00;
 pub const ADMIN_STATUS_DUPLICATE: u8 = 0x01;
 pub const ADMIN_STATUS_UNSUPPORTED: u8 = 0x80;
@@ -342,10 +359,11 @@ pub const ADMIN_STATUS_REJECTED: u8 = 0x81;
 pub const ADMIN_STATUS_NOT_LEADER: u8 = 0x82;
 
 /// Admin op codes (first body byte of an admin command). FREEZE / THAW /
-/// TRANSFER_LEADER / DURABILITY_MODE / SNAPSHOT are local-only effects
-/// applied by `consensus`. Membership ops (ADD/REMOVE voter) require
-/// joint consensus and are intentionally still `ADMIN_STATUS_UNSUPPORTED`
-/// — see RFC §14.
+/// DURABILITY_MODE replicate through the log; TRANSFER_LEADER / SNAPSHOT
+/// and the membership ops reach `consensus` directly, which turns a
+/// membership change into the `CONFIG_CHANGE` entry that carries the
+/// joint-consensus transition. The migration, placement, tenant-quota and
+/// shard-map ops go to the control-plane controller instead.
 pub const ADMIN_OP_FREEZE: u8 = 0x01;
 pub const ADMIN_OP_THAW: u8 = 0x02;
 pub const ADMIN_OP_TRANSFER_LEADER: u8 = 0x03;
@@ -353,19 +371,143 @@ pub const ADMIN_OP_DURABILITY_MODE: u8 = 0x04;
 pub const ADMIN_OP_SNAPSHOT: u8 = 0x05;
 pub const ADMIN_OP_ADD_VOTER: u8 = 0x06;
 pub const ADMIN_OP_REMOVE_VOTER: u8 = 0x07;
-/// `POST /propose` client-write bridge (RFC §8 stopgap). Carried on the admin
-/// command channel for wiring reuse, but the admin component emits it as a RAW
+/// Add a replica as a non-voting learner: it receives the log and
+/// counts toward no quorum. The catch-up step that must precede
+/// [`ADMIN_OP_ADD_VOTER`]. Op body: `[replica_id:u8]`.
+pub const ADMIN_OP_ADD_LEARNER: u8 = 0x0C;
+/// Drop a replica from the learner set. Op body: `[replica_id:u8]`.
+pub const ADMIN_OP_REMOVE_LEARNER: u8 = 0x0D;
+/// `POST /propose` client-write bridge. Carried on the admin command
+/// channel for wiring reuse, but the admin component emits it as a RAW
 /// (un-marked) `MSG_CLIENT_PROPOSAL` — the op_body is opaque application data,
 /// NOT an admin op, so it is never applied at commit time. Lets an off-DUT
 /// generator drive real client writes over HTTP without a dedicated ingress.
 pub const ADMIN_OP_PROPOSE: u8 = 0x08;
 
-/// Magic prefix of an admin entry replicated through the Raft log
-/// (RFC §3.1). When a committed entry's body starts with these eight
-/// bytes, the substrate interprets the remainder as
-/// `[command_id:u32 LE][op_code:u8][op_body...]` and applies the op
-/// at commit time on every replica. Plain proposal bodies (no magic)
-/// remain opaque per the RFC and are passed through unchanged.
+/// Start a shard migration. Op body: `[migration_id:u64 LE]
+/// [source_prg:u16 LE][target_prg:u16 LE][shard_count:u16 LE]`.
+pub const ADMIN_OP_MIGRATE_BEGIN: u8 = 0x0E;
+/// Report that the CURRENT migration phase's work has finished, so the
+/// state machine may advance. Op body: `[phase:u8]` — naming the phase
+/// being completed is what makes a late or re-sent signal harmless
+/// (MIG-IDEMPOTENT).
+pub const ADMIN_OP_MIGRATE_PHASE_DONE: u8 = 0x0F;
+/// Abort the active migration. Refused once fenced (MIG-ONEWAY).
+/// Empty op body.
+pub const ADMIN_OP_MIGRATE_ABORT: u8 = 0x10;
+
+/// Set the cluster's PRG topology: `[prg_count:u16]`.
+///
+/// The divisor that maps a virtual shard to its owning PRG. Changing it
+/// re-owns every shard at once, so it advances the placement epoch and
+/// is recorded durably with it.
+///
+/// DANGER, and the reason this is an explicit operator action rather
+/// than something inferred: publishing a `prg_count` higher than the
+/// number of PRGs that actually exist makes every node release the
+/// state for shards mapping to groups that were never activated. Those
+/// shards are then owned by nobody and their sessions, retained values
+/// and offline queues are dropped. Raising the topology is gated on
+/// having activated the groups first — never the reverse.
+pub const ADMIN_OP_PLACEMENT_TOPOLOGY: u8 = 0x11;
+
+/// Op-body length of [`ADMIN_OP_PLACEMENT_TOPOLOGY`].
+pub const PLACEMENT_TOPOLOGY_BODY_LEN: usize = 2;
+
+/// Set a tenant's publish-rate quota: `[tenant_id:u32][max_rate:u32]`.
+///
+/// The quota `governance` enforces was a synthetic constant re-emitted
+/// on every refresh tick — not settable, and reset to the same default
+/// on every restart, so an operator could neither raise a tenant's rate
+/// nor keep a lowered one across a reboot. Recorded through Raft so it
+/// is cluster-wide and survives.
+pub const ADMIN_OP_TENANT_QUOTA: u8 = 0x12;
+
+/// Op-body length of [`ADMIN_OP_TENANT_QUOTA`].
+pub const TENANT_QUOTA_BODY_LEN: usize = 8;
+
+/// Magic prefixing a committed tenant-quota record.
+pub const TENANT_CMD_MAGIC: [u8; 2] = *b"TQ";
+
+/// Body length of a tenant-quota record (magic + tenant_id + rate).
+pub const TENANT_RECORD_LEN: usize = 2 + 4 + 4;
+
+/// True when `buf` is a committed tenant-quota record.
+#[inline]
+pub fn is_tenant_record(buf: &[u8]) -> bool {
+    buf.len() >= TENANT_RECORD_LEN && buf[..2] == TENANT_CMD_MAGIC
+}
+
+/// Pin one shard to a PRG, overriding the modulo baseline — the `ShardMap`
+/// record class. Body: `[shard_id:u32 LE][prg:u16 LE]`, with `prg ==
+/// SHARD_OVERRIDE_CLEAR` removing the override.
+///
+/// The override is recorded through Raft for the same reason the tenant
+/// quota is: it is applied on the COMMIT, so a leader that loses its
+/// term before the record commits cannot route on a map no other node
+/// has, and a restart cannot lose a placement an operator set.
+pub const ADMIN_OP_SHARD_MAP: u8 = 0x13;
+
+/// Op-body length of [`ADMIN_OP_SHARD_MAP`]: shard + prg.
+pub const SHARD_MAP_BODY_LEN: usize = 6;
+
+/// Magic prefixing a committed shard-map record.
+pub const SHARD_MAP_CMD_MAGIC: [u8; 2] = *b"SM";
+
+/// Body length of a shard-map record (magic + shard_id + prg).
+pub const SHARD_MAP_RECORD_LEN: usize = 2 + 4 + 2;
+
+/// True when `buf` is a committed shard-map record.
+#[inline]
+pub fn is_shard_map_record(buf: &[u8]) -> bool {
+    buf.len() >= SHARD_MAP_RECORD_LEN && buf[..2] == SHARD_MAP_CMD_MAGIC
+}
+
+/// Encode a committed shard-map record.
+pub fn encode_shard_map_record(buf: &mut [u8], shard: u32, prg: u16) -> usize {
+    if buf.len() < SHARD_MAP_RECORD_LEN {
+        return 0;
+    }
+    buf[..2].copy_from_slice(&SHARD_MAP_CMD_MAGIC);
+    buf[2..6].copy_from_slice(&shard.to_le_bytes());
+    buf[6..8].copy_from_slice(&prg.to_le_bytes());
+    SHARD_MAP_RECORD_LEN
+}
+
+/// Decode a committed shard-map record into `(shard, prg)`.
+pub fn decode_shard_map_record(buf: &[u8]) -> Option<(u32, u16)> {
+    if !is_shard_map_record(buf) {
+        return None;
+    }
+    Some((
+        u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]),
+        u16::from_le_bytes([buf[6], buf[7]]),
+    ))
+}
+
+/// Migration command carried from the admin surface to the controller
+/// that owns the state machine. Body:
+/// `[op_code:u8][op_body...]` — the admin op codes above, forwarded
+/// verbatim so the controller and the admin surface share one
+/// vocabulary rather than translating between two.
+pub const MSG_MIGRATION_COMMAND: u8 = 0x83;
+
+/// Op-body length of [`ADMIN_OP_MIGRATE_BEGIN`].
+/// `[migration_id:u64][source_prg:u16][target_prg:u16][shard_count:u16][base_shard:u32]`
+///
+/// The batch is named, not implied. A PRG owns every shard congruent to
+/// it mod `prg_count`, which at the designed shard-space size is 2^18
+/// of them, so "the source's shards" is not a set any bounded override
+/// table can carry. A
+/// migration moves a NAMED batch, and `base_shard` is what lets the
+/// cutover emit exactly the overrides it promised.
+pub const MIGRATE_BEGIN_BODY_LEN: usize = 8 + 2 + 2 + 2 + 4;
+
+/// Magic prefix of an admin entry replicated through the Raft log. When a
+/// committed entry's body starts with these eight bytes, the substrate
+/// interprets the remainder as `[command_id:u32 LE][op_code:u8][op_body...]`
+/// and applies the op at commit time on every replica. Plain proposal bodies
+/// (no magic) remain opaque and are passed through unchanged.
 ///
 /// Sizing: entry TYPE is inferred from the head of a body that is
 /// otherwise opaque application data, so the magic must be wide enough
@@ -391,14 +533,21 @@ pub fn has_admin_magic(buf: &[u8]) -> bool {
 /// the WAL minus the 8-byte magic:
 /// `[command_id:u32 LE][op_code:u8][op_body...]`.
 pub const MSG_ADMIN_COMMITTED: u8 = 0x1A;
-/// `consensus` → `consensus` config-change commit. Emitted
-/// when a committed entry's body begins with `CONFIG_CHANGE_MAGIC`.
-/// Payload is the entry body verbatim — the magic STAYS, so the
-/// consumer validates with `decode_config_change`. See RFC §1.2.
+/// `consensus` → `consensus` config-change commit. Emitted when a committed
+/// entry's body begins with `CONFIG_CHANGE_MAGIC`. Payload is the entry body
+/// verbatim — the magic STAYS, so the consumer validates with
+/// `decode_config_change`.
 pub const MSG_CONFIG_COMMITTED: u8 = 0x1B;
 
+/// Client proposal carrying a proposer-chosen virtual-shard id.
+/// Payload is `[shard_id:u32 LE]` followed by the payload the router
+/// forwards after stripping it — see "Keyed proposal envelope" below.
+/// Accepted only by `partition_router`; `consensus` never sees this
+/// type, because the router rewrites it to [`MSG_CLIENT_PROPOSAL`].
+pub const MSG_CLIENT_PROPOSAL_KEYED: u8 = 0x1C;
+
 /// Body-prefix byte for a Raft-replicated configuration change (joint
-/// consensus, RFC §1.2). Followed by:
+/// consensus). Followed by:
 /// `[op_code:u8 (1 = C_old,new, 2 = C_new)][voter_count:u8]
 ///  [voter_id_0:u8]...[voter_id_{n-1}:u8]` for the "new" voter set.
 /// For `C_old,new` entries the old set is recoverable from the
@@ -416,6 +565,22 @@ pub fn has_config_change_magic(buf: &[u8]) -> bool {
 }
 pub const CONFIG_CHANGE_OP_JOINT: u8 = 0x01;
 pub const CONFIG_CHANGE_OP_NEW: u8 = 0x02;
+/// Replace the learner set. Learners receive the log but count toward
+/// NO quorum — not the commit tally, not the durability tally, not an
+/// election. They exist so a replica can catch up on the real log
+/// before it is made a voter: a voter added cold would join with an
+/// empty log and immediately count toward both majorities, which can
+/// stall commit until it catches up and can lose entries if the leader
+/// fails meanwhile.
+///
+/// Body is the same shape as the voter ops — the id list is the
+/// COMPLETE learner set, not a delta, so replay is idempotent.
+pub const CONFIG_CHANGE_OP_LEARNER: u8 = 0x03;
+
+/// Fixed prefix of a config-change body: the 8-byte magic, the op code
+/// and the id count. A buffer must be `CONFIG_CHANGE_HDR + voters.len()`
+/// or [`encode_config_change`] refuses it and returns 0.
+pub const CONFIG_CHANGE_HDR: usize = 10;
 
 /// Encode a config-change entry body for the WAL log. Layout:
 ///   `[CONFIG_CHANGE_MAGIC:8][op_code:u8][voter_count:u8][voter_id_0..n-1:u8]`
@@ -423,7 +588,7 @@ pub const CONFIG_CHANGE_OP_NEW: u8 = 0x02;
 #[inline]
 pub fn encode_config_change(buf: &mut [u8], op_code: u8, voters: &[u8]) -> usize {
     let n = voters.len().min(0xFF);
-    let total = 10 + n;
+    let total = CONFIG_CHANGE_HDR + n;
     if buf.len() < total {
         return 0;
     }
@@ -451,15 +616,13 @@ pub fn decode_config_change(buf: &[u8]) -> Option<(u8, usize, usize)> {
     Some((op_code, 10, n))
 }
 
-/// Magic prefix of a deterministic-timing substrate entry
-/// (rfc_deterministic_timing.md §8, §18). Followed by
-/// `[op:u8 (1 = TimeAdvance, 2 = TimeDrain)][time_ms:u64 LE]`.
-/// TimeAdvance carries the proposed logical time; TimeDrain carries
-/// `through_time_ms`, which must equal the applied logical time or
-/// the drain is a deterministic no-op. These are internal entries:
-/// only the leader's time producer may propose them, and the gateway
-/// rejects client bodies carrying this prefix (RFC §17). See
-/// [`ADMIN_MAGIC`] for the 8-byte sizing rationale.
+/// Magic prefix of a deterministic-timing substrate entry. Followed by
+/// `[op:u8 (1 = TimeAdvance, 2 = TimeDrain)][time_ms:u64 LE]`. TimeAdvance
+/// carries the proposed logical time; TimeDrain carries `through_time_ms`,
+/// which must equal the applied logical time or the drain is a deterministic
+/// no-op. These are internal entries: only the leader's time producer may
+/// propose them, and the gateway rejects client bodies carrying this prefix.
+/// See [`ADMIN_MAGIC`] for the 8-byte sizing rationale.
 pub const TIMING_MAGIC: [u8; 8] = [0x54, 0x4D, 0x45, 0x21, 0x9E, 0x1F, 0x5C, 0xA7];
 
 /// True when `buf` begins with [`TIMING_MAGIC`].
@@ -487,7 +650,7 @@ pub fn encode_time_entry(buf: &mut [u8], op: u8, time_ms: u64) -> usize {
 
 /// Decode a timing entry body. Returns `(op, time_ms)` or `None` when
 /// the prefix, op or length is wrong (unknown timing entries fail
-/// closed at the consumer, RFC §18).
+/// closed at the consumer).
 #[inline]
 pub fn decode_time_entry(buf: &[u8]) -> Option<(u8, u64)> {
     if !has_timing_magic(buf) || buf.len() < TIMING_ENTRY_LEN {
@@ -505,31 +668,42 @@ pub fn decode_time_entry(buf: &[u8]) -> Option<(u8, u64)> {
 /// `consensus` → `consensus` / `durability` voter-set
 /// update. Sent every time the current or joint voter set changes so
 /// the downstream quorum tracker can adjust. Payload (3 bytes):
-///   `[current_set:u8][joint_set:u8][joint_active:u8]`
+///   `[current_set:u8][joint_set:u8][joint_active:u8][learner_set:u8]`
 /// Each `u8` is a [`super::types::NodeSet`] bitmask. `joint_active = 0`
 /// means single-config; otherwise both sets must be considered for
 /// quorum.
+///
+/// `learner_set` names replicas that receive the log but count toward
+/// no quorum. It is carried here so the replicator knows to keep
+/// shipping AppendEntries to them; every quorum tally derives from
+/// `current_set` / `joint_set` alone and must ignore it.
 pub const MSG_VOTER_SET_UPDATE: u8 = 0x76;
+
+/// Payload length of [`MSG_VOTER_SET_UPDATE`].
+pub const VOTER_SET_UPDATE_LEN: usize = 4;
 
 #[inline]
 pub fn encode_voter_set_update(
-    buf: &mut [u8; 3],
+    buf: &mut [u8; VOTER_SET_UPDATE_LEN],
     current_set: u8,
     joint_set: u8,
     joint_active: bool,
+    learner_set: u8,
 ) {
     Writer::new(buf)
         .u8(current_set)
         .u8(joint_set)
-        .bool(joint_active);
+        .bool(joint_active)
+        .u8(learner_set);
 }
 
+/// Returns `(current, joint, joint_active, learners)`.
 #[inline]
-pub fn decode_voter_set_update(buf: &[u8]) -> Option<(u8, u8, bool)> {
-    if buf.len() < 3 {
+pub fn decode_voter_set_update(buf: &[u8]) -> Option<(u8, u8, bool, u8)> {
+    if buf.len() < VOTER_SET_UPDATE_LEN {
         return None;
     }
-    Some((buf[0], buf[1], buf[2] != 0))
+    Some((buf[0], buf[1], buf[2] != 0, buf[3]))
 }
 
 /// `MSG_CLIENT_REJECT` status codes (status byte, after the conn_id /
@@ -556,8 +730,8 @@ pub const CLIENT_REJECT_INTERNAL_LEN: usize = 8 + CLIENT_REJECT_BODY_LEN;
 pub const CLIENT_REJECT_WIRE_LEN: usize = 1 + CLIENT_REJECT_BODY_LEN;
 
 /// Encode the 10-byte reject body. Used by both envelope variants.
-/// `reserved` is repurposed as `leader_id` when `status == CLIENT_REJECT_NOT_LEADER`
-/// (per RFC §5.8). Pass `0` for every other status.
+/// `reserved` is repurposed as `leader_id` when
+/// `status == CLIENT_REJECT_NOT_LEADER`. Pass `0` for every other status.
 #[inline]
 pub fn encode_client_reject_body(
     buf: &mut [u8; CLIENT_REJECT_BODY_LEN],
@@ -666,27 +840,26 @@ pub const MSG_WAL_ENTRY_REPLY: u8 = 0x2A;
 /// snapshot install fast-forwards `commit_index`. Payload (16 bytes):
 /// `[term:u64 LE][index:u64 LE]`. The pipeline must drop any pending
 /// observer entries whose index <= reset index and bump its own
-/// `apply_index` to the reset point. See §2.3 of the phase-3 RFC.
+/// `apply_index` to the reset point.
 pub const MSG_APPLY_PIPELINE_RESET: u8 = 0x2B;
 /// WAL compaction request emitted by `consensus` after a snapshot
 /// install or post-snapshot trim. Payload (8 bytes):
 /// `[before_index:u64 LE]`. WAL deletes segments whose max-index <
 /// `before_index` and trims its in-memory offset map.
 pub const MSG_WAL_COMPACT_BEFORE: u8 = 0x2C;
-/// WAL → consensus boot-time replay-complete signal. Emitted exactly
-/// once after the WAL finishes its replay scan (PHASE_REPLAY → NORMAL),
-/// carrying the EXACT on-disk high-water it reconstructed. Payload
-/// (16 bytes): `[term:u64 LE][high_water_index:u64 LE]` (encoded via
+/// WAL → consensus boot-time replay-complete signal. Emitted exactly once
+/// after the WAL finishes its replay scan (PHASE_REPLAY → NORMAL), carrying
+/// the EXACT on-disk high-water it reconstructed. Payload (16 bytes):
+/// `[term:u64 LE][high_water_index:u64 LE]` (encoded via
 /// `encode_term_index`). On a crash-recovery boot raft loads only a
 /// THROTTLED durable hint from its metadata slots (`META_PERSIST_STRIDE`),
-/// which lags the WAL's true replayed high-water; resuming at the stale
-/// hint makes new post-recovery appends collide with the replayed index
-/// space. raft HOLDS proposal intake until this signal arrives, then
-/// resumes `last_log_index` at `high_water_index` and re-seeds
-/// consensus. This needs its OWN dedicated edge — it CANNOT ride
-/// the shared `wal.flushed` fan-out (which also feeds durability;
-/// a one-shot signal there is consumed by the wrong consumer and the
-/// boot deadlocks). See the L4 recovery follow-up (RFC §14 item 3b).
+/// which lags the WAL's true replayed high-water; resuming at the stale hint
+/// makes new post-recovery appends collide with the replayed index space.
+/// raft HOLDS proposal intake until this signal arrives, then resumes
+/// `last_log_index` at `high_water_index` and re-seeds consensus. This needs
+/// its OWN dedicated edge — it CANNOT ride the shared `wal.flushed` fan-out
+/// (which also feeds durability; a one-shot signal there is consumed by the
+/// wrong consumer and the boot deadlocks).
 pub const MSG_WAL_REPLAY_COMPLETE: u8 = 0x2D;
 /// consensus → WAL log-suffix truncation (Raft §5.3 conflict repair).
 /// Emitted by a follower when an AppendEntries reveals a divergent suffix:
@@ -876,7 +1049,7 @@ pub const MSG_SNAPSHOT_TRIGGER: u8 = 0x52;
 /// InstallSnapshot RPC (leader → follower). Payload header (33 bytes):
 /// `[term:u64][last_included_index:u64][last_included_term:u64][offset:u64][done:u8][data...]`
 /// `done == 1` marks the final chunk. Until then the follower accumulates
-/// `data` at `offset` into a per-source buffer. See RFC §5.13.
+/// `data` at `offset` into a per-source buffer.
 pub const MSG_INSTALL_SNAPSHOT: u8 = 0x53;
 /// Follower → leader response. Payload (9 bytes): `[term:u64][success:u8]`.
 pub const MSG_INSTALL_SNAPSHOT_RESP: u8 = 0x54;
@@ -884,13 +1057,12 @@ pub const MSG_INSTALL_SNAPSHOT_RESP: u8 = 0x54;
 /// finishes locally. Payload (24 bytes):
 /// `[term:u64][last_included_index:u64][last_included_term:u64]`.
 pub const MSG_SNAPSHOT_INSTALLED: u8 = 0x55;
-/// `replicator` → `durability` on-demand catch-up trigger. The
-/// replicator emits this when a follower's `next_index` falls below
-/// the leader's WAL retention floor (a NOT_FOUND `MSG_WAL_ENTRY_REPLY`
-/// is the canonical signal). `durability` responds by emitting
-/// `MSG_INSTALL_SNAPSHOT` chunks at the most recent snapshot point.
-/// Payload (1 byte): `[target_replica_id:u8]` (0xFF = broadcast).
-/// See RFC §4.2 of the phase-3 plan.
+/// `replicator` → `durability` on-demand catch-up trigger. The replicator
+/// emits this when a follower's `next_index` falls below the leader's WAL
+/// retention floor (a NOT_FOUND `MSG_WAL_ENTRY_REPLY` is the canonical
+/// signal). `durability` responds by emitting `MSG_INSTALL_SNAPSHOT` chunks
+/// at the most recent snapshot point. Payload (1 byte):
+/// `[target_replica_id:u8]` (0xFF = broadcast).
 pub const MSG_SNAPSHOT_INSTALL_REQUEST: u8 = 0x56;
 
 /// TLS peer identity from the foundation `tls` module to
@@ -1021,7 +1193,7 @@ pub fn decode_peer_identity(buf: &[u8]) -> Option<PeerIdentity> {
 /// downstream consumer (install path). Payload (28+ bytes):
 /// `[term:u64 LE][last_included_index:u64 LE][offset:u64 LE]
 ///  [done:u8][reserved:u8;3][body...]`. The body is opaque — only
-/// the producing consumer knows how to interpret it. See RFC §2.1.
+/// the producing consumer knows how to interpret it.
 pub const MSG_APP_SNAPSHOT_CHUNK: u8 = 0x57;
 /// Snapshot-export trigger from `durability` to a downstream
 /// consumer. Payload (16 bytes):
@@ -1035,6 +1207,21 @@ pub const MSG_APP_SNAPSHOT_REQUEST: u8 = 0x58;
 /// `apply_index`. Payload (16 bytes):
 /// `[term:u64 LE][last_included_index:u64 LE]`.
 pub const MSG_APP_SNAPSHOT_RESET: u8 = 0x59;
+
+/// "The exported snapshot is now DURABLE" signal from `durability` to a
+/// downstream consumer, emitted only after the snapshot body has been
+/// written crash-atomically (`write_snapshot_durable`) AND its boot
+/// pointer persisted — i.e. exactly when raft is told the local snapshot
+/// is durable and the WAL compaction floor advances. Payload (16 bytes):
+/// `[term:u64 LE][last_included_index:u64 LE]`.
+///
+/// This is the acknowledgement an app worker needs before it may advance
+/// any garbage-collection floor past `last_included_index`: a consumer
+/// that trusts its own export COMPLETION instead can advance the GC floor
+/// onto state a crash-before-durable would force WAL replay to read as
+/// compacted-away. The signal is leader-local (the durable snapshot is a
+/// per-node fact); a follower learns durability through install, not this.
+pub const MSG_APP_SNAPSHOT_DURABLE: u8 = 0x5B;
 
 /// `MSG_APP_SNAPSHOT_CHUNK` fixed header size (28 bytes); body follows.
 pub const APP_SNAPSHOT_HDR: usize = 28;
@@ -1155,9 +1342,9 @@ pub const MSG_CERT_REFRESH: u8 = 0x61;
 pub const MSG_METRICS: u8 = 0x70;
 pub const MSG_READYZ: u8 = 0x71;
 pub const MSG_WHY: u8 = 0x72;
-/// Typed metric sample envelope (RFC §4.3). Replaces ad-hoc
-/// per-module `MSG_METRICS` payloads with a uniform shape so
-/// `operations` can aggregate without per-module parse code.
+/// Typed metric sample envelope. Replaces ad-hoc per-module `MSG_METRICS`
+/// payloads with a uniform shape so `operations` can aggregate without
+/// per-module parse code.
 ///
 /// Payload (14 bytes):
 /// `[module_id:u8]
@@ -1195,13 +1382,25 @@ pub const MSG_CLIENT_FRAME: u8 = 0xEA;
 /// gateway does).
 pub const MSG_CONN_CLOSED: u8 = 0xEB;
 
+/// Ask `peer_router` to CLOSE a client connection. Payload `[conn_id:u8]`,
+/// on the same `client_resp` lane the codecs write frames to.
+///
+/// The inverse direction of [`MSG_CONN_CLOSED`], which is a NOTICE that a
+/// socket went away. This is a command, and it exists because MQTT 3.1.1
+/// has no server-initiated DISCONNECT: when placement moves a session's
+/// shard, a v5 client is told `0x9D` Server moved and reconnects, but a
+/// 3.1.1 client can only be informed by closing its socket. Without this
+/// it stays connected to a node that no longer owns it, receives
+/// nothing, and never reaches the CONNECT redirect.
+pub const MSG_CONN_CLOSE_REQUEST: u8 = 0xEC;
+
 /// Metric kinds for `MSG_METRIC_SAMPLE`.
 pub const METRIC_KIND_COUNTER: u8 = 0;
 pub const METRIC_KIND_GAUGE: u8 = 1;
 pub const METRIC_KIND_HISTOGRAM: u8 = 2;
 
-/// Module id space (RFC §4.3). Stable across releases — never
-/// re-number an existing entry. Add new modules at the end.
+/// Module id space. Stable across releases — never re-number an existing
+/// entry. Add new modules at the end.
 pub const SOURCE_ID_RAFT: u8 = 0x01;
 pub const SOURCE_ID_WAL: u8 = 0x02;
 pub const SOURCE_ID_REPLICATOR: u8 = 0x03;
@@ -1243,14 +1442,13 @@ pub mod metric_ids {
     pub const RAFT_FROZEN_FLAG: u16 = 0x0008;
     pub const RAFT_STRICT_FALLBACK_FLAG: u16 = 0x0009;
     /// Counter: proposal-batch flushes deferred because `wal.entries`
-    /// (out_log) had no write space — the durability-backpressure signal
-    /// (RFC §13/§14). Non-zero means raft held the log at WAL durability
-    /// rather than over-producing; sustained growth = WAL-bound plateau.
+    /// (out_log) had no write space — the durability-backpressure signal.
+    /// Non-zero means raft held the log at WAL durability rather than
+    /// over-producing; sustained growth = WAL-bound plateau.
     pub const RAFT_FLUSHES_DEFERRED: u16 = 0x000A;
     /// Gauge: uncommitted-inflight window (`last_log_index - commit_index`).
     /// Sitting at `MAX_UNCOMMITTED_INFLIGHT` means the leader is holding
-    /// intake to keep the log from running past quorum-durable commit
-    /// (RFC §13/§14 durability backpressure).
+    /// intake to keep the log from running past quorum-durable commit.
     pub const RAFT_UNCOMMITTED_INFLIGHT: u16 = 0x000B;
     /// Gauge: raft's `last_log_index` (highest appended index). After a
     /// crash-recovery boot this reflects whether raft RESUMED its index from
@@ -1283,7 +1481,7 @@ pub mod metric_ids {
     /// tip back to the index the WAL actually holds (`MSG_WAL_REJECT`).
     /// Steady state is 0. Non-zero means raft's log had claimed entries the
     /// WAL never persisted; sustained growth means something upstream is
-    /// repeatedly desynchronising the two (see rfc/troubleshooting §5b).
+    /// repeatedly desynchronising the two.
     pub const RAFT_WAL_RESYNCS: u16 = 0x0013;
     /// Counter: appends held because the log was already `MAX_WAL_UNACKED`
     /// ahead of the local durable index. Non-zero = the WAL is the
@@ -1323,6 +1521,13 @@ pub mod metric_ids {
     /// refused instead, so a non-zero value is the auto posture
     /// reporting what it could not fence.
     pub const RAFT_NAME_UNFENCED: u16 = 0x001A;
+    /// Counter: AppendEntries answered without a verdict because the
+    /// follower's tail ring held no term for the index the leader named.
+    /// The follower keeps its log and reports its tip; the leader's next
+    /// append past that tip resolves it. Steady state 0; a climbing value
+    /// on a node that just restarted means its WAL replay acks are not
+    /// reaching raft.
+    pub const RAFT_AE_UNVERIFIED: u16 = 0x001B;
 
     // wal (module_id = 0x02)
     pub const WAL_ENTRIES_WRITTEN: u16 = 0x0001;
@@ -1414,6 +1619,11 @@ pub mod metric_ids {
     /// the strict posture this is always 0 — the publication is
     /// refused instead.
     pub const WAL_NAME_UNFENCED: u16 = 0x001B;
+    /// Counter: compactions whose trim point a retention floor (an
+    /// application's window, or the slowest voter's match) pulled
+    /// below the snapshot index. Rising means the floor, not the
+    /// snapshot cadence, bounds disk.
+    pub const WAL_COMPACT_FLOORED: u16 = 0x001C;
 
     // replicator (module_id = 0x03)
     pub const REPL_RPCS_SENT: u16 = 0x0001;
@@ -1450,7 +1660,7 @@ pub mod metric_ids {
     /// install signal was withheld so consensus never trusts a torn body.
     pub const SNAP_INSTALL_FAILURES: u16 = 0x0005;
     /// Counter: complete app-snapshot bodies received from the state
-    /// machine (RFC §2.1 capture round-trips that finished).
+    /// machine.
     pub const SNAP_APP_BODIES_RECEIVED: u16 = 0x0006;
     /// Counter: app-snapshot captures that timed out with no body — the
     /// app refused (capacity denial) or is wedged; either way the WAL
@@ -1531,6 +1741,18 @@ pub mod metric_ids {
     /// Counter: frames the router dropped (oversize chunk / route
     /// frame / undeliverable response).
     pub const PEER_FRAMES_DROPPED: u16 = 0x0004;
+    /// Counter: outbound peer writes `net_out` refused and retried. A
+    /// rising count means the peer net edge is undersized for the
+    /// traffic; nothing was lost.
+    pub const PEER_TX_REFUSED: u16 = 0x0005;
+    /// Counter: client chunks the `cleartext` consumer refused and the
+    /// router retained (see `peer_router::client_stash`). A refusal
+    /// used as a drop corrupts that connection's protocol stream for
+    /// good — the codec parses a continuous byte stream — so the chunk
+    /// is held and inbound draining pauses until it lands. Steady
+    /// state 0; a climbing value means the codec's input edge is too
+    /// small for the connection count.
+    pub const PEER_CLIENT_REFUSED: u16 = 0x0006;
 
     // operations (module_id = 0x15) — the aggregator's self-metrics.
     pub const TELE_MESSAGES_INGESTED: u16 = 0x0001;
@@ -1545,7 +1767,7 @@ pub mod metric_ids {
     /// export truncation observable instead of silent.
     pub const TELE_RECORDS_DROPPED: u16 = 0x0005;
 
-    // nvme_bench (module_id = 0x16) — L0 NVMe floor bench (RFC §6).
+    // nvme_bench (module_id = 0x16) — L0 NVMe floor bench.
     pub const NVBENCH_PHASE: u16 = 0x0001;
     pub const NVBENCH_BYTES_WRITTEN: u16 = 0x0002;
     pub const NVBENCH_SEQ_KBPS: u16 = 0x0003;
@@ -1578,9 +1800,8 @@ pub mod metric_ids {
     pub const CBENCH_PROPOSALS_SENT: u16 = 0x0002;
     pub const CBENCH_BLOCKED: u16 = 0x0003;
 
-    // timing (source_id = 0x19) — deterministic replicated timing
-    // (rfc_deterministic_timing.md §16), emitted by the deadline-
-    // enabled consumer module (session_directory today).
+    // timing (source_id = 0x19) — deterministic replicated timing, emitted
+    // by the deadline-enabled consumer module (session_directory today).
     /// Gauge: committed PRG logical time (ms since epoch).
     pub const TIMING_LOGICAL_TIME_MS: u16 = 0x0001;
     /// Gauge: disciplined wall time minus logical time on the leader
@@ -1604,15 +1825,14 @@ pub mod metric_ids {
     pub const TIMING_PAUSE_REASON: u16 = 0x0009;
 }
 
-/// `TIMING_PAUSE_REASON` gauge values (rfc_deterministic_timing.md
-/// §16 `/why` vocabulary, node-local view).
+/// `TIMING_PAUSE_REASON` gauge values.
 pub const TIMING_PAUSE_NONE: u8 = 0;
 pub const TIMING_PAUSE_NOT_LEADER: u8 = 1;
 pub const TIMING_PAUSE_CLOCK_ALARM: u8 = 2;
 pub const TIMING_PAUSE_DRAIN_BACKLOG: u8 = 3;
 pub const TIMING_PAUSE_IDLE: u8 = 4;
 
-/// Fixed-bucket histograms (RFC §4.1, `docs/architecture/observability.md`).
+/// Fixed-bucket histograms.
 ///
 /// Each histogram occupies a contiguous per-module `metric_id` range
 /// starting at [`hist::HIST_BASE`]: bucket `i` is emitted as a
@@ -1628,7 +1848,7 @@ pub mod hist {
     pub const HIST_BASE: u16 = 0x1000;
 
     /// First `metric_id` for the operations module's PER-MODULE kernel step-timing
-    /// histogram (RFC §4.3). Each scheduler module's 8 step buckets are
+    /// histogram. Each scheduler module's 8 step buckets are
     /// emitted under `module_id = SOURCE_ID_TELEMETRY`,
     /// `partition_id = scheduler_module_idx`, `metric_id = STEP_PERMOD_BASE + i`
     /// — distinct from the global step histogram (which uses HIST_BASE,
@@ -1726,9 +1946,8 @@ pub fn decode_metric_sample(buf: &[u8]) -> Option<(u8, u16, u16, u8, i64)> {
     Some((module_id, partition_id, metric_id, kind, value))
 }
 
-// Session directory (fluxor rfc_protocols.md §8.3 / §13.7 — the
-// replicated session-registry consumer in
-// `modules/app/session_directory/`).
+// Session directory (fluxor / — the replicated session-registry
+// consumer in `modules/app/session_directory/`).
 //
 // `MSG_SR_REQUEST`: anchor/orchestrator → session_directory. Payload:
 // `[request_id:u64 LE][session_registry command body]` where the body
@@ -1745,6 +1964,313 @@ pub const MSG_SR_REPLY: u8 = 0x91;
 
 // Routing
 pub const MSG_PLACEMENT_UPDATE: u8 = 0x80;
+
+// ── Shard map ────────────────────────────────────────────────────────────────
+//
+// Which Partition Raft Group owns a virtual shard. The control plane
+// owns this mapping; `partition_router` consumes it.
+//
+// The map is a MODULO BASELINE plus SPARSE OVERRIDES, not a dense table. A
+// dense `VIRTUAL_SHARDS`-entry array is 512 KiB, which no module can hold
+// and no channel should carry; and at steady state the baseline is what
+// every shard uses anyway. An override exists only for a shard the control
+// plane has deliberately placed somewhere other than its baseline — which is
+// exactly what a migration produces, a bounded batch at a time (: a
+// migration moves a named shard list, not the whole space).
+//
+// The override table is what makes a MIGRATION cheap. A RESIZE is cheap
+// because of the baseline: `baseline_prg` is a jump consistent hash, so
+// growing the PRG count from N to N+1 moves exactly the 1/(N+1) of shards
+// that land on the new PRG and nothing else, and shrinking moves only the
+// departing PRG's shards. No dense map is needed for either.
+
+/// Shard-map update. Payload:
+///   `[epoch:u64 LE][count:u16 LE]` then `count` × `[shard:u32 LE][prg:u16 LE]`.
+///
+/// An entry maps one virtual shard to the group that owns it,
+/// overriding the modulo baseline. `prg == SHARD_OVERRIDE_CLEAR`
+/// removes the override and returns the shard to its baseline.
+pub const MSG_SHARD_MAP_UPDATE: u8 = 0x81;
+
+/// Header length of a [`MSG_SHARD_MAP_UPDATE`] payload.
+/// Largest override set a consumer is required to hold, and therefore
+/// the largest batch one migration may move.
+///
+/// The wire contract states it because the PRODUCER must not emit a map
+/// bigger than every consumer can apply: a consumer that dropped the
+/// tail would resolve those shards to their baseline owner while other
+/// nodes used the override, which is split ownership. Quantum's
+/// `edge_routing_core::MAX_SHARD_OVERRIDES` is sized to match.
+pub const SHARD_MAP_MAX_ENTRIES: usize = 256;
+
+pub const SHARD_MAP_HDR: usize = 10;
+/// Bytes per shard-map entry.
+pub const SHARD_MAP_ENTRY: usize = 6;
+/// `prg` value that clears an override rather than setting one.
+/// `0xFFFF` is already wire-reserved as "never a real partition id".
+pub const SHARD_OVERRIDE_CLEAR: u16 = 0xFFFF;
+
+// ── Migration state machine ──────────────────────────────────────────────────
+//
+// One executable, durable state machine covers every elastic operation:
+// shard move, PRG activation, node add, node drain, replica move.
+//
+//   PLANNED -> PROVISIONING -> COPYING -> CATCHING_UP -> FENCED
+//           -> ACTIVE -> RETIRING -> DONE
+//                     \
+//                      -> ABORTED   (only before FENCED)
+//
+// The phase is written to the durable record BEFORE the work of that
+// phase begins (MIG-DURABLE), so a controller crash resumes by reading
+// the phase and re-running it — which every phase must tolerate
+// (MIG-IDEMPOTENT). FENCED is the point of no return (MIG-ONEWAY):
+// before it, abort restores the old map at the old epoch; after it, the
+// target has begun accepting and only roll-forward is safe.
+
+pub const MIG_PLANNED: u8 = 0;
+pub const MIG_PROVISIONING: u8 = 1;
+pub const MIG_COPYING: u8 = 2;
+pub const MIG_CATCHING_UP: u8 = 3;
+pub const MIG_FENCED: u8 = 4;
+pub const MIG_ACTIVE: u8 = 5;
+pub const MIG_RETIRING: u8 = 6;
+pub const MIG_DONE: u8 = 7;
+pub const MIG_ABORTED: u8 = 8;
+
+/// True when `phase` is past the point of no return. Abort is refused
+/// from here on: the target has begun accepting at the new epoch, so
+/// restoring the old placement would give two groups the same shards.
+#[inline]
+pub fn mig_is_committed(phase: u8) -> bool {
+    matches!(phase, MIG_FENCED | MIG_ACTIVE | MIG_RETIRING | MIG_DONE)
+}
+
+/// True when `phase` is terminal — no further transition is legal.
+#[inline]
+pub fn mig_is_terminal(phase: u8) -> bool {
+    matches!(phase, MIG_DONE | MIG_ABORTED)
+}
+
+/// The phase that follows `phase` on the success path, or `None` at a
+/// terminal phase.
+#[inline]
+pub fn mig_next(phase: u8) -> Option<u8> {
+    match phase {
+        MIG_PLANNED => Some(MIG_PROVISIONING),
+        MIG_PROVISIONING => Some(MIG_COPYING),
+        MIG_COPYING => Some(MIG_CATCHING_UP),
+        MIG_CATCHING_UP => Some(MIG_FENCED),
+        MIG_FENCED => Some(MIG_ACTIVE),
+        MIG_ACTIVE => Some(MIG_RETIRING),
+        MIG_RETIRING => Some(MIG_DONE),
+        _ => None,
+    }
+}
+
+/// Whether `from -> to` is a legal transition.
+///
+/// Advancing one step on the success path is legal; so is aborting, but
+/// only from a phase that has not yet fenced. Everything else — a skip,
+/// a rewind, a move out of a terminal phase — is refused, so a
+/// controller bug cannot walk a migration into a state its invariants
+/// were never checked against.
+#[inline]
+pub fn mig_transition_ok(from: u8, to: u8) -> bool {
+    if mig_is_terminal(from) {
+        return false;
+    }
+    if to == MIG_ABORTED {
+        return !mig_is_committed(from);
+    }
+    mig_next(from) == Some(to)
+}
+
+/// Migration record payload:
+///   `[migration_id:u64 LE][phase:u8][source_prg:u16 LE][target_prg:u16 LE]`
+///   `[epoch:u64 LE][shard_count:u16 LE][deadline_ms:u64 LE]`
+pub const MIGRATION_RECORD_LEN: usize = 35;
+
+/// Activate a hosted Raft group at runtime — the WORK of a migration's
+/// PROVISIONING phase. Body: `[partition_id:u16
+/// LE][self_id:u8][voter_count:u8]`.
+///
+/// Carried on the `cp_state` seam rather than a port of its own: the
+/// consensus engine is at fluxor's 16-port-per-direction ceiling, and
+/// that input already demuxes control-plane frames by type. A slot
+/// activation IS control-plane state reaching consensus, so it belongs
+/// there on meaning as well as on necessity.
+pub const MSG_SLOT_ACTIVATE: u8 = 0x84;
+
+/// Body length of [`MSG_SLOT_ACTIVATE`].
+pub const SLOT_ACTIVATE_LEN: usize = 4;
+
+/// Magic prefix of a migration record replicated through the Raft log,
+/// inside the opaque proposal body (the same idiom as
+/// `session_directory`'s `SR`). A committed entry starting with these
+/// two bytes is the controller's own phase record coming back durable.
+///
+/// The record MUST travel this way rather than straight to a sink:
+/// MIG-DURABLE is satisfied by the entry being COMMITTED, not by it
+/// being accepted for write, and only the commit round-trip can tell
+/// the controller which of those happened.
+pub const MIG_CMD_MAGIC: [u8; 2] = *b"MG";
+
+/// True when `buf` is a committed migration record body.
+#[inline]
+pub fn is_migration_record(buf: &[u8]) -> bool {
+    buf.len() >= 2 + MIGRATION_RECORD_LEN && buf[..2] == MIG_CMD_MAGIC
+}
+
+/// Magic prefix of a ROUTING EPOCH record replicated through the Raft
+/// log, inside the opaque proposal body (same idiom as `MG` and
+/// `session_directory`'s `SR`).
+///
+/// The epoch is otherwise per-node and in memory: it starts at 1 and
+/// advances on local fence transitions. While every node is up they
+/// track together, because the transitions come from replicated
+/// migration records — but a node that RESTARTS resets to 1 while its
+/// peers are at N. It then routes on a stale epoch, and the forwards it
+/// stamps carry an epoch its peers treat as superseded. Recording the
+/// epoch makes it survive the restart.
+///
+/// Body: `[epoch:u32 LE]`. Applied as a MAXIMUM, so replay,
+/// re-delivery and out-of-order arrival all converge, and an epoch can
+/// only move forward.
+pub const EPOCH_CMD_MAGIC: [u8; 2] = *b"RE";
+
+/// Body length of a routing-epoch record (magic + epoch).
+pub const EPOCH_RECORD_LEN: usize = 2 + 4;
+
+/// Body length of a routing-epoch record that also carries the PRG
+/// topology: `[RE][epoch:u32][prg_count:u16]`.
+///
+/// The topology rides the epoch record rather than getting a record of
+/// its own, because a topology change IS an epoch change — every shard
+/// changes owner when the divisor changes, which is precisely what an
+/// epoch means. Two records could commit in either order and leave a
+/// window where the epoch says "new placement" while the divisor is
+/// still the old one, and every node would resolve owners wrongly for
+/// exactly that window. One record makes them inseparable.
+///
+/// The tail is OPTIONAL, matching `MSG_PLACEMENT_UPDATE`: a 6-byte
+/// record from a controller that only advanced the epoch leaves the
+/// topology alone.
+pub const EPOCH_RECORD_LEN_TOPO: usize = 2 + 4 + 2;
+
+/// Body length of a routing-epoch record that also carries which node
+/// serves each PRG: `[RE][epoch:u32][prg_count:u16][node_for_prg:u8 x
+/// MAX_NODES]`. A permutation of `0..prg_count` (identity when absent),
+/// so a whole PRG changes hands with one record and the fence unit —
+/// the PRG — is already the right one. It rides the same record as the
+/// count for the same reason the count rides the epoch: a change to who
+/// serves what IS an epoch change.
+pub const EPOCH_RECORD_LEN_PERM: usize = EPOCH_RECORD_LEN_TOPO + PERM_NODES;
+
+/// Width of the `node_for_prg` permutation on the wire: `types::MAX_NODES`,
+/// restated because this file is mounted where `types` is not.
+pub const PERM_NODES: usize = 7;
+
+/// True when `buf` is a committed routing-epoch record.
+#[inline]
+pub fn is_epoch_record(buf: &[u8]) -> bool {
+    buf.len() >= EPOCH_RECORD_LEN && buf[..2] == EPOCH_CMD_MAGIC
+}
+
+/// Envelope carrying a migration record.
+pub const MSG_MIGRATION_RECORD: u8 = 0x82;
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one argument per wire field; the record is a flat struct"
+)]
+#[inline]
+pub fn encode_migration_record(
+    buf: &mut [u8; MIGRATION_RECORD_LEN],
+    migration_id: u64,
+    phase: u8,
+    source_prg: u16,
+    target_prg: u16,
+    epoch: u64,
+    shard_count: u16,
+    deadline_ms: u64,
+    base_shard: u32,
+) {
+    Writer::new(buf)
+        .u64(migration_id)
+        .u8(phase)
+        .u16(source_prg)
+        .u16(target_prg)
+        .u64(epoch)
+        .u16(shard_count)
+        .u64(deadline_ms)
+        .u32(base_shard);
+}
+
+/// Returns `(migration_id, phase, source_prg, target_prg, epoch,
+/// shard_count, deadline_ms, base_shard)`.
+#[inline]
+#[expect(
+    clippy::type_complexity,
+    reason = "one element per wire field; a struct here would be a second \
+              definition of the record layout, which is how this header \
+              acquired six drifting copies"
+)]
+pub fn decode_migration_record(buf: &[u8]) -> Option<(u64, u8, u16, u16, u64, u16, u64, u32)> {
+    let mut r = Reader::new(buf, MIGRATION_RECORD_LEN)?;
+    let migration_id = r.u64();
+    let phase = r.u8();
+    let source_prg = r.u16();
+    let target_prg = r.u16();
+    let epoch = r.u64();
+    let shard_count = r.u16();
+    let deadline_ms = r.u64();
+    let base_shard = r.u32();
+    Some((
+        migration_id,
+        phase,
+        source_prg,
+        target_prg,
+        epoch,
+        shard_count,
+        deadline_ms,
+        base_shard,
+    ))
+}
+
+/// Encode a shard-map update header. Returns bytes written.
+#[inline]
+pub fn encode_shard_map_header(buf: &mut [u8], epoch: u64, count: u16) -> usize {
+    if buf.len() < SHARD_MAP_HDR {
+        return 0;
+    }
+    Writer::new(buf).u64(epoch).u16(count);
+    SHARD_MAP_HDR
+}
+
+/// Decode a shard-map update header into `(epoch, count)`.
+#[inline]
+pub fn decode_shard_map_header(buf: &[u8]) -> Option<(u64, u16)> {
+    let mut r = Reader::new(buf, SHARD_MAP_HDR)?;
+    Some((r.u64(), r.u16()))
+}
+
+/// Write one `(shard, prg)` entry at `buf`. Returns bytes written.
+#[inline]
+pub fn encode_shard_map_entry(buf: &mut [u8], shard: u32, prg: u16) -> usize {
+    if buf.len() < SHARD_MAP_ENTRY {
+        return 0;
+    }
+    Writer::new(buf).u32(shard).u16(prg);
+    SHARD_MAP_ENTRY
+}
+
+/// Read the `i`-th `(shard, prg)` entry of a shard-map payload.
+#[inline]
+pub fn decode_shard_map_entry(buf: &[u8], i: usize) -> Option<(u32, u16)> {
+    let off = SHARD_MAP_HDR + i * SHARD_MAP_ENTRY;
+    let mut r = Reader::new(buf.get(off..)?, SHARD_MAP_ENTRY)?;
+    Some((r.u32(), r.u16()))
+}
 
 /// `control_plane` → any downstream session-bearing consumer: a kpg's
 /// placement has changed, and a session bound to that kpg should
@@ -1815,10 +2341,9 @@ pub fn decode_header(buf: &[u8]) -> Option<(u8, u16)> {
 // ── Partitioned envelope helpers (multi-Raft channels) ──────────────────────
 //
 // Channels between partition-aware modules carry a 2-byte `partition_id`
-// prefix in front of the standard 3-byte envelope. See
-// `.context/rfc_partition_groups.md` §"Wire envelope". Partitioned and
-// non-partitioned channels coexist via distinct ports, never via in-band
-// flag bytes.
+// prefix in front of the standard 3-byte envelope. §"Wire envelope".
+// Partitioned and non-partitioned channels coexist via distinct ports, never
+// via in-band flag bytes.
 //
 // Wire: [partition_id: u16 LE] [msg_type: u8] [len: u16 LE] [payload]
 
@@ -1892,6 +2417,31 @@ pub fn encode_term_index(buf: &mut [u8], term: u64, index: u64) {
     Writer::new(buf).u64(term).u64(index);
 }
 
+/// Prefix on a `MSG_COMMITTED_ENTRY` body:
+/// `[partition_id:u16 LE][term:u64 LE][index:u64 LE]`, then the entry.
+///
+/// The partition id is REQUIRED, not decorative. One engine hosts K raft
+/// groups whose logs each number from 1, and every slot writes this one
+/// stream — so without it a consumer tracking a single `apply_index`
+/// sees partition 1's index 1 arrive after partition 0's and discards it
+/// as a duplicate, or worse treats a forward jump as a gap and wipes its
+/// apply-derived state. At K=4 that shows up as only ~1/4 of topics
+/// ever delivering, deterministically. The ack path keys on
+/// `(partition_id, wal_index)` for exactly this reason.
+pub const COMMITTED_ENTRY_HDR: usize = 18;
+
+/// Write the `MSG_COMMITTED_ENTRY` prefix. Body goes at
+/// `COMMITTED_ENTRY_HDR`.
+pub fn encode_committed_entry_hdr(buf: &mut [u8], partition_id: u16, term: u64, index: u64) {
+    Writer::new(buf).u16(partition_id).u64(term).u64(index);
+}
+
+/// Read it back: `(partition_id, term, index)`, or `None` if short.
+pub fn decode_committed_entry_hdr(buf: &[u8]) -> Option<(u16, u64, u64)> {
+    let mut r = Reader::new(buf, COMMITTED_ENTRY_HDR)?;
+    Some((r.u16(), r.u64(), r.u64()))
+}
+
 /// Decode a term + index pair (16 bytes), or `None` on a short frame.
 ///
 /// A truncated peer frame must never index past the buffer: `no_std`
@@ -1905,7 +2455,7 @@ pub fn decode_term_index(buf: &[u8]) -> Option<(u64, u64)> {
     Some((r.u64(), r.u64()))
 }
 
-// ── Extended AppendEntries envelope (RFC §5.1 log matching) ────────────────
+// ── Extended AppendEntries envelope ────────────────────────────────────────
 //
 // `[term:u64][leader_id:u8][prev_log_index:u64][prev_log_term:u64]
 //  [leader_commit:u64][entry_term:u64][entry_index:u64][body...]`
@@ -2023,16 +2573,15 @@ pub fn decode_vote_response(buf: &[u8]) -> Option<(u64, bool, u8)> {
 /// Encode an FsyncAck payload (17 bytes):
 ///   term(8) + index(8) + replica_id(1)
 ///
-/// Emitted by `wal` directly on `wal.flushed` (one `wal` per
-/// partition). The `replica` byte must be the WAL's `self_id` so
-/// `durability` keys per-replica progress correctly — see
-/// RFC §4.1. For cross-partition fan-in to `ack_tracker` see
-/// `encode_durability_proof` below.
+/// Emitted by `wal` directly on `wal.flushed` (one `wal` per partition). The
+/// `replica` byte must be the WAL's `self_id` so `durability` keys
+/// per-replica progress correctly. For cross-partition fan-in to
+/// `ack_tracker` see `encode_durability_proof` below.
 ///
 /// On the leader, `durability` also receives FsyncAck frames
 /// synthesized by `replicator` from follower AppendEntriesResponse
 /// envelopes (see `AE_RESP_LEN`), so the per-replica progress array
-/// covers every voter — the spec §10.4.1 quorum-fsync semantic.
+/// covers every voter quorum-fsync semantic.
 #[inline]
 pub fn encode_fsync_ack(buf: &mut [u8], term: u64, index: u64, replica: u8) {
     encode_term_index_replica(buf, term, index, replica);
@@ -2049,7 +2598,7 @@ pub fn decode_fsync_ack(buf: &[u8]) -> Option<(u64, u64, u8)> {
 /// where `replica_byte = self_id | (success << 7)`.
 ///
 /// `durable_index` is the follower's `local_wal_durable_index` at the
-/// moment the response is sent (spec §10.4.1). The leader's
+/// moment the response is sent. The leader's
 /// `replicator` decodes this field and forwards a synthesized
 /// `MSG_FSYNC_ACK` to `durability.ack` so the leader can
 /// compute quorum durability across replicas.
@@ -2252,6 +2801,133 @@ pub fn encode_tagged_proposal(dst: &mut [u8], correlation_id: u64, body: &[u8]) 
 pub fn decode_tagged_proposal(buf: &[u8]) -> Option<(u64, usize)> {
     let correlation_id = Reader::new(buf, TAGGED_PROPOSAL_HDR)?.u64();
     Some((correlation_id, TAGGED_PROPOSAL_HDR))
+}
+
+// ── Keyed proposal envelope ──────────────────────────────────────────────────
+//
+// A third MSG_CLIENT_PROPOSAL shape, used when the *proposer* — not the
+// substrate — decides which partition a proposal belongs to.
+//
+// 3. Keyed — sent as MSG_CLIENT_PROPOSAL_KEYED on either proposal port:
+//        proposals        (untagged): [shard_id: u32 LE][body]
+//        proposals_tagged (tagged):   [shard_id: u32 LE][correlation_id: u64 LE][body]
+//
+// `partition_router` maps `shard_id` to a partition, strips the 4-byte
+// prefix, and forwards the remaining payload as a plain
+// MSG_CLIENT_PROPOSAL — so `consensus` sees exactly the two shapes it
+// already handles and needs no change.
+//
+// Why the shard id rides a *stripped prefix* rather than the body: the
+// facade's opaque-command invariant (replica_facade.rs "Clustor never
+// inspects the body bytes") is load-bearing. Routing is the substrate's
+// concern, the schema is the consumer's, and the correlation_id prefix
+// already established that a proposer-supplied, router-stripped prefix
+// is how the two meet. Anything the *apply* path must re-derive after a
+// replay (a routing epoch, a dedupe key) belongs in the consumer's own
+// body schema, where Clustor still never looks.
+//
+// The shard id is a virtual-shard index, already reduced modulo
+// [`VIRTUAL_SHARDS`] by the proposer (see [`shard_for_key`]). It is not
+// a partition id: the shard space is fixed for the life of a cluster
+// while the partition count changes, which is the whole point — growing
+// the partition count moves shards between partitions instead of
+// rehashing every key.
+
+/// Size of the virtual-shard space. Fixed for the life of a cluster:
+/// changing it rehashes every key and is a full-cluster migration, not an
+/// operation. Sized so that a large cluster still gets tens of shards per
+/// partition, keeping the smallest possible load movement small (see
+/// quantum's).
+pub const VIRTUAL_SHARDS: u32 = 1 << 18;
+
+/// Reduce a routing-key hash to a virtual-shard id.
+///
+/// Callers hash their own routing key with [`fnv1a_64`] — an MQTT
+/// `(tenant, client_id)` or `(tenant, normalized_topic)`, a Kafka
+/// `(tenant, topic, partition)` — and pass the result here. Both sides
+/// of a forward therefore agree on the shard without either publishing
+/// a private hash variant.
+#[inline]
+pub fn shard_for_key(key_hash: u64) -> u32 {
+    (key_hash % VIRTUAL_SHARDS as u64) as u32
+}
+
+/// The PRG a shard belongs to when no override names another: jump
+/// consistent hash (Lamping & Veach, 2014) over `prg_count` PRGs.
+///
+/// Chosen over `shard % prg_count` for what happens when the count
+/// changes. Under modulo a resize re-homes most of the shard space;
+/// under jump hash growing N -> N+1 moves exactly the 1/(N+1) of shards
+/// that land on the NEW PRG and leaves every other shard where it was,
+/// and shrinking moves only the departing PRG's shards. That is the
+/// property a dense shard map was going to be built to provide, and it
+/// costs six lines and no table.
+///
+/// One implementation for the whole cluster: the edge core in quantum
+/// mirrors this function byte for byte and the two are pinned to the
+/// same vectors by test. A node running a different baseline would
+/// resolve a different owner for every shard, so a cluster is rebuilt
+/// together when this changes (the ABI-epoch discipline).
+///
+/// `prg_count == 0` is treated as 1 — the wire's "unchanged" sentinel
+/// must never divide.
+#[inline]
+pub fn baseline_prg(shard: u32, prg_count: u16) -> u16 {
+    let buckets = i64::from(prg_count.max(1));
+    let mut key = u64::from(shard);
+    let mut b: i64 = -1;
+    let mut j: i64 = 0;
+    while j < buckets {
+        b = j;
+        key = key.wrapping_mul(2_862_933_555_777_941_757).wrapping_add(1);
+        // (b + 1) * (2^31 / (high 31 bits of key + 1)), in the paper's
+        // double arithmetic — reproduced exactly so every implementation
+        // agrees on every shard.
+        let denom = ((key >> 33) + 1) as f64;
+        j = ((b + 1) as f64 * (2_147_483_648.0_f64 / denom)) as i64;
+    }
+    b as u16
+}
+
+/// Header size of a keyed proposal envelope (shard_id prefix only).
+pub const KEYED_PROPOSAL_HDR: usize = 4;
+
+/// The shard every CONTROL-PLANE record is keyed to.
+///
+/// `shard_to_partition` is `shard % num_partitions` (modulo any
+/// override), and `0 % n == 0` for every `n`, so a record keyed here
+/// always lands on partition 0, the distinguished CP-Raft group.
+///
+/// Without a key a record goes out UNTAGGED on `consensus.proposals`,
+/// whose channel handle is cloned to every slot. At K>1 each hosted
+/// group's `drain_proposals` reads that same handle, so whichever slot
+/// stepped first would take the record — a control-plane entry landing
+/// on an ARBITRARY partition, varying run to run. Keying them makes
+/// group 0 the answer by construction.
+pub const CP_RECORD_SHARD: u32 = 0;
+
+/// Build a keyed proposal payload into `dst`. `rest` is the payload the
+/// router will forward once it strips the prefix — a bare body for the
+/// untagged port, or `[correlation_id: u64 LE][body]` for the tagged
+/// one. Returns total bytes written (`4 + rest.len()`), or -1 if `dst`
+/// is too small.
+#[inline]
+pub fn encode_keyed_proposal(dst: &mut [u8], shard_id: u32, rest: &[u8]) -> i32 {
+    let total = KEYED_PROPOSAL_HDR + rest.len();
+    if dst.len() < total {
+        return -1;
+    }
+    Writer::new(dst).u32(shard_id).bytes(rest);
+    total as i32
+}
+
+/// Decode a keyed proposal payload. Returns `(shard_id, rest_offset)`
+/// where `rest_offset == KEYED_PROPOSAL_HDR`. Returns `None` if `buf` is
+/// shorter than the header.
+#[inline]
+pub fn decode_keyed_proposal(buf: &[u8]) -> Option<(u32, usize)> {
+    let shard_id = Reader::new(buf, KEYED_PROPOSAL_HDR)?.u32();
+    Some((shard_id, KEYED_PROPOSAL_HDR))
 }
 
 /// MSG_PROPOSAL_ASSIGNED payload size (18 bytes):

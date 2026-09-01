@@ -55,14 +55,14 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+#[path = "../../common/step_accounting.rs"]
+mod step_accounting;
 #[path = "../../common/types.rs"]
 mod types;
 #[path = "../../common/wire.rs"]
 mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
-#[path = "../../common/step_accounting.rs"]
-mod step_accounting;
 
 mod flow;
 mod proof_cache;

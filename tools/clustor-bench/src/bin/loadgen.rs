@@ -1,4 +1,4 @@
-//! `clustor-loadgen` — off-DUT open-loop load generator (RFC §5.2/§5.3).
+//! `clustor-loadgen` — off-DUT open-loop load generator.
 //!
 //! Drives the DUT over the real client path (`POST /propose` by default; any
 //! POST path via `--path`) at a fixed offered rate using a Poisson-free fixed
@@ -8,7 +8,7 @@
 //! does not shift the arrival process; latency is measured from the actual
 //! send instant, and only successful (2xx/3xx) requests enter the histogram.
 //!
-//! It also self-reports the RFC §2.4 harness-headroom verdict — achieved
+//! It also self-reports a harness-headroom verdict — achieved
 //! *successful* vs offered rate — so a run that the generator (not the DUT)
 //! bottlenecked is flagged `HARNESS_BOUND` rather than silently reported as a
 //! DUT ceiling, and a run with a material error ratio is flagged
@@ -177,7 +177,7 @@ fn main() {
     let elapsed = wall.elapsed().as_secs_f64().max(0.001);
     let achieved = ok as f64 / elapsed;
 
-    // RFC §2.4 headroom verdict on *successful* throughput: if the generator
+    // Headroom verdict on *successful* throughput: if the generator
     // couldn't offer ≥ the target rate, the run is harness-bound and excluded
     // from DUT-ceiling baselines. Above 1% errors the DUT wasn't doing the
     // offered work, so no rate-based verdict is attributable at all.

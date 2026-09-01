@@ -76,14 +76,14 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
-#[path = "../../common/wire.rs"]
-mod wire;
-#[path = "../../common/wire_channels.rs"]
-mod wire_channels;
 #[path = "../../common/http_admin.rs"]
 mod http_admin;
 #[path = "../../common/step_accounting.rs"]
 mod step_accounting;
+#[path = "../../common/wire.rs"]
+mod wire;
+#[path = "../../common/wire_channels.rs"]
+mod wire_channels;
 
 mod admin;
 mod rbac;
@@ -204,6 +204,9 @@ pub extern "C" fn module_new(
         s.telemetry.out_why = dev_channel_port(sys, 1, 6);
         s.telemetry.out_export = dev_channel_port(sys, 1, 7);
         s.rbac.out_authorized = dev_channel_port(sys, 1, 9);
+        // Index 11: `migration_cmd`, declared last in the manifest so
+        // no existing output index shifted.
+        s.admin.out_migration = dev_channel_port(sys, 1, 11);
         #[cfg(feature = "http")]
         {
             s.http.in_proposal_assigned = dev_channel_port(sys, 0, 5);
@@ -431,7 +434,10 @@ unsafe fn route_admin(
 /// Caller must hold an exclusive `&mut ModuleState` and a valid
 /// `&SyscallTable` per the module ABI.
 #[cfg(feature = "http")]
-#[allow(clippy::too_many_arguments, reason = "flat request parts avoid a borrowed struct")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "flat request parts avoid a borrowed struct"
+)]
 unsafe fn route_http_request(
     s: &mut ModuleState,
     sys: &SyscallTable,
