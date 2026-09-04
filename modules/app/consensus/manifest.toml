@@ -407,5 +407,34 @@ metrics = [
   # apply
   "entries_applied", "queue_depth", "refetched", "caught_up",
   "entries_evicted", "reads_evicted", "delivery_stalls",
+  # Kernel-ring twins of the two histograms: ids 41/42 pinned by
+  # COMMIT_HIST_RING_ID / APPLY_HIST_RING_ID in mod.rs — count before
+  # reordering. The ring carries its own 15-bound ladders
+  # (wire::hist::*_RING_US); the channel export keeps its own, so neither
+  # wire's bucket ranges move when the other is tuned.
+  "commit_latency_us", "apply_batch_us",
 ]
 histograms = ["commit_latency_ms", "apply_batch_latency_ms"]
+
+# Bounds MUST match wire::hist::COMMIT_LATENCY_RING_US / APPLY_BATCH_RING_US.
+[[observability.instrument]]
+name      = "commit_latency_us"
+kind      = "histogram16"
+bounds_us = [500, 1000, 2000, 4000, 6000, 8000, 10000, 15000, 20000, 30000,
+             40000, 60000, 80000, 100000, 200000]
+
+[[observability.instrument.dimension]]
+key    = "fluxor.slot"
+domain = "numeric"
+max    = 64
+
+[[observability.instrument]]
+name      = "apply_batch_us"
+kind      = "histogram16"
+bounds_us = [250, 500, 1000, 2000, 4000, 6000, 8000, 10000, 15000, 20000,
+             30000, 40000, 60000, 80000, 100000]
+
+[[observability.instrument.dimension]]
+key    = "fluxor.slot"
+domain = "numeric"
+max    = 64

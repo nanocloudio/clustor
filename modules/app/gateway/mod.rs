@@ -318,7 +318,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Route one client record `[conn_id:u8][body]` through the
+/// Route one client record `[conn_id:u16 LE][body]` through the
 /// codec → throttle → codec → surface chain. Cross-component order
 /// lives here, in the composition layer, not in any component.
 ///

@@ -2,7 +2,7 @@
 //!
 //! Authorized admin commands arrive from the [`rbac`](super::rbac) component
 //! (or pre-authorized on the module's `admin_requests` port), with the
-//! convention `[conn_id:u8][op_code:u8][op_body...]`. Each command is
+//! convention `[conn_id:u16 LE][op_code:u8][op_body...]`. Each command is
 //! compared byte-for-byte against its immediate predecessor for idempotency.
 //!
 //! An accepted op takes one of three routes, and the choice is a
@@ -27,7 +27,7 @@
 //!   refuses these rather than accepting a command nothing will run.
 //!
 //! Either of the first two acks via `MSG_ADMIN_APPLIED`, after which the
-//! component emits `MSG_ADMIN_RESPONSE([conn_id, status])` on the
+//! component emits `MSG_ADMIN_RESPONSE([conn_id:u16 LE][status])` on the
 //! module's `responses` port. An op outside the supported set is
 //! answered `ADMIN_STATUS_UNSUPPORTED` without being staged.
 //!
@@ -63,7 +63,7 @@ const CMD_MAX: usize = ENV_BUF - 12;
 #[derive(Clone, Copy)]
 struct CmdEntry {
     command_id: u32,
-    conn_id: u8,
+    conn_id: u16,
 }
 
 #[repr(C)]
@@ -198,7 +198,7 @@ unsafe fn drain_requests(a: &mut Admin, sys: &SyscallTable, now: u64) {
 }
 
 /// Process one authorized admin command envelope
-/// `[conn_id:u8][op_code:u8][op_body...]`. This is the single
+/// `[conn_id:u16 LE][op_code:u8][op_body...]`. This is the single
 /// admission point regardless of how the command arrived (rbac
 /// delivery or the `admin_requests` port).
 ///
@@ -208,11 +208,11 @@ unsafe fn drain_requests(a: &mut Admin, sys: &SyscallTable, now: u64) {
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &[u8]) {
     let pl = payload.len();
-    if pl < 2 {
+    if pl < 3 {
         return; // need conn_id + op_code at minimum
     }
-    let conn_id = payload[0];
-    let op_code = payload[1];
+    let conn_id = u16::from_le_bytes([payload[0], payload[1]]);
+    let op_code = payload[2];
     // Receipt signal — paired with `[http] admin op=N
     // conn_id=M`, the only external proof the POST→admin path
     // landed: admin ops reply 202 immediately (see the http
@@ -222,9 +222,9 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     let n = format_recv_log(&mut log, op_code, conn_id);
     dev_log(sys, 3, log.as_ptr(), n);
     // Copy command bytes for the idempotency compare + forwarding.
-    let cmd_len = pl - 1;
+    let cmd_len = pl - 2;
     let mut cmd = [0u8; ENV_BUF];
-    cmd[..cmd_len].copy_from_slice(&payload[1..pl]);
+    cmd[..cmd_len].copy_from_slice(&payload[2..pl]);
 
     // Client-write bridge: ADMIN_OP_PROPOSE carries opaque application data,
     // not an admin op. Emit it as a RAW (unmarked) MSG_CLIENT_PROPOSAL to
@@ -451,17 +451,18 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
 ///
 /// Caller must hold an exclusive `&mut Admin` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn emit_admin_response(a: &mut Admin, sys: &SyscallTable, conn_id: u8, status: u8) {
+unsafe fn emit_admin_response(a: &mut Admin, sys: &SyscallTable, conn_id: u16, status: u8) {
     if a.out_responses < 0 {
         return;
     }
     if wire_channels::writable(sys, a.out_responses) {
-        let resp = [conn_id, status];
+        let cid = conn_id.to_le_bytes();
+        let resp = [cid[0], cid[1], status];
         wire_channels::channel_write_msg(sys, a.out_responses, wire::MSG_ADMIN_RESPONSE, &resp);
     }
 }
 
-fn put_cmd(a: &mut Admin, command_id: u32, conn_id: u8) {
+fn put_cmd(a: &mut Admin, command_id: u32, conn_id: u16) {
     let slot = (a.cmd_head as usize) % CMD_RING;
     a.cmd_ring[slot] = CmdEntry {
         command_id,
@@ -470,7 +471,7 @@ fn put_cmd(a: &mut Admin, command_id: u32, conn_id: u8) {
     a.cmd_head = a.cmd_head.wrapping_add(1);
 }
 
-fn take_cmd(a: &mut Admin, command_id: u32) -> Option<u8> {
+fn take_cmd(a: &mut Admin, command_id: u32) -> Option<u16> {
     for slot in a.cmd_ring.iter_mut() {
         if slot.command_id == command_id {
             let c = slot.conn_id;
@@ -481,7 +482,7 @@ fn take_cmd(a: &mut Admin, command_id: u32) -> Option<u8> {
     None
 }
 
-fn format_recv_log(dst: &mut [u8], op_code: u8, conn_id: u8) -> usize {
+fn format_recv_log(dst: &mut [u8], op_code: u8, conn_id: u16) -> usize {
     let mut pos = 0usize;
     let head = b"[admin] op=";
     let n = head.len().min(dst.len() - pos);

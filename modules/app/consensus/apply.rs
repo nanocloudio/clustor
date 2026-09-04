@@ -308,6 +308,8 @@ pub struct Apply {
     /// time of each horizon-delivery pass that actually applied ≥1 entry,
     /// µs-classified.
     apply_batch_buckets: [u32; wire::hist::APPLY_BATCH_US.len() + 1],
+    /// Kernel-ring twin (`APPLY_BATCH_RING_US`, 16 buckets — see wire::hist).
+    pub ring_apply_buckets: [u64; wire::hist::APPLY_BATCH_RING_US.len() + 1],
 
     // ── Pending-entry buffer ──────────────────────────────────
     pending: [PendingEntry; PENDING_ENTRY_SLOTS],
@@ -354,6 +356,7 @@ pub fn init(s: &mut Apply) {
     s.last_stall_log_ms = 0;
     s.last_metrics_ms = 0;
     s.apply_batch_buckets = [0u32; wire::hist::APPLY_BATCH_US.len() + 1];
+    s.ring_apply_buckets = [0u64; wire::hist::APPLY_BATCH_RING_US.len() + 1];
     // `init` runs against kernel-zeroed state, so every `body` is
     // already null here; assigning `empty()` cannot strand an
     // allocation. Slots that hold one are released through
@@ -446,6 +449,8 @@ pub unsafe fn step(
         let elapsed = dev_micros(sys).wrapping_sub(batch_start);
         let b = wire::hist::bucket(&wire::hist::APPLY_BATCH_US, elapsed);
         s.apply_batch_buckets[b] = s.apply_batch_buckets[b].saturating_add(1);
+        let rb = wire::hist::bucket(&wire::hist::APPLY_BATCH_RING_US, elapsed);
+        s.ring_apply_buckets[rb] = s.ring_apply_buckets[rb].wrapping_add(1);
     }
 
     // 3) Track CP read permits — used to gate the read queue.

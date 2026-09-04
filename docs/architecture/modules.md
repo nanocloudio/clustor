@@ -202,7 +202,7 @@ traffic: bench drivers and the `operations` module's `/propose` and
 admin-PROPOSE bridges feed it, and it is admitted through the same
 throttle as wire-side client traffic. `client_requests` is the
 intake for producers that own their own connection namespace and
-have already demuxed the request — `[conn_id:u8][body]` framed as
+have already demuxed the request — `[conn_id:u16 LE][body]` framed as
 `MSG_CLIENT_PROPOSAL` or `MSG_CLIENT_READ_REQUEST`, drained in the
 dispatch table after `surface` and handed straight to the codec.
 Replies to all three intakes leave on `responses` through the

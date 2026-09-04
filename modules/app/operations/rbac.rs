@@ -74,7 +74,7 @@ const IDENTITY_SLOTS: usize = 32;
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct IdentityBinding {
-    conn_id: u8,
+    conn_id: u16,
     role: u8,
     tls_verified: bool,
     /// 0 means "no SVID stored"; otherwise length within `svid` below.
@@ -199,7 +199,7 @@ pub unsafe fn next_wire_command(r: &mut Rbac, sys: &SyscallTable, out: &mut [u8;
     Pulled::Command(pl)
 }
 
-/// Evaluate one admin command envelope `[conn_id:u8][op_code:u8][body]`.
+/// Evaluate one admin command envelope `[conn_id:u16 LE][op_code:u8][body]`.
 /// Returns whether the command is authorized; the dispatch table
 /// delivers authorized envelopes to `admin::on_command` and pings
 /// `telemetry::on_legacy_envelope` — this component only judges.
@@ -219,10 +219,10 @@ pub unsafe fn next_wire_command(r: &mut Rbac, sys: &SyscallTable, out: &mut [u8;
 /// Caller must hold an exclusive `&mut Rbac` and a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn evaluate(r: &mut Rbac, sys: &SyscallTable, origin: Origin, payload: &[u8]) -> bool {
-    if payload.is_empty() {
+    if payload.len() < 2 {
         return false;
     }
-    let conn_id = payload[0];
+    let conn_id = u16::from_le_bytes([payload[0], payload[1]]);
     let role = match origin {
         Origin::Wire => lookup_role(r, conn_id),
         // HTTP conn_ids live in the listener's namespace; never
@@ -249,7 +249,8 @@ pub unsafe fn evaluate(r: &mut Rbac, sys: &SyscallTable, origin: Origin, payload
     } else {
         if origin == Origin::Wire && r.out_denied >= 0 {
             if wire_channels::writable(sys, r.out_denied) {
-                let resp = [conn_id, wire::ADMIN_STATUS_REJECTED];
+                let cid = conn_id.to_le_bytes();
+                let resp = [cid[0], cid[1], wire::ADMIN_STATUS_REJECTED];
                 wire_channels::channel_write_msg(
                     sys,
                     r.out_denied,
@@ -261,12 +262,13 @@ pub unsafe fn evaluate(r: &mut Rbac, sys: &SyscallTable, origin: Origin, payload
         r.denied_count += 1;
     }
 
-    // Audit envelope: `[authorized:u8][role:u8][conn_id:u8]`. External
-    // consumers see it on `audit_events`; the telemetry component
-    // counts it like any other legacy metrics envelope.
+    // Audit envelope: `[authorized:u8][role:u8][conn_id:u16 LE]`.
+    // External consumers see it on `audit_events`; the telemetry
+    // component counts it like any other `MSG_METRICS` envelope.
     if r.out_audit >= 0 {
         if wire_channels::writable(sys, r.out_audit) {
-            let audit = [authorized as u8, role, conn_id];
+            let cid = conn_id.to_le_bytes();
+            let audit = [authorized as u8, role, cid[0], cid[1]];
             wire_channels::channel_write_msg(sys, r.out_audit, wire::MSG_METRICS, &audit);
         }
     }
@@ -329,7 +331,7 @@ unsafe fn drain_identity(r: &mut Rbac, sys: &SyscallTable) {
     }
 }
 
-fn record_identity(r: &mut Rbac, conn_id: u8, verified: bool, svid: &[u8]) {
+fn record_identity(r: &mut Rbac, conn_id: u16, verified: bool, svid: &[u8]) {
     // A fresh identity envelope is a connection-establishment event:
     // the transport emits one per handshake, so it always describes
     // the connection currently holding this conn_id. The rebind is
@@ -355,13 +357,13 @@ fn record_identity(r: &mut Rbac, conn_id: u8, verified: bool, svid: &[u8]) {
     b.svid[..take].copy_from_slice(&svid[..take]);
 }
 
-fn clear_binding(r: &mut Rbac, conn_id: u8) {
+fn clear_binding(r: &mut Rbac, conn_id: u16) {
     if let Some(i) = find_binding(r, conn_id) {
         r.bindings[i] = IdentityBinding::empty();
     }
 }
 
-fn find_binding(r: &Rbac, conn_id: u8) -> Option<usize> {
+fn find_binding(r: &Rbac, conn_id: u16) -> Option<usize> {
     for (i, b) in r.bindings.iter().enumerate() {
         if !b.is_empty() && b.conn_id == conn_id {
             return Some(i);
@@ -370,7 +372,7 @@ fn find_binding(r: &Rbac, conn_id: u8) -> Option<usize> {
     None
 }
 
-fn lookup_role(r: &Rbac, conn_id: u8) -> u8 {
+fn lookup_role(r: &Rbac, conn_id: u16) -> u8 {
     match find_binding(r, conn_id) {
         Some(i) => r.bindings[i].role,
         None => r.default_role,

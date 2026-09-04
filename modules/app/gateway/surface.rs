@@ -3,7 +3,7 @@
 //! Routes inbound Clustor wire envelopes from peer_router to the raft RPC
 //! port, the [`codec`](super::codec) component (client traffic) or the admin
 //! port, based on `msg_type`. Returns responses to peer_router with
-//! per-message `[conn_id:u8]` routing tags. This component does NOT parse
+//! per-message `[conn_id:u16 LE]` routing tags. This component does NOT parse
 //! HTTP — the operations module owns the HTTP diagnostic surface.
 
 use super::abi::SyscallTable;
@@ -21,12 +21,12 @@ pub enum Inbound {
         len: usize,
     },
     /// peer_router reported a client connection closed
-    /// (`MSG_CONN_CLOSED`, 1-byte `[conn_id]` payload). The dispatch
+    /// (`MSG_CONN_CLOSED`, `[conn_id:u16 LE]` payload). The dispatch
     /// table purges that conn's correlation state in the codec —
     /// conn_ids are reused, so a stale entry would route a later
     /// client's response to the wrong connection.
     ConnClosed {
-        conn_id: u8,
+        conn_id: u16,
     },
     /// The record's payload exceeds the proposal cap. Truncating and
     /// forwarding a prefix would commit a corrupted entry while acking
@@ -34,7 +34,7 @@ pub enum Inbound {
     /// `CLIENT_REJECT_TOO_LARGE` instead (the consume-gate guarantees
     /// the response egress can carry it).
     Oversize {
-        conn_id: u8,
+        conn_id: u16,
     },
 }
 
@@ -59,11 +59,11 @@ pub struct Surface {
     /// when another send arrived (bounded stash, counted loss).
     responses_dropped: u32,
     /// Must hold peer_router's largest MSG_CLIENT_FRAME payload:
-    /// conn_id byte + a full 4 KiB client record. `channel_read_msg`
-    /// silently discards any payload larger than this buffer, so
-    /// undersizing it drops big client records with no error at
-    /// exactly the hop after peer_router accepted them.
-    msg_buf: [u8; 4097],
+    /// the u16 LE conn_id + a full 4 KiB client record.
+    /// `channel_read_msg` silently discards any payload larger than
+    /// this buffer, so undersizing it drops big client records with
+    /// no error at exactly the hop after peer_router accepted them.
+    msg_buf: [u8; 4098],
 }
 
 pub unsafe fn init(su: &mut Surface) {
@@ -85,7 +85,7 @@ pub fn work_count(su: &Surface) -> u32 {
 /// Pull ONE inbound request off the `requests` port and route it by
 /// message type. Raft RPC and admin frames are routed here on the
 /// surface's own ports ([`Inbound::Handled`]); client traffic is
-/// copied into `out` as the `[conn_id:u8][body]` record and returned
+/// copied into `out` as the `[conn_id:u16 LE][body]` record and returned
 /// as [`Inbound::Client`] for the dispatch table to hand to the
 /// codec. The dispatch table drives the ≤8/step loop, so every
 /// consumed frame — routed, handed off, or malformed — counts
@@ -93,7 +93,7 @@ pub fn work_count(su: &Surface) -> u32 {
 ///
 /// peer_router wraps each cleartext record in a MSG_CLIENT_FRAME
 /// envelope; channel_read_msg strips it, leaving the record payload
-/// `[conn_id][msg_type][len: u16 LE][payload]` at msg_buf[0..]. The
+/// `[conn_id:u16 LE][msg_type][len: u16 LE][payload]` at msg_buf[0..]. The
 /// framing keeps records for distinct conn_ids from coalescing on
 /// the byte FIFO (see wire::MSG_CLIENT_FRAME).
 ///
@@ -128,29 +128,29 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
     }
 
     let (frame_type, plen) = wire_channels::channel_read_msg(sys, su.in_requests, &mut su.msg_buf);
-    // peer_router's close notice is a 1-byte `[conn_id]` payload, so
-    // it must be matched BEFORE the `plen < 4` client-frame gate
+    // peer_router's close notice is a `[conn_id:u16 LE]` payload, so
+    // it must be matched BEFORE the `plen < 5` client-frame gate
     // below — that gate would discard it and per-conn correlation
     // state would never be purged.
     if frame_type == wire::MSG_CONN_CLOSED {
-        if plen >= 1 {
+        if plen >= 2 {
             return Inbound::ConnClosed {
-                conn_id: su.msg_buf[0],
+                conn_id: u16::from_le_bytes([su.msg_buf[0], su.msg_buf[1]]),
             };
         }
         return Inbound::Handled;
     }
-    if plen < 4 {
+    if plen < 5 {
         return Inbound::Handled; // need at least conn_id + 3-byte envelope header
     }
     let len = plen as usize;
 
-    // Extract conn_id prefix
-    let conn_id = su.msg_buf[0];
-    // Parse wire envelope from offset 1
-    let msg_type = su.msg_buf[1];
-    let payload_len = u16::from_le_bytes([su.msg_buf[2], su.msg_buf[3]]) as usize;
-    let payload_start = 4usize; // 1 (conn_id) + 3 (envelope)
+    // Extract the u16 LE conn_id prefix
+    let conn_id = u16::from_le_bytes([su.msg_buf[0], su.msg_buf[1]]);
+    // Parse wire envelope from offset 2
+    let msg_type = su.msg_buf[2];
+    let payload_len = u16::from_le_bytes([su.msg_buf[3], su.msg_buf[4]]) as usize;
+    let payload_start = 5usize; // 2 (conn_id) + 3 (envelope)
     let payload_end = (payload_start + payload_len).min(len);
 
     match msg_type {
@@ -189,19 +189,19 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
                     // Prepend per-message conn_id so the admin consumer can
                     // correlate responses back to this connection.
                     let mut framed = [0u8; 2048];
-                    if payload_end - payload_start > framed.len() - 1 {
+                    if payload_end - payload_start > framed.len() - 2 {
                         su.requests_routed += 1;
                         return Inbound::Oversize { conn_id };
                     }
-                    framed[0] = conn_id;
+                    framed[..2].copy_from_slice(&conn_id.to_le_bytes());
                     let pl = payload_end - payload_start;
-                    framed[1..1 + pl]
+                    framed[2..2 + pl]
                         .copy_from_slice(&su.msg_buf[payload_start..payload_start + pl]);
                     wire_channels::channel_write_msg(
                         sys,
                         su.out_admin_req,
                         msg_type,
-                        &framed[..1 + pl],
+                        &framed[..2 + pl],
                     );
                     su.requests_routed += 1;
                 }
@@ -231,17 +231,17 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
                 wire::MSG_CLIENT_PROPOSAL | wire::MSG_CLIENT_READ_REQUEST => msg_type,
                 _ => wire::MSG_CLIENT_PROPOSAL,
             };
-            if payload_end - payload_start > out.len() - 1 {
+            if payload_end - payload_start > out.len() - 2 {
                 su.requests_routed += 1;
                 return Inbound::Oversize { conn_id };
             }
-            out[0] = conn_id;
+            out[..2].copy_from_slice(&conn_id.to_le_bytes());
             let pl = payload_end - payload_start;
-            out[1..1 + pl].copy_from_slice(&su.msg_buf[payload_start..payload_start + pl]);
+            out[2..2 + pl].copy_from_slice(&su.msg_buf[payload_start..payload_start + pl]);
             su.requests_routed += 1;
             Inbound::Client {
                 msg_type: routed_type,
-                len: 1 + pl,
+                len: 2 + pl,
             }
         }
     }
@@ -277,10 +277,11 @@ pub unsafe fn send_outbound(su: &mut Surface, sys: &SyscallTable, out: &codec::O
     send_response(su, sys, out.msg_type, &out.buf[..out.len as usize])
 }
 
-/// Emit one response to peer_router. `payload` carries the `[conn_id:u8]`
-/// prefix set by the producer; it is stripped and used as the per-message
-/// routing tag. Wire bytes written: `[conn_id:u8][msg_type:u8][len:u16
-/// LE][payload-without-conn-id]`. Returns whether the frame was written OR
+/// Emit one response to peer_router. `payload` carries the
+/// `[conn_id:u16 LE]` prefix set by the producer; it is stripped and used
+/// as the per-message routing tag. Wire bytes written:
+/// `[conn_id:u16 LE][msg_type:u8][len:u16 LE][payload-without-conn-id]`.
+/// Returns whether the frame was written OR
 /// retained in the retry stash (either way the response will reach the
 /// wire); false means it was not accepted and, if a prior frame still
 /// occupies the stash, was dropped and counted.
@@ -295,7 +296,7 @@ pub unsafe fn send_response(
     msg_type: u8,
     payload: &[u8],
 ) -> bool {
-    if su.out_responses < 0 || payload.is_empty() {
+    if su.out_responses < 0 || payload.len() < 2 {
         return false;
     }
     // A previously retained frame goes first (ordering). If it still
@@ -305,20 +306,19 @@ pub unsafe fn send_response(
         su.responses_dropped += 1;
         return false;
     }
-    let conn_id = payload[0];
-    let inner_len = payload.len() - 1;
-    let total = 1 + wire::ENVELOPE_HDR + inner_len;
+    let inner_len = payload.len() - 2;
+    let total = 2 + wire::ENVELOPE_HDR + inner_len;
     let mut frame = [0u8; 256];
     if total > 256 {
         return false;
     }
-    frame[0] = conn_id;
-    frame[1] = msg_type;
+    frame[..2].copy_from_slice(&payload[..2]);
+    frame[2] = msg_type;
     let lb = (inner_len as u16).to_le_bytes();
-    frame[2] = lb[0];
-    frame[3] = lb[1];
+    frame[3] = lb[0];
+    frame[4] = lb[1];
     if inner_len > 0 {
-        frame[4..4 + inner_len].copy_from_slice(&payload[1..1 + inner_len]);
+        frame[5..5 + inner_len].copy_from_slice(&payload[2..2 + inner_len]);
     }
     let wrote = if wire_channels::writable(sys, su.out_responses) {
         (sys.channel_write)(su.out_responses, frame.as_ptr(), total)
@@ -389,7 +389,7 @@ pub unsafe fn ready_to_send(su: &mut Surface, sys: &SyscallTable) -> bool {
 }
 
 /// Forward admin responses from the `admin_responses` port. Each
-/// payload starts with `[conn_id:u8]` (set by the admin producer).
+/// payload starts with `[conn_id:u16 LE]` (set by the admin producer).
 unsafe fn forward_admin_responses(su: &mut Surface, sys: &SyscallTable) {
     if su.in_admin_resp < 0 || su.out_responses < 0 {
         return;
@@ -408,9 +408,9 @@ unsafe fn forward_admin_responses(su: &mut Surface, sys: &SyscallTable) {
         if plen == 0 {
             break;
         }
-        // Payload must carry at least the conn_id byte. Anything
+        // Payload must carry at least the u16 conn_id. Anything
         // shorter is a wiring mistake — drop it rather than misroute.
-        if (plen as usize) < 1 {
+        if (plen as usize) < 2 {
             continue;
         }
         let pl = plen as usize;

@@ -43,11 +43,12 @@ pub const ADMIN_OP_TENANT_QUOTA: u8 = 0x12;
 /// Shard-map override — see `wire::ADMIN_OP_SHARD_MAP`.
 pub const ADMIN_OP_SHARD_MAP: u8 = 0x13;
 
-/// Max body length the admin envelope can carry. `emit_admin_command`
-/// uses a 1 KiB stack buffer with a 2-byte header (conn_id + op_code),
-/// so bodies up to 1022 bytes fit. Beyond that, the call returns
-/// false and the HTTP caller gets a 503.
-pub const ADMIN_BODY_MAX: usize = 1022;
+/// Max body length the admin envelope can carry. The HTTP adapter
+/// stages the envelope in a 1 KiB buffer behind a 3-byte header
+/// (`conn_id:u16 LE` + `op_code`), so bodies up to 1021 bytes fit.
+/// Beyond that, `admin_body_fits` is false and the HTTP caller gets
+/// a 503.
+pub const ADMIN_BODY_MAX: usize = 1021;
 
 /// Map a path-tail (everything after `/admin/`) to the admin op byte
 /// expected by the admin component. Returns `None` for unknown op names so

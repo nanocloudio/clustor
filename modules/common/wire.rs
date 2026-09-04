@@ -318,13 +318,14 @@ pub const MSG_CLIENT_RESPONSE: u8 = 0x11;
 pub const MSG_ADMIN_COMMAND: u8 = 0x12;
 pub const MSG_ADMIN_RESPONSE: u8 = 0x13;
 /// Structured client rejection on the wire (after gateway stamps
-/// `conn_id`). Wire payload (11 bytes):
-/// `[conn_id:u8][status:u8][reserved:u8][retry_after_ms:u16 LE][entry_credits:i16 LE][byte_credits:i32 LE]`
+/// `conn_id`). Wire payload (12 bytes):
+/// `[conn_id:u16 LE][status:u8][reserved:u8][retry_after_ms:u16 LE][entry_credits:i16 LE][byte_credits:i32 LE]`
 /// Surfaced when a request is denied before it can be replicated —
 /// throttle rejection, NotLeader, stale-epoch, read-unsupported, etc.
 pub const MSG_CLIENT_REJECT: u8 = 0x15;
-/// Linearizable read request from a client. Payload after the conn_id prefix
-/// supplied by gateway: `[read_id:u64 LE][body]`. The substrate does not yet
+/// Linearizable read request from a client. Payload
+/// `[conn_id:u16 LE][read_id:u64 LE][body]`; the conn_id prefix is
+/// supplied by gateway. The substrate does not yet
 /// implement linearizable reads end-to-end — gateway answers every read with
 /// `CLIENT_REJECT_READ_UNSUPPORTED`.
 pub const MSG_CLIENT_READ_REQUEST: u8 = 0x16;
@@ -726,8 +727,8 @@ pub const CLIENT_REJECT_BODY_LEN: usize = 10;
 /// 8-byte correlation_id + 10-byte body.
 pub const CLIENT_REJECT_INTERNAL_LEN: usize = 8 + CLIENT_REJECT_BODY_LEN;
 /// `MSG_CLIENT_REJECT` wire payload size (codec → surface → peer):
-/// 1-byte conn_id + 10-byte body.
-pub const CLIENT_REJECT_WIRE_LEN: usize = 1 + CLIENT_REJECT_BODY_LEN;
+/// 2-byte conn_id + 10-byte body.
+pub const CLIENT_REJECT_WIRE_LEN: usize = 2 + CLIENT_REJECT_BODY_LEN;
 
 /// Encode the 10-byte reject body. Used by both envelope variants.
 /// `reserved` is repurposed as `leader_id` when
@@ -785,21 +786,21 @@ pub fn decode_client_reject_internal(buf: &[u8]) -> Option<(u64, u8, u16, i16, i
     Some((correlation_id, status, retry, entry, byte))
 }
 
-/// Encode a wire reject envelope `[conn_id:u8][body 10b]`.
+/// Encode a wire reject envelope `[conn_id:u16 LE][body 10b]`.
 ///
 /// `reserved` carries `leader_id` when `status == CLIENT_REJECT_NOT_LEADER`,
 /// otherwise pass 0.
 #[inline]
 pub fn encode_client_reject_wire(
     buf: &mut [u8; CLIENT_REJECT_WIRE_LEN],
-    conn_id: u8,
+    conn_id: ConnId,
     status: u8,
     reserved: u8,
     retry_after_ms: u16,
     entry_credits: i16,
     byte_credits: i32,
 ) {
-    buf[0] = conn_id;
+    buf[..2].copy_from_slice(&conn_id.to_le_bytes());
     let mut body = [0u8; CLIENT_REJECT_BODY_LEN];
     encode_client_reject_body(
         &mut body,
@@ -809,7 +810,7 @@ pub fn encode_client_reject_wire(
         entry_credits,
         byte_credits,
     );
-    buf[1..1 + CLIENT_REJECT_BODY_LEN].copy_from_slice(&body);
+    buf[2..2 + CLIENT_REJECT_BODY_LEN].copy_from_slice(&body);
 }
 
 /// Emitted by consensus on its `proposal_assigned` output port for every
@@ -1150,11 +1151,12 @@ impl PeerIdentity {
         self.is_established() && (self.flags & PEER_CHECK_SAN) != 0 && self.principal_len > 0
     }
 
-    /// Connection ids are `u8` on this side; slot ids never reach 256.
+    /// The app-facing connection id this session's frames carry: the
+    /// low 16 bits of the transport session id (see [`ConnId`]).
     #[inline]
     #[must_use]
-    pub fn conn_id(&self) -> u8 {
-        (self.session_id & 0xFF) as u8
+    pub fn conn_id(&self) -> ConnId {
+        (self.session_id & 0xFFFF) as ConnId
     }
 }
 
@@ -1363,27 +1365,36 @@ pub const MSG_METRIC_SAMPLE: u8 = 0x73;
 // stability promise (standards fluxor-modules.md §8). Do not reuse
 // these ids until the sibling repos confirm no reader remains.
 
+/// App-facing client connection id on the cleartext lane: the
+/// peer_router connection-table slot index, carried as `u16 LE` on the
+/// wire in every `MSG_CLIENT_FRAME`, `MSG_CONN_CLOSED`,
+/// `MSG_CONN_CLOSE_REQUEST`, `MSG_CLIENT_REJECT` and
+/// `MSG_CLIENT_READ_REQUEST` payload. The protocol stacks in front of
+/// the router conform to this width byte for byte.
+pub type ConnId = u16;
+
 /// Multiplexed client record on the cleartext path. Payload is
-/// `[conn_id:u8][raw client bytes]`. peer_router wraps every cleartext
-/// write in this length-delimited envelope so records from different
-/// conn_ids never coalesce on the byte-FIFO channel (a raw write per
-/// record loses the per-record boundary and the next conn_id byte is
-/// misread as stream data, silently dropping that connection).
+/// `[conn_id:u16 LE][raw client bytes]`. peer_router wraps every
+/// cleartext write in this length-delimited envelope so records from
+/// different conn_ids never coalesce on the byte-FIFO channel (a raw
+/// write per record loses the per-record boundary and the next conn_id
+/// bytes are misread as stream data, silently dropping that connection).
 /// Consumers demarcate with `channel_read_msg`. The id is fixed here
 /// and a protocol stack in front of this router conforms to it;
 /// changing it silently breaks every one of them, so it does not move.
 pub const MSG_CLIENT_FRAME: u8 = 0xEA;
 
 /// Transport-level connection-closed notice on the cleartext lane.
-/// Payload `[conn_id:u8]`. peer_router emits it when a CLIENT socket
+/// Payload `[conn_id:u16 LE]`. peer_router emits it when a CLIENT socket
 /// closes so a downstream consumer can release per-connection state
 /// deterministically rather than leaking it until a timeout. The id is
 /// fixed here; a consumer that does not care ignores the msg_type (the
 /// gateway does).
 pub const MSG_CONN_CLOSED: u8 = 0xEB;
 
-/// Ask `peer_router` to CLOSE a client connection. Payload `[conn_id:u8]`,
-/// on the same `client_resp` lane the codecs write frames to.
+/// Ask `peer_router` to CLOSE a client connection. Payload
+/// `[conn_id:u16 LE]`, on the same `client_resp` lane the codecs write
+/// frames to.
 ///
 /// The inverse direction of [`MSG_CONN_CLOSED`], which is a NOTICE that a
 /// socket went away. This is a command, and it exists because MQTT 3.1.1
@@ -1870,6 +1881,50 @@ pub mod hist {
     /// `clustor.snapshot.transfer_seconds` — inclusive upper bounds, milliseconds.
     pub const SNAPSHOT_MS: [u64; 9] = [
         1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 64_000, 128_000, 256_000,
+    ];
+
+    // ── Kernel-ring (METRIC_HISTOGRAM_16) ladders ──────────────────────
+    //
+    // The fluxor ring's 16-bucket kind takes EXACTLY 15 declared bounds.
+    // `FSYNC_LATENCY_US` already has 15, so the fsync histogram rides both
+    // wires off one ladder; the commit, apply and snapshot ladders above
+    // have 14, 8 and 9. Padding those to 15 would declare resolution that
+    // does not exist, and widening them would shift the binary /metrics
+    // bucket ranges that recorded baselines pin — so those three carry
+    // their OWN ring ladders and their own accumulators, and the classify
+    // sites bucket twice, once per wire, at commit/apply/snapshot event
+    // rates where the extra scan is noise. Each ring ladder deliberately
+    // reaches further than its channel counterpart: commit adds a 200 ms top
+    // bound, apply the fsync tail above its 10 ms ceiling, snapshot a
+    // sub-second low end and a 4096 s top (the u32-µs blob ceiling).
+
+    /// `commit_latency_us` on the kernel ring — 15 bounds, µs.
+    pub const COMMIT_LATENCY_RING_US: [u64; 15] = [
+        500, 1_000, 2_000, 4_000, 6_000, 8_000, 10_000, 15_000, 20_000, 30_000, 40_000, 60_000,
+        80_000, 100_000, 200_000,
+    ];
+    /// `apply_batch_us` on the kernel ring — 15 bounds, µs.
+    pub const APPLY_BATCH_RING_US: [u64; 15] = [
+        250, 500, 1_000, 2_000, 4_000, 6_000, 8_000, 10_000, 15_000, 20_000, 30_000, 40_000,
+        60_000, 80_000, 100_000,
+    ];
+    /// `snapshot_transfer_us` on the kernel ring — 15 bounds, µs.
+    pub const SNAPSHOT_RING_US: [u64; 15] = [
+        250_000,
+        500_000,
+        1_000_000,
+        2_000_000,
+        4_000_000,
+        8_000_000,
+        16_000_000,
+        32_000_000,
+        64_000_000,
+        128_000_000,
+        256_000_000,
+        512_000_000,
+        1_024_000_000,
+        2_048_000_000,
+        4_096_000_000,
     ];
 
     /// Per-component step-time histogram (fluxor-modules.md §8 rule 8)

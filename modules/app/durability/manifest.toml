@@ -196,9 +196,44 @@ metrics = [
   "preallocate_errno", "name_fence", "name_unfenced", "compact_floored",
   # snapshot
   "snapshots_taken", "chunks_imported", "triggers_deferred", "install_failures",
-  "app_bodies_received", "app_captures_timed_out"
+  "app_bodies_received", "app_captures_timed_out",
+  # Kernel-ring twin of the wal fsync histogram, as a METRIC_HISTOGRAM_16:
+  # id 34 = this position (pinned by `FSYNC_HIST_RING_ID` in mod.rs — count
+  # before reordering). The same accumulators also feed the
+  # MSG_METRIC_SAMPLE channel export.
+  "fsync_latency_us",
+  # Ring twin of the snapshot transfer histogram (id 35; its own 16-bucket
+  # ladder — wire::hist::SNAPSHOT_RING_US — because the channel export's
+  # 9-bound seconds ladder fits neither ring kind).
+  "snapshot_transfer_us"
 ]
 histograms = ["fsync_latency_ms", "transfer_seconds"]
+
+# Bounds mirror `wire::hist::FSYNC_LATENCY_US` exactly — the id-table ships
+# them to consumers; the record carries counts only. The dimension is the
+# hosted slot's partition id (numeric; one image hosts at most K_MAX = 64).
+[[observability.instrument]]
+name      = "fsync_latency_us"
+kind      = "histogram16"
+bounds_us = [250, 500, 1000, 2000, 4000, 6000, 8000, 10000, 15000, 20000,
+             30000, 40000, 60000, 80000, 100000]
+
+[[observability.instrument.dimension]]
+key    = "fluxor.slot"
+domain = "numeric"
+max    = 64
+
+[[observability.instrument]]
+name      = "snapshot_transfer_us"
+kind      = "histogram16"
+bounds_us = [250000, 500000, 1000000, 2000000, 4000000, 8000000, 16000000,
+             32000000, 64000000, 128000000, 256000000, 512000000,
+             1024000000, 2048000000, 4096000000]
+
+[[observability.instrument.dimension]]
+key    = "fluxor.slot"
+domain = "numeric"
+max    = 64
 
 # Runtime group activation (MSG_SLOT_ACTIVATE), the durability half of a
 # migration's PROVISIONING work. Activating a consensus slot WITHOUT its

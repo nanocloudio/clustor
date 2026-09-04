@@ -83,6 +83,47 @@ its own id range so the three families never collide within a module:
   the snapshot whole, and the cumulative counts re-publish complete on
   the next tick.
 
+### Kernel-ring histograms
+
+The four latency histograms above also go out on a second wire: the
+fluxor kernel's telemetry ring, as `METRIC_HISTOGRAM_16` records. The
+two wires read the SAME accumulators, so a deployment scrapes whichever
+its collector speaks and gets the same numbers either way — the channel
+export pushes `MSG_METRIC_SAMPLE` frames through the operations module,
+while the ring is a pull surface the kernel owns.
+
+`consensus` and `durability` emit one record per hosted slot every 5 s,
+with the slot's partition id as the declared dimension. Both emits are
+gated on `dev_telemetry_enabled`, so a graph with no telemetry consumer
+subscribed pays nothing, and an all-zero row is skipped rather than
+sent — a follower that has never led reports no commit latencies.
+
+| Ring id | Metric | Producer | Ladder |
+|---|---|---|---|
+| 34 | `fsync_latency_us` | `durability` | `hist::FSYNC_LATENCY_US` |
+| 35 | `snapshot_transfer_us` | `durability` | `hist::SNAPSHOT_RING_US` |
+| 41 | `commit_latency_us` | `consensus` | `hist::COMMIT_LATENCY_RING_US` |
+| 42 | `apply_batch_us` | `consensus` | `hist::APPLY_BATCH_RING_US` |
+
+Each id is the metric's POSITION in its manifest `[observability]
+metrics` list, pinned in source as `*_HIST_RING_ID`; reordering that
+list renumbers the ids, so the constants are counted against it.
+
+The ring's 16-bucket kind takes exactly 15 declared bounds.
+`FSYNC_LATENCY_US` already has 15 and is shared by both wires. The
+commit, apply and snapshot ladders have 14, 8 and 9, so rather than pad
+them — which would declare resolution that does not exist — or widen
+them — which would move the binary `/metrics` bucket ranges that
+recorded baselines pin — those three carry their own ring ladders,
+reaching further than their channel counterparts: commit adds a 200 ms
+top bound, apply the fsync tail above its 10 ms ceiling, and snapshot a
+sub-second low end and a 4096 s top (the `u32`-µs blob ceiling). The
+classify sites bucket twice, once per wire, at event rates where the
+second scan is noise.
+
+`tests/ring_parity.rs` is the gate: it prefix-sums a ring row and
+requires it to reproduce the binary row bucket for bucket.
+
 ### Aggregation and export
 
 The telemetry component of the operations module drains the metrics

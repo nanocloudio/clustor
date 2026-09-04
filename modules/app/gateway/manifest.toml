@@ -72,10 +72,10 @@ name = "client_requests"
 direction = "input"
 content_type = "OctetStream"
 buffer_size = 8192
-# Envelope (3) + conn_id (1) + client record (up to 2044).
+# Envelope (3) + conn_id (2) + client record (up to 2043).
 max_record = 2048
 rate_class_max = "transaction"
-# Pre-demuxed client traffic: `[conn_id:u8][body]` framed as
+# Pre-demuxed client traffic: `[conn_id:u16 LE][body]` framed as
 # MSG_CLIENT_PROPOSAL or MSG_CLIENT_READ_REQUEST, from a producer that
 # already owns the connection namespace and does its own request
 # routing. `requests` (in[0]) carries peer_router's MSG_CLIENT_FRAME
@@ -107,7 +107,7 @@ name = "admin_req"
 direction = "output"
 content_type = "OctetStream"
 buffer_size = 8192
-# Envelope (3) + conn_id (1) + admin command body (up to 2044).
+# Envelope (3) + conn_id (2) + admin command body (up to 2043).
 max_record = 2048
 rate_class_max = "transaction"
 

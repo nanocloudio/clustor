@@ -21,7 +21,8 @@
 //!   repl_tx     (in[2]):  routed-partitioned outbound from
 //!                         consensus.net_out (AE bodies, snapshot
 //!                         chunks)
-//!   client_resp (in[3]):  slot-tagged responses from the gateway
+//!   client_resp (in[3]):  slot-tagged (`wire::ConnId`, u16 LE)
+//!                         responses from the gateway
 //!   net_out     (out[0]): cleartext to tls (net_proto commands)
 //!   cleartext   (out[1]): non-Raft client data → gateway
 //!   peer_rx     (out[2]): MSG_APPEND_ENTRIES_RESP frames →
@@ -75,14 +76,20 @@ use types::*;
 // the table fills, alloc_conn drops NMSG_ACCEPT for the overflow conns
 // and those clients never get a CONNACK.
 //
-// This is the FIRST ceiling every client connection meets, so it must
-// stay at or above the broker-side tables it fronts
-// (quantum's `protocol` MAX_CONNS / KCONNS / ACONNS). 64 silently
-// capped an MQTT broker at 64 concurrent clients regardless of what
-// those tables allowed. 512 covers a 7-node cluster's peer links plus
-// client headroom; `Conn` carries no payload buffer, so the table is
-// small — the per-connection cost lives in the protocol modules.
-const MAX_CONNS: usize = 512;
+// This is the FIRST ceiling every client connection meets: it fronts
+// the transport's own connection table, so it must stay at or above
+// every broker-side table behind it (quantum's `protocol` MAX_CONNS /
+// KCONNS / ACONNS) — a smaller value here silently caps the broker at
+// this many concurrent clients regardless of what those tables allow.
+// 8192 covers a 7-node cluster's peer links plus a full broker's
+// client population; `Conn` carries no payload buffer, so the table
+// is small — the per-connection cost lives in the protocol modules.
+// The slot index is the app-facing `wire::ConnId` (u16 LE), so the
+// table can never exceed 65536 entries.
+const MAX_CONNS: usize = 8192;
+/// Transport conn ids are `u16 LE` on the wire: the reverse index
+/// from conn id to slot covers the whole id space.
+const CONN_ID_SPACE: usize = 65536;
 // Must hold the largest frame on ANY lane through this module:
 // peer side, a full proposal batch (2 KiB) plus AE/envelope headers;
 // client side, the largest single client response (Kafka Fetch builds
@@ -99,8 +106,11 @@ const BUF_SIZE: usize = 8192;
 // AND `send_to_conn`'s staging buffer are all sized by THIS const: a
 // smaller cap anywhere on the path silently drops or truncates exactly
 // the frames that matter. The gateway's `surface::msg_buf`
-// (`1 + ROUTE_FRAME_MAX`) is the matching receive bound.
+// (`2 + ROUTE_FRAME_MAX`) is the matching receive bound.
 const ROUTE_FRAME_MAX: usize = 4096;
+/// A gateway-facing client frame: the `wire::ConnId` slot tag (u16 LE)
+/// ahead of up to `ROUTE_FRAME_MAX` bytes of client data.
+const CLIENT_FRAME_MAX: usize = 2 + ROUTE_FRAME_MAX;
 /// Retained inbound peer bytes awaiting a full destination: up to one
 /// chunk plus the partial record carried over from the chunk before.
 const INB_STASH_MAX: usize = 2 * ROUTE_FRAME_MAX;
@@ -370,6 +380,28 @@ struct ModuleState {
 
     // Connection table
     conns: [Conn; MAX_CONNS],
+    /// Reverse index keyed by transport conn id: `slot + 1` of the
+    /// active `Conn` holding that id, 0 = none. Maintained by
+    /// `register_conn` / `clear_slot`, so every per-frame lookup is
+    /// O(1) instead of a walk of the whole table.
+    slot_by_conn: [u16; CONN_ID_SPACE],
+    /// Reverse index keyed by replica id: `slot + 1` of the `Conn`
+    /// whose `replica_id` is that peer, 0 = none. Exact — the identity
+    /// dedup keeps one slot per replica — and maintained by
+    /// `bind_replica` / `unbind_replica` / `clear_slot`, so outbound
+    /// unicast and broadcast never scan the client population.
+    slot_by_replica: [u16; MAX_NODES],
+    /// Free-slot cursor for `alloc_conn`: the scan starts here and
+    /// wraps, so allocation is O(1) amortised rather than a walk from
+    /// slot 0 past every live connection.
+    next_alloc: u16,
+    /// One past the highest slot that may be active; the bound the
+    /// per-step and per-second sweeps walk instead of `MAX_CONNS`.
+    conn_high: u16,
+    /// Number of active slots whose identity frame is still owed
+    /// (`identity_pending`). `flush_pending_identity` skips its sweep
+    /// while this is zero, which is almost every step.
+    identity_owed: u16,
 
     // Peer addresses (indexed by replica_id)
     peer_addrs: [PeerAddr; MAX_NODES],
@@ -456,7 +488,7 @@ struct ModuleState {
     net_events: u32,
     last_account_ms: u64,
     inb_stash: [u8; INB_STASH_MAX],
-    client_stash: [u8; 1 + ROUTE_FRAME_MAX],
+    client_stash: [u8; CLIENT_FRAME_MAX],
     peer_tail: [[u8; ROUTE_FRAME_MAX]; MAX_NODES],
     out_stash: [u8; ROUTE_FRAME_MAX],
     resp_stash: [u8; BUF_SIZE],
@@ -527,6 +559,11 @@ pub extern "C" fn module_new(
         for i in 0..MAX_CONNS {
             s.conns[i] = Conn::empty();
         }
+        s.slot_by_conn = [0; CONN_ID_SPACE];
+        s.slot_by_replica = [0; MAX_NODES];
+        s.next_alloc = 0;
+        s.conn_high = 0;
+        s.identity_owed = 0;
         s.inb_stash_len = 0;
         s.inb_stash_rid = -1;
         s.client_stash_len = 0;
@@ -649,7 +686,7 @@ unsafe fn emit_metrics(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     s.last_metrics_ms = now;
 
     let mut open: i64 = 0;
-    for c in s.conns.iter() {
+    for c in s.conns[..s.conn_high as usize].iter() {
         if c.active {
             open += 1;
         }
@@ -718,29 +755,26 @@ unsafe fn drain_tls_identity(s: &mut ModuleState, sys: &SyscallTable) {
         let mut fp = [0u8; PEER_FP_MAX];
         fp[..fp_len].copy_from_slice(&s.buf[id.fingerprint_at..id.fingerprint_at + fp_len]);
         let established = id.is_established();
-        let conn_id = id.conn_id();
+        let conn_id: u16 = id.conn_id();
 
-        let mut slot_idx: Option<usize> = None;
-        for (i, c) in s.conns.iter().enumerate() {
-            if c.active && c.conn_id == conn_id as u16 {
-                slot_idx = Some(i);
-                break;
-            }
+        let i = find_conn(s, conn_id);
+        if i >= MAX_CONNS {
+            continue;
         }
-        let Some(i) = slot_idx else { continue };
-        let c = &mut s.conns[i];
         if !established || fp_len == 0 {
             // The peer offered no usable credential, or one that
             // failed a check the profile required. Strip whatever the
             // in-band handshake may have bound: a connection that
             // cannot be authenticated must not route as a Raft peer.
-            c.replica_id = -1;
+            unbind_replica(s, i);
+            let c = &mut s.conns[i];
             c.identified = false;
             c.tls_verified = false;
             c.peer_fp_len = 0;
             dev_log(sys, 2, b"[pr] tls unverified".as_ptr(), 19);
             continue;
         }
+        let c = &mut s.conns[i];
         c.tls_verified = true;
         c.peer_fp = fp;
         c.peer_fp_len = fp_len as u8;
@@ -757,19 +791,16 @@ unsafe fn drain_tls_identity(s: &mut ModuleState, sys: &SyscallTable) {
 /// — which is how a peer that authenticated as *somebody* is stopped
 /// from routing as *anybody*.
 fn replica_held_by_other_key(s: &ModuleState, slot: usize, replica_id: u8, fp: &[u8]) -> bool {
-    for (i, c) in s.conns.iter().enumerate() {
-        if i == slot || !c.active || !c.tls_verified || c.peer_fp_len == 0 {
-            continue;
-        }
-        if c.replica_id != replica_id as i8 {
-            continue;
-        }
-        let held = &c.peer_fp[..c.peer_fp_len as usize];
-        if held != fp {
-            return true;
-        }
+    let i = slot_of_replica(s, replica_id);
+    if i >= MAX_CONNS || i == slot {
+        return false;
     }
-    false
+    let c = &s.conns[i];
+    if !c.active || !c.tls_verified || c.peer_fp_len == 0 {
+        return false;
+    }
+    let held = &c.peer_fp[..c.peer_fp_len as usize];
+    held != fp
 }
 
 // ── Bind ────────────────────────────────────────────────────
@@ -907,11 +938,10 @@ unsafe fn reconnect_stale_peers(s: &mut ModuleState, sys: &SyscallTable, now: u6
         // Silent past the liveness window → dead link. Close every conn slot
         // bound to this peer (inbound and/or outbound) and free it so a fresh
         // dial + identity handshake re-establishes the binding cleanly.
-        for slot in 0..MAX_CONNS {
-            if s.conns[slot].active && s.conns[slot].replica_id == i as i8 {
-                close_conn(s, sys, s.conns[slot].conn_id);
-                s.conns[slot] = Conn::empty();
-            }
+        let slot = slot_of_replica(s, i as u8);
+        if slot < MAX_CONNS && s.conns[slot].active {
+            close_conn(s, sys, s.conns[slot].conn_id);
+            clear_slot(s, slot);
         }
         s.peer_addrs[i].connected = false;
         // Redial promptly: clear the backoff so connect_peers dials this pass
@@ -1010,11 +1040,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                 if payload_len >= 2 && local_port == s.listen_port {
                     reap_conn_id(s, sys, conn_id);
                     if let Some(slot) = alloc_conn(s) {
-                        s.conns[slot] = Conn {
-                            conn_id,
-                            active: true,
-                            ..Conn::empty()
-                        };
+                        register_conn(s, slot, conn_id, false);
                     }
                 }
             }
@@ -1024,12 +1050,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                 if payload_len >= 2 {
                     reap_conn_id(s, sys, conn_id);
                     if let Some(slot) = alloc_conn(s) {
-                        s.conns[slot] = Conn {
-                            conn_id,
-                            active: true,
-                            outbound: true,
-                            ..Conn::empty()
-                        };
+                        register_conn(s, slot, conn_id, true);
                         send_identity(s, sys, slot);
                     }
                 }
@@ -1092,20 +1113,20 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                         // Client traffic → gateway. Frame each record as
                         // a MSG_CLIENT_FRAME envelope so records from
                         // different conns don't coalesce on the byte
-                        // FIFO (see wire::MSG_CLIENT_FRAME). The 1-byte
-                        // tag is CLUSTOR-INTERNAL: it carries the SLOT
-                        // INDEX (the u16 transport conn id does not fit)
-                        // and route_client_responses maps it back.
+                        // FIFO (see wire::MSG_CLIENT_FRAME). The u16 LE
+                        // tag is the `wire::ConnId`: the SLOT INDEX of
+                        // this table, which route_client_responses maps
+                        // back to the transport conn id.
                         //
                         // Sized to pass the full inbound copy
                         // (`ROUTE_FRAME_MAX`); the gateway's
-                        // `surface::msg_buf` is `1 + ROUTE_FRAME_MAX` and
+                        // `surface::msg_buf` is `2 + ROUTE_FRAME_MAX` and
                         // channel_read_msg silently discards anything
                         // larger, so the two bounds move together.
                         if s.cleartext >= 0 && cl <= ROUTE_FRAME_MAX {
-                            let mut tagged = [0u8; 1 + ROUTE_FRAME_MAX];
-                            tagged[0] = slot as u8;
-                            tagged[1..1 + cl].copy_from_slice(&local[..cl]);
+                            let mut tagged = [0u8; CLIENT_FRAME_MAX];
+                            tagged[..2].copy_from_slice(&(slot as u16).to_le_bytes());
+                            tagged[2..2 + cl].copy_from_slice(&local[..cl]);
                             // A refusal retains the chunk and stops the
                             // drain: the next event may be more bytes
                             // for this connection.
@@ -1113,7 +1134,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                                 s,
                                 sys,
                                 wire::MSG_CLIENT_FRAME,
-                                &tagged[..1 + cl],
+                                &tagged[..2 + cl],
                             ) {
                                 break;
                             }
@@ -1144,15 +1165,20 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                         // codec reassembly, session consumers/group members).
                         // Peers (rid >= 0) are handled by the Raft liveness
                         // machinery below, not this notice. The gateway-facing
-                        // 1-byte tag is the SLOT INDEX (clustor-internal),
+                        // u16 LE tag is the SLOT INDEX (`wire::ConnId`),
                         // matching the MSG_CLIENT_FRAME tagging above.
                         // The notice is retained like data: a drop
                         // here leaves the codec holding a connection
                         // the transport has already recycled.
                         let closed_held = rid < 0
                             && s.cleartext >= 0
-                            && !deliver_client_frame(s, sys, wire::MSG_CONN_CLOSED, &[slot as u8]);
-                        s.conns[slot] = Conn::empty();
+                            && !deliver_client_frame(
+                                s,
+                                sys,
+                                wire::MSG_CONN_CLOSED,
+                                &(slot as u16).to_le_bytes(),
+                            );
+                        clear_slot(s, slot);
                         // Only mark the peer disconnected if NO other
                         // identified link to it survives. `handle_identity`'s
                         // dedup routinely closes a superseded DUPLICATE link
@@ -1164,20 +1190,8 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                         // net_in merge and starves the client anchors (redis
                         // unreachable on busy/dialing nodes). Keeping
                         // `connected` while a live link remains breaks the loop.
-                        if rid >= 0 && (rid as usize) < MAX_NODES {
-                            let mut still_linked = false;
-                            for other in 0..MAX_CONNS {
-                                if s.conns[other].active
-                                    && s.conns[other].identified
-                                    && s.conns[other].replica_id == rid
-                                {
-                                    still_linked = true;
-                                    break;
-                                }
-                            }
-                            if !still_linked {
-                                s.peer_addrs[rid as usize].connected = false;
-                            }
+                        if rid >= 0 && (rid as usize) < MAX_NODES && !still_linked(s, rid as u8) {
+                            s.peer_addrs[rid as usize].connected = false;
                         }
                         if closed_held {
                             break;
@@ -1203,7 +1217,10 @@ unsafe fn send_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize) {
     // pending flag is what makes the handshake robust: a write that
     // hits transport backpressure is retried every step by
     // `flush_pending_identity` instead of being silently dropped.
-    s.conns[slot].identity_pending = true;
+    if !s.conns[slot].identity_pending {
+        s.conns[slot].identity_pending = true;
+        s.identity_owed = s.identity_owed.saturating_add(1);
+    }
     try_send_identity(s, sys, slot);
 }
 
@@ -1231,17 +1248,21 @@ unsafe fn try_send_identity(s: &mut ModuleState, sys: &SyscallTable, slot: usize
         s.buf.as_mut_ptr(),
         BUF_SIZE,
     );
-    if written > 0 {
+    if written > 0 && s.conns[slot].identity_pending {
         s.conns[slot].identity_pending = false;
+        s.identity_owed = s.identity_owed.saturating_sub(1);
     }
 }
 
-/// Retry every owed identity frame (bounded by MAX_CONNS; almost
-/// always a no-op). Runs once per step so a handshake frame dropped
-/// under transport backpressure completes on a later step instead of
-/// never.
+/// Retry every owed identity frame. Runs once per step so a handshake
+/// frame dropped under transport backpressure completes on a later
+/// step instead of never; the sweep is skipped outright while
+/// `identity_owed` is zero, which is almost every step.
 unsafe fn flush_pending_identity(s: &mut ModuleState, sys: &SyscallTable) {
-    for slot in 0..MAX_CONNS {
+    if s.identity_owed == 0 {
+        return;
+    }
+    for slot in 0..s.conn_high as usize {
         if s.conns[slot].active && s.conns[slot].identity_pending {
             try_send_identity(s, sys, slot);
         }
@@ -1317,13 +1338,13 @@ unsafe fn handle_identity(
 
         // Forward everything that arrived — buffered fragment plus this
         // chunk (it's application data, not identity). Prepend the SLOT
-        // INDEX (clustor-internal 1-byte tag; the u16 transport conn id
-        // does not fit) for response routing. Frame as MSG_CLIENT_FRAME
-        // so concurrent first-data records from different conns stay
-        // demarcated on the byte FIFO (see wire::MSG_CLIENT_FRAME).
+        // INDEX (the `wire::ConnId`, u16 LE) for response routing.
+        // Frame as MSG_CLIENT_FRAME so concurrent first-data records
+        // from different conns stay demarcated on the byte FIFO (see
+        // wire::MSG_CLIENT_FRAME).
         //
         // Same `ROUTE_FRAME_MAX` bound as the steady-state path above:
-        // the gateway's `surface::msg_buf` is `1 + ROUTE_FRAME_MAX` and
+        // the gateway's `surface::msg_buf` is `2 + ROUTE_FRAME_MAX` and
         // channel_read_msg silently discards a larger payload, so a
         // reassembled record past the budget is dropped and COUNTED
         // here rather than vanishing downstream.
@@ -1333,13 +1354,13 @@ unsafe fn handle_identity(
                 dev_log(sys, 2, b"[pr] oversize first".as_ptr(), 19);
                 return false;
             }
-            let mut tagged = [0u8; 1 + ROUTE_FRAME_MAX];
-            tagged[0] = slot as u8;
-            tagged[1..1 + fl].copy_from_slice(&hdr[..fl]);
-            tagged[1 + fl..1 + total_len].copy_from_slice(data);
+            let mut tagged = [0u8; CLIENT_FRAME_MAX];
+            tagged[..2].copy_from_slice(&(slot as u16).to_le_bytes());
+            tagged[2..2 + fl].copy_from_slice(&hdr[..fl]);
+            tagged[2 + fl..2 + total_len].copy_from_slice(data);
             // Refused → retained; `true` tells the caller to stop
             // draining until it lands, as for a stashed peer tail.
-            return !deliver_client_frame(s, sys, wire::MSG_CLIENT_FRAME, &tagged[..1 + total_len]);
+            return !deliver_client_frame(s, sys, wire::MSG_CLIENT_FRAME, &tagged[..2 + total_len]);
         }
         return false;
     }
@@ -1357,12 +1378,13 @@ unsafe fn handle_identity(
         fp[..fp_len].copy_from_slice(&s.conns[slot].peer_fp[..fp_len]);
         if replica_held_by_other_key(s, slot, peer_id, &fp[..fp_len]) {
             dev_log(&*s.syscalls, 2, b"[pr] replica key clash".as_ptr(), 22);
-            s.conns[slot].replica_id = -1;
+            unbind_replica(s, slot);
             s.conns[slot].identified = false;
             return false;
         }
     }
-    s.conns[slot].replica_id = peer_id as i8;
+    // Dedupe below evicts the previous holder of this replica id;
+    // binding happens after that so the index names this slot.
     s.conns[slot].identified = true;
     s.peer_addrs[peer_id as usize].connected = true;
     {
@@ -1390,18 +1412,15 @@ unsafe fn handle_identity(
     // the transport's NMSG_CLOSED notice lands, so that arm's
     // `find_conn` misses and never clears the flag — nobody redials
     // into fresh churn.
-    for other in 0..MAX_CONNS {
-        if other == slot {
-            continue;
-        }
-        if s.conns[other].active && s.conns[other].replica_id == peer_id as i8 {
-            close_conn(s, sys, s.conns[other].conn_id);
-            s.conns[other] = Conn::empty();
-            let mut m = *b"[pr] dedup close p=?";
-            m[19] = b'0' + (peer_id % 10);
-            dev_log(sys, 3, m.as_ptr(), m.len());
-        }
+    let other = slot_of_replica(s, peer_id);
+    if other < MAX_CONNS && other != slot && s.conns[other].active {
+        close_conn(s, sys, s.conns[other].conn_id);
+        clear_slot(s, other);
+        let mut m = *b"[pr] dedup close p=?";
+        m[19] = b'0' + (peer_id % 10);
+        dev_log(sys, 3, m.as_ptr(), m.len());
     }
+    bind_replica(s, slot, peer_id);
 
     // If we're the inbound side, reply with our identity
     if !s.conns[slot].outbound {
@@ -1588,7 +1607,7 @@ unsafe fn route_outbound_chan(s: &mut ModuleState, sys: &SyscallTable, chan: i32
             deliver_peer_frame(s, sys, target, 0, partition_id, msg_type, &local[..pl])
         {
             // `net_out` refused a copy. The frame is already off the
-            // channel, so retain it with the slot to resume from and
+            // channel, so retain it with the replica to resume from and
             // stop routing until it goes: dropping it would lose a
             // heartbeat or a vote for exactly one peer, and a snapshot
             // chunk is never re-sent at all.
@@ -1609,7 +1628,7 @@ unsafe fn route_outbound_chan(s: &mut ModuleState, sys: &SyscallTable, chan: i32
 }
 
 /// Hand one routed frame to every conn it addresses, resuming a
-/// broadcast at conn slot `from`. `Err(slot)` names the first conn
+/// broadcast at replica id `from`. `Err(rid)` names the first peer
 /// whose copy `net_out` refused, so the caller can retain the frame and
 /// resume there; copies before it went out and are not re-sent.
 ///
@@ -1628,15 +1647,13 @@ unsafe fn deliver_peer_frame(
     data: &[u8],
 ) -> Result<(), usize> {
     if target == wire::TARGET_BROADCAST {
-        for slot in from..MAX_CONNS {
-            if !s.conns[slot].active || !s.conns[slot].identified {
-                continue;
-            }
-            if s.conns[slot].replica_id < 0 {
+        for rid in from..MAX_NODES {
+            let slot = slot_of_replica(s, rid as u8);
+            if slot >= MAX_CONNS || !s.conns[slot].active || !s.conns[slot].identified {
                 continue;
             }
             if !send_to_conn(s, sys, slot, partition_id, msg_type, data) {
-                return Err(slot);
+                return Err(rid);
             }
         }
         return Ok(());
@@ -1775,12 +1792,11 @@ unsafe fn send_to_conn(
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Read slot-tagged responses from the gateway and send back to
 /// the originating TCP connection.
-/// Format: [slot: u8] [msg_type: u8] [len: u16 LE] [payload]
-/// The 1-byte tag is CLUSTOR-INTERNAL: it is the connection-table
-/// SLOT INDEX this router stamped on the inbound MSG_CLIENT_FRAME
-/// (the transport's u16 conn id does not fit in one byte). It is
-/// used only to look the slot up; the outgoing NCMD_SEND carries the
-/// slot's REAL u16 LE conn id.
+/// Format: [slot: u16 LE] [msg_type: u8] [len: u16 LE] [payload]
+/// The tag is the `wire::ConnId`: the connection-table SLOT INDEX this
+/// router stamped on the inbound MSG_CLIENT_FRAME. It is used only to
+/// look the slot up; the outgoing NCMD_SEND carries the slot's
+/// transport u16 LE conn id.
 unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
     if s.client_resp < 0 || s.net_out < 0 {
         return;
@@ -1816,10 +1832,10 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         // not is the close command below.
         let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.client_resp, &mut s.buf);
         let len = plen as usize;
-        // A close request is `[conn_id]` alone — one byte, so it is
-        // checked BEFORE the 2-byte minimum every data frame has.
-        if msg_type == wire::MSG_CONN_CLOSE_REQUEST && len >= 1 {
-            let slot = s.buf[0] as usize;
+        // A close request is `[conn_id:u16 LE]` alone — two bytes, so
+        // it is checked BEFORE the 3-byte minimum every data frame has.
+        if msg_type == wire::MSG_CONN_CLOSE_REQUEST && len >= 2 {
+            let slot = u16::from_le_bytes([s.buf[0], s.buf[1]]) as usize;
             if slot < MAX_CONNS && s.conns[slot].active {
                 let cid = s.conns[slot].conn_id;
                 // Same teardown a peer-initiated close takes, so the
@@ -1829,15 +1845,15 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
             }
             continue;
         }
-        if len < 2 {
+        if len < 3 {
             continue;
         }
 
-        // The gateway's 1-byte tag is the slot index we stamped on
-        // ingress; resolve it to the live connection's u16 conn id.
-        // A stale/out-of-range tag (conn closed since the request)
+        // The gateway's u16 LE tag is the slot index we stamped on
+        // ingress; resolve it to the live connection's transport conn
+        // id. A stale/out-of-range tag (conn closed since the request)
         // drops the response — there is nowhere valid to send it.
-        let slot = s.buf[0] as usize;
+        let slot = u16::from_le_bytes([s.buf[0], s.buf[1]]) as usize;
         if slot >= MAX_CONNS || !s.conns[slot].active {
             continue;
         }
@@ -1851,7 +1867,7 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         // MQTT delivery) while small acks still pass. State-owned
         // rather than a stack array so the hot path never re-zeroes
         // 8 KiB per iteration (256 KiB at this loop's 32-frame bound).
-        let data_len = len - 1; // strip the 1-byte slot tag
+        let data_len = len - 2; // strip the u16 LE slot tag
         let payload_len = 2 + data_len; // 2 (conn_id u16 LE) + data
         if NET_FRAME_HDR + payload_len > BUF_SIZE {
             // Cannot ever transit net_write_frame's scratch — a
@@ -1860,7 +1876,7 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
             continue;
         }
         s.resp_stash[..2].copy_from_slice(&conn_id.to_le_bytes());
-        s.resp_stash[2..payload_len].copy_from_slice(&s.buf[1..len]);
+        s.resp_stash[2..payload_len].copy_from_slice(&s.buf[2..len]);
         s.resp_stash_len = payload_len as u16;
         if !flush_resp_stash(s, sys) {
             // net_out refused the atomic write after all; the ack is
@@ -1951,7 +1967,7 @@ unsafe fn flush_client_stash(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     if cl == 0 {
         return true;
     }
-    let mut frame = [0u8; 1 + ROUTE_FRAME_MAX];
+    let mut frame = [0u8; CLIENT_FRAME_MAX];
     frame[..cl].copy_from_slice(&s.client_stash[..cl]);
     if wire_channels::channel_write_msg(sys, s.cleartext, s.client_stash_type, &frame[..cl]) > 0 {
         s.client_stash_len = 0;
@@ -1988,13 +2004,93 @@ unsafe fn flush_inbound_stash(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 
 // ── Helpers ─────────────────────────────────────────────────
 
+/// Find a free slot, scanning from the `next_alloc` cursor and
+/// wrapping. The cursor moves past each hand-out, so the scan is O(1)
+/// amortised: it only walks the slots the previous allocations left
+/// behind. The caller registers the slot with `register_conn`.
 fn alloc_conn(s: &mut ModuleState) -> Option<usize> {
-    for i in 0..MAX_CONNS {
+    let start = s.next_alloc as usize;
+    for k in 0..MAX_CONNS {
+        let i = (start + k) % MAX_CONNS;
         if !s.conns[i].active {
+            s.next_alloc = ((i + 1) % MAX_CONNS) as u16;
             return Some(i);
         }
     }
     None
+}
+
+/// Make `slot` the live `Conn` for transport `conn_id` and index it.
+/// The caller has already reaped any stale slot holding that id.
+fn register_conn(s: &mut ModuleState, slot: usize, conn_id: u16, outbound: bool) {
+    s.conns[slot] = Conn {
+        conn_id,
+        active: true,
+        outbound,
+        ..Conn::empty()
+    };
+    s.slot_by_conn[conn_id as usize] = (slot + 1) as u16;
+    if slot + 1 > s.conn_high as usize {
+        s.conn_high = (slot + 1) as u16;
+    }
+}
+
+/// Empty `slot` and drop every index entry that names it: the conn-id
+/// reverse index, the replica index and the owed-identity count.
+/// `conn_high` shrinks when the top slot goes, so the sweeps stay
+/// bounded by the live population.
+fn clear_slot(s: &mut ModuleState, slot: usize) {
+    let c = s.conns[slot];
+    if c.active && s.slot_by_conn[c.conn_id as usize] == (slot + 1) as u16 {
+        s.slot_by_conn[c.conn_id as usize] = 0;
+    }
+    unbind_replica(s, slot);
+    if c.active && c.identity_pending {
+        s.identity_owed = s.identity_owed.saturating_sub(1);
+    }
+    s.conns[slot] = Conn::empty();
+    while s.conn_high > 0 && !s.conns[s.conn_high as usize - 1].active {
+        s.conn_high -= 1;
+    }
+}
+
+/// Name `slot` as the link to `replica_id`. The identity dedup has
+/// evicted any previous holder, so the index stays one slot per peer.
+fn bind_replica(s: &mut ModuleState, slot: usize, replica_id: u8) {
+    s.conns[slot].replica_id = replica_id as i8;
+    if (replica_id as usize) < MAX_NODES {
+        s.slot_by_replica[replica_id as usize] = (slot + 1) as u16;
+    }
+}
+
+/// Forget which replica `slot` links to, in the slot and in the index.
+fn unbind_replica(s: &mut ModuleState, slot: usize) {
+    let rid = s.conns[slot].replica_id;
+    if rid >= 0 && (rid as usize) < MAX_NODES && s.slot_by_replica[rid as usize] == (slot + 1) as u16
+    {
+        s.slot_by_replica[rid as usize] = 0;
+    }
+    s.conns[slot].replica_id = -1;
+}
+
+/// Slot whose `replica_id` is `replica_id`, or `MAX_CONNS`. No liveness
+/// filter beyond the index itself; callers apply their own.
+fn slot_of_replica(s: &ModuleState, replica_id: u8) -> usize {
+    if (replica_id as usize) >= MAX_NODES {
+        return MAX_CONNS;
+    }
+    let v = s.slot_by_replica[replica_id as usize];
+    if v == 0 {
+        MAX_CONNS
+    } else {
+        (v - 1) as usize
+    }
+}
+
+/// Whether an active, identified link to `replica_id` remains.
+fn still_linked(s: &ModuleState, replica_id: u8) -> bool {
+    let slot = slot_of_replica(s, replica_id);
+    slot < MAX_CONNS && s.conns[slot].active && s.conns[slot].identified
 }
 
 /// Reap any slot still holding `conn_id` before registering a NEW
@@ -2013,47 +2109,41 @@ fn alloc_conn(s: &mut ModuleState) -> Option<usize> {
 /// peer's `connected` claim if the ghost was its last identified
 /// link, so `connect_peers` may redial for real.
 unsafe fn reap_conn_id(s: &mut ModuleState, sys: &SyscallTable, conn_id: u16) {
-    for i in 0..MAX_CONNS {
-        if !s.conns[i].active || s.conns[i].conn_id != conn_id {
-            continue;
-        }
-        let rid = s.conns[i].replica_id;
-        s.conns[i] = Conn::empty();
-        // A reaped CLIENT slot must be announced exactly as a normal
-        // close is: the gateway keys correlation state, codec
-        // reassembly and session membership by the SLOT INDEX we
-        // stamp on MSG_CLIENT_FRAME, and `alloc_conn` hands the
-        // lowest free index straight back to the next conn. Skipping
-        // the notice would let a new client inherit the previous
-        // occupant's in-flight state and receive its responses.
-        if rid < 0 && s.cleartext >= 0 {
-            wire_channels::channel_write_msg(sys, s.cleartext, wire::MSG_CONN_CLOSED, &[i as u8]);
-        }
-        if rid >= 0 && (rid as usize) < MAX_NODES {
-            let mut still_linked = false;
-            for other in 0..MAX_CONNS {
-                if s.conns[other].active
-                    && s.conns[other].identified
-                    && s.conns[other].replica_id == rid
-                {
-                    still_linked = true;
-                    break;
-                }
-            }
-            if !still_linked {
-                s.peer_addrs[rid as usize].connected = false;
-            }
-        }
+    let i = find_conn(s, conn_id);
+    if i >= MAX_CONNS {
+        return;
+    }
+    let rid = s.conns[i].replica_id;
+    clear_slot(s, i);
+    // A reaped CLIENT slot must be announced exactly as a normal
+    // close is: the gateway keys correlation state, codec
+    // reassembly and session membership by the SLOT INDEX we
+    // stamp on MSG_CLIENT_FRAME, and `alloc_conn` hands a freed
+    // index back to a later conn. Skipping the notice would let a
+    // new client inherit the previous occupant's in-flight state
+    // and receive its responses.
+    if rid < 0 && s.cleartext >= 0 {
+        wire_channels::channel_write_msg(
+            sys,
+            s.cleartext,
+            wire::MSG_CONN_CLOSED,
+            &(i as u16).to_le_bytes(),
+        );
+    }
+    if rid >= 0 && (rid as usize) < MAX_NODES && !still_linked(s, rid as u8) {
+        s.peer_addrs[rid as usize].connected = false;
     }
 }
 
+/// Slot holding transport `conn_id`, or `MAX_CONNS`: one read of the
+/// reverse index, on every inbound event.
 fn find_conn(s: &ModuleState, conn_id: u16) -> usize {
-    for i in 0..MAX_CONNS {
-        if s.conns[i].active && s.conns[i].conn_id == conn_id {
-            return i;
-        }
+    let v = s.slot_by_conn[conn_id as usize];
+    if v == 0 {
+        MAX_CONNS
+    } else {
+        (v - 1) as usize
     }
-    MAX_CONNS
 }
 
 /// Destination channel for one peer frame type: replication responses
@@ -2098,18 +2188,17 @@ fn peer_dest(s: &ModuleState, peer_msg_type: u8) -> i32 {
 }
 
 fn find_conn_by_replica(s: &ModuleState, replica_id: u8) -> usize {
-    for i in 0..MAX_CONNS {
-        // `identity_pending` gates outbound routing: raft frames must
-        // never overtake our identity frame on a fresh conn, or the
-        // peer's classifier sees non-identity first bytes and the
-        // handshake never completes.
-        if s.conns[i].active
-            && s.conns[i].identified
-            && !s.conns[i].identity_pending
-            && s.conns[i].replica_id == replica_id as i8
-        {
-            return i;
-        }
+    let i = slot_of_replica(s, replica_id);
+    if i >= MAX_CONNS {
+        return MAX_CONNS;
     }
-    MAX_CONNS
+    // `identity_pending` gates outbound routing: raft frames must
+    // never overtake our identity frame on a fresh conn, or the
+    // peer's classifier sees non-identity first bytes and the
+    // handshake never completes.
+    if s.conns[i].active && s.conns[i].identified && !s.conns[i].identity_pending {
+        i
+    } else {
+        MAX_CONNS
+    }
 }

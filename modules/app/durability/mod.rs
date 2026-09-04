@@ -217,6 +217,19 @@ define_params! {
 /// `partition_router.proposals_p0` alone whatever K is.
 const K_MAX: usize = 64;
 
+/// Ring-telemetry id of `fsync_latency_us` — its POSITION in this manifest's
+/// `[observability].metrics` list (28 wal + 6 snapshot names precede it).
+/// The manifest's `[[observability.instrument]]` row carries the bounds and
+/// the `fluxor.slot` dimension; drift between this constant and the list is
+/// a mislabeled series, so both sit next to a counting comment.
+const FSYNC_HIST_RING_ID: u16 = 34;
+/// Ring id of `snapshot_transfer_us` (manifest position 35 — appended after
+/// `fsync_latency_us`; count before reordering).
+const SNAPSHOT_HIST_RING_ID: u16 = 35;
+/// Declared numeric domain of the slot dimension (`max` in the manifest row).
+/// A partition id at or past it folds to `__other__` rather than lying.
+const FSYNC_DIM_MAX: u16 = K_MAX as u16;
+
 /// One Partition Raft Group's durability state.
 ///
 /// Everything here is per-group: its own WAL segments and index ring,
@@ -259,6 +272,14 @@ struct ModuleState {
     /// How many of `slots` this instance hosts, from the `partitions`
     /// param. Clamped to `1..=K_MAX`.
     active_slots: u8,
+    /// Throttle for the kernel-ring telemetry emit (`dev_millis` of the last
+    /// round). The wal fsync-latency histogram goes out on TWO wires from
+    /// one set of accumulators: the kernel telemetry ring (id
+    /// `FSYNC_HIST_RING_ID`, one record per hosted slot, partition id as the
+    /// declared dimension) and the `MSG_METRIC_SAMPLE` channel export. The
+    /// ring is a pull surface and the channel export a push one, so a
+    /// deployment can scrape whichever its collector speaks.
+    last_ring_tlm_ms: u64,
     /// Frames whose envelope named a partition no slot hosts.
     frames_misrouted: u32,
     /// One held frame per demuxed channel (entries, entry_request, ack).
@@ -334,6 +355,7 @@ pub extern "C" fn module_new(
         s.slots[0].self_id = 0;
         s.slots[0].voter_count = 1;
         s.active_slots = 1;
+        s.last_ring_tlm_ms = 0;
         s.frames_misrouted = 0;
         for c in s.carry.iter_mut() {
             *c = Carry::empty();
@@ -864,6 +886,45 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
             if slot_wal_rc == STEP_BURST {
                 wal_rc = STEP_BURST;
+            }
+        }
+
+        // Kernel-ring histogram emit (see `last_ring_tlm_ms`). Zero-cost
+        // when no telemetry consumer is subscribed; one hist16 record per
+        // hosted slot every 5 s otherwise.
+        if dev_telemetry_enabled(sys) && now.wrapping_sub(s.last_ring_tlm_ms) >= 5000 {
+            s.last_ring_tlm_ms = now;
+            let me = dev_self_index(sys);
+            if me >= 0 {
+                let t = dev_micros(sys);
+                for i in 0..s.active_slots as usize {
+                    let src = &s.slots[i].wal.fsync_buckets;
+                    let mut b = [0u64; 16];
+                    for (k, v) in src.iter().enumerate() {
+                        b[k] = *v as u64;
+                    }
+                    let pid = s.slots[i].partition_id;
+                    let dim = if pid < FSYNC_DIM_MAX {
+                        pid
+                    } else {
+                        abi::contracts::telemetry::DIM_OTHER
+                    };
+                    dev_telemetry_histogram16(sys, -1, me as u16, t, FSYNC_HIST_RING_ID, dim, &b);
+                    // Snapshot transfers are rare; skip an all-zero row so a
+                    // node that never installed one emits no empty series.
+                    let sn = &s.slots[i].snapshot.ring_transfer_buckets;
+                    if sn.iter().any(|v| *v != 0) {
+                        dev_telemetry_histogram16(
+                            sys,
+                            -1,
+                            me as u16,
+                            t,
+                            SNAPSHOT_HIST_RING_ID,
+                            dim,
+                            sn,
+                        );
+                    }
+                }
             }
         }
 

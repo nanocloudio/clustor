@@ -258,6 +258,12 @@ define_params! {
 /// NOT bounded by fluxor's 16-ports-per-direction cap: the engine takes
 /// ONE partitioned input and demuxes on the envelope, so a graph wires
 /// `partition_router.proposals_p0` alone whatever K is.
+/// Ring ids of the two consensus histograms — their POSITIONS in this
+/// manifest's `[observability].metrics` list (26 raft + 6 replicator +
+/// 2 commit + 7 apply names precede them; count before reordering).
+const COMMIT_HIST_RING_ID: u16 = 41;
+const APPLY_HIST_RING_ID: u16 = 42;
+
 const K_MAX: usize = 64;
 
 /// One Partition Raft Group's complete state.
@@ -298,6 +304,14 @@ struct ModuleState {
     /// How many of `slots` this instance actually hosts, from the
     /// `partitions` param. Clamped to `1..=K_MAX`.
     active_slots: u8,
+    /// Throttle for the kernel-ring telemetry emit (`dev_millis` of the last
+    /// round). The commit-latency and apply-batch histograms go out on TWO
+    /// wires from one set of accumulators: the kernel telemetry ring, one
+    /// record per hosted slot with the partition id as the `fluxor.slot`
+    /// dimension, and the `MSG_METRIC_SAMPLE` channel export. The ring is a
+    /// pull surface and the channel export a push one, so a deployment can
+    /// scrape whichever its collector speaks.
+    last_ring_tlm_ms: u64,
 
     /// Frames whose envelope named a partition no slot hosts. Consumed
     /// and counted rather than left on the channel, where they would
@@ -415,6 +429,7 @@ pub extern "C" fn module_new(
         let sys = &*(syscalls as *const SyscallTable);
         s.syscalls = sys;
         s.active_slots = 1;
+        s.last_ring_tlm_ms = 0;
         s.slot_activations = 0;
         s.slot_activations_refused = 0;
         s.rr_offset = 0;
@@ -1394,6 +1409,51 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // synchronous FS write+fsync. Classify it as Burst so the
             // scheduler forgives the one-shot overrun instead of letting it
             // delay the heartbeat that keeps this leader elected.
+        }
+
+        // Kernel-ring histogram emit: one commit-latency and one apply-batch
+        // METRIC_HISTOGRAM_16 per hosted slot every 5 s, partition id as the
+        // declared dimension. Zero-cost when no consumer is subscribed;
+        // all-zero rows are skipped (a follower that never led has no commit
+        // latencies to report).
+        if dev_telemetry_enabled(sys) && now.wrapping_sub(s.last_ring_tlm_ms) >= 5000 {
+            s.last_ring_tlm_ms = now;
+            let me = dev_self_index(sys);
+            if me >= 0 {
+                let t = dev_micros(sys);
+                for i in 0..s.active_slots as usize {
+                    let pid = s.slots[i].partition_id;
+                    let dim = if (pid as usize) < K_MAX {
+                        pid
+                    } else {
+                        abi::contracts::telemetry::DIM_OTHER
+                    };
+                    let cb = &s.slots[i].raft.ring_commit_buckets;
+                    if cb.iter().any(|v| *v != 0) {
+                        dev_telemetry_histogram16(
+                            sys,
+                            -1,
+                            me as u16,
+                            t,
+                            COMMIT_HIST_RING_ID,
+                            dim,
+                            cb,
+                        );
+                    }
+                    let ab = &s.slots[i].apply.ring_apply_buckets;
+                    if ab.iter().any(|v| *v != 0) {
+                        dev_telemetry_histogram16(
+                            sys,
+                            -1,
+                            me as u16,
+                            t,
+                            APPLY_HIST_RING_ID,
+                            dim,
+                            ab,
+                        );
+                    }
+                }
+            }
         }
 
         if s.slots[0].raft.meta_fs_step {

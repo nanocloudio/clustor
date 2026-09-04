@@ -130,7 +130,7 @@ An unwired `credit_supply` means unlimited, not zero.
 
 `client_requests` is the third intake, for producers that own their
 own connection namespace and have already demuxed the request:
-`[conn_id:u8][body]` framed as `MSG_CLIENT_PROPOSAL` or
+`[conn_id:u16 LE][body]` framed as `MSG_CLIENT_PROPOSAL` or
 `MSG_CLIENT_READ_REQUEST`, entering the correlation hub directly.
 `requests` (peer_router's `MSG_CLIENT_FRAME` envelope) and
 `proposals` (already correlation-tagged) are the other two. Replies

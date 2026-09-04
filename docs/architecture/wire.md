@@ -186,7 +186,7 @@ byte), `MSG_FALLBACK_SIGNAL` (0x32), `MSG_READ_PERMIT` (0x33).
 | 0x56 | `MSG_SNAPSHOT_INSTALL_REQUEST` | `[target_replica_id:u8]` (0xFF = broadcast) — follower fell below the WAL retention floor |
 | 0x57 | `MSG_APP_SNAPSHOT_CHUNK` | 28-byte header `[term:u64][last_included_index:u64][offset:u64][done:u8][reserved:u8;3]` + opaque body |
 | 0x58 / 0x59 | `MSG_APP_SNAPSHOT_REQUEST` / `_RESET` | `[term:u64][last_included_index:u64]` |
-| 0x5A | `MSG_PEER_IDENTITY` | `[conn_id:u8][replica_id:u8][verified:u8][svid_len:u8][svid...]` — TLS identity binding to `peer_router` |
+| 0x5A | `MSG_PEER_IDENTITY` | `[session_id:u32][verification_result:u8][credential_kind:u8][profile_id:u16][not_before:u64][not_after:u64][verification_flags:u32][key_fp_alg:u8][key_fp_len:u8][principal_len:u16][key_fingerprint][principal]` — TLS identity binding to `peer_router`; the record is fluxor's and this is a mirror of it |
 
 ### Key management, telemetry, and membership (0x60–0x76)
 
@@ -218,9 +218,11 @@ per-module parser.
 command is quorum-committed and applied; `MSG_PLACEMENT_EPOCH_EVENT`
 (0xD5, `[kpg_id:u16][new_epoch:u32][reason:u8]`);
 `MSG_COMPACTION_FLOOR` (0xE1, `[kpg_id:u16][floor_revision:u64]`);
-`MSG_CLIENT_FRAME` (0xEA, `[conn_id:u8][raw client bytes]`, the
-multiplexed cleartext client lane); `MSG_CONN_CLOSED` (0xEB,
-`[conn_id:u8]`).
+`MSG_CLIENT_FRAME` (0xEA, `[conn_id:u16 LE][raw client bytes]`, the
+multiplexed cleartext client lane — the conn id is peer_router's
+slot index, `wire::ConnId`); `MSG_CONN_CLOSED` (0xEB,
+`[conn_id:u16 LE]`); `MSG_CONN_CLOSE_REQUEST` (0xEC,
+`[conn_id:u16 LE]`).
 
 ## Log-entry body magics
 

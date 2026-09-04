@@ -173,6 +173,13 @@ strip = "symbols"
 name = "facade"
 path = "tests/facade.rs"
 
+# Ring-vs-binary telemetry parity (kernel-ring convergence R5 gate). Its own
+# binary: the export hook is env-driven and must not leak into cluster.rs's
+# threaded tests.
+[[test]]
+name = "ring_parity"
+path = "tests/ring_parity.rs"
+
 [[test]]
 name = "limit_register"
 path = "tests/limit_register.rs"

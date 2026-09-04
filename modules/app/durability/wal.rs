@@ -596,7 +596,9 @@ pub struct Wal {
     /// `wire::hist::FSYNC_LATENCY_US` bound plus a trailing `+Inf` overflow
     /// bucket. Measured in µs at each `FS_FSYNC` call site; emitted as
     /// `METRIC_KIND_HISTOGRAM` samples.
-    fsync_buckets: [u32; wire::hist::FSYNC_LATENCY_US.len() + 1],
+    /// Read by mod.rs's kernel-ring emit as well as the MSG_METRIC_SAMPLE
+    /// export below — one array, two wires.
+    pub fsync_buckets: [u32; wire::hist::FSYNC_LATENCY_US.len() + 1],
 
     // Replay state
     phase: u8,             // PHASE_REPLAY or PHASE_NORMAL

@@ -11,17 +11,17 @@ rejection occurs. Sources: `modules/common/wire.rs`,
 
 ## Client rejections (`MSG_CLIENT_REJECT`)
 
-A request denied before it can be replicated is answered with an
-11-byte `MSG_CLIENT_REJECT` payload:
+A request denied before it can be replicated is answered with a
+12-byte `MSG_CLIENT_REJECT` payload:
 
 | Offset | Field | Type |
 |---|---|---|
-| 0 | `conn_id` | `u8` |
-| 1 | `status` | `u8` |
-| 2 | `reserved` | `u8` — carries `leader_id` when `status` is NOT_LEADER, otherwise 0 |
-| 3 | `retry_after_ms` | `u16` LE |
-| 5 | `entry_credits` | `i16` LE |
-| 7 | `byte_credits` | `i32` LE |
+| 0 | `conn_id` | `u16` LE — peer_router's slot index (`wire::ConnId`) |
+| 2 | `status` | `u8` |
+| 3 | `reserved` | `u8` — carries `leader_id` when `status` is NOT_LEADER, otherwise 0 |
+| 4 | `retry_after_ms` | `u16` LE |
+| 6 | `entry_credits` | `i16` LE |
+| 8 | `byte_credits` | `i32` LE |
 
 Between the gateway's throttle and its codec the same 10-byte body
 rides an internal envelope (`MSG_CLIENT_REJECT_INTERNAL`) keyed by an

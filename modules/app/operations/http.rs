@@ -855,16 +855,16 @@ pub unsafe fn on_request(
                     ReqOut::Done
                 } else {
                     // The admin envelope keeps its wire form
-                    // (`[conn_id:u8][op_code][body]`); the low conn
-                    // byte is a log breadcrumb there, never a reply
+                    // (`[conn_id:u16 LE][op_code][body]`); the conn
+                    // id is a log breadcrumb there, never a reply
                     // route — HTTP replies correlate on the full
                     // `(conn_id, stream_id)` held here.
-                    h.admin_env[0] = conn_id as u8;
-                    h.admin_env[1] = op_code;
-                    h.admin_env[2..2 + body.len()].copy_from_slice(body);
+                    h.admin_env[..2].copy_from_slice(&conn_id.to_le_bytes());
+                    h.admin_env[2] = op_code;
+                    h.admin_env[3..3 + body.len()].copy_from_slice(body);
                     ReqOut::Admin {
                         op_code,
-                        len: (2 + body.len()) as u16,
+                        len: (3 + body.len()) as u16,
                     }
                 }
             }

@@ -270,6 +270,8 @@ pub struct Snapshot {
     /// time from first install chunk to `done`, ms-classified against
     /// `wire::hist::SNAPSHOT_MS`.
     transfer_buckets: [u32; wire::hist::SNAPSHOT_MS.len() + 1],
+    /// Kernel-ring twin (`SNAPSHOT_RING_US`, 16 buckets, µs — see wire::hist).
+    pub ring_transfer_buckets: [u64; wire::hist::SNAPSHOT_RING_US.len() + 1],
 
     // In-flight install state (single-stream, fail-open if interleaved):
     in_progress_term: u64,
@@ -385,6 +387,7 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.last_metrics_ms = 0;
     s.install_start_ms = 0;
     s.transfer_buckets = [0u32; wire::hist::SNAPSHOT_MS.len() + 1];
+    s.ring_transfer_buckets = [0u64; wire::hist::SNAPSHOT_RING_US.len() + 1];
     s.in_progress_term = 0;
     s.in_progress_last_idx = 0;
     s.in_progress_last_term = 0;
@@ -919,6 +922,11 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         let elapsed_ms = dev_millis(sys).wrapping_sub(s.install_start_ms);
         let b = wire::hist::bucket(&wire::hist::SNAPSHOT_MS, elapsed_ms);
         s.transfer_buckets[b] = s.transfer_buckets[b].saturating_add(1);
+        let rb = wire::hist::bucket(
+            &wire::hist::SNAPSHOT_RING_US,
+            elapsed_ms.saturating_mul(1_000),
+        );
+        s.ring_transfer_buckets[rb] = s.ring_transfer_buckets[rb].wrapping_add(1);
         s.in_progress_active = false;
         s.body_len = 0;
         s.in_progress_offset = 0;

@@ -786,6 +786,10 @@ pub struct Raft {
     commit_ts_index: [Index; COMMIT_TS_RING],
     commit_ts_us: [u64; COMMIT_TS_RING],
     commit_latency_buckets: [u32; wire::hist::COMMIT_LATENCY_US.len() + 1],
+    /// Kernel-ring twin of the above: the same latencies classified against
+    /// `COMMIT_LATENCY_RING_US` (16 buckets, its own deliberate ladder —
+    /// see wire::hist), emitted per slot as a METRIC_HISTOGRAM_16.
+    pub ring_commit_buckets: [u64; wire::hist::COMMIT_LATENCY_RING_US.len() + 1],
 
     // ── Leader-state hint ───────────────────────────────────
     // Last (leader_id, term) we broadcast on `leader_state`. Re-emit
@@ -964,6 +968,7 @@ pub fn init(s: &mut Raft) {
     s.commit_ts_index = [0; COMMIT_TS_RING];
     s.commit_ts_us = [0; COMMIT_TS_RING];
     s.commit_latency_buckets = [0u32; wire::hist::COMMIT_LATENCY_US.len() + 1];
+    s.ring_commit_buckets = [0u64; wire::hist::COMMIT_LATENCY_RING_US.len() + 1];
     s.last_hint_leader_id = -2;
     s.last_hint_term = 0;
     for b in s.msg_buf.iter_mut() {
@@ -2138,6 +2143,8 @@ unsafe fn drain_commit_in(s: &mut Raft, sys: &SyscallTable) {
                 let lat = now.wrapping_sub(s.commit_ts_us[ts_slot]);
                 let b = wire::hist::bucket(&wire::hist::COMMIT_LATENCY_US, lat);
                 s.commit_latency_buckets[b] = s.commit_latency_buckets[b].saturating_add(1);
+                let rb = wire::hist::bucket(&wire::hist::COMMIT_LATENCY_RING_US, lat);
+                s.ring_commit_buckets[rb] = s.ring_commit_buckets[rb].wrapping_add(1);
                 s.commit_ts_index[ts_slot] = 0;
                 // One in 32, so the append-to-commit age is readable off
                 // the log under load without decoding the histogram.
