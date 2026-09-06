@@ -81,12 +81,16 @@ use types::*;
 // every broker-side table behind it (quantum's `protocol` MAX_CONNS /
 // KCONNS / ACONNS) — a smaller value here silently caps the broker at
 // this many concurrent clients regardless of what those tables allow.
-// 8192 covers a 7-node cluster's peer links plus a full broker's
-// client population; `Conn` carries no payload buffer, so the table
-// is small — the per-connection cost lives in the protocol modules.
+// 16384 covers a 7-node cluster's peer links plus a 10k-client broker's
+// client population. A slot is 46 B — a `Conn` holds identity and
+// handshake state, never a payload buffer, so per-connection BYTES
+// live in the protocol modules — but 16384 of them is still 736 KiB,
+// and that makes this table the module's dominant fixed cost. It is
+// paid whether or not a single client ever connects, so the number is
+// a deployment-envelope decision, not a free ceiling to round up.
 // The slot index is the app-facing `wire::ConnId` (u16 LE), so the
 // table can never exceed 65536 entries.
-const MAX_CONNS: usize = 8192;
+const MAX_CONNS: usize = 16384;
 /// Transport conn ids are `u16 LE` on the wire: the reverse index
 /// from conn id to slot covers the whole id space.
 const CONN_ID_SPACE: usize = 65536;
@@ -276,12 +280,11 @@ struct Conn {
     /// True once `MSG_PEER_IDENTITY` from the TLS layer reported an
     /// established peer credential on this connection: the chain
     /// reached a configured anchor and the peer proved possession of
-    /// the key. It does NOT say which replica the peer is — the
-    /// transport has no notion of a replica id, and the field that
-    /// used to claim otherwise is gone (see `wire::MSG_PEER_IDENTITY`).
-    /// What it buys is `peer_fp`: a plaintext claim of a replica id is
-    /// refused when another connection already holds that id under a
-    /// different key.
+    /// the key. It does NOT say which replica the peer is: the
+    /// transport has no notion of a replica id, so
+    /// `MSG_PEER_IDENTITY` carries none. What it buys is `peer_fp`:
+    /// a plaintext claim of a replica id is refused when another
+    /// connection already holds that id under a different key.
     tls_verified: bool,
     /// The peer's key fingerprint from `MSG_PEER_IDENTITY`, valid only
     /// while `tls_verified`.

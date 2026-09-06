@@ -1073,15 +1073,13 @@ pub const MSG_SNAPSHOT_INSTALL_REQUEST: u8 = 0x56;
 /// plaintext handshake that disagrees.
 ///
 /// The record is fluxor's — `modules/foundation/tls/mod.rs` owns the
-/// format and this is a mirror of it, not a second definition. It
-/// replaced a `[conn_id][replica_id][verified][svid_len][svid]`
-/// payload in which the transport was expected to name a clustor
-/// replica id. It never could: fluxor has no idea what a replica is
-/// and always wrote `0xFF`, which was this repo's "clear the
-/// binding" sentinel, so every TLS identity envelope tore down the
-/// binding it was supposed to establish. The replica id is now
-/// derived where it is actually known — from the peer's own
-/// handshake, cross-checked against the fingerprint below.
+/// format and this is a mirror of it, not a second definition.
+///
+/// It names no clustor replica, and must not: fluxor has no notion of
+/// a replica, so any replica id the transport wrote would be a
+/// constant standing in for a value it cannot know. The replica id is
+/// derived where it IS known — from the peer's own handshake,
+/// cross-checked against the fingerprint below.
 ///
 /// Payload (variable):
 ///   `[session_id:u32 LE]
