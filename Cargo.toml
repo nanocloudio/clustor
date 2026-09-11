@@ -258,6 +258,12 @@ path = "tests/migration_state_machine.rs"
 name = "session_registry"
 path = "tests/session_registry.rs"
 
+# The directory's SessionCtrlV1 face: how an anchor's contract verbs map
+# onto replicated registry commands and back.
+[[test]]
+name = "session_directory_face"
+path = "tests/session_directory_face.rs"
+
 [[test]]
 name = "timing"
 path = "tests/timing.rs"

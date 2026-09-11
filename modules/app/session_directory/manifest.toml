@@ -23,9 +23,10 @@ hardware_targets = ["bcm2712"]
 #                         module is quorum-durable first (R5).
 #
 # fence.enforceable is deliberately NOT declared: this module enforces
-# fence ORDERING (no takeover past an unconfirmed fence) but cannot cut
-# power. The deployment's fence agent (STONITH / fabric cutoff — the
-# fluxor rig's kasa_local backend is the reference) declares it.
+# fence ORDERING (no takeover past a confirmed fence whose generation
+# the takeover presents) but cannot cut anything itself. The out-of-band
+# fence agent declares it — a member placed outside the failure domain
+# whose cut is power or the fabric port.
 capabilities = [
   "session.directory",
   "session.reservation",
@@ -82,6 +83,15 @@ index = 5
 direction = "input"
 content_type = "OctetStream"
 
+# SessionCtrlV1 from anchors: HELLO / ATTACH / EPOCH_BUMP / DETACH — the
+# contract's directory verbs (fluxor `contracts/net/session_ctrl.rs`),
+# each a replicated command answered after commit. Optional.
+[[ports]]
+name = "ctrl_in"
+index = 6
+direction = "input"
+content_type = "OctetStream"
+
 # Tagged proposals (MSG_CLIENT_PROPOSAL) to consensus.proposals_tagged.
 [[ports]]
 name = "proposals"
@@ -106,6 +116,15 @@ content_type = "OctetStream"
 [[ports]]
 name = "snapshot_export"
 index = 3
+direction = "output"
+content_type = "OctetStream"
+
+# SessionCtrlV1 to anchors: ATTACHED / EPOCH_CONFIRMED / DETACHED / ERROR,
+# HELLO_ACK, and the reservation grant that follows a committed binding
+# (CMD_SC_RESERVATION_GRANT — fluxor's grant record). Optional.
+[[ports]]
+name = "ctrl_out"
+index = 4
 direction = "output"
 content_type = "OctetStream"
 

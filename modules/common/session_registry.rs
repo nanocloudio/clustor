@@ -15,8 +15,9 @@
 // - the **single-writer session directory**: one authoritative (anchor,
 //   worker) binding per `(session_id, session_epoch)`; competing stale writers
 //   are rejected.
-// - the **reservation authority** for the hot egress counters: blocks are
-//   granted monotonically from a per-(session, counter) high-water mark and
+// - the **reservation authority** for the hot egress counters, answering
+//   fluxor's `session.reservation` capability: blocks are granted
+//   monotonically from a per-(session, counter) high-water mark and
 //   NEVER re-handed out. The grant reply reaches the proposer only after the
 //   command is quorum-committed (the module replies from the committed-entry
 //   stream, not from proposal submission) — "quorum-durable before emit" holds
@@ -30,13 +31,19 @@
 //   generation-fenced deadline in the embedded `TimingState`; the due handler
 //   wipes the key while applying the committed time entry. There is no second
 //   authoritative local timer queue.
-// - the **fence-ordering gate** (R3): an anchor takeover (BIND that changes
-//   `anchor_id` on a fence-required session) is refused until an out-of-band
-//   emission fence has been recorded as CONFIRMED for that session. The
-//   registry cannot cut power itself — enforceability is the fence backend's
-//   job (STONITH / fabric egress cutoff; the fluxor rig's `kasa_local` power
-//   backend is the reference) — but it enforces the ORDERING: no takeover
-//   binding advances past an unconfirmed fence.
+// - the **fence-ordering gate** (R3): an anchor takeover — ACTIVATE, which
+//   moves a fence-required session's `anchor_id` under a strictly higher
+//   epoch — is refused until an out-of-band emission fence has been recorded
+//   as CONFIRMED against the anchor being replaced, and refused unless it
+//   carries the generation that confirmation recorded: the fence agent's
+//   custody generation, the one `MSG_ADDR_FENCED` reports and a coordinator
+//   carries forward as `fence_gen`. A fence confirmed under an earlier
+//   custody therefore never admits a later takeover, and one confirmed fence
+//   admits one activation. The registry cannot cut power itself —
+//   enforceability is the fence agent's job (a member placed outside the
+//   failure domain whose cut is power or the fabric port) — but it enforces
+//   the ORDERING: no takeover advances past an unconfirmed fence, and none
+//   past a fence that is not the one presented.
 // - the **unsafe-recovery marker** (R2): RECOVERY_MARK voids every session's
 //   outstanding reservations and blocks further grants until that session's
 //   epoch bumps. This is the consumer-observable form of "unsafe recovery
@@ -71,6 +78,8 @@ pub const SR_OP_FENCE_REQUEST: u8 = 7;
 pub const SR_OP_FENCE_CONFIRM: u8 = 8;
 pub const SR_OP_UNBIND: u8 = 9;
 pub const SR_OP_RECOVERY_MARK: u8 = 10;
+/// Fenced anchor takeover: the transport half of the directory role.
+pub const SR_OP_ACTIVATE: u8 = 11;
 
 // ── Status codes ────────────────────────────────────────────────────
 
@@ -92,6 +101,9 @@ pub const SR_ST_RECOVERY_STALE: u8 = 8;
 /// capacity or generation overflow). The command fails without storing the
 /// key — capacity is checked as part of the same apply operation.
 pub const SR_ST_DEADLINE_CAPACITY: u8 = 9;
+/// The fence generation presented on ACTIVATE is not the one FENCE_CONFIRM
+/// recorded — a fence from some other custody, not evidence about this host.
+pub const SR_ST_FENCE_STALE: u8 = 10;
 
 // ── Deterministic timing ────────────────────────────────────────────
 
@@ -134,7 +146,8 @@ pub const SR_PEER_ID: usize = 8;
 //   KEY_PUT       [sid:16][epoch:4][ttl_ms:4][blob_len:2][blob..]
 //   KEY_WIPE      [sid:16][epoch:4]
 //   FENCE_REQUEST [sid:16][epoch:4][target_anchor:8]
-//   FENCE_CONFIRM [sid:16][epoch:4][target_anchor:8]
+//   FENCE_CONFIRM [sid:16][epoch:4][target_anchor:8][fence_gen:4]
+//   ACTIVATE      [sid:16][new_epoch:4][new_anchor:8][fence_gen:4]
 //   UNBIND        [sid:16][epoch:4]
 //   RECOVERY_MARK [recovery_epoch:4]
 
@@ -145,6 +158,8 @@ pub const SR_RX_FLOOR_LEN: usize = 1 + SR_SESSION_ID + 4 + 8;
 pub const SR_KEY_PUT_HDR: usize = 1 + SR_SESSION_ID + 4 + 4 + 2;
 pub const SR_KEY_WIPE_LEN: usize = 1 + SR_SESSION_ID + 4;
 pub const SR_FENCE_LEN: usize = 1 + SR_SESSION_ID + 4 + SR_PEER_ID;
+pub const SR_FENCE_CONFIRM_LEN: usize = SR_FENCE_LEN + 4;
+pub const SR_ACTIVATE_LEN: usize = 1 + SR_SESSION_ID + 4 + SR_PEER_ID + 4;
 pub const SR_UNBIND_LEN: usize = 1 + SR_SESSION_ID + 4;
 pub const SR_RECOVERY_MARK_LEN: usize = 1 + 4;
 
@@ -154,9 +169,22 @@ pub const SR_MAX_CMD: usize = SR_KEY_PUT_HDR + SR_MAX_WRAPPED_KEY;
 // ── Reply ───────────────────────────────────────────────────────────
 
 /// Encoded reply layout: `[op:1][status:1][sid:16][epoch:4][a:8][b:8]`.
-/// `a`/`b` are op-specific: RESERVE → (block start, block len);
-/// RX_FLOOR → (committed floor, 0); RECOVERY_MARK → (voided-session
-/// count, new recovery epoch); otherwise zero.
+/// `a`/`b` are op-specific: BIND → (1 when this advanced an existing
+/// binding's epoch, 0 for a first binding or an idempotent retry; 0);
+/// RESERVE → (block
+/// start, block len); RX_FLOOR → (committed floor, 0); RECOVERY_MARK →
+/// (voided-session count, new recovery epoch); FENCE_* → (fence state,
+/// generation); ACTIVATE → (the generation consumed, 0); otherwise zero.
+///
+/// A RESERVE reply is fluxor's reservation-grant record: the layout above
+/// is the one `modules/sdk/contracts/net/session_ctrl.rs` pins (`GRANT_LEN`
+/// = 38, `GRANT_OP_RESERVE` = 3 = `SR_OP_RESERVE`, `GRANT_STATUS_OK` = 0 =
+/// `SR_ST_OK`,
+/// `GRANT_OP_RESERVE`, `GRANT_STATUS_OK`), and a transport consuming a
+/// grant reads exactly these bytes. Fluxor defines the shape because it
+/// is the transport's safety property — no counter value emitted twice
+/// under one key — that the record exists to carry. This registry is one
+/// authority that can satisfy it.
 pub const SR_REPLY_LEN: usize = 1 + 1 + SR_SESSION_ID + 4 + 8 + 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,19 +337,55 @@ pub fn build_key_wipe(dst: &mut [u8], sid: &[u8; SR_SESSION_ID], epoch: u32) -> 
     SR_KEY_WIPE_LEN
 }
 
-pub fn build_fence(
+pub fn build_fence_request(
     dst: &mut [u8],
-    op: u8,
     sid: &[u8; SR_SESSION_ID],
     epoch: u32,
     target_anchor: &[u8; SR_PEER_ID],
 ) -> usize {
-    if dst.len() < SR_FENCE_LEN || (op != SR_OP_FENCE_REQUEST && op != SR_OP_FENCE_CONFIRM) {
+    if dst.len() < SR_FENCE_LEN {
         return 0;
     }
-    let o = put_common(dst, op, sid, epoch);
+    let o = put_common(dst, SR_OP_FENCE_REQUEST, sid, epoch);
     dst[o..o + 8].copy_from_slice(target_anchor);
     SR_FENCE_LEN
+}
+
+/// `fence_gen` is the custody generation the fence agent reported on
+/// `MSG_ADDR_FENCED`; zero is never a generation and encodes nothing.
+pub fn build_fence_confirm(
+    dst: &mut [u8],
+    sid: &[u8; SR_SESSION_ID],
+    epoch: u32,
+    target_anchor: &[u8; SR_PEER_ID],
+    fence_gen: u32,
+) -> usize {
+    if dst.len() < SR_FENCE_CONFIRM_LEN || fence_gen == 0 {
+        return 0;
+    }
+    let o = put_common(dst, SR_OP_FENCE_CONFIRM, sid, epoch);
+    dst[o..o + 8].copy_from_slice(target_anchor);
+    dst[o + 8..o + 12].copy_from_slice(&fence_gen.to_le_bytes());
+    SR_FENCE_CONFIRM_LEN
+}
+
+/// Move the session's anchor to `new_anchor` under `new_epoch`, presenting
+/// the fence generation the coordinator observed confirmed for the anchor
+/// being replaced.
+pub fn build_activate(
+    dst: &mut [u8],
+    sid: &[u8; SR_SESSION_ID],
+    new_epoch: u32,
+    new_anchor: &[u8; SR_PEER_ID],
+    fence_gen: u32,
+) -> usize {
+    if dst.len() < SR_ACTIVATE_LEN {
+        return 0;
+    }
+    let o = put_common(dst, SR_OP_ACTIVATE, sid, new_epoch);
+    dst[o..o + 8].copy_from_slice(new_anchor);
+    dst[o + 8..o + 12].copy_from_slice(&fence_gen.to_le_bytes());
+    SR_ACTIVATE_LEN
 }
 
 pub fn build_unbind(dst: &mut [u8], sid: &[u8; SR_SESSION_ID], epoch: u32) -> usize {
@@ -360,6 +424,9 @@ pub struct SessionSlot {
     /// Anchor the fence was initiated/confirmed against. A takeover
     /// only trusts a fence aimed at the anchor being replaced.
     pub fence_target: [u8; SR_PEER_ID],
+    /// Custody generation the confirmed fence carries; zero until
+    /// FENCE_CONFIRM. ACTIVATE must present exactly this.
+    pub fence_gen: u32,
     /// Durable receive-window floor (R4). Forward-only.
     pub rx_floor: u64,
     /// Exclusive high-water of every counter block ever granted.
@@ -386,6 +453,7 @@ impl SessionSlot {
             anchor_id: [0; SR_PEER_ID],
             worker_id: [0; SR_PEER_ID],
             fence_target: [0; SR_PEER_ID],
+            fence_gen: 0,
             rx_floor: 0,
             high_water: [0; SR_NUM_COUNTERS],
             key_len: 0,
@@ -493,6 +561,7 @@ impl SessionRegistry {
             SR_OP_FENCE_REQUEST | SR_OP_FENCE_CONFIRM => self.apply_fence(body),
             SR_OP_UNBIND => self.apply_unbind(body),
             SR_OP_RECOVERY_MARK => self.apply_recovery_mark(body),
+            SR_OP_ACTIVATE => self.apply_activate(body),
             _ => SessionReply::fail(op, SR_ST_MALFORMED),
         };
         // Post-command due pass: a command that registered an already-due
@@ -628,16 +697,12 @@ impl SessionRegistry {
                 // current or an older generation is rejected.
                 return Self::reply_err(SR_OP_BIND, &sid, slot.epoch, SR_ST_STALE_EPOCH);
             }
-            // Epoch-advancing rebind. An ANCHOR change is a takeover:
-            // on a fence-required session it must not proceed until an
-            // enforceable fence against the OLD anchor is confirmed
-            // (R3 step 1 — fence CONFIRMED before the epoch
-            // advances, which is what lets the VIP move).
-            let takeover = anchor != slot.anchor_id;
-            if takeover
-                && (slot.flags & SR_BIND_FENCE_REQUIRED) != 0
-                && !(slot.fence_state == SR_FENCE_CONFIRMED && slot.fence_target == slot.anchor_id)
-            {
+            // Epoch-advancing rebind. An ANCHOR change is a takeover,
+            // and on a fence-required session a takeover is ACTIVATE's
+            // alone: it presents the confirmed fence's generation, which
+            // a BIND does not carry. The refusal leaves any confirmed
+            // fence in place for the ACTIVATE that will use it.
+            if anchor != slot.anchor_id && (slot.flags & SR_BIND_FENCE_REQUIRED) != 0 {
                 return Self::reply_err(SR_OP_BIND, &sid, slot.epoch, SR_ST_FENCE_REQUIRED);
             }
             slot.epoch = epoch;
@@ -645,11 +710,12 @@ impl SessionRegistry {
             slot.worker_id = worker;
             slot.flags = flags;
             // The epoch advanced: recovery-void clears (R2 — the bump
-            // is the fence), and the consumed fence resets.
+            // is the fence), and any fence in flight resets.
             slot.voided = false;
             slot.fence_state = SR_FENCE_NONE;
             slot.fence_target = [0; SR_PEER_ID];
-            return Self::reply_ok(SR_OP_BIND, &sid, epoch, 0, 0);
+            slot.fence_gen = 0;
+            return Self::reply_ok(SR_OP_BIND, &sid, epoch, 1, 0);
         }
 
         let Some(i) = self.find_free() else {
@@ -814,7 +880,12 @@ impl SessionRegistry {
 
     fn apply_fence(&mut self, body: &[u8]) -> SessionReply {
         let op = body[0];
-        let Some((sid, epoch)) = Self::common(body, SR_FENCE_LEN) else {
+        let want = if op == SR_OP_FENCE_CONFIRM {
+            SR_FENCE_CONFIRM_LEN
+        } else {
+            SR_FENCE_LEN
+        };
+        let Some((sid, epoch)) = Self::common(body, want) else {
             return SessionReply::fail(op, SR_ST_MALFORMED);
         };
         let mut target = [0u8; SR_PEER_ID];
@@ -829,16 +900,67 @@ impl SessionRegistry {
         if op == SR_OP_FENCE_REQUEST {
             slot.fence_state = SR_FENCE_INITIATED;
             slot.fence_target = target;
+            slot.fence_gen = 0;
         } else {
             // CONFIRM only upgrades the fence it was initiated for —
             // a confirmation aimed at a different anchor is malformed
-            // orchestration, not a fence.
-            if slot.fence_state != SR_FENCE_INITIATED || slot.fence_target != target {
+            // orchestration, not a fence — and it records the agent's
+            // custody generation, which is never zero.
+            let fence_gen = u32::from_le_bytes([body[29], body[30], body[31], body[32]]);
+            if slot.fence_state != SR_FENCE_INITIATED
+                || slot.fence_target != target
+                || fence_gen == 0
+            {
                 return Self::reply_err(op, &sid, slot.epoch, SR_ST_MALFORMED);
             }
             slot.fence_state = SR_FENCE_CONFIRMED;
+            slot.fence_gen = fence_gen;
         }
-        Self::reply_ok(op, &sid, slot.epoch, slot.fence_state as u64, 0)
+        Self::reply_ok(
+            op,
+            &sid,
+            slot.epoch,
+            slot.fence_state as u64,
+            u64::from(slot.fence_gen),
+        )
+    }
+
+    /// The fenced takeover: move the anchor under a strictly higher epoch,
+    /// admitted only by the confirmed fence whose generation is presented.
+    fn apply_activate(&mut self, body: &[u8]) -> SessionReply {
+        let Some((sid, new_epoch)) = Self::common(body, SR_ACTIVATE_LEN) else {
+            return SessionReply::fail(SR_OP_ACTIVATE, SR_ST_MALFORMED);
+        };
+        let mut anchor = [0u8; SR_PEER_ID];
+        anchor.copy_from_slice(&body[21..29]);
+        let fence_gen = u32::from_le_bytes([body[29], body[30], body[31], body[32]]);
+        let Some(i) = self.find(&sid) else {
+            return Self::reply_err(SR_OP_ACTIVATE, &sid, 0, SR_ST_UNKNOWN_SESSION);
+        };
+        let slot = &mut self.slots[i];
+        // Only a session that declared the class has a fenced takeover,
+        // and a takeover changes the anchor.
+        if (slot.flags & SR_BIND_FENCE_REQUIRED) == 0 || anchor == slot.anchor_id {
+            return Self::reply_err(SR_OP_ACTIVATE, &sid, slot.epoch, SR_ST_MALFORMED);
+        }
+        if new_epoch <= slot.epoch {
+            return Self::reply_err(SR_OP_ACTIVATE, &sid, slot.epoch, SR_ST_STALE_EPOCH);
+        }
+        if slot.fence_state != SR_FENCE_CONFIRMED || slot.fence_target != slot.anchor_id {
+            return Self::reply_err(SR_OP_ACTIVATE, &sid, slot.epoch, SR_ST_FENCE_REQUIRED);
+        }
+        if fence_gen == 0 || fence_gen != slot.fence_gen {
+            return Self::reply_err(SR_OP_ACTIVATE, &sid, slot.epoch, SR_ST_FENCE_STALE);
+        }
+        slot.epoch = new_epoch;
+        slot.anchor_id = anchor;
+        // The epoch advanced: recovery-void clears (R2), and the fence
+        // that admitted this activation is consumed.
+        slot.voided = false;
+        slot.fence_state = SR_FENCE_NONE;
+        slot.fence_target = [0; SR_PEER_ID];
+        slot.fence_gen = 0;
+        Self::reply_ok(SR_OP_ACTIVATE, &sid, new_epoch, u64::from(fence_gen), 0)
     }
 
     fn apply_unbind(&mut self, body: &[u8]) -> SessionReply {
@@ -912,7 +1034,7 @@ impl SessionRegistry {
     ///   [used:1][voided:1][fence_state:1][flags:1][epoch:4]
     ///   [session_id:16][anchor:8][worker:8][fence_target:8]
     ///   [rx_floor:8][high_water:8*3][key_gen:8][key_len:2]
-    ///   [key_ttl_ms:4][key:80]
+    ///   [key_ttl_ms:4][fence_gen:4][key:80]
     pub const SNAPSHOT_LEN: usize =
         4 + 8 + 4 + 4 + TimingState::SNAPSHOT_LEN + SR_MAX_SESSIONS * SLOT_SNAP_LEN;
 
@@ -953,7 +1075,8 @@ impl SessionRegistry {
             dst[o + 80..o + 88].copy_from_slice(&s.key_gen.to_le_bytes());
             dst[o + 88..o + 90].copy_from_slice(&s.key_len.to_le_bytes());
             dst[o + 90..o + 94].copy_from_slice(&s.key_ttl_ms.to_le_bytes());
-            dst[o + 94..o + 94 + SR_MAX_WRAPPED_KEY].copy_from_slice(&s.key);
+            dst[o + 94..o + 98].copy_from_slice(&s.fence_gen.to_le_bytes());
+            dst[o + 98..o + 98 + SR_MAX_WRAPPED_KEY].copy_from_slice(&s.key);
             o += SLOT_SNAP_LEN;
             i += 1;
         }
@@ -1029,8 +1152,9 @@ impl SessionRegistry {
             ]);
             s.key_len = u16::from_le_bytes([src[o + 88], src[o + 89]]);
             s.key_ttl_ms = u32::from_le_bytes([src[o + 90], src[o + 91], src[o + 92], src[o + 93]]);
+            s.fence_gen = u32::from_le_bytes([src[o + 94], src[o + 95], src[o + 96], src[o + 97]]);
             s.key
-                .copy_from_slice(&src[o + 94..o + 94 + SR_MAX_WRAPPED_KEY]);
+                .copy_from_slice(&src[o + 98..o + 98 + SR_MAX_WRAPPED_KEY]);
             o += SLOT_SNAP_LEN;
             i += 1;
         }
@@ -1039,4 +1163,4 @@ impl SessionRegistry {
 }
 
 /// Per-slot snapshot record length (see `snapshot` layout comment).
-pub const SLOT_SNAP_LEN: usize = 94 + SR_MAX_WRAPPED_KEY;
+pub const SLOT_SNAP_LEN: usize = 98 + SR_MAX_WRAPPED_KEY;
