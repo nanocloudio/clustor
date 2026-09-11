@@ -9,12 +9,39 @@ It is an ordinary Clustor replicated consumer — the same
 seven-primitive facade `example_consumer` demonstrates — with a real
 state machine behind it.
 
+Two kinds of client reach it. An **anchor** speaks fluxor's
+SessionCtrlV1 — the contract every `session.directory` provider
+answers — on `ctrl_in` / `ctrl_out`: ATTACH binds a session at a
+generation, EPOCH_BUMP advances it, DETACH releases it, and a committed
+binding is followed by a reservation grant in the contract's record.
+An **orchestrator** speaks the registry's own command set on
+`requests` / `replies` (`MSG_SR_REQUEST`, `[request_id][SR_OP_* body]`):
+reservations for other counters, key custody, receive-window floors,
+fence request and confirmation, the fenced takeover, recovery marks.
+Both are the same replicated log; the contract is the wire an anchor
+sees, so a graph places this directory or any other provider of the
+capability interchangeably.
+
+The log reaches the module on `committed_entries` in one of two
+shapes, declared by `forwarded_stream`. Wired straight from consensus
+it is the group's whole log, contiguous, and a gap is a fault recovered
+by snapshot install. Behind a forwarder — a graph whose one consumer of
+the committed stream passes this directory's entries on, as Quantum's
+session processor does — it is a selection of that log, this
+directory's entries in order, and an index jump is the forwarder's
+omission of other consumers' entries; the cursor follows it, and a lost
+entry of the directory's own shows as an unanswered proposal reclaimed
+by the pending TTL. `partition_id` names the group whose log this is: an
+engine hosting several groups writes them all to one stream, each
+numbered from 1, and only this group's entries apply here.
+
 ## Pieces
 
 | Piece | Path | Role |
 |---|---|---|
 | State machine | `modules/common/session_registry.rs` | Deterministic `apply(committed body) → reply`; pure no_std. |
 | Module | `modules/app/session_directory/` | Channels, proposal correlation, reply routing, snapshots, telemetry. |
+| Contract face | `modules/common/session_directory_face.rs` | An anchor's SessionCtrlV1 verbs (HELLO / ATTACH / EPOCH_BUMP / DETACH on `ctrl_in`) mapped onto registry commands, and committed replies mapped back onto the contract's frames (ATTACHED / EPOCH_CONFIRMED / DETACHED / ERROR, then the reservation grant) on `ctrl_out`. |
 | Deployment | the substrate graph plus this module wired as a consumer | Boots a real group; grants are quorum-committed and monotone end to end. |
 
 ## What the registry enforces
@@ -39,18 +66,24 @@ state machine behind it.
   epoch-refused) and `UNBIND` (teardown) zeroize every custody byte.
   TTL is metadata; expiry is enforced by a *replicated* wipe so
   determinism holds.
-- **Fence ordering.** A takeover — a BIND that changes `anchor_id` on
-  a session flagged `SR_BIND_FENCE_REQUIRED` — is refused
+- **Fence ordering.** A takeover — `ACTIVATE`, which moves a
+  session's `anchor_id` under a strictly higher epoch — is refused
   `fence_required` until `FENCE_CONFIRM` has landed **for the anchor
   being replaced** (`FENCE_REQUEST` alone is not enough: initiated ≠
   confirmed, and moving the VIP on an unconfirmed kill is exactly the
-  split-brain this ordering forbids). The registry enforces the
-  *ordering*; making the fence *enforceable* is the deployment's
-  fence backend (STONITH via managed PDU / fabric egress cutoff —
-  the fluxor rig's `kasa_local` power backend is the reference).
-  `FENCE_CONFIRM` must be proposed only by the agent that observed
-  the cutoff. This module therefore does NOT declare fluxor's
-  `fence.enforceable` capability; the fence agent does.
+  split-brain this ordering forbids), and refused `fence_stale` unless
+  it carries the **generation** that confirmation recorded. The
+  generation is the out-of-band fence agent's custody generation — what
+  `MSG_ADDR_FENCED` reports and a failover coordinator carries forward
+  as `fence_gen` — so a fence confirmed under an earlier custody never
+  admits a later takeover. One confirmed fence admits one activation;
+  the consumed fence resets. A `BIND` that changes the anchor on a
+  session flagged `SR_BIND_FENCE_REQUIRED` presents no generation and
+  is refused outright; its anchor moves only by `ACTIVATE`. The
+  registry enforces the *ordering*; making the fence *enforceable* is
+  the fence agent's job (a member placed on another node whose cut is
+  power or the fabric port — fluxor's reference agent opens the rig's
+  plug).
 - **Unsafe-recovery voiding.** `RECOVERY_MARK`
   (operator/orchestrator-proposed after any forced quorum recovery —
   force-new-cluster, quorum reduction) advances a monotone
@@ -146,7 +179,8 @@ the round-trip stays off the emit path.
   `modules/sdk/cores/nonce_reservation.rs` consumes the grants;
   protocol anchors composing it are application work in downstream
   repositories.
-- A **fence backend** (deployment infrastructure).
+- The **fence agent**: the out-of-band member that performs the cut
+  and reports the custody generation `FENCE_CONFIRM` records.
 - **Automatic unsafe-recovery detection** — the substrate has no
   force-new-cluster marker today; `RECOVERY_MARK` is the explicit,
   auditable operator hook. If the substrate grows a first-class unsafe

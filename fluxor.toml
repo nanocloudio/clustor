@@ -24,6 +24,12 @@ wave   = "0.0.1"
 # already listed). Add `rp2350` here when that backend lands.
 targets = ["bcm2712"]
 
+# The limit register's coverage half fails rather than reports. Every
+# ceiling-shaped const in a register-named file is either a row or an
+# explicit exemption, so the list is empty — and locking it here is what
+# stops it growing back one unreviewed constant at a time.
+limit_register_coverage = "fail"
+
 [ci.test]
 # Runtime gate (CI phase 3.5, after the strict module build): the
 # sequential, thread-bounded e2e suite. Without this, `fluxor ci`

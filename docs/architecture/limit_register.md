@@ -210,12 +210,149 @@ Failure to reschedule deferred work is a correctness defect.
 - The 2048-byte WAL body binds before the facade's nominal 4096-byte command.
   Either narrow the advertised facade contract or introduce deterministic
   chunking above consensus.
-- Lattice's 8164-byte memory snapshot binds before this register's 16384-byte
-  Clustor snapshot body. Snapshot compatibility is a graph property, not a
-  local constant.
-- The host test checks documented literal values against source, but it does
-  not discover a new source constant omitted here. New fixed tables, bounded
-  buffers, capacity/depth/slot constants, overwrite/drop paths, and semantic
-  fallbacks must update this register. A reverse source scan remains needed to
-  make completeness mechanical; non-constant behaviours will still need
-  review even after that guard exists.
+- Lattice's 8164-byte memory snapshot is the binding figure for a memory
+  state store; Clustor imposes no snapshot-body ceiling of its own (bodies
+  stream to and from the snapshot file). Snapshot compatibility is a graph
+  property, not a local constant.
+- Two gates cover this register, and they check different things. The host
+  test compares each row's documented value against the source. The
+  `limit-register` phase checks the block below — that every named `const`
+  is still declared where the register says, with the right-hand side the
+  register quotes — and separately COUNTS the ceiling-shaped constants in
+  register-named files that no row covers, reporting the number rather than
+  failing on it. Between them, a renamed, retuned or deleted ceiling is
+  caught; a NEW one in a file this register does not already name is not, and
+  non-constant behaviours never will be. New fixed tables, bounded buffers,
+  capacity/depth/slot constants, overwrite/drop paths and semantic fallbacks
+  must still be added here by the author who introduces them.
+
+## Machine-checked declarations
+
+The tables above are prose: the Reason column is the part that makes a
+ceiling reviewable, and prose is not parseable. This block is the same
+register in the form a gate can read — for each ceiling, the `const` and
+the file it must still be declared in, with the right-hand side compared
+as TEXT after whitespace normalisation. Comparing the expression rather
+than an evaluated number is deliberate: `256 * 1024` and a variant's
+`if VOLATILE { .. } else { .. }` are recorded as what the source says, so
+retuning one arm of a variant is drift rather than a silent pass.
+
+Every name here also appears in a table above; the gate requires it, so
+the machine-checked list and the human one cannot become two registers.
+
+```limit-register
+MAX_CHUNK_BODY | modules/app/durability/snapshot.rs | 4 * 1024
+RETENTION_FLOOR_SLOTS | modules/app/durability/wal.rs | 32
+MAX_COMMAND_BYTES | modules/common/replica_facade.rs | 4096
+MAX_ENTRY_BODY | modules/common/wal_frame.rs | 2048
+MAX_PAYLOAD | modules/common/wire.rs | 0xFFFF
+MAX_PAYLOAD | modules/common/replica_facade.rs | 0xFFFF
+MAX_NODES | modules/common/types.rs | 7
+MAX_NODES | modules/common/replica_facade.rs | 7
+K_MAX | modules/app/consensus/mod.rs | 64
+K_MAX | modules/app/durability/mod.rs | 64
+INBOX_DEPTH | modules/common/frame_inbox.rs | 16
+ARENA_BYTES | modules/app/consensus/mod.rs | 256 * 1024
+ARENA_BYTES | modules/app/durability/mod.rs | 256 * 1024
+TAIL_TERM_RING | modules/app/consensus/raft.rs | 64
+COMMIT_TS_RING | modules/app/consensus/raft.rs | 64
+MAX_INFLIGHT_PROBES | modules/app/consensus/raft.rs | 32
+PENDING_READ_SLOTS | modules/app/consensus/apply.rs | 16
+PENDING_ENTRY_SLOTS | modules/app/consensus/apply.rs | 64
+MAX_BATCH_PROPOSALS | modules/app/consensus/raft.rs | 256
+MAX_UNCOMMITTED_INFLIGHT | modules/app/consensus/raft.rs | 48
+MAX_WAL_UNACKED | modules/app/consensus/raft.rs | 256
+MAX_PENDING_WAL_REQS | modules/app/consensus/replicator.rs | 16
+PROBE_QUEUE_SLOTS | modules/app/consensus/seam.rs | 8
+CORR_RING | modules/app/gateway/codec.rs | 64
+IDX_RING | modules/app/gateway/codec.rs | 64
+CMD_RING | modules/app/operations/admin.rs | 16
+MAX_ACTIVE | modules/app/control_plane/migration.rs | 1
+TRUNCATE_HOLD_TIMEOUTS | modules/app/consensus/raft.rs | 3
+VOTING_LAG_THRESHOLD | modules/app/consensus/replicator.rs | 64
+ENVELOPE_CACHE | modules/app/operations/http.rs | 1024
+SNAP_VERIFY_CHUNK | modules/app/durability/snapshot.rs | 1024
+SNAP_CHUNK | modules/app/session_directory/mod.rs | 1024
+PEER_FP_MAX | modules/app/peer_router/mod.rs | 32
+BUF_SIZE | modules/app/peer_router/mod.rs | 8192
+EXPORT_BUF_LEN | modules/app/operations/telemetry.rs | 8192
+REPLAY_REEMIT_MAX_ATTEMPTS | modules/app/durability/wal.rs | 256
+REPLAY_GAP_TOLERANCE | modules/app/durability/wal.rs | 16
+APP_CAPTURE_TIMEOUT_TICKS | modules/app/durability/snapshot.rs | 2000
+ENV_BUF | modules/app/operations/admin.rs | 1024
+MAX_EXT_BODY | modules/app/operations/http.rs | 1024
+MAX_EXT_PATH | modules/app/operations/http.rs | 64
+MAX_EXT_REQUEST | modules/app/operations/http.rs | 8192
+RESP_SLICE | modules/app/operations/http.rs | 3072
+HTTP_INFLIGHT | modules/app/operations/http.rs | 64
+ADMIN_BODY_MAX | modules/common/http_admin.rs | 1021
+VOLATILE_RETENTION_SLOTS | modules/app/durability/wal.rs | 256
+MEMORY_RING_SIZE | modules/app/durability/wal.rs | if VOLATILE { VOLATILE_RETENTION_SLOTS } else { 1 }
+ENTRY_LOC_RING_SIZE | modules/app/durability/wal.rs | if VOLATILE { VOLATILE_RETENTION_SLOTS } else { 8192 }
+WRITE_BUF_SIZE | modules/app/durability/wal.rs | 16 * 1024
+WAL_FOOTPRINT_BUDGET | modules/app/durability/wal.rs | if VOLATILE { 600 * 1024 } else { 320 * 1024 }
+FENCE_RING_MAX | modules/app/durability/wal.rs | 8
+META_SLOTS | modules/app/consensus/raft.rs | 2
+SNAP_PTR_SLOTS | modules/app/durability/snapshot.rs | 2
+META_PATH_MAX | modules/app/consensus/raft.rs | 32
+WAL_PATH_MAX | modules/app/durability/wal.rs | 48
+SNAP_PATH_MAX | modules/app/durability/snapshot.rs | 64
+MAX_CONNS | modules/app/peer_router/mod.rs | 16384
+CONN_ID_SPACE | modules/app/peer_router/mod.rs | 65536
+ROUTE_FRAME_MAX | modules/app/peer_router/mod.rs | 4096
+MAX_LOCAL_PARTITIONS | modules/app/partition_router/mod.rs | 4
+MAX_ROUTED_PARTITIONS | modules/app/partition_router/mod.rs | 64
+NODE_SET_CAPACITY | modules/common/types.rs | 8
+DEFAULT_INFLIGHT_CAPACITY | modules/common/replica_facade.rs | 64
+SR_MAX_SESSIONS | modules/common/session_registry.rs | 64
+SR_MAX_WRAPPED_KEY | modules/common/session_registry.rs | 80
+MAX_PENDING | modules/app/session_directory/mod.rs | 16
+TM_MAX_OWNERS | modules/common/timing.rs | 4
+TM_MAX_DEADLINES | modules/common/timing.rs | 64
+IDENTITY_SLOTS | modules/app/operations/rbac.rs | 32
+SVID_PREFIX_MAX | modules/app/operations/rbac.rs | 64
+METRIC_SLOTS | modules/app/operations/telemetry.rs | 320
+SAFE_EXPORT_MAX | modules/app/operations/telemetry.rs | 7400
+MAX_ENTRY_PUMP_RECORDS | modules/app/durability/wal.rs | 8
+MAX_SYNC_FSYNC_RECORDS | modules/app/durability/wal.rs | 4
+REPLAY_FRAMES_PER_STEP | modules/app/durability/wal.rs | 4
+SCAN_RECORDS_PER_STEP | modules/app/durability/wal.rs | 16
+COMPACT_UNLINKS_PER_STEP | modules/app/durability/wal.rs | 4
+TM_BATCH_MAX | modules/common/timing.rs | 8
+```
+
+The coverage half of the gate counts every ceiling-shaped `const` in a file
+this register names and reports those no row covers. The block below is the
+machine-readable form of *What is not a row* above — each entry is a
+constant that LOOKS like a ceiling to the naming convention and is not one,
+so the count reaching zero means the register is complete rather than that
+someone stopped reading the report.
+
+```limit-register-exempt
+# Wire and on-disk record widths: a layout, not a ceiling anything reaches.
+META_FLAT_SIZE | modules/app/consensus/raft.rs | -
+META_SLOT_SIZE | modules/app/consensus/raft.rs | -
+SNAP_PTR_FLAT_SIZE | modules/app/durability/snapshot.rs | -
+SNAP_PTR_SIZE | modules/app/durability/snapshot.rs | -
+
+# Derived from a registered symbol, so they track it in source. A second
+# row here would be a second place to update and one to forget.
+PENDING_BODY_CAP | modules/app/consensus/apply.rs | -
+PROPOSAL_BATCH_CAP | modules/app/consensus/raft.rs | -
+CARRY_MAX | modules/app/consensus/mod.rs | -
+CARRY_MAX | modules/app/durability/mod.rs | -
+FSYNC_DIM_MAX | modules/app/durability/mod.rs | -
+MEMORY_ENTRY_BODY_CAP | modules/app/durability/wal.rs | -
+MAX_ENTRY_LEN | modules/common/wal_frame.rs | -
+CMD_MAX | modules/app/operations/admin.rs | -
+EXPORT_BUDGET | modules/app/operations/telemetry.rs | -
+CLIENT_FRAME_MAX | modules/app/peer_router/mod.rs | -
+INB_STASH_MAX | modules/app/peer_router/mod.rs | -
+SEND_STAGE_MAX | modules/app/peer_router/mod.rs | -
+
+# Status codes. The convention keys on the NAME, and a reply status that
+# reports exhaustion reads as a capacity — these are values on the wire,
+# and nothing is bounded by them.
+SR_ST_NO_CAPACITY | modules/common/session_registry.rs | -
+SR_ST_DEADLINE_CAPACITY | modules/common/session_registry.rs | -
+```

@@ -28,17 +28,19 @@
 //! - **Telemetry**: `MON_SESSION` lines (fluxor
 //!   `monitor-protocol.md`) on every continuity-relevant transition —
 //!   `reservation_granted`, `epoch_bump`, `fence_initiated` /
-//!   `fence_confirmed`, `unsafe_recovery_epoch_void`, `rejected` — so
+//!   `fence_confirmed`, `vip_moved` (a fenced ACTIVATE),
+//!   `unsafe_recovery_epoch_void`, `rejected` — so
 //!   a failover is legible on the same channel as the rest of the
 //!   platform.
 //!
 //! **Fence honesty (R3).** This module records fence state and the
-//! registry refuses anchor takeovers until a fence is CONFIRMED, which
-//! enforces the ordering. It cannot make a fence enforceable — that is
-//! the fence backend's job (STONITH via a managed PDU, a
-//! fabric egress cutoff; the fluxor rig's `kasa_local` power backend
-//! is the reference implementation). FENCE_CONFIRM must be proposed
-//! only by the agent that actually observed the cutoff.
+//! registry refuses an anchor takeover (ACTIVATE) until a fence is
+//! CONFIRMED against the anchor being replaced and the takeover presents
+//! that confirmation's generation, which enforces the ordering. It cannot
+//! make a fence enforceable — that is the out-of-band fence agent's job, a
+//! member placed outside the failure domain whose cut is power or the
+//! fabric port. FENCE_CONFIRM must be proposed only from the agent's own
+//! `MSG_ADDR_FENCED`, carrying the custody generation it reports.
 //!
 //! - **Deterministic timing**: this module hosts the leader-fenced time
 //!   producer for its state machine. When (and only when) this node is
@@ -63,6 +65,8 @@
 //! | 4   | logical_max_step_ms    | u32 | 60000 | Max forward movement of logical time per proposed entry (forward-jump clamp). |
 //! | 5   | clock_slew_tolerance_ms | u32 | 2000 | Wall-vs-monotonic disagreement tolerated before the backward-jump alarm. Default sized for the pi5's ~1 s-granular UNIX_MILLIS (apparent slews ≥1100 ms on healthy rigs); a tighter value false-alarms and pauses deterministic time production. |
 //! | 6   | logical_staleness_ms   | u32 | 5000 | Duration-admission freshness bound: a TTL command observed while logical time lags wall time by more than this triggers a time-freshness barrier (admission-time only). |
+//! | 7   | partition_id           | u32 | 0    | The raft group whose log this directory is. An engine hosting several groups writes them all to one committed stream; only this group's entries apply here. |
+//! | 8   | forwarded_stream       | u8  | 0    | 1 = `committed_entries` is a forwarder's selection of the group's log (this directory's entries only, in order), so an index jump is an omission, not a loss. 0 = the whole log, where a gap is a fault recovered by snapshot install. |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -86,10 +90,18 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+use abi::contracts::net::session_ctrl;
+#[path = "../../common/session_directory_face.rs"]
+mod face;
 #[path = "../../common/replica_facade.rs"]
 mod replica_facade;
 #[path = "../../common/session_registry.rs"]
 mod session_registry;
+use face::{
+    grant_command, hello_ack, reply_to_frame, request_to_command, FACE_ATTACH, FACE_DETACH,
+    FACE_EPOCH_BUMP, FACE_GRANT, FACE_NONE,
+};
+use session_ctrl as sc;
 #[path = "../../common/timing.rs"]
 mod timing;
 #[path = "../../common/wal_frame.rs"]
@@ -165,16 +177,32 @@ struct ModuleState {
     in_snapshot_request: i32,  // in[3]: MSG_APP_SNAPSHOT_REQUEST
     in_proposal_assigned: i32, // in[4]: MSG_PROPOSAL_ASSIGNED from consensus
     in_leader_state: i32,      // in[5]: MSG_LEADER_HINT from consensus
+    in_ctrl: i32,              // in[6]: SessionCtrlV1 commands from anchors
     out_proposals: i32,        // out[0]: MSG_CLIENT_PROPOSAL to consensus.proposals_tagged
     out_replies: i32,          // out[1]: MSG_SR_REPLY to requester
     out_metrics: i32,          // out[2]: MSG_METRICS to operations
     out_snapshot_export: i32,  // out[3]: MSG_APP_SNAPSHOT_CHUNK to durability
+    out_ctrl: i32,             // out[4]: SessionCtrlV1 replies and grants to anchors
 
     // Params
     replica_id: u8,
     smoke: u8,
     smoke_phase: u8,
     _pad0: u8,
+    /// The raft group this directory's log is: the committed stream
+    /// carries every group's entries, each numbered from 1, and only
+    /// this group's are applied here. A proposal the engine assigns to
+    /// another group can never be answered and is counted, not waited
+    /// for.
+    partition_id: u16,
+    /// The committed stream reaching this module is a forwarder's
+    /// selection of the group's log — this directory's own entries, in
+    /// order — rather than the whole log. An index jump is then the
+    /// forwarder's omission of other consumers' entries, not a loss,
+    /// and the cursor follows it; a lost entry of this directory's own
+    /// shows as an unanswered proposal, reclaimed by the pending TTL.
+    forwarded_stream: u8,
+    _pad4: u8,
 
     /// The replicated state machine.
     registry: SessionRegistry,
@@ -199,6 +227,11 @@ struct ModuleState {
     /// dev_millis stamp at propose time, for the TTL reclaim.
     pending_born_ms: [u64; MAX_PENDING],
     pending_used: [bool; MAX_PENDING],
+    /// The contract verb a pending proposal answers (`FACE_*`), or
+    /// `FACE_NONE` for one taken on the registry's own request port.
+    pending_face: [u8; MAX_PENDING],
+    /// The raft group the engine assigned each pending proposal to.
+    pending_part: [u16; MAX_PENDING],
 
     // Counters (metrics)
     requests_in: u32,
@@ -209,6 +242,12 @@ struct ModuleState {
     applied_ok: u32,
     applied_rejected: u32,
     stream_gaps: u32,
+    /// Committed entries of other raft groups seen on the shared stream
+    /// and left alone.
+    foreign_entries: u32,
+    /// Proposals the engine assigned to a group other than this
+    /// directory's: never applied here, never answered.
+    misrouted: u32,
 
     // ── Deterministic timing ────────────────────────────────────────
     /// Current PRG leader per MSG_LEADER_HINT (0xFF = unknown).
@@ -281,6 +320,10 @@ mod params_def {
 
         6, logical_staleness_ms, u32, 5000
             => |s, d, len| { s.logical_staleness_ms = p_u32(d, len, 0, 5000); };
+        7, partition_id, u32, 0
+            => |s, d, len| { s.partition_id = p_u32(d, len, 0, 0) as u16; };
+        8, forwarded_stream, u8, 0
+            => |s, d, len| { s.forwarded_stream = p_u8(d, len, 0, 0); };
     }
 }
 
@@ -299,6 +342,12 @@ fn next_correlation(s: &mut ModuleState) -> u64 {
 /// route the reply. Returns false when the pending table or the
 /// proposal channel is full.
 unsafe fn propose(s: &mut ModuleState, request_id: u64, body: &[u8]) -> bool {
+    propose_on(s, request_id, body, FACE_NONE)
+}
+
+/// `propose` for a command that answers a contract verb: the committed
+/// reply goes back on `ctrl_out` as that verb's frame.
+unsafe fn propose_on(s: &mut ModuleState, request_id: u64, body: &[u8], face: u8) -> bool {
     let sys = &*s.syscalls;
     let Some(slot) = (0..MAX_PENDING).find(|&i| !s.pending_used[i]) else {
         return false;
@@ -330,6 +379,7 @@ unsafe fn propose(s: &mut ModuleState, request_id: u64, body: &[u8]) -> bool {
     s.pending_idx[slot] = 0;
     s.pending_born_ms[slot] = dev_millis(sys);
     s.pending_used[slot] = true;
+    s.pending_face[slot] = face;
     s.proposals_out = s.proposals_out.saturating_add(1);
     true
 }
@@ -430,6 +480,75 @@ unsafe fn apply_timing_entry(s: &mut ModuleState, body: &[u8]) {
 
 // ── Telemetry ───────────────────────────────────────────────────────
 
+fn fmt_u32(mut v: u32, out: &mut [u8; 12]) -> &[u8] {
+    let mut i = 12;
+    if v == 0 {
+        i -= 1;
+        out[i] = b'0';
+    }
+    while v > 0 {
+        i -= 1;
+        out[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    &out[i..]
+}
+
+/// One log line per contract verdict, in the vocabulary every
+/// `session.directory` provider logs, so a rig reads this directory and
+/// any other the same way:
+///
+///   [directory] bound epoch=<e>
+///   [directory] stale epoch=<e>
+///   [directory] detached epoch=<e>
+///   [directory] granted start=<s> len=<l>
+unsafe fn log_face(s: &ModuleState, face: u8, reply: &SessionReply) {
+    let sys = &*s.syscalls;
+    let mut a = [0u8; 12];
+    let mut b = [0u8; 12];
+    let mut line = [0u8; 80];
+    let parts: [&[u8]; 4] = match (face, reply.status) {
+        (FACE_GRANT, SR_ST_OK) => [
+            b"[directory] granted start=",
+            fmt_u32(reply.a as u32, &mut a),
+            b" len=",
+            fmt_u32(reply.b as u32, &mut b),
+        ],
+        (FACE_GRANT, _) => return,
+        (FACE_DETACH, SR_ST_OK) => [
+            b"[directory] detached epoch=",
+            fmt_u32(reply.epoch, &mut a),
+            b"",
+            b"",
+        ],
+        (_, SR_ST_OK) => [
+            b"[directory] bound epoch=",
+            fmt_u32(reply.epoch, &mut a),
+            b"",
+            b"",
+        ],
+        (_, SR_ST_STALE_EPOCH) => [
+            b"[directory] stale epoch=",
+            fmt_u32(reply.epoch, &mut a),
+            b"",
+            b"",
+        ],
+        _ => [
+            b"[directory] refused epoch=",
+            fmt_u32(reply.epoch, &mut a),
+            b"",
+            b"",
+        ],
+    };
+    let mut p = 0usize;
+    for part in parts {
+        let n = part.len().min(80 - p);
+        line[p..p + n].copy_from_slice(&part[..n]);
+        p += n;
+    }
+    dev_log(sys, 3, line.as_ptr(), p);
+}
+
 /// Emit a MON_SESSION line for a committed registry transition.
 unsafe fn mon_reply(s: &mut ModuleState, reply: &SessionReply) {
     let sys = &*s.syscalls;
@@ -444,6 +563,7 @@ unsafe fn mon_reply(s: &mut ModuleState, reply: &SessionReply) {
             SR_ST_STALE_EPOCH => b"stale_epoch",
             SR_ST_RECOVERY_VOID => b"recovery_void",
             SR_ST_FENCE_REQUIRED => b"fence_required",
+            SR_ST_FENCE_STALE => b"fence_stale",
             SR_ST_FLOOR_REGRESSION => b"floor_regression",
             SR_ST_UNKNOWN_SESSION => b"unknown_session",
             SR_ST_NO_CAPACITY => b"no_capacity",
@@ -453,11 +573,17 @@ unsafe fn mon_reply(s: &mut ModuleState, reply: &SessionReply) {
         (MON_EV_REJECTED, reason)
     } else {
         match reply.op {
+            // A first binding attaches; a binding advanced to a new
+            // generation relocated.
+            SR_OP_BIND if reply.a == 0 => (MON_EV_ATTACHED, b""),
             SR_OP_BIND => (MON_EV_RELOCATED, b""),
             SR_OP_EPOCH_BUMP => (MON_EV_EPOCH_BUMP, b""),
             SR_OP_RESERVE => (MON_EV_RESERVATION_GRANTED, b""),
             SR_OP_FENCE_REQUEST => (MON_EV_FENCE_INITIATED, b""),
             SR_OP_FENCE_CONFIRM => (MON_EV_FENCE_CONFIRMED, b""),
+            // The fenced takeover: the attachment's anchor moved, which
+            // is what lets the address follow it.
+            SR_OP_ACTIVATE => (MON_EV_VIP_MOVED, b""),
             SR_OP_UNBIND => (MON_EV_DETACHED, b""),
             SR_OP_RECOVERY_MARK => (MON_EV_UNSAFE_RECOVERY_EPOCH_VOID, b""),
             // KEY_PUT / KEY_WIPE / RX_FLOOR are deliberately silent:
@@ -526,10 +652,12 @@ pub extern "C" fn module_new(
         s.in_snapshot_request = dev_channel_port(sys, 0, 3);
         s.in_proposal_assigned = dev_channel_port(sys, 0, 4);
         s.in_leader_state = dev_channel_port(sys, 0, 5);
+        s.in_ctrl = dev_channel_port(sys, 0, 6);
         s.out_proposals = out_chan;
         s.out_replies = dev_channel_port(sys, 1, 1);
         s.out_metrics = dev_channel_port(sys, 1, 2);
         s.out_snapshot_export = dev_channel_port(sys, 1, 3);
+        s.out_ctrl = dev_channel_port(sys, 1, 4);
 
         s.replica_id = 0;
         s.smoke = 0;
@@ -550,6 +678,8 @@ pub extern "C" fn module_new(
         s.applied_ok = 0;
         s.applied_rejected = 0;
         s.stream_gaps = 0;
+        s.foreign_entries = 0;
+        s.misrouted = 0;
         s.leader_id = 0xFF;
         s.pause_reason = wire::TIMING_PAUSE_NOT_LEADER;
         s._pad3 = [0; 2];
@@ -618,8 +748,32 @@ unsafe fn apply_committed(s: &mut ModuleState, index: u64, command: &[u8]) {
     };
     s.pending_used[slot] = false;
     let request_id = s.pending_req[slot];
+    let face = s.pending_face[slot];
+    s.pending_face[slot] = FACE_NONE;
 
     smoke_advance(s, &reply);
+
+    if face != FACE_NONE {
+        let sys = &*s.syscalls;
+        log_face(s, face, &reply);
+        let mut out = [0u8; 64];
+        if s.out_ctrl >= 0 {
+            if let Some((msg, n)) = reply_to_frame(face, &reply, &mut out) {
+                let wrote = wire_channels::channel_write_msg(sys, s.out_ctrl, msg, &out[..n]);
+                if wrote > 0 {
+                    s.replies_out = s.replies_out.saturating_add(1);
+                }
+            }
+        }
+        // A binding the anchor now holds is granted its first block of
+        // egress-counter values under the epoch it holds it at.
+        if reply.status == SR_ST_OK && (face == FACE_ATTACH || face == FACE_EPOCH_BUMP) {
+            let mut body = [0u8; SR_MAX_CMD];
+            let n = grant_command(&reply.session_id, reply.epoch, &mut body);
+            let _ = propose_on(s, 0, &body[..n], FACE_GRANT);
+        }
+        return;
+    }
 
     if s.out_replies >= 0 && request_id != 0 {
         let sys = &*s.syscalls;
@@ -715,6 +869,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.msg_buf[6],
                     s.msg_buf[7],
                 ]);
+                let partition = u16::from_le_bytes([s.msg_buf[8], s.msg_buf[9]]);
                 let wal_index = u64::from_le_bytes([
                     s.msg_buf[10],
                     s.msg_buf[11],
@@ -728,6 +883,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 for i in 0..MAX_PENDING {
                     if s.pending_used[i] && s.pending_corr[i] == corr {
                         s.pending_idx[i] = wal_index;
+                        s.pending_part[i] = partition;
+                        if partition != s.partition_id {
+                            s.misrouted = s.misrouted.saturating_add(1);
+                            dev_log(sys, 2, b"[sess_dir] misrouted".as_ptr(), 20);
+                        }
                         break;
                     }
                 }
@@ -760,6 +920,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 continue;
             }
             let plen = plen as usize;
+            match wire::decode_committed_entry_hdr(&s.msg_buf[..plen]) {
+                Some((partition, _, _)) if partition != s.partition_id => {
+                    s.foreign_entries = s.foreign_entries.saturating_add(1);
+                    continue;
+                }
+                _ => {}
+            }
             match s.subscriber.ingest_committed_entry(&s.msg_buf[..plen]) {
                 Ok(entry) => {
                     // Copy the command out of msg_buf so apply can
@@ -769,6 +936,22 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     cmd[..n].copy_from_slice(&entry.command[..n]);
                     let index = entry.index;
                     apply_committed(s, index, &cmd[..n]);
+                }
+                Err(CommitOrderError::GapInPerEntryStream { observed, .. })
+                    if s.forwarded_stream != 0 =>
+                {
+                    // A forwarder handed us the next of OUR entries; the
+                    // indices it skipped were other consumers'. Follow it.
+                    let term = wire::decode_committed_entry_hdr(&s.msg_buf[..plen])
+                        .map_or(0, |(_, term, _)| term);
+                    s.subscriber.reset_to(observed - 1, term);
+                    if let Ok(entry) = s.subscriber.ingest_committed_entry(&s.msg_buf[..plen]) {
+                        let mut cmd = [0u8; 2 + SR_MAX_CMD];
+                        let n = entry.command.len().min(cmd.len());
+                        cmd[..n].copy_from_slice(&entry.command[..n]);
+                        let index = entry.index;
+                        apply_committed(s, index, &cmd[..n]);
+                    }
                 }
                 Err(CommitOrderError::GapInPerEntryStream { .. }) => {
                     s.stream_gaps = s.stream_gaps.saturating_add(1);
@@ -822,6 +1005,48 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 // requester retries on reply timeout. Dropping beats
                 // wedging the ring.
                 let _ = propose(s, request_id, &body[..blen]);
+            }
+        }
+
+        // 2b) The contract's verbs from anchors. HELLO is answered here;
+        //     everything else is a replicated command answered after
+        //     commit, on the frame its face names.
+        if s.in_ctrl >= 0 {
+            for _ in 0..8 {
+                let has_free = s.pending_used.iter().any(|u| !u);
+                if !has_free {
+                    break;
+                }
+                let Some((msg_type, plen)) =
+                    wire_channels::next_msg(sys, s.in_ctrl, &mut s.msg_buf)
+                else {
+                    break;
+                };
+                let plen = plen as usize;
+                if msg_type == sc::CMD_SC_HELLO {
+                    let mut ack = [0u8; 16];
+                    let n = hello_ack(s.replica_id, &mut ack);
+                    dev_log(sys, 3, b"[directory] hello".as_ptr(), 17);
+                    if s.out_ctrl >= 0 {
+                        let _ = wire_channels::channel_write_msg(
+                            sys,
+                            s.out_ctrl,
+                            sc::MSG_SC_HELLO_ACK,
+                            &ack[..n],
+                        );
+                    }
+                    continue;
+                }
+                let mut payload = [0u8; 64];
+                let take = plen.min(64);
+                payload[..take].copy_from_slice(&s.msg_buf[..take]);
+                let mut body = [0u8; SR_MAX_CMD];
+                let Some((blen, face)) = request_to_command(msg_type, &payload[..take], &mut body)
+                else {
+                    continue;
+                };
+                s.requests_in = s.requests_in.saturating_add(1);
+                let _ = propose_on(s, 0, &body[..blen], face);
             }
         }
 
