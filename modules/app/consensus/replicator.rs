@@ -78,6 +78,14 @@ struct PeerState {
     /// via WAL read-back or by recording the per-batch tip.
     prev_log_index: Index,
     prev_log_term: Term,
+    /// Steps left on an outstanding snapshot install request. Non-zero
+    /// holds this peer's WAL read-backs: the WAL has already said it no
+    /// longer serves the peer's `next_index`, so re-asking every step
+    /// only turns each NOT_FOUND into another install request and
+    /// another manifest on the wire. A successful ack clears it; the
+    /// countdown re-arms the request for a peer whose link is down or
+    /// whose install was lost.
+    snapshot_hold: u16,
 }
 
 impl PeerState {
@@ -99,6 +107,7 @@ impl PeerState {
             voting: false,
             prev_log_index: 0,
             prev_log_term: 0,
+            snapshot_hold: 0,
         }
     }
 }
@@ -144,6 +153,13 @@ impl PendingWalReq {
 /// reply that is merely still in transit. Matches the inflight-decay
 /// horizon (`PeerState::inflight_age`).
 const PENDING_WAL_REQ_TTL: u16 = 500;
+
+/// Steps a snapshot install request stays outstanding for a peer
+/// before the next NOT_FOUND may raise another. One manifest per hold
+/// per lagging peer is the ceiling on install traffic; a peer that
+/// installs acks well inside it, and one that cannot be reached costs
+/// one routed frame per hold instead of one per step.
+const SNAPSHOT_REQUEST_HOLD: u16 = 500;
 
 #[repr(C)]
 pub struct Repl {
@@ -579,6 +595,10 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                             peer.inflight -= 1;
                         }
                         peer.inflight_age = 0;
+                        // A successful ack places the peer: whatever
+                        // install was outstanding is either done or
+                        // no longer the shortest path forward.
+                        peer.snapshot_hold = 0;
                         if index > peer.match_index {
                             peer.match_index = index;
                             peer.next_index = index + 1;
@@ -715,6 +735,9 @@ unsafe fn drive_catchup(s: &mut Repl, sys: &SyscallTable) {
                 s.peers[i].inflight_age = 0;
             }
         }
+        if s.peers[i].snapshot_hold > 0 {
+            s.peers[i].snapshot_hold -= 1;
+        }
     }
 
     // AppendEntries is leader-only. A follower (or a demoted ex-leader,
@@ -821,11 +844,11 @@ unsafe fn issue_wal_request(s: &mut Repl, sys: &SyscallTable, peer: u8, wal_inde
     // don't reissue for this peer — the per-step renudge would
     // otherwise re-read and re-ship the same entries every tick until
     // the acks round-trip. Probes are exempt (they don't ship).
-    if peer != PROBE_PEER
-        && (peer as usize) < MAX_NODES
-        && s.peers[peer as usize].inflight >= CATCHUP_WINDOW
-    {
-        return;
+    if peer != PROBE_PEER && (peer as usize) < MAX_NODES {
+        let state = &s.peers[peer as usize];
+        if state.inflight >= CATCHUP_WINDOW || state.snapshot_hold > 0 {
+            return;
+        }
     }
 
     // A request for this (peer, index) is already in flight: leave it
@@ -926,6 +949,7 @@ pub unsafe fn on_voter_set(
                 voting: false,
                 prev_log_index: 0,
                 prev_log_term: 0,
+                snapshot_hold: 0,
             };
             dev_log(sys, 3, b"[repl] new peer".as_ptr(), 15);
         } else if !in_union && s.peers[i].active {
@@ -1061,11 +1085,19 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
     }
 
     // term == 0 (header-only NOT_FOUND reply) means the WAL doesn't have the
-    // index any more — snapshot install is the recovery path. An empty BODY
-    // with a real term is a leader-election no-op entry and ships like any
-    // other.
+    // index. At or below this node's tip the entry has been retired and
+    // snapshot install is the only recovery path: one request per hold,
+    // since the read-backs already in flight for this peer answer
+    // NOT_FOUND too and must not each raise their own. Beyond the tip
+    // there is nothing to install — a nack carries the follower's own
+    // last index, which can exceed ours when its log is longer — and the
+    // next append at the tip repairs it. An empty BODY with a real term
+    // is a leader-election no-op entry and ships like any other.
     if term == 0 {
-        request_snapshot_install(s, sys, peer);
+        if index <= s.last_emitted_index && s.peers[peer as usize].snapshot_hold == 0 {
+            s.peers[peer as usize].snapshot_hold = SNAPSHOT_REQUEST_HOLD;
+            request_snapshot_install(s, sys, peer);
+        }
         return;
     }
 

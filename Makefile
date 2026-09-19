@@ -102,3 +102,7 @@ e2e:
 	# serialise the binary like the other port-heavy suites.
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test volatile_cluster -- --test-threads=1
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test session_directory_e2e --test timing_cluster_e2e -- --test-threads=1
+	# ring_parity proves the kernel-ring and channel histogram wires agree.
+	# Its export hook is env-driven, and env is process-global, so it is
+	# its own binary rather than a case in cluster.rs.
+	CLUSTOR_REQUIRE_E2E=1 cargo test --test ring_parity

@@ -238,9 +238,13 @@ Snapshots are per-partition and manifest-plus-body
 
 **Triggers.** The WAL fires a trigger at every segment rotation; an
 external `trigger` port accepts `MSG_SNAPSHOT_TRIGGER` from admin
-tooling or coordinators; and the replicator requests a re-broadcast
+tooling or coordinators; and the replicator requests an install
 (`MSG_SNAPSHOT_INSTALL_REQUEST`) when a follower's `next_index` falls
-below the leader's WAL retention floor. Every trigger passes the
+below the leader's WAL retention floor. That request is held open per
+follower for `SNAPSHOT_REQUEST_HOLD` steps: the follower's read-backs
+pause while it stands, a successful ack releases it, and the hold
+expiring re-raises it, so an unreachable follower costs one routed
+manifest per hold rather than one per step. Every trigger passes the
 retention-floor gate: a snapshot at index *n* implies compaction below
 *n*, so any registered consumer floor still below *n* defers the
 trigger.

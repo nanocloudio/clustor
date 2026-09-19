@@ -536,20 +536,20 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             }
         }
         // At most one demand capture per step, and none while an app
-        // capture is already in flight (requests re-arrive every
-        // follower renudge; funnelling them all into on_trigger would
-        // spam triggers_deferred without adding work).
+        // capture is already in flight (each lagging follower re-raises
+        // its request once per hold; funnelling them all into
+        // on_trigger would spam triggers_deferred without adding work).
         if demand_trigger && !s.app_capture_pending && hw_index > 0 {
-            // Debug, not info: install requests re-arrive on every
-            // follower renudge, and a blocked retention floor or a
-            // refused app capture leaves this branch re-entered.
+            // Debug, not info: a blocked retention floor or a refused
+            // app capture leaves this branch re-entered on every
+            // re-raised request.
             dev_log(sys, 4, b"[snap] demand trigger".as_ptr(), 21);
             if on_trigger(s, sys, hw_term, hw_index) {
                 cold_fs = true;
             }
             // Manifest-only graphs finalise synchronously: the NEXT
-            // request (the follower re-requests on a steady cadence)
-            // is served from `last_snapshot_index`. App-state graphs
+            // request (re-raised when the follower's hold expires) is
+            // served from `last_snapshot_index`. App-state graphs
             // finalise via the app-body path above.
         }
     }
@@ -581,9 +581,6 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                 ]) as usize;
                 let done = s.msg_buf[24] != 0;
                 let body_len = pl - wire::APP_SNAPSHOT_HDR;
-                // Strict in-order accumulation; a gap or an oversized
-                // body aborts the capture and the next rotation
-                // re-requests.
                 // Strict in-order accumulation, streamed straight to
                 // the snapshot file: a captured body is bounded by the
                 // filesystem, not by module state. An install in flight
