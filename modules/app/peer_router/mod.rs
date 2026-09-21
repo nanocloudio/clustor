@@ -127,6 +127,14 @@ const ROUTE_FRAMES_PER_STEP: usize = 128;
 const SEND_STAGE_MAX: usize = 2 + wire::PARTITIONED_HDR + ROUTE_FRAME_MAX;
 const METRICS_INTERVAL_MS: u64 = 1000;
 const RECONNECT_MS: u64 = 2000;
+
+/// Longest peer authority kept, `host[:port]`. A 63-byte label with a port
+/// fits; a longer one is left unconfigured rather than truncated into a
+/// different host.
+const PEER_AUTHORITY_MAX: usize = 64;
+/// The port a peer authority takes when it names none: the port a node of
+/// this cluster listens on, because they are alike.
+const PEER_DEFAULT_PORT: u16 = 9090;
 /// A `connected` peer silent this long is deemed a dead/half-open link and
 /// torn down for reconnection. Held WELL above the Raft heartbeat/election
 /// cadence so a healthy peer is never dropped — and deliberately generous
@@ -156,91 +164,40 @@ define_params! {
     3, listen_port, u16, 9090
         => |s, d, len| { s.listen_port = p_u16(d, len, 0, 9090); };
 
-    4, peer0_port, u16, 0
-        => |s, d, len| { configure_peer(s, 0, p_u16(d, len, 0, 0)); };
+    // Tags 4-13 are retired: a peer was a port beside a host, written twice.
+    // A peer is now one authority.
 
-    5, peer1_port, u16, 0
-        => |s, d, len| { configure_peer(s, 1, p_u16(d, len, 0, 0)); };
-
-    6, peer2_port, u16, 0
-        => |s, d, len| { configure_peer(s, 2, p_u16(d, len, 0, 0)); };
-
-    7, peer3_port, u16, 0
-        => |s, d, len| { configure_peer(s, 3, p_u16(d, len, 0, 0)); };
-
-    8, peer4_port, u16, 0
-        => |s, d, len| { configure_peer(s, 4, p_u16(d, len, 0, 0)); };
-
-    // Per-peer IPv4 host overrides for cross-machine clusters
-    // (dotted-quad strings). Default (absent / unparseable) stays
-    // 127.0.0.1, so single-machine templates work unchanged.
-    9, peer0_host, str, 0
-        => |s, d, len| { configure_peer_host(s, 0, d, len); };
-    10, peer1_host, str, 0
-        => |s, d, len| { configure_peer_host(s, 1, d, len); };
-    11, peer2_host, str, 0
-        => |s, d, len| { configure_peer_host(s, 2, d, len); };
-    12, peer3_host, str, 0
-        => |s, d, len| { configure_peer_host(s, 3, d, len); };
-    13, peer4_host, str, 0
-        => |s, d, len| { configure_peer_host(s, 4, d, len); };
+    // Each peer as `host[:port]` — a DNS name the network provider resolves,
+    // or a literal. Port 9090 when the authority names none, matching
+    // `listen_port`, because a cluster of like nodes listens where it dials.
+    14, peer0, str, 0
+        => |s, d, len| { configure_peer(s, 0, d, len); };
+    15, peer1, str, 0
+        => |s, d, len| { configure_peer(s, 1, d, len); };
+    16, peer2, str, 0
+        => |s, d, len| { configure_peer(s, 2, d, len); };
+    17, peer3, str, 0
+        => |s, d, len| { configure_peer(s, 3, d, len); };
+    18, peer4, str, 0
+        => |s, d, len| { configure_peer(s, 4, d, len); };
 }
 
-fn configure_peer(s: &mut ModuleState, idx: usize, port: u16) {
-    if idx < MAX_NODES && port > 0 {
-        if s.peer_addrs[idx].ip == 0 {
-            s.peer_addrs[idx].ip = 0x7F000001; // 127.0.0.1 (host LE)
-        }
-        s.peer_addrs[idx].port = port;
-        s.peer_addrs[idx].configured = true;
-    }
-}
-
-/// Parse a dotted-quad IPv4 param into the peer's address (host
-/// LE byte order, matching `configure_peer`'s localhost default).
-/// Order-independent with the port param: a host arriving before
-/// OR after peer{N}_port wins over the localhost default.
-unsafe fn configure_peer_host(s: &mut ModuleState, idx: usize, d: *const u8, len: usize) {
-    if idx >= MAX_NODES || d.is_null() || len == 0 || len > 15 {
+/// Adopt a peer's authority, `host[:port]`. A peer that does not fit the
+/// buffer or does not parse is left unconfigured rather than dialled at a
+/// truncated name, which would be a different host.
+unsafe fn configure_peer(s: &mut ModuleState, idx: usize, d: *const u8, len: usize) {
+    if idx >= MAX_NODES || d.is_null() || len == 0 || len > PEER_AUTHORITY_MAX {
         return;
     }
-    let mut octets = [0u32; 4];
-    let mut oct = 0usize;
-    let mut cur: u32 = 0;
-    let mut digits = 0u8;
-    let mut i = 0usize;
-    while i < len {
-        let c = *d.add(i);
-        match c {
-            b'0'..=b'9' => {
-                cur = cur * 10 + (c - b'0') as u32;
-                digits += 1;
-                if digits > 3 || cur > 255 {
-                    return;
-                }
-            }
-            b'.' => {
-                if digits == 0 || oct >= 3 {
-                    return;
-                }
-                octets[oct] = cur;
-                oct += 1;
-                cur = 0;
-                digits = 0;
-            }
-            _ => return,
-        }
-        i += 1;
-    }
-    if digits == 0 || oct != 3 {
+    let text = core::slice::from_raw_parts(d, len);
+    let Some((_, port)) = net_proto::Target::parse(text) else {
         return;
-    }
-    octets[3] = cur;
-    let ip = (octets[0] << 24) | (octets[1] << 16) | (octets[2] << 8) | octets[3];
-    if ip == 0 {
-        return;
-    }
-    s.peer_addrs[idx].ip = ip;
+    };
+    let peer = &mut s.peer_addrs[idx];
+    peer.authority[..len].copy_from_slice(text);
+    peer.authority_len = len as u8;
+    peer.port = port.unwrap_or(PEER_DEFAULT_PORT);
+    peer.configured = true;
 }
 
 // net_proto stream contract — the SDK contract mounted through
@@ -257,7 +214,7 @@ const NMSG_CONNOK: u8 = net_proto::MSG_CONNECTED;
 const NCMD_BIND: u8 = net_proto::CMD_BIND;
 const NCMD_SEND: u8 = net_proto::CMD_SEND;
 const NCMD_CLOSE: u8 = net_proto::CMD_CLOSE;
-const NCMD_CONNECT: u8 = net_proto::CMD_CONNECT;
+const NCMD_CONNECT_TO: u8 = net_proto::CMD_CONNECT_TO;
 const NSOCK_STREAM: u8 = net_proto::SOCK_TYPE_STREAM;
 
 // Identity handshake: first message on any peer connection.
@@ -329,7 +286,10 @@ impl Conn {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PeerAddr {
-    ip: u32,
+    /// The peer as configured, `host[:port]`, dialled verbatim.
+    authority: [u8; PEER_AUTHORITY_MAX],
+    authority_len: u8,
+    /// The authority's port, or [`PEER_DEFAULT_PORT`] when it names none.
     port: u16,
     configured: bool,
     connected: bool,
@@ -347,7 +307,8 @@ struct PeerAddr {
 impl PeerAddr {
     const fn empty() -> Self {
         Self {
-            ip: 0,
+            authority: [0; PEER_AUTHORITY_MAX],
+            authority_len: 0,
             port: 0,
             configured: false,
             connected: false,
@@ -411,16 +372,13 @@ struct ModuleState {
 
     // State
     bound: bool,
-    /// Set once we've warned that a `MSG_ACCEPTED` arrived WITHOUT a
-    /// stamped listener port (`payload_len < 4`). On a shared
-    /// linux_net/ip provider that means we cannot tell our own client
-    /// conns from another anchor's (e.g. the operations HTTP diagnostic
-    /// port) and fall back to claiming everything — which silently
-    /// misroutes the other anchor's bytes here as bogus client
-    /// proposals. The modern provider stamps the port (fluxor
-    /// `c8331d4`); seeing this warning means the runtime is stale or
-    /// a legacy provider is in use. Warn once, not per-accept.
-    legacy_accept_warned: bool,
+    /// Set once we've warned about a `MSG_ACCEPTED` that carried no
+    /// listener port (`payload_len < 4`). The contract stamps the
+    /// accepting port on every accept, so a frame without one is
+    /// malformed and is dropped: claiming it on a shared provider would
+    /// pull another anchor's connection in here as a bogus client
+    /// proposal. Warn once, not per-accept.
+    short_accept_warned: bool,
 
     /// Retained inbound peer chunk whose destination channel could not
     /// accept it (length 0 = empty). `process_net_events` stops
@@ -581,6 +539,7 @@ pub extern "C" fn module_new(
         s.out_stash_partition = 0;
         s.tx_refused = 0;
         s.tx_stalled = false;
+        s.short_accept_warned = false;
         s.rx_by_replica = [0; MAX_NODES];
         s.tx_by_replica = [0; MAX_NODES];
         s.inb_stalls = 0;
@@ -870,17 +829,30 @@ unsafe fn connect_peers(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
             return;
         }
 
-        // CMD_CONNECT payload: [sock_type:1] [ip:4 LE] [port:2 LE]
-        let mut payload = [0u8; 7];
-        payload[0] = NSOCK_STREAM;
-        payload[1..5].copy_from_slice(&s.peer_addrs[i].ip.to_le_bytes());
-        payload[5..7].copy_from_slice(&s.peer_addrs[i].port.to_le_bytes());
+        // The peer is dialled by the authority it was configured with: a
+        // name goes to the network provider as a name, for it to resolve.
+        let peer = &s.peer_addrs[i];
+        let text = &peer.authority[..peer.authority_len as usize];
+        let Some((target, _)) = net_proto::Target::parse(text) else {
+            continue;
+        };
+        let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
+        let n = net_proto::write_connect_to(
+            &mut payload,
+            NSOCK_STREAM,
+            peer.port,
+            &target,
+            Some(dev_requester_tag(sys)),
+        );
+        if n == 0 {
+            continue;
+        }
         net_write_frame(
             sys,
             s.net_out,
-            NCMD_CONNECT,
+            NCMD_CONNECT_TO,
             payload.as_ptr(),
-            7,
+            n,
             s.buf.as_mut_ptr(),
             BUF_SIZE,
         );
@@ -1021,26 +993,20 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                 // this filter peer_router would alloc a slot for a
                 // diagnostic HTTP connection and forward its raw HTTP
                 // bytes to the gateway as a bogus client proposal.
-                let local_port = if payload_len >= 4 {
-                    u16::from_le_bytes([s.buf[NET_FRAME_HDR + 2], s.buf[NET_FRAME_HDR + 3]])
-                } else {
-                    // Legacy providers that omit the port: claim as before.
-                    // On a shared provider this misroutes other anchors'
-                    // conns (e.g. the HTTP diagnostic port) here as bogus client
-                    // proposals — warn once so a stale runtime is visible
-                    // rather than a silent double-processing bug.
-                    if !s.legacy_accept_warned {
-                        s.legacy_accept_warned = true;
-                        dev_log(
-                            sys,
-                            2,
-                            b"[pr] accept w/o port stamp; stale runtime?".as_ptr(),
-                            42,
-                        );
+                if payload_len < 4 {
+                    // No port to filter on. Claiming it would take whatever
+                    // the provider accepted, on any listener, as a client of
+                    // this router. Warn once and drop it.
+                    if !s.short_accept_warned {
+                        s.short_accept_warned = true;
+                        let m = b"[pr] MSG_ACCEPTED without a listener port; dropped";
+                        dev_log(sys, 2, m.as_ptr(), m.len());
                     }
-                    s.listen_port
-                };
-                if payload_len >= 2 && local_port == s.listen_port {
+                    continue;
+                }
+                let local_port =
+                    u16::from_le_bytes([s.buf[NET_FRAME_HDR + 2], s.buf[NET_FRAME_HDR + 3]]);
+                if local_port == s.listen_port {
                     reap_conn_id(s, sys, conn_id);
                     if let Some(slot) = alloc_conn(s) {
                         register_conn(s, slot, conn_id, false);
@@ -1048,9 +1014,17 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                 }
             }
             NMSG_CONNOK => {
-                // Outbound connection established — send identity
+                // Outbound connection established — send identity. Claimed by
+                // requester tag, so a fanned `net_out` hands this module only
+                // the connections it dialled.
+                let tag = if payload_len > net_proto::CONN_ID_LEN {
+                    s.buf[NET_FRAME_HDR + net_proto::CONN_ID_LEN]
+                } else {
+                    net_proto::REQUESTER_TAG_NONE
+                };
+                let mine = tag == dev_requester_tag(sys) || tag == net_proto::REQUESTER_TAG_NONE;
                 dev_log(sys, 2, b"[pr] dial-ok".as_ptr(), 11);
-                if payload_len >= 2 {
+                if payload_len >= 2 && mine {
                     reap_conn_id(s, sys, conn_id);
                     if let Some(slot) = alloc_conn(s) {
                         register_conn(s, slot, conn_id, true);
@@ -1458,7 +1432,12 @@ unsafe fn handle_identity(
 /// Caller must hold an exclusive `&mut ModuleState` and supply a
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn ingest_peer_bytes(s: &mut ModuleState, sys: &SyscallTable, rid: u8, bytes: &[u8]) -> bool {
+unsafe fn ingest_peer_bytes(
+    s: &mut ModuleState,
+    sys: &SyscallTable,
+    rid: u8,
+    bytes: &[u8],
+) -> bool {
     let r = rid as usize;
     let tail = s.peer_tail_len[r] as usize;
     let mut assembled = [0u8; INB_STASH_MAX];
@@ -2069,7 +2048,9 @@ fn bind_replica(s: &mut ModuleState, slot: usize, replica_id: u8) {
 /// Forget which replica `slot` links to, in the slot and in the index.
 fn unbind_replica(s: &mut ModuleState, slot: usize) {
     let rid = s.conns[slot].replica_id;
-    if rid >= 0 && (rid as usize) < MAX_NODES && s.slot_by_replica[rid as usize] == (slot + 1) as u16
+    if rid >= 0
+        && (rid as usize) < MAX_NODES
+        && s.slot_by_replica[rid as usize] == (slot + 1) as u16
     {
         s.slot_by_replica[rid as usize] = 0;
     }

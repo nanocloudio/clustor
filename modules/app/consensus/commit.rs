@@ -22,7 +22,7 @@ const METRICS_INTERVAL_MS: u64 = 1000;
 #[repr(C)]
 pub struct Commit {
     // Channels
-    pub in_durable: i32,          // in: DurabilityProof from durability's ledger
+    pub in_durable: i32, // in: DurabilityProof from durability's ledger
     /// Set when the ENGINE routed a proof into this slot. K slots share
     /// one `in_durable` handle, so a slot cannot drain it itself — see
     /// `apply_durability_proof`.

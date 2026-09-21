@@ -89,6 +89,7 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Cached small HTTP envelopes | `ENVELOPE_CACHE` | modules/app/operations/http.rs | 1024 | Shape: bounds the cached `/readyz` and `/why` envelopes, which carry a single status byte. |
 | Snapshot verify read granularity | `SNAP_VERIFY_CHUNK` | modules/app/durability/snapshot.rs | 1024 | Shape: read granularity for the finalise-time CRC pass and the boot-time integrity check. A stack buffer, not module state — snapshot bodies are streamed, never held whole. |
 | Session-registry snapshot chunk | `SNAP_CHUNK` | modules/app/session_directory/mod.rs | 1024 | Shape: export chunk body. `SessionRegistry::SNAPSHOT_LEN` is ~13 KiB (64 session slots plus the timing section), so an export runs to fourteen chunks. |
+| Peer authority | `PEER_AUTHORITY_MAX` | modules/app/peer_router/mod.rs | 64 | Shape: the longest `host[:port]` a `peerN` parameter carries. A 63-byte DNS label with a port fits, which is the longest single label the wire allows; a longer value leaves that peer unconfigured rather than truncated, because a prefix of a name is a different host. One buffer per peer in module state, so the cost is `MAX_NODES × 64` B. |
 | Peer key fingerprint | `PEER_FP_MAX` | modules/app/peer_router/mod.rs | 32 | Shape: longest key fingerprint `MSG_PEER_IDENTITY` carries (SHA-256). |
 | Peer/client connection staging | `BUF_SIZE` | modules/app/peer_router/mod.rs | 8192 | Shape: per-connection staging, pinned to fluxor's `CHANNEL_BUFFER_SIZE` — nothing larger can transit a channel. Undersizing this drops frames silently at every hop (`channel_read_msg` discards oversized payloads, encoders return 0): followers wedge on the replication path and clients time out on the response path. |
 | `/metrics` export staging | `EXPORT_BUF_LEN` | modules/app/operations/telemetry.rs | 8192 | Capacity: one full channel ring. `SAFE_EXPORT_MAX` is the byte budget actually applied when building the payload, so an export always fits one atomic frame. |
@@ -273,6 +274,7 @@ VOTING_LAG_THRESHOLD | modules/app/consensus/replicator.rs | 64
 ENVELOPE_CACHE | modules/app/operations/http.rs | 1024
 SNAP_VERIFY_CHUNK | modules/app/durability/snapshot.rs | 1024
 SNAP_CHUNK | modules/app/session_directory/mod.rs | 1024
+PEER_AUTHORITY_MAX | modules/app/peer_router/mod.rs | 64
 PEER_FP_MAX | modules/app/peer_router/mod.rs | 32
 BUF_SIZE | modules/app/peer_router/mod.rs | 8192
 EXPORT_BUF_LEN | modules/app/operations/telemetry.rs | 8192

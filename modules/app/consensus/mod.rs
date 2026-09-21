@@ -872,7 +872,11 @@ unsafe fn demux_partitioned(
                 let len = s.carry[carry_idx].len as usize;
                 let placed = {
                     let (carry, slots) = (&s.carry[carry_idx], &mut s.slots);
-                    inbox_for(&mut slots[slot], carry_idx, mt, which).push(sys, mt, &carry.buf[..len])
+                    inbox_for(&mut slots[slot], carry_idx, mt, which).push(
+                        sys,
+                        mt,
+                        &carry.buf[..len],
+                    )
                 };
                 if !placed {
                     // Arena exhausted; keep holding and retry next step.
@@ -978,14 +982,11 @@ unsafe fn route_durability_proofs(s: &mut ModuleState, sys: &SyscallTable) {
     }
     let budget = 32 * s.active_slots.max(1) as usize;
     for _ in 0..budget {
-        let Some((msg_type, plen)) =
-            wire_channels::next_msg(sys, s.durable_chan, &mut s.msg_buf)
+        let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.durable_chan, &mut s.msg_buf)
         else {
             break;
         };
-        if msg_type != wire::MSG_DURABILITY_PROOF
-            || (plen as usize) < wire::DURABILITY_PROOF_LEN
-        {
+        if msg_type != wire::MSG_DURABILITY_PROOF || (plen as usize) < wire::DURABILITY_PROOF_LEN {
             continue;
         }
         let Some((partition_id, term, index, _replica)) =
@@ -1002,9 +1003,19 @@ unsafe fn route_durability_proofs(s: &mut ModuleState, sys: &SyscallTable) {
         commit::apply_durability_proof(&mut s.slots[slot].commit, term, index);
         if index & 31 == 0 {
             let mut line = [0u8; 72];
-            let mut pos = log_fmt::log_field(&mut line, 0, b"[commit] durable p=", u32::from(partition_id));
+            let mut pos = log_fmt::log_field(
+                &mut line,
+                0,
+                b"[commit] durable p=",
+                u32::from(partition_id),
+            );
             pos = log_fmt::log_field(&mut line, pos, b" idx=", index.min(u32::MAX as u64) as u32);
-            pos = log_fmt::log_field(&mut line, pos, b" ms=", (dev_millis(sys) & 0xFFFF_FFFF) as u32);
+            pos = log_fmt::log_field(
+                &mut line,
+                pos,
+                b" ms=",
+                (dev_millis(sys) & 0xFFFF_FFFF) as u32,
+            );
             dev_log(sys, 3, line.as_ptr(), pos);
         }
     }
@@ -1030,21 +1041,37 @@ unsafe fn intake_demux(s: &mut ModuleState, sys: &SyscallTable) {
     let per = |base: usize| (base * k).min(base * 16);
 
     let rpc = s.slots[0].raft.in_rpc;
-    demux_partitioned(s, sys, rpc, 0, per(8), OnFull::Drop, |sl| &mut sl.raft.inbox_rpc);
+    demux_partitioned(s, sys, rpc, 0, per(8), OnFull::Drop, |sl| {
+        &mut sl.raft.inbox_rpc
+    });
     let pp = s.slots[0].raft.in_proposals_partitioned;
-    demux_partitioned(s, sys, pp, 1, per(16), OnFull::Hold, |sl| &mut sl.raft.inbox_prop_p);
+    demux_partitioned(s, sys, pp, 1, per(16), OnFull::Hold, |sl| {
+        &mut sl.raft.inbox_prop_p
+    });
     let ppt = s.slots[0].raft.in_proposals_partitioned_tagged;
-    demux_partitioned(s, sys, ppt, 2, per(16), OnFull::Hold, |sl| &mut sl.raft.inbox_prop_pt);
+    demux_partitioned(s, sys, ppt, 2, per(16), OnFull::Hold, |sl| {
+        &mut sl.raft.inbox_prop_pt
+    });
     let fl = s.slots[0].raft.in_wal_flushed;
-    demux_partitioned(s, sys, fl, 3, per(16), OnFull::Hold, |sl| &mut sl.raft.inbox_flushed);
+    demux_partitioned(s, sys, fl, 3, per(16), OnFull::Hold, |sl| {
+        &mut sl.raft.inbox_flushed
+    });
     let rp = s.slots[0].raft.in_wal_replay_complete;
-    demux_partitioned(s, sys, rp, 4, per(4), OnFull::Hold, |sl| &mut sl.raft.inbox_replay);
+    demux_partitioned(s, sys, rp, 4, per(4), OnFull::Hold, |sl| {
+        &mut sl.raft.inbox_replay
+    });
     let sn = s.slots[0].raft.in_snapshot_installed;
-    demux_partitioned(s, sys, sn, 5, per(4), OnFull::Hold, |sl| &mut sl.raft.inbox_snap);
+    demux_partitioned(s, sys, sn, 5, per(4), OnFull::Hold, |sl| {
+        &mut sl.raft.inbox_snap
+    });
     let ack = s.slots[0].repl.in_ack;
-    demux_partitioned(s, sys, ack, 6, per(8), OnFull::Drop, |sl| &mut sl.repl.inbox_ack);
+    demux_partitioned(s, sys, ack, 6, per(8), OnFull::Drop, |sl| {
+        &mut sl.repl.inbox_ack
+    });
     let adm = s.slots[0].raft.in_admin;
-    demux_partitioned(s, sys, adm, 7, per(4), OnFull::Hold, |sl| &mut sl.raft.inbox_admin);
+    demux_partitioned(s, sys, adm, 7, per(4), OnFull::Hold, |sl| {
+        &mut sl.raft.inbox_admin
+    });
 
     route_durability_proofs(s, sys);
 }

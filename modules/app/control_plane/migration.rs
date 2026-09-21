@@ -324,7 +324,7 @@ pub unsafe fn step(m: &mut Migration, sys: &SyscallTable, now: u64) {
         m.epoch,
         m.shard_count,
         m.deadline_ms,
-            m.base_shard,
+        m.base_shard,
     );
     // The record goes through Raft as an ordinary opaque proposal,
     // magic-prefixed so the controller recognises its own record coming
@@ -382,8 +382,7 @@ pub fn on_committed(m: &mut Migration, now: u64, body: &[u8]) {
         shard_count,
         _deadline,
         base_shard,
-    )) =
-        wire::decode_migration_record(&body[2..2 + wire::MIGRATION_RECORD_LEN])
+    )) = wire::decode_migration_record(&body[2..2 + wire::MIGRATION_RECORD_LEN])
     else {
         return;
     };

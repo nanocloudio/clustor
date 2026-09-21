@@ -286,7 +286,11 @@ impl ShardOverride {
 /// override the routers could not hold would refuse migrations on a
 /// map nobody routes by.
 fn mirror_override(s: &mut ModuleState, shard: u32, prg: u16) {
-    if let Some(e) = s.overrides.iter_mut().find(|e| e.active && e.shard == shard) {
+    if let Some(e) = s
+        .overrides
+        .iter_mut()
+        .find(|e| e.active && e.shard == shard)
+    {
         if prg == wire::SHARD_OVERRIDE_CLEAR {
             e.active = false;
         } else {
@@ -515,8 +519,7 @@ unsafe fn drain_migration_commands(s: &mut ModuleState, sys: &SyscallTable, now:
                 let source_prg = u16::from_le_bytes([body[8], body[9]]);
                 let target_prg = u16::from_le_bytes([body[10], body[11]]);
                 let shard_count = u16::from_le_bytes([body[12], body[13]]);
-                let base_shard =
-                    u32::from_le_bytes([body[14], body[15], body[16], body[17]]);
+                let base_shard = u32::from_le_bytes([body[14], body[15], body[16], body[17]]);
                 // The fence covers `source_prg` alone, so every shard in
                 // the batch must be its. A batch that straddles PRGs
                 // would hand most of itself over unfenced — split
@@ -902,7 +905,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if let Some((tenant_id, max_rate)) = s.pending_tenant {
             let due = s.tenant_sent_ms == 0
                 || now.wrapping_sub(s.tenant_sent_ms) >= TENANT_RECORD_RETRY_MS;
-            if due && s.migration.out_record >= 0 && wire_channels::writable(sys, s.migration.out_record)
+            if due
+                && s.migration.out_record >= 0
+                && wire_channels::writable(sys, s.migration.out_record)
             {
                 let mut body = [0u8; wire::TENANT_RECORD_LEN];
                 body[..2].copy_from_slice(&wire::TENANT_CMD_MAGIC);
@@ -928,8 +933,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let n = wire::encode_shard_map_record(&mut body, shard, prg);
                 if n > 0 && propose_cp_record(sys, s.migration.out_record, &body[..n]) {
                     s.shard_map_sent_ms = if now == 0 { 1 } else { now };
-                    s.shard_map_records_proposed =
-                        s.shard_map_records_proposed.wrapping_add(1);
+                    s.shard_map_records_proposed = s.shard_map_records_proposed.wrapping_add(1);
                 }
             }
         }

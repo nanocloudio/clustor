@@ -184,7 +184,12 @@ pub extern "C" fn module_new(
             s.num_partitions = 1;
         }
         if (s.num_partitions as usize) > MAX_ROUTED_PARTITIONS {
-            dev_log(sys, 1, b"[prtn] num_partitions above K_MAX; clamped".as_ptr(), 40);
+            dev_log(
+                sys,
+                1,
+                b"[prtn] num_partitions above K_MAX; clamped".as_ptr(),
+                40,
+            );
             s.num_partitions = MAX_ROUTED_PARTITIONS as u16;
         }
 

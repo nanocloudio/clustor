@@ -36,7 +36,11 @@ struct TenantQuota {
 
 impl TenantQuota {
     const fn zero() -> Self {
-        Self { tenant_id: 0, max_rate: 0, active: 0 }
+        Self {
+            tenant_id: 0,
+            max_rate: 0,
+            active: 0,
+        }
     }
 }
 
@@ -74,7 +78,11 @@ pub unsafe fn init(c: &mut Cp) {
     // to. Seeded so a cluster with no quota records behaves exactly as
     // the synthetic record did, rather than leaving the default tenant
     // unmetered until an operator happens to set one.
-    c.tenants[0] = TenantQuota { tenant_id: 0, max_rate: DEFAULT_MAX_RATE, active: 1 };
+    c.tenants[0] = TenantQuota {
+        tenant_id: 0,
+        max_rate: DEFAULT_MAX_RATE,
+        active: 1,
+    };
 }
 
 /// Apply a committed tenant-quota record. Last writer wins per tenant,
@@ -88,7 +96,11 @@ pub fn set_tenant_quota(c: &mut Cp, tenant_id: u32, max_rate: u32) {
     }
     for i in 0..MAX_TENANTS {
         if c.tenants[i].active == 0 {
-            c.tenants[i] = TenantQuota { tenant_id, max_rate, active: 1 };
+            c.tenants[i] = TenantQuota {
+                tenant_id,
+                max_rate,
+                active: 1,
+            };
             return;
         }
     }

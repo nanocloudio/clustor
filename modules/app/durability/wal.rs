@@ -418,9 +418,9 @@ pub struct Wal {
     /// retention (or a lagging voter) is what bounds disk, not the
     /// snapshot cadence.
     compact_floored: u32,
-    pub out_flushed: i32,      // out[0]: FsyncAck (external consumers; ledger is fed in-module)
+    pub out_flushed: i32, // out[0]: FsyncAck (external consumers; ledger is fed in-module)
     pub out_replay_complete: i32, // out[1]: MSG_WAL_REPLAY_COMPLETE to consensus
-    pub out_entry_reply: i32,  // out[2]: MSG_WAL_ENTRY_REPLY back to requester
+    pub out_entry_reply: i32, // out[2]: MSG_WAL_ENTRY_REPLY back to requester
     /// Cold-read request/reply: a SECOND, independent entry read-back
     /// path for consumers that address the log by content rather than by
     /// replication position — today, a Kafka Fetch whose offset has aged
@@ -441,8 +441,8 @@ pub struct Wal {
     /// can still locate.
     pub cold_served: u32,
     pub cold_notfound: u32,
-    pub out_compaction: i32,   // out[3]: SnapshotTrigger for downstream coordinators
-    pub out_metrics: i32,      // out[4]: MetricsPayload to operations.telemetry
+    pub out_compaction: i32, // out[3]: SnapshotTrigger for downstream coordinators
+    pub out_metrics: i32,    // out[4]: MetricsPayload to operations.telemetry
 
     // WAL state
     pub partition_id: u16,
@@ -2883,7 +2883,12 @@ unsafe fn upsert_retention_floor(
             // window bounds compaction here, rather than being computed
             // and dropped somewhere on the way.
             let mut line = [0u8; 64];
-            let mut pos = emit_field(line.as_mut_ptr(), 0, b"[wal] floor p=", u32::from(s.partition_id));
+            let mut pos = emit_field(
+                line.as_mut_ptr(),
+                0,
+                b"[wal] floor p=",
+                u32::from(s.partition_id),
+            );
             pos += emit_field(line.as_mut_ptr(), pos, b" kpg=", u32::from(kpg_id));
             pos += emit_field(
                 line.as_mut_ptr(),

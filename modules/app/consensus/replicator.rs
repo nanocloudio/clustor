@@ -534,7 +534,13 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                         None => continue,
                     };
                 if success && index & 31 == 0 {
-                    log_idx(sys, b"[repl] ack rx p=", s.partition_id, index, u32::from(replica));
+                    log_idx(
+                        sys,
+                        b"[repl] ack rx p=",
+                        s.partition_id,
+                        index,
+                        u32::from(replica),
+                    );
                 }
 
                 // E13: a response term above ours means we are deposed
