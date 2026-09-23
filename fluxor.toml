@@ -66,6 +66,39 @@ forbid_inline_tests = ["modules", "src"]
 mode = "strict"
 max_inline_lines = 80
 
+# Crate-root allows are permitted only where the cause is source a file
+# mounts rather than code it contains (standards/lints.md §4).
+[[ci.hygiene.allow_crate_root]]
+prefix = "modules/"
+reason = """PIC modules mount the fluxor SDK wholesale via include!, and modules/common/*.rs are #[path]-mounted into several modules; each compile sees the entire surface and uses a subset."""
+
+# Host tests that include! the SDK runtime at crate root to drive PIC
+# module sources against a mock SyscallTable. The include! expansion
+# cannot carry an item attribute, so the suppression sits at the root.
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/name_fence.rs"
+reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/raft_fault_matrix.rs"
+reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/raft_meta.rs"
+reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/snap_pointer.rs"
+reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/wal_scan.rs"
+reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/wal_truncate.rs"
+reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
+
 [ci.templates]
 dir = "configs"
 # Defaults for the template-render gate (CI phase 1.5). These values

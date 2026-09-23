@@ -14,13 +14,6 @@
 //! exclusively through PIC `#[path]` mounts.
 
 #![no_std]
-#![allow(
-    clippy::too_many_arguments,
-    clippy::manual_range_contains,
-    clippy::needless_range_loop,
-    clippy::identity_op,
-    reason = "common source is shared with PIC builds, where a different lint baseline applies"
-)]
 
 // `#[rustfmt::skip]` on each `mod` declaration preserves the
 // hand-aligned const tables in the bundled files. The same files
@@ -40,6 +33,10 @@ pub mod types;
 pub mod collections;
 
 #[rustfmt::skip]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "encode_append_entries mirrors the AppendEntries header field-for-field; the PIC call sites pass each field directly"
+)]
 #[path = "../common/wire.rs"]
 pub mod wire;
 
