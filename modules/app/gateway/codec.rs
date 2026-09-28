@@ -31,7 +31,7 @@
 
 use super::abi::SyscallTable;
 use super::dev_millis;
-use super::{types, wire, wire_channels};
+use super::{types, wal_frame, wire, wire_channels};
 
 const CORR_RING: usize = 64;
 const IDX_RING: usize = 64;
@@ -118,6 +118,8 @@ pub struct Codec {
     responses_sent: u32,
     reads_rejected: u32,
     not_leader_rejected: u32,
+    /// Requests refused as larger than one log entry carries.
+    too_large_rejected: u32,
     stale_epoch_rejected: u32,
     corr_misses: u32,
     idx_misses: u32,
@@ -151,6 +153,7 @@ pub unsafe fn init(c: &mut Codec) {
     c.responses_sent = 0;
     c.reads_rejected = 0;
     c.not_leader_rejected = 0;
+    c.too_large_rejected = 0;
     c.stale_epoch_rejected = 0;
     c.corr_misses = 0;
     c.idx_misses = 0;
@@ -412,11 +415,21 @@ pub unsafe fn on_request(
                     c.leader_id,
                 ));
             }
-            let corr_id = next_corr_id(c);
             let total = wire::TAGGED_PROPOSAL_HDR + body_len;
-            if total > 2048 {
-                return Route::Done;
+            if total > wal_frame::MAX_ENTRY_BODY {
+                // Refused, not dropped: a silent drop leaves the client
+                // waiting on a reply that never comes.
+                c.too_large_rejected += 1;
+                return Route::Respond(build_reject_wire(
+                    conn_id,
+                    wire::CLIENT_REJECT_TOO_LARGE,
+                    0,
+                    0,
+                    0,
+                    0,
+                ));
             }
+            let corr_id = next_corr_id(c);
             let mut framed = [0u8; 2048];
             framed[0..8].copy_from_slice(&corr_id.to_le_bytes());
             framed[8..total].copy_from_slice(&body[..body_len]);
@@ -470,16 +483,26 @@ pub unsafe fn on_request(
                 ));
             }
 
-            let corr_id = next_corr_id(c);
-            put_corr(c, corr_id, conn_id, dev_millis(sys));
-
             // Tagged proposal `[correlation_id:u64][body]` so the
             // leader can echo MSG_PROPOSAL_ASSIGNED back on
-            // consensus.proposal_assigned. Body itself is opaque.
+            // consensus.proposal_assigned. Body itself is opaque. One
+            // that cannot fit an entry is refused before a correlation
+            // is recorded: dropping it after would strand the slot and
+            // leave the client waiting on a reply that never comes.
             let total = wire::TAGGED_PROPOSAL_HDR + body_len;
-            if total > 2048 {
-                return Route::Done;
+            if total > wal_frame::MAX_ENTRY_BODY {
+                c.too_large_rejected += 1;
+                return Route::Respond(build_reject_wire(
+                    conn_id,
+                    wire::CLIENT_REJECT_TOO_LARGE,
+                    0,
+                    0,
+                    0,
+                    0,
+                ));
             }
+            let corr_id = next_corr_id(c);
+            put_corr(c, corr_id, conn_id, dev_millis(sys));
             proposal_out[0..8].copy_from_slice(&corr_id.to_le_bytes());
             proposal_out[8..total].copy_from_slice(&body[..body_len]);
             c.requests_parsed += 1;
