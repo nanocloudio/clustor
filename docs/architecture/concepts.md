@@ -61,11 +61,13 @@ The runtime knobs, with their defaults, as declared in the modules'
 |---|---|
 | `durability_mode` | Consensus commit gating: strict (0), group_fsync (1), relaxed (2) — `DUR_STRICT` / `DUR_GROUP_FSYNC` / `DUR_RELAXED` in `types.rs`. Default group_fsync. Strict and group_fsync gate the commit index on quorum durability; relaxed commits on replication match alone. |
 | `fsync_mode` | WAL writer behaviour in the durability module: 0 = write + fsync + ack per entry, 1 = group fsync. Group mode batches under `group_window_ms` (default 2) and `group_max_pending` (default 64). |
+| `aead` | Sealed durability records in the durability module: 0 = unsealed (default), 1 = ChaCha20-Poly1305, 2 = AES-256-GCM. A WAL written under one setting is not read under the other: segments without sealed-WAL state fail a sealed replica closed. `segment_bytes` counts stored bytes, so sealed frames (52 bytes larger) rotate segments slightly sooner. |
+| `cluster` | Up to 16 bytes naming the cluster; bound into every sealed record's key and associated data. |
 | `segment_bytes` | WAL segment size limit. Default 67,108,864 (64 MiB). |
 | `name_fence` | Name-publication posture, declared identically on the consensus and durability modules. Default strict (1): a filesystem that cannot fence a name publishes nothing, so segments are not admitted, snapshots are not published and vote grants stay withheld. Auto (0): publish every artefact name through the filesystem's directory fence where it offers one, and report the disposition where it does not. |
 | `partition_id` | Partition slot for multi-Raft graphs. Stamped into segment and snapshot filenames, durability proofs, and raft metadata paths. |
 | `fresh_threshold_s` / `grace_period_s` | Admission proof-cache ladder thresholds; defaults 60 and 120. See the cache states below. |
-| `dek_epoch` | Data-encryption-key epoch, owned by the durability module's keys component. Rotated locally on a weekly timer and stamped into snapshot manifests and headers. There is no AEAD encryption of WAL or snapshot bytes; the epoch is carried metadata. |
+| `dek_epoch` | Data-encryption-key epoch, stamped into snapshot manifests and headers. Unsealed (`aead = 0`) it is a label advanced on a weekly timer by the durability module's keys component. Sealed (`aead` 1 or 2) it is the key epoch the snapshot's chunks were sealed under: a real vault master, and the timer only requests the next one (see [security.md](security.md)). |
 
 Control-plane cache states (`CP_FRESH` / `CP_CACHED` / `CP_STALE` /
 `CP_EXPIRED` in `types.rs`) are derived from the age of the last

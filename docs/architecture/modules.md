@@ -129,10 +129,10 @@ epochs.
 
 | Component | Responsibility |
 |---|---|
-| `wal` | Segment-file WAL: CRC32C framing, replay, group/async-fenced fsync, truncation, compaction bounded by the retention floors, gap-refetch and cold-read serving. |
+| `wal` | Segment-file WAL: CRC32C framing (or sealed v1 frames with `aead` set), replay, group/async-fenced fsync, truncation, compaction bounded by the retention floors, gap-refetch and cold-read serving. Sealed, it also owns the nonce-domain allocator and the key epochs (see [security.md](security.md)). |
 | `ledger` | Per-replica durable indices → quorum durability proofs. |
-| `snapshot` | Manifest persistence, chunked install transfer, app-snapshot round trip. |
-| `keys` | DEK epoch rotation; hands the current epoch to `wal` and `snapshot`. |
+| `snapshot` | Manifest persistence, chunked install transfer, app-snapshot round trip; sealed chunk bodies with `aead` set. |
+| `keys` | DEK epoch timer. Unsealed it hands the epoch label to `snapshot`; sealed it asks `wal` for a new key epoch, and `snapshot` seals under the epoch `wal` has established. |
 
 Dispatch order is `keys → wal → ledger → snapshot`. `wal`'s
 durable high-water and its rotation trigger land in monotone
@@ -144,7 +144,7 @@ themselves rather than behind channel capacity.
 |---|---|
 | Inputs | `entries`, `entry_request`, `compact_before`, `ack`, `import_chunks`, `trigger`, `install_request`, `retention_floor`, `app_snapshot_body` |
 | Outputs | `flushed`, `replay_complete`, `entry_reply`, `compaction_signal`, `metrics`, `quorum_durable`, `export_chunks`, `manifest_auth`, `installed_local`, `app_snapshot_ctl`, `cert_refresh` |
-| Params | `encoding`, `segment_bytes`, `partition_id`, `self_id`, `fsync_mode`, `group_window_ms`, `group_max_pending`, `root_path`, `skip_replay`, `fixed_segment`, `preallocate_settle_ms`, `fence_depth`, `voter_count`, `name_fence` |
+| Params | `encoding`, `segment_bytes`, `aead`, `cluster`, `partition_id`, `self_id`, `fsync_mode`, `group_window_ms`, `group_max_pending`, `root_path`, `skip_replay`, `fixed_segment`, `preallocate_settle_ms`, `fence_depth`, `voter_count`, `name_fence` |
 | Variants | `disk` (default), `volatile` |
 
 `disk` is the durable composition: FS-backed segments and

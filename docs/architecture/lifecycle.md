@@ -53,9 +53,10 @@ prefix. The write path later rewinds onto that tail and stages a
 zero-length terminator, so stale bytes beyond it are never replayed as
 valid. Startup verification is exactly this per-frame CRC walk — there
 is no separate scrub pass, no index files to rebuild, and no
-quarantine state. A `dek_epoch: u32` is stamped into snapshot headers
-and rotated weekly by the keys component
-(`modules/app/durability/keys.rs`), but nothing encrypts yet.
+quarantine state. With `aead` set the frames are sealed v1 records and
+replay also authenticates each one: a torn tail stops replay as above,
+while a whole frame that fails authentication fails the replica closed
+(see [security.md](security.md)).
 
 When replay finishes, the WAL freezes the recovered durable
 high-water, seeds the durability ledger with it (replay produces no

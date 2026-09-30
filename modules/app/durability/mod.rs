@@ -6,12 +6,14 @@
 //!
 //!   - [`wal`]      — segment-file WAL: CRC32C framing, replay,
 //!     group/async-fenced fsync, truncation, compaction, gap-refetch
-//!     serving.
+//!     serving; with `aead` set, sealed frames, the nonce-domain
+//!     allocator and key epochs (`wal_seal`).
 //!   - [`ledger`]   — per-replica durable indices → quorum durability
 //!     proofs (compiled out of the `volatile` variant).
 //!   - [`snapshot`] — manifest persistence, chunked install transfer,
 //!     retention floors, app snapshot round-trip.
-//!   - [`keys`]     — DEK epoch rotation.
+//!   - [`keys`]     — DEK epoch timer (sealed: a request for a new key
+//!     epoch, which the wal takes at a segment boundary).
 //!
 //! ## Variants
 //!
@@ -122,7 +124,21 @@ define_params! {
     2, segment_bytes, u32, 67_108_864
         => |s, d, len| { s.slots[0].wal.segment_limit = p_u32(d, len, 0, 67_108_864); };
 
-    // 3, aead — reserved (0=none, 1=aes_256_gcm); not yet read at runtime.
+    // Sealed records: seal WAL frames and snapshot chunks with
+    // this v1 suite id: 0 = unsealed, 1 = ChaCha20-Poly1305, 2 = AES-256-GCM.
+    // Any other value fails the WAL closed rather than writing cleartext.
+    3, aead, u8, 0
+        => |s, d, len| { s.slots[0].wal.seal.suite = u16::from(p_u8(d, len, 0, 0)); };
+
+    // Cluster identity bound into every sealed record's key and AAD: up
+    // to 16 bytes, zero-padded.
+    17, cluster, str, 0
+        => |s, d, len| {
+            let dst = &mut s.slots[0].wal.seal.cluster;
+            let n = if len > dst.len() { dst.len() } else { len };
+            for i in 0..dst.len() { dst[i] = 0; }
+            for i in 0..n { dst[i] = *d.add(i); }
+        };
 
     // Partition slot for multi-Raft graphs. Stamped into segment and
     // snapshot filenames and into outgoing durability proofs.
@@ -249,6 +265,9 @@ struct DurSlot {
     ledger: ledger::Ledger,
     snapshot: snapshot::Snapshot,
     keys: keys::Keys,
+    /// The keys component's timer epoch last seen. Sealed, a change asks
+    /// the wal for a real key epoch instead of relabelling one.
+    timer_epoch: u32,
 }
 
 #[repr(C)]
@@ -373,6 +392,7 @@ pub extern "C" fn module_new(
             ledger::init(&mut s.slots[i].ledger);
             snapshot::init(&mut s.slots[i].snapshot);
             keys::init(&mut s.slots[i].keys, sys);
+            s.slots[i].timer_epoch = s.slots[i].keys.dek_epoch;
         }
 
         // Port handles. Indices follow the manifest declaration order;
@@ -709,6 +729,8 @@ fn clone_slot_from_zero(
     dst.wal.fixed_segment = src.wal.fixed_segment;
     dst.wal.preallocate_settle_ms = src.wal.preallocate_settle_ms;
     dst.wal.fence_depth = src.wal.fence_depth;
+    dst.wal.seal.suite = src.wal.seal.suite;
+    dst.wal.seal.cluster = src.wal.seal.cluster;
 
     dst.self_id = self_id;
     dst.voter_count = voter_count;
@@ -732,6 +754,14 @@ fn fan_slot_identity(s: &mut ModuleState, i: usize) {
         ledger::clamp_voters(&mut s.slots[i].ledger);
     }
     wal::arm(&mut s.slots[i].wal);
+    // After `arm`: the volatile variant has no durable records to seal.
+    s.slots[i].snapshot.seal_suite = if wal::sealed(&s.slots[i].wal) {
+        s.slots[i].wal.seal.suite
+    } else {
+        0
+    };
+    s.slots[i].snapshot.seal_cluster = s.slots[i].wal.seal.cluster;
+    s.slots[i].snapshot.self_id = s.slots[i].self_id;
 }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
@@ -777,7 +807,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let epoch = keys::step(&mut s.slots[i].keys, sys, now);
             s.comp_step[0].record(dev_micros(sys).wrapping_sub(t0));
             s.slots[i].wal.dek_epoch = epoch;
-            s.slots[i].snapshot.dek_epoch = epoch;
+            if wal::sealed(&s.slots[i].wal) {
+                // Sealed, an epoch is a key: the timer asks the wal for a
+                // new one (created and durably recorded at the next
+                // segment boundary), and snapshots seal under whichever
+                // epoch the wal has actually established.
+                if epoch != s.slots[i].timer_epoch {
+                    s.slots[i].timer_epoch = epoch;
+                    wal::request_key_rotation(&mut s.slots[i].wal);
+                }
+                s.slots[i].snapshot.dek_epoch = wal::key_epoch(&s.slots[i].wal);
+                s.slots[i].wal.seal.snapshot_epoch = snapshot::sealed_epoch(&s.slots[i].snapshot);
+            } else {
+                s.slots[i].snapshot.dek_epoch = epoch;
+            }
 
             // Boot restore FIRST: the persisted local snapshot's app body
             // must reach the state machine before the wal replays its

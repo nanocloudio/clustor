@@ -25,6 +25,11 @@ use super::abi::SyscallTable;
 use super::collections::Crc32c;
 use super::types::{Index, Term};
 use super::wal_frame;
+
+#[path = "../../common/sealed_record.rs"]
+mod sealed;
+#[path = "wal_seal.rs"]
+pub mod wal_seal;
 use super::{
     dev_input_flow_budget, dev_log, dev_micros, dev_millis, dev_report_step_effect, fmt_u32_raw,
     step_effect, wire, wire_channels, POLL_IN, POLL_OUT,
@@ -839,9 +844,20 @@ pub struct Wal {
     pub snap_trigger: (Term, Index),
     pub snap_trigger_dirty: bool,
 
+    /// Sealed frames, the nonce-domain allocator and key
+    /// epochs. Inert when the `aead` parameter is 0.
+    pub seal: wal_seal::WalSeal,
+    /// One whole sealed frame read back for serving or scanning, and the
+    /// reply composed over it. In state rather than on the stack, so the
+    /// sealed read paths add no page-sized frame of their own.
+    seal_frame: [u8; SEALED_FRAME_MAX],
+
     // Scratch buffer for reading messages
     msg_buf: [u8; 4096],
 }
+
+/// Largest stored sealed frame: the largest entry plus the v1 overhead.
+const SEALED_FRAME_MAX: usize = wal_frame::MAX_ENTRY_LEN + sealed::WAL_OVERHEAD;
 
 /// Write a frame to a consensus-facing channel in the 5-byte
 /// partitioned envelope, stamped with this WAL's partition.
@@ -1018,6 +1034,8 @@ pub unsafe fn init(s: &mut Wal) {
     s.ledger_dirty = false;
     s.snap_trigger = (0, 0);
     s.snap_trigger_dirty = false;
+    wal_seal::init(&mut s.seal);
+    s.seal_frame = [0; SEALED_FRAME_MAX];
 }
 
 /// Apply post-param bootstrap decisions. Called by the composite once
@@ -1059,8 +1077,19 @@ pub fn arm(s: &mut Wal) {
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
+#[inline(always)]
 pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     s.dbg_steps = s.dbg_steps.wrapping_add(1);
+
+    // A sealed WAL reads nothing and writes nothing until its allocator
+    // state and current master are in hand — and nothing ever again once
+    // it has failed closed.
+    if wal_seal::enabled(s) {
+        if let Some(rc) = wal_seal::boot_step(s, sys) {
+            emit_metrics(s, sys);
+            return rc;
+        }
+    }
 
     if s.phase == PHASE_REPLAY {
         // Replay existing WAL segments before accepting new entries.
@@ -1138,7 +1167,10 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     //    conflict-repair truncation) BEFORE appending. A truncate must
     //    land before any same-step append, else the fresh entry would be
     //    written above the divergent tail and then rewound away.
-    let retired = drain_compact_before(s, sys);
+    let mut retired = drain_compact_before(s, sys);
+    if wal_seal::maybe_retire(s, sys) {
+        retired = true;
+    }
 
     // 2. Persist complete records up to the live transaction budget. A
     // classed input derives its grant from the graph and current pacer
@@ -1392,12 +1424,39 @@ unsafe fn serve_entry_request_on(
     reply_chan: i32,
     allow_scan: bool,
 ) {
-    if reply_chan < 0 || !wire_channels::writable(sys, reply_chan) {
+    // Dispatched here, above either path's frame: the unsealed serve
+    // stages page-sized buffers on the stack that the sealed one does not
+    // need, and nesting one inside the other would add them up.
+    let Some(loc) = locate_for_serve(s, sys, request_id, wal_index, reply_chan, allow_scan) else {
         return;
+    };
+    if wal_seal::enabled(s) {
+        serve_sealed(s, sys, loc, request_id, wal_index, reply_chan);
+    } else {
+        serve_clear(s, sys, loc, request_id, wal_index, reply_chan);
     }
+}
 
-    let loc = match lookup_entry_loc(s, wal_index) {
-        Some(l) => l,
+/// The location of `wal_index` for a read-back on `reply_chan`, or
+/// `None` once the request has been answered (NOT_FOUND), handed to the
+/// below-floor scan, or left for a retry because the channel is full.
+///
+/// # Safety
+/// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
+#[inline(never)]
+unsafe fn locate_for_serve(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    request_id: u32,
+    wal_index: u64,
+    reply_chan: i32,
+    allow_scan: bool,
+) -> Option<EntryLoc> {
+    if reply_chan < 0 || !wire_channels::writable(sys, reply_chan) {
+        return None;
+    }
+    match lookup_entry_loc(s, wal_index) {
+        Some(l) => Some(l),
         None => {
             // Below-floor miss: the index aged out of the location ring
             // (see ENTRY_LOC_RING_SIZE) but its record is still in a
@@ -1416,7 +1475,7 @@ unsafe fn serve_entry_request_on(
                 // No reply yet — the scan answers on a later step; the
                 // requester's re-issue throttle covers a dropped attach.
                 begin_entry_scan(s, sys, request_id, wal_index);
-                return;
+                return None;
             }
             // NOT_FOUND — reply with header only, empty body. The leader
             // takes this as a signal to fall through to snapshot install.
@@ -1436,10 +1495,24 @@ unsafe fn serve_entry_request_on(
             let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
             wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
             write_part(s, sys, reply_chan, wire::MSG_WAL_ENTRY_REPLY, &hdr);
-            return;
+            None
         }
-    };
+    }
+}
 
+/// The unsealed read-back of an entry located at `loc`.
+///
+/// # Safety
+/// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
+#[inline(never)]
+unsafe fn serve_clear(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    loc: EntryLoc,
+    request_id: u32,
+    wal_index: u64,
+    reply_chan: i32,
+) {
     if s.no_fs {
         let slot = memory_slot(wal_index);
         let mem = s.memory_entries[slot];
@@ -1707,6 +1780,348 @@ unsafe fn serve_entry_request(s: &mut Wal, sys: &SyscallTable, request_id: u32, 
     serve_entry_request_on(s, sys, request_id, wal_index, s.out_entry_reply, true);
 }
 
+/// Header-only NOT_FOUND reply: the requester escalates to snapshot
+/// install.
+///
+/// # Safety
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+#[inline(never)]
+unsafe fn reply_not_found(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    request_id: u32,
+    wal_index: u64,
+    chan: i32,
+) {
+    s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
+    let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
+    wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
+    write_part(s, sys, chan, wire::MSG_WAL_ENTRY_REPLY, &hdr);
+}
+
+/// Read the whole stored frame of `loc` into `seal_frame`, from the
+/// staged batch when it has not reached the device yet. Returns the
+/// frame's stored length, or `None` when it cannot be had now.
+///
+/// # Safety
+/// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
+#[inline(never)]
+unsafe fn read_sealed_frame(s: &mut Wal, sys: &SyscallTable, loc: &EntryLoc) -> Option<usize> {
+    let c = loc.payload_len as usize;
+    let flen = sealed::wal_frame_len(c);
+    if c > wal_frame::MAX_ENTRY_LEN || flen > SEALED_FRAME_MAX {
+        return None;
+    }
+    let frame_start = loc.payload_offset.checked_sub(sealed::WAL_HDR_LEN as u32)?;
+    let staged_logical =
+        (s.write_pos as usize).saturating_sub(if s.staged_terminator { 4 } else { 0 });
+    if loc.seg_seq == s.segment_seq && staged_logical > 0 {
+        let batch_start = s.cursor.saturating_sub(staged_logical as u32);
+        if frame_start >= batch_start {
+            let off = (frame_start - batch_start) as usize;
+            if off + flen > staged_logical {
+                return None;
+            }
+            core::ptr::copy_nonoverlapping(
+                s.write_buf.as_ptr().add(off),
+                s.seal_frame.as_mut_ptr(),
+                flen,
+            );
+            return Some(flen);
+        }
+    }
+    let fd = if loc.seg_seq == s.segment_seq && s.fd >= 0 {
+        s.fd
+    } else {
+        let mut path = [0u8; WAL_PATH_MAX];
+        let plen = encode_segment_path(s.partition_id, loc.seg_seq, s.root_path != 0, &mut path);
+        (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen)
+    };
+    if fd < 0 {
+        return None;
+    }
+    let seek = (frame_start as i32).to_le_bytes();
+    let ok = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) >= 0
+        && (sys.provider_call)(fd, FS_READ, s.seal_frame.as_mut_ptr(), flen) == flen as i32;
+    if fd == s.fd {
+        let restore = (s.cursor as i32).to_le_bytes();
+        (sys.provider_call)(fd, FS_SEEK, restore.as_ptr() as *mut u8, 4);
+    } else {
+        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    }
+    if ok {
+        Some(flen)
+    } else {
+        None
+    }
+}
+
+/// Authenticate the frame in `seal_frame` in place. Only a frame whose
+/// tag verifies is served: read-back feeds followers, and a replica must
+/// not ship what it cannot vouch for.
+///
+/// # Safety
+/// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
+#[inline(never)]
+unsafe fn open_for_serve(s: &mut Wal, sys: &SyscallTable, loc: &EntryLoc, flen: usize) -> bool {
+    let who = wal_seal::who(s);
+    let opened = wal_seal::open_stored(
+        &mut s.seal,
+        who,
+        sys,
+        loc.seg_seq,
+        &mut s.seal_frame[..flen],
+    );
+    let c = loc.payload_len as usize;
+    match opened {
+        wal_seal::Opened::Ok { ct_len } if ct_len as usize == c && c >= 16 => true,
+        other => {
+            wal_seal::serve_verdict(s, sys, other);
+            false
+        }
+    }
+}
+
+/// Send the entry opened in `seal_frame` as a read-back reply. The reply
+/// is composed in place: its header overwrites the frame header and the
+/// term/index prologue just ahead of the entry body, so no second
+/// page-sized buffer sits on this path's stack.
+///
+/// # Safety
+/// `sys` must reach live kernel routines per the module ABI.
+#[inline(never)]
+unsafe fn send_sealed_reply(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    loc: &EntryLoc,
+    request_id: u32,
+    prev_term: u64,
+    chan: i32,
+) {
+    let body = sealed::WAL_HDR_LEN + 16;
+    let start = body - wire::WAL_ENTRY_REPLY_HDR;
+    let end = sealed::WAL_HDR_LEN + loc.payload_len as usize;
+    let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
+    wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, loc.term, loc.index, prev_term);
+    s.seal_frame[start..body].copy_from_slice(&hdr);
+    write_part(
+        s,
+        sys,
+        chan,
+        wire::MSG_WAL_ENTRY_REPLY,
+        &s.seal_frame[start..end],
+    );
+}
+
+/// The sealed twin of the ring-served read-back.
+///
+/// # Safety
+/// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
+#[inline(never)]
+unsafe fn serve_sealed(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    loc: EntryLoc,
+    request_id: u32,
+    wal_index: u64,
+    reply_chan: i32,
+) {
+    let staged = loc.seg_seq == s.segment_seq
+        && s.write_pos > 0
+        && loc.payload_offset
+            >= s.cursor.saturating_sub(
+                (s.write_pos as u32).saturating_sub(if s.staged_terminator { 4 } else { 0 }),
+            );
+    // As unsealed: a written-but-unfenced frame reads back undefined
+    // until its fence lands; the requester's retry throttle re-asks.
+    if !staged && loc.seg_seq == s.segment_seq && wal_index > s.ledger_ack.1 {
+        return;
+    }
+    let Some(flen) = read_sealed_frame(s, sys, &loc) else {
+        reply_not_found(s, sys, request_id, wal_index, reply_chan);
+        return;
+    };
+    let prev_term = if loc.index > 1 {
+        lookup_entry_loc(s, loc.index - 1).map_or(0, |p| p.term)
+    } else {
+        0
+    };
+    if open_for_serve(s, sys, &loc, flen) {
+        send_sealed_reply(s, sys, &loc, request_id, prev_term, reply_chan);
+        s.entryreq_served = s.entryreq_served.saturating_add(1);
+    } else {
+        reply_not_found(s, sys, request_id, wal_index, reply_chan);
+    }
+}
+
+/// The sealed twin of the scan's frame walk: a sealed frame keeps term
+/// and index inside its ciphertext, so each record is read whole and
+/// authenticated before its index can be believed.
+///
+/// # Safety
+/// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
+#[inline(never)]
+unsafe fn scan_sealed_records(s: &mut Wal, sys: &SyscallTable) {
+    let mut records = 0usize;
+    while records < SCAN_RECORDS_PER_STEP {
+        let remaining = s.scan_file_size.saturating_sub(s.scan_pos) as usize;
+        let close_next = |s: &mut Wal| {
+            (sys.provider_call)(s.scan_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.scan_fd = -1;
+            s.scan_seg = s.scan_seg.saturating_add(1);
+        };
+        if remaining < sealed::WAL_PREFIX_LEN {
+            close_next(s);
+            return;
+        }
+        let seek = (s.scan_pos as i32).to_le_bytes();
+        if (sys.provider_call)(s.scan_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) < 0 {
+            fail_entry_scan(s, sys);
+            reset_scan_cursor(s, sys);
+            return;
+        }
+        let n = (sys.provider_call)(
+            s.scan_fd,
+            FS_READ,
+            s.seal_frame.as_mut_ptr(),
+            sealed::WAL_PREFIX_LEN,
+        );
+        if n < sealed::WAL_PREFIX_LEN as i32 {
+            close_next(s);
+            return;
+        }
+        let frame_len = match sealed::wal_parse_prefix(
+            &s.seal_frame[..sealed::WAL_PREFIX_LEN],
+            wal_frame::MAX_ENTRY_LEN,
+        ) {
+            sealed::WalPrefix::Frame { frame_len } => frame_len as usize,
+            _ => {
+                close_next(s);
+                return;
+            }
+        };
+        let flen = sealed::WAL_PREFIX_LEN + frame_len;
+        if frame_len > remaining - sealed::WAL_PREFIX_LEN || flen > SEALED_FRAME_MAX {
+            close_next(s);
+            return;
+        }
+        let n2 = (sys.provider_call)(
+            s.scan_fd,
+            FS_READ,
+            s.seal_frame.as_mut_ptr().add(sealed::WAL_PREFIX_LEN),
+            frame_len,
+        );
+        if (n2 as usize) < frame_len {
+            fail_entry_scan(s, sys);
+            reset_scan_cursor(s, sys);
+            return;
+        }
+        let who = wal_seal::who(s);
+        let seg = s.scan_seg;
+        let opened = wal_seal::open_stored(&mut s.seal, who, sys, seg, &mut s.seal_frame[..flen]);
+        let ct_len = match opened {
+            wal_seal::Opened::Ok { ct_len } if ct_len >= 16 => ct_len,
+            wal_seal::Opened::Torn => {
+                // Same stop rule as replay: the segment's live data ends.
+                s.checksum_failures = s.checksum_failures.saturating_add(1);
+                close_next(s);
+                return;
+            }
+            other => {
+                wal_seal::serve_verdict(s, sys, other);
+                fail_entry_scan(s, sys);
+                reset_scan_cursor(s, sys);
+                return;
+            }
+        };
+        let Some((term, index)) =
+            wire::decode_term_index(&s.seal_frame[sealed::WAL_HDR_LEN..sealed::WAL_HDR_LEN + 16])
+        else {
+            fail_entry_scan(s, sys);
+            reset_scan_cursor(s, sys);
+            return;
+        };
+        let payload_offset = s.scan_pos + sealed::WAL_HDR_LEN as u32;
+        if index == s.scan_target {
+            s.scan_loc = EntryLoc {
+                index,
+                term,
+                seg_seq: s.scan_seg,
+                payload_offset,
+                payload_len: ct_len,
+            };
+            // Delivered by the caller once this walk's frame is gone.
+            s.scan_found = true;
+            s.scan_active = false;
+            return;
+        }
+        if index > s.scan_target {
+            fail_entry_scan(s, sys);
+            return;
+        }
+        if index + 1 == s.scan_target {
+            s.scan_prev_term = term;
+        }
+        if index > 0 {
+            s.scan_last_index = index;
+            s.scan_last_term = term;
+        }
+        s.scan_pos += flen as u32;
+        records += 1;
+    }
+}
+
+/// The sealed twin of `deliver_scan_reply`'s read and verify.
+///
+/// # Safety
+/// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
+#[inline(never)]
+unsafe fn deliver_scan_reply_sealed(s: &mut Wal, sys: &SyscallTable) {
+    if !s.scan_found {
+        return;
+    }
+    if s.out_entry_reply < 0 {
+        s.scan_found = false;
+        s.scan_target = 0;
+        return;
+    }
+    if !wire_channels::writable(sys, s.out_entry_reply) {
+        return;
+    }
+    let loc = s.scan_loc;
+    let c = loc.payload_len as usize;
+    let flen = sealed::wal_frame_len(c);
+    let frame_start = loc
+        .payload_offset
+        .saturating_sub(sealed::WAL_HDR_LEN as u32);
+    let mut ok = s.scan_fd >= 0 && c <= wal_frame::MAX_ENTRY_LEN && flen <= SEALED_FRAME_MAX;
+    if ok {
+        let seek = (frame_start as i32).to_le_bytes();
+        ok = (sys.provider_call)(s.scan_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) >= 0
+            && (sys.provider_call)(s.scan_fd, FS_READ, s.seal_frame.as_mut_ptr(), flen)
+                == flen as i32;
+    }
+    let sent = ok && open_for_serve(s, sys, &loc, flen);
+    if !sent {
+        s.scan_target = loc.index;
+        s.scan_found = false;
+        s.scan_active = true;
+        fail_entry_scan(s, sys);
+        reset_scan_cursor(s, sys);
+        return;
+    }
+    let chan = s.out_entry_reply;
+    send_sealed_reply(s, sys, &loc, s.scan_request_id, s.scan_prev_term, chan);
+    s.entryreq_served = s.entryreq_served.saturating_add(1);
+    s.entryreq_scan_served = s.entryreq_scan_served.saturating_add(1);
+    s.scan_found = false;
+    s.scan_target = 0;
+    s.scan_last_index = loc.index;
+    s.scan_last_term = loc.term;
+    s.scan_prev_term = 0;
+    s.scan_pos = frame_start + flen as u32;
+}
+
 // ── Below-floor segment-scan fallback ───────────────────────
 //
 // Serves entry requests whose index has aged out of `entry_ring` by
@@ -1838,7 +2253,7 @@ unsafe fn fail_entry_scan(s: &mut Wal, sys: &SyscallTable) {
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
     if s.scan_found {
-        deliver_scan_reply(s, sys);
+        deliver_scan(s, sys);
         return;
     }
     if !s.scan_active {
@@ -1886,6 +2301,14 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
         s.scan_file_size = size;
         s.scan_pos = 0;
         return; // bounded: the open was this step's work
+    }
+
+    if wal_seal::enabled(s) {
+        scan_sealed_records(s, sys);
+        if s.scan_found {
+            deliver_scan(s, sys);
+        }
+        return;
     }
 
     // Walk frames: [entry_len:u32][crc32c:u32][payload], where payload
@@ -1951,7 +2374,7 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
                 };
                 s.scan_found = true;
                 s.scan_active = false;
-                deliver_scan_reply(s, sys);
+                deliver_scan(s, sys);
                 return;
             }
             if index > s.scan_target {
@@ -1974,6 +2397,20 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
     }
 }
 
+/// Deliver a scan-located record's reply by the path that matches the
+/// WAL's frames, chosen above either path's frame (see
+/// `serve_entry_request_on`).
+///
+/// # Safety
+/// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
+unsafe fn deliver_scan(s: &mut Wal, sys: &SyscallTable) {
+    if wal_seal::enabled(s) {
+        deliver_scan_reply_sealed(s, sys);
+    } else {
+        deliver_scan_reply(s, sys);
+    }
+}
+
 /// Emit the reply for a scan-located record: read the payload from the
 /// scan fd and send it in the same wire shape as the ring-served path.
 /// Retries next step if the reply channel is full. On success the
@@ -1985,6 +2422,7 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI in
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+#[inline(never)]
 unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
     if !s.scan_found {
         return;
@@ -2082,7 +2520,7 @@ unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
     s.scan_last_index = loc.index;
     s.scan_last_term = loc.term;
     s.scan_prev_term = 0;
-    s.scan_pos = loc.payload_offset + loc.payload_len;
+    s.scan_pos = loc.payload_offset + loc.payload_len + wal_seal::payload_trail(s);
 }
 
 /// # Safety
@@ -2226,7 +2664,7 @@ unsafe fn truncate_after(
         match lookup_entry_loc(s, keep_through_index) {
             Some(loc) => {
                 keep_seg = loc.seg_seq;
-                new_cursor = loc.payload_offset + loc.payload_len;
+                new_cursor = loc.payload_offset + loc.payload_len + wal_seal::payload_trail(s);
                 new_term = loc.term;
             }
             None => {
@@ -2333,6 +2771,9 @@ unsafe fn publish_truncation(
     s.current_index = keep_through_index;
     s.current_term = new_term;
     s.truncations = s.truncations.saturating_add(1);
+    // The replacement suffix reuses indices and offsets the discarded one
+    // held: it is sealed under a new incarnation, never the old one's.
+    wal_seal::close_incarnation(s, sys);
 
     // Truncation rewrites the tail under the scan's ascending-order
     // assumption. Drop the warm cursor; an in-flight scan for a target
@@ -3240,6 +3681,11 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         }
         s.replay_last_found = s.replay_seg;
 
+        if wal_seal::enabled(s) && !wal_seal::on_replay_segment(s, sys) {
+            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            return 0;
+        }
+
         if s.replay_tainted {
             // Past a mid-log fault the prefix already replayed IS the
             // recoverable log. Later segments are walked only so
@@ -3259,6 +3705,10 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         // (tens of ms). Forgive it via Burst and read frames on subsequent
         // warm steps rather than falling through here.
         return STEP_BURST;
+    }
+
+    if wal_seal::enabled(s) {
+        return wal_seal::replay_frames(s, sys, REPLAY_FRAMES_PER_STEP);
     }
 
     // Read framed entries: [entry_len: u32 LE] [crc32c: u32 LE] [entry_data].
@@ -3617,6 +4067,7 @@ unsafe fn persist_sidecar(s: &mut Wal, sys: &SyscallTable, floor: u32, start: u3
 /// below it goes to the scan rather than reading as "not in the ring,
 /// so compacted".
 fn settle_after_replay(s: &mut Wal) {
+    wal_seal::after_replay(s);
     if s.replay_last_found == 0 {
         s.segment_seq = 1;
         s.oldest_segment_seq = 1;
@@ -3785,12 +4236,10 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     // cross the limit: an overshooting append short-writes and the flush
     // retries the same overshooting batch forever. EOF-sized segments keep
     // the grow-then-rotate path below.
+    let frame_len = wal_seal::frame_len(s, payload_len);
     if s.fixed_segment_active
         && s.cursor > 0
-        && s.cursor
-            .saturating_add(FRAME_HDR + payload_len as u32)
-            .saturating_add(4)
-            > s.segment_limit
+        && s.cursor.saturating_add(frame_len as u32).saturating_add(4) > s.segment_limit
     {
         if s.has_batch {
             flush_batch(s, sys);
@@ -3805,7 +4254,22 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         rotate_segment(s, sys);
     }
 
-    let entry_payload_offset = s.cursor.saturating_add(FRAME_HDR);
+    // A new key epoch starts at a segment boundary: close the current
+    // segment first, so no segment holds frames of two epochs by
+    // rotation (a truncation back into an older segment still can).
+    if wal_seal::boundary_wanted(s) && s.cursor > 0 {
+        if s.has_batch {
+            flush_batch(s, sys);
+            if s.has_batch {
+                s.stashed_len = plen;
+                s.stashed_holds = s.stashed_holds.saturating_add(1);
+                return;
+            }
+        }
+        rotate_segment(s, sys);
+    }
+
+    let entry_payload_offset = s.cursor.saturating_add(wal_seal::payload_lead(s));
     ensure_segment_open(s, sys);
     if s.fd < 0 {
         if s.no_fs {
@@ -3852,12 +4316,6 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     // Stage a complete record contiguously so group mode coalesces
     // several records into ONE provider write as well as one fsync,
     // rather than issuing separate header and body writes per entry.
-    let crc = {
-        let mut c = Crc32c::new();
-        c.update(&s.msg_buf[..payload_len]);
-        c.finalize()
-    };
-    let frame_len = FRAME_HDR as usize + payload_len;
     if frame_len > WRITE_BUF_SIZE {
         // Unstageable at any time (record larger than the whole write buffer).
         // Not a transient condition, so do NOT stash — that would spin. This
@@ -3880,14 +4338,31 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         }
     }
     let pos = s.write_pos as usize;
-    s.write_buf[pos..pos + 4].copy_from_slice(&(payload_len as u32).to_le_bytes());
-    s.write_buf[pos + 4..pos + 8].copy_from_slice(&crc.to_le_bytes());
-    s.write_buf[pos + 8..pos + frame_len].copy_from_slice(&s.msg_buf[..payload_len]);
+    if wal_seal::enabled(s) {
+        // Sealed once, here: the staged bytes are what every write and
+        // retry of this record sends, so a retry after an unknown outcome
+        // repeats the identical ciphertext under the identical nonce.
+        if !wal_seal::ensure_writable(s, sys) || !wal_seal::seal_into(s, sys, pos, payload_len) {
+            s.stashed_len = plen;
+            s.stashed_holds = s.stashed_holds.saturating_add(1);
+            s.write_errors = s.write_errors.saturating_add(1);
+            return;
+        }
+    } else {
+        let crc = {
+            let mut c = Crc32c::new();
+            c.update(&s.msg_buf[..payload_len]);
+            c.finalize()
+        };
+        s.write_buf[pos..pos + 4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        s.write_buf[pos + 4..pos + 8].copy_from_slice(&crc.to_le_bytes());
+        s.write_buf[pos + 8..pos + 8 + payload_len].copy_from_slice(&s.msg_buf[..payload_len]);
+    }
     s.write_pos = (pos + frame_len) as u16;
 
     s.current_term = term;
     s.current_index = index;
-    s.cursor += FRAME_HDR + payload_len as u32;
+    s.cursor += frame_len as u32;
     s.entries_written += 1;
     s.bytes_written += payload_len as u64;
     record_entry_loc(
@@ -3967,6 +4442,7 @@ unsafe fn rotate_segment(s: &mut Wal, sys: &SyscallTable) {
     flush_block(s, sys);
     fsync_segment(s, sys);
     close_segment(s, sys);
+    wal_seal::close_incarnation(s, sys);
 
     note_trigger(s, s.current_term, s.current_index);
     if s.out_compaction >= 0 {
@@ -4602,6 +5078,26 @@ fn segment_mode(s: &Wal) -> i64 {
 /// capture would.
 pub fn high_water(s: &Wal) -> (Term, Index) {
     (s.current_term, s.current_index)
+}
+
+/// Whether this WAL writes sealed frames.
+pub fn sealed(s: &Wal) -> bool {
+    wal_seal::enabled(s)
+}
+
+/// The key epoch new sealed records use; 0 until the sealed WAL is
+/// ready, and always 0 unsealed.
+pub fn key_epoch(s: &Wal) -> u32 {
+    if wal_seal::enabled(s) && s.seal.phase == wal_seal::PHASE_READY {
+        s.seal.epoch
+    } else {
+        0
+    }
+}
+
+/// Ask for a new key epoch, taken at the next segment boundary.
+pub fn request_key_rotation(s: &mut Wal) {
+    wal_seal::request_rotation(s);
 }
 
 /// Seam delivery from the snapshot component: a peer snapshot was

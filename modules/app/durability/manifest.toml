@@ -13,6 +13,10 @@ hardware_targets = ["bcm2712"]
 # persistence + chunked install transfer + retention floors + app
 # snapshot round-trip), keys (DEK epoch rotation).
 #
+# `aead` (1 = ChaCha20-Poly1305, 2 = AES-256-GCM) seals WAL frames and
+# snapshot chunks under per-group masters in the KEY_VAULT;
+# `cluster` names the cluster those records are bound to.
+#
 # Variants:
 #   disk (default) — durable composition; FS-backed segments and
 #     snapshots; quorum proofs on `quorum_durable`.

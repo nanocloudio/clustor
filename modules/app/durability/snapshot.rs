@@ -17,6 +17,10 @@ use super::abi::SyscallTable;
 use super::collections::Crc32c;
 use super::types::{Index, Term};
 use super::{dev_log, dev_millis, wire, wire_channels};
+use crate::abi::contracts::key_vault as kv;
+
+#[path = "../../common/sealed_record.rs"]
+mod sealed;
 
 const FS_OPEN: u32 = 0x0900;
 const FS_READ: u32 = 0x0901;
@@ -163,6 +167,12 @@ const MAX_CHUNK_BODY: usize = 4 * 1024;
 const APP_CAPTURE_TIMEOUT_TICKS: u32 = 2000;
 
 const METRICS_INTERVAL_MS: u64 = 1000;
+
+/// Plaintext one sealed chunk carries: the transfer chunk size, so a
+/// sealed body reads back in exactly the pieces an unsealed one does.
+const SEAL_CHUNK_PLAIN: usize = MAX_CHUNK_BODY;
+/// One whole sealed chunk: header, plaintext capacity, tag.
+const SEAL_BUF: usize = sealed::SNAP_HDR_LEN + SEAL_CHUNK_PLAIN + sealed::TAG_LEN;
 
 #[repr(C)]
 pub struct Snapshot {
@@ -342,6 +352,40 @@ pub struct Snapshot {
     capture_had_fs: bool,
     app_body_len: u32,
 
+    // ── Chunk-sealed snapshot bodies ─────────────────────────────
+    //
+    // With `seal_suite` non-zero a snapshot body is stored as v1 `FXSC`
+    // chunks under a key derived from the group's master
+    // for the epoch in force, with a fresh 128-bit generation per
+    // snapshot. The file header, CRC trailer and every read-back stream
+    // keep their unsealed shape: the header's `body_len` counts stored
+    // bytes, and the stream above sees the same bytes in the same
+    // `MAX_CHUNK_BODY` pieces. Peers receive logical chunks over the
+    // transport and seal them under their own key.
+    /// v1 suite id, 0 = unsealed. Fanned in from the wal.
+    pub seal_suite: u16,
+    pub seal_cluster: [u8; sealed::CLUSTER_LEN],
+    /// This replica's id: the "source replica" of the chunks it seals.
+    pub self_id: u8,
+    /// Lowest key epoch among the sealed snapshot files that may still
+    /// be on disk (0 = none): its master must outlive them.
+    sealed_epoch: u32,
+    /// The stream being written: its key, epoch, generation, next chunk
+    /// index, plaintext staged toward the next chunk, and stored bytes.
+    wkey: i32,
+    wepoch: u32,
+    wgen: [u8; sealed::GENERATION_LEN],
+    wchunk: u64,
+    wfill: u32,
+    wstored: u32,
+    /// Epoch of the file `snap_finish` last made durable.
+    done_epoch: u32,
+    /// A sealed snapshot failed authentication: boot does not proceed.
+    seal_fault: bool,
+    pub seal_failures: u32,
+    /// Scratch for one sealed chunk (in state: bodies stream).
+    seal_buf: [u8; SEAL_BUF],
+
     // Scratch
     path_buf: [u8; SNAP_PATH_MAX],
     msg_buf: [u8; 8192],
@@ -406,6 +450,257 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.app_bodies_received = 0;
     s.app_captures_timed_out = 0;
     s.app_body_len = 0;
+    s.seal_suite = 0;
+    s.seal_cluster = [0; sealed::CLUSTER_LEN];
+    s.self_id = 0;
+    s.sealed_epoch = 0;
+    s.wkey = -1;
+    s.wepoch = 0;
+    s.wgen = [0; sealed::GENERATION_LEN];
+    s.wchunk = 0;
+    s.wfill = 0;
+    s.wstored = 0;
+    s.done_epoch = 0;
+    s.seal_fault = false;
+    s.seal_failures = 0;
+    s.seal_buf = [0; SEAL_BUF];
+}
+
+/// Lowest key epoch a sealed snapshot on disk may still name (0 when
+/// none): the wal keeps that epoch's master alive.
+pub fn sealed_epoch(s: &Snapshot) -> u32 {
+    s.sealed_epoch
+}
+
+#[inline]
+fn sealing(s: &Snapshot) -> bool {
+    s.seal_suite != 0
+}
+
+fn seal_identity(s: &Snapshot) -> sealed::Identity {
+    sealed::Identity {
+        cluster: s.seal_cluster,
+        partition: u64::from(s.partition_id),
+        replica: u64::from(s.self_id),
+    }
+}
+
+/// The chunk key for a snapshot of `generation` under `epoch`. The
+/// master is the wal's (same label, same owner): opened, never
+/// destroyed here.
+///
+/// # Safety
+/// `sys` must reach live kernel routines per the module ABI.
+unsafe fn snap_key(
+    s: &Snapshot,
+    sys: &SyscallTable,
+    epoch: u32,
+    generation: &[u8; sealed::GENERATION_LEN],
+) -> i32 {
+    let Some(vsuite) = sealed::vault_suite(s.seal_suite) else {
+        return -22;
+    };
+    let mut label = [0u8; sealed::MASTER_LABEL_CAP];
+    let n = sealed::master_label(s.partition_id, s.self_id, epoch, &mut label);
+    let master = sealed::open_master(sys, &label[..n], false);
+    if master < 0 {
+        return master;
+    }
+    let ctx = sealed::snap_context(&seal_identity(s), generation, epoch);
+    sealed::derive(
+        sys,
+        master,
+        vsuite,
+        kv::usage::SEAL | kv::usage::OPEN,
+        sealed::SNAP_LABEL,
+        &ctx,
+    )
+}
+
+/// Seal the staged plaintext as the stream's next chunk and write it.
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn seal_chunk_out(s: &mut Snapshot, sys: &SyscallTable, flags: u8) -> bool {
+    let c = s.wfill as usize;
+    let binding = sealed::SnapBinding {
+        generation: s.wgen,
+        last_term: s.wterm,
+        last_index: s.windex,
+        epoch: s.wepoch,
+    };
+    let aad = sealed::snap_aad(&seal_identity(s), &binding, s.wchunk, flags, c as u32);
+    let nonce = sealed::snap_nonce(s.wchunk);
+    sealed::snap_write_header(
+        &mut s.seal_buf,
+        s.wepoch,
+        &s.wgen,
+        s.wchunk,
+        flags,
+        c as u32,
+    );
+    let base = s.seal_buf.as_mut_ptr();
+    let rc = sealed::aead(
+        sys,
+        s.wkey,
+        true,
+        &nonce,
+        &aad,
+        base.add(sealed::SNAP_HDR_LEN),
+        c,
+        base.add(sealed::SNAP_HDR_LEN + c),
+    );
+    if rc != sealed::Aead::Ok {
+        s.seal_failures = s.seal_failures.saturating_add(1);
+        return false;
+    }
+    let total = sealed::SNAP_OVERHEAD + c;
+    if (sys.provider_call)(s.wfd, FS_WRITE, base, total) != total as i32 {
+        return false;
+    }
+    s.wchunk += 1;
+    s.wfill = 0;
+    s.wstored = s.wstored.saturating_add(total as u32);
+    true
+}
+
+/// A reader over a sealed body: the binding its first chunk fixes and
+/// the key it derived.
+struct ChunkReader {
+    key: i32,
+    binding: sealed::SnapBinding,
+    next: u64,
+    done: bool,
+}
+
+/// Why a sealed body could not be read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkErr {
+    /// Short read or malformed header: the file is not whole.
+    Io,
+    /// A chunk that does not authenticate, or out of place.
+    Auth,
+    /// Its epoch's master is not in the vault.
+    Key,
+}
+
+impl ChunkReader {
+    fn new(term: Term, index: Index) -> Self {
+        Self {
+            key: -1,
+            binding: sealed::SnapBinding {
+                generation: [0; sealed::GENERATION_LEN],
+                last_term: term,
+                last_index: index,
+                epoch: 0,
+            },
+            next: 0,
+            done: false,
+        }
+    }
+}
+
+/// Read and open the next chunk from `fd` into `seal_buf`. Returns the
+/// plaintext length (at `seal_buf[40..]`).
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn read_chunk(
+    s: &mut Snapshot,
+    sys: &SyscallTable,
+    fd: i32,
+    r: &mut ChunkReader,
+) -> Result<usize, ChunkErr> {
+    let hl = sealed::SNAP_HDR_LEN;
+    if (sys.provider_call)(fd, FS_READ, s.seal_buf.as_mut_ptr(), hl) != hl as i32 {
+        return Err(ChunkErr::Io);
+    }
+    let Some(h) = sealed::snap_parse_header(&s.seal_buf[..hl], SEAL_CHUNK_PLAIN) else {
+        return Err(ChunkErr::Io);
+    };
+    let c = h.ct_len as usize;
+    let rest = c + sealed::TAG_LEN;
+    if (sys.provider_call)(fd, FS_READ, s.seal_buf.as_mut_ptr().add(hl), rest) != rest as i32 {
+        return Err(ChunkErr::Io);
+    }
+    if r.next == 0 {
+        r.binding.generation = h.generation;
+        r.binding.epoch = h.epoch;
+        r.key = snap_key(s, sys, h.epoch, &h.generation);
+        if r.key < 0 {
+            return Err(ChunkErr::Key);
+        }
+    }
+    if h.chunk_index != r.next || h.generation != r.binding.generation || h.epoch != r.binding.epoch
+    {
+        return Err(ChunkErr::Auth);
+    }
+    let aad = sealed::snap_aad(
+        &seal_identity(s),
+        &r.binding,
+        h.chunk_index,
+        h.flags,
+        c as u32,
+    );
+    let nonce = sealed::snap_nonce(h.chunk_index);
+    let base = s.seal_buf.as_mut_ptr();
+    match sealed::aead(
+        sys,
+        r.key,
+        false,
+        &nonce,
+        &aad,
+        base.add(hl),
+        c,
+        base.add(hl + c),
+    ) {
+        sealed::Aead::Ok => {}
+        sealed::Aead::AuthFailed => return Err(ChunkErr::Auth),
+        sealed::Aead::Refused(_) => return Err(ChunkErr::Key),
+    }
+    r.next += 1;
+    r.done = h.flags & sealed::SNAP_FLAG_FINAL != 0;
+    Ok(c)
+}
+
+/// Authenticate a whole sealed body of `stored` bytes starting at the
+/// file's current position: every chunk in order, the last one final,
+/// nothing after it. Returns the plaintext length.
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn verify_sealed_body(
+    s: &mut Snapshot,
+    sys: &SyscallTable,
+    fd: i32,
+    stored: usize,
+    term: Term,
+    index: Index,
+) -> Result<u32, ChunkErr> {
+    let mut r = ChunkReader::new(term, index);
+    let mut consumed = 0usize;
+    let mut logical = 0u32;
+    while !r.done {
+        if consumed >= stored {
+            sealed::destroy(sys, r.key);
+            return Err(ChunkErr::Auth);
+        }
+        let got = read_chunk(s, sys, fd, &mut r);
+        let c = match got {
+            Ok(c) => c,
+            Err(e) => {
+                sealed::destroy(sys, r.key);
+                return Err(e);
+            }
+        };
+        consumed += sealed::SNAP_OVERHEAD + c;
+        logical = logical.saturating_add(c as u32);
+    }
+    sealed::destroy(sys, r.key);
+    if consumed != stored {
+        return Err(ChunkErr::Auth);
+    }
+    Ok(logical)
 }
 
 /// Deliver the wal component's current `(term, index)` high-water.
@@ -657,12 +952,6 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                     ingest_install_chunk(s, sys, pl);
                     cold_fs = true; // chunk ingest persists to disk
                 }
-                wire::MSG_SNAPSHOT_CHUNK => {
-                    // Legacy untyped chunk — count for backward
-                    // compatibility with older test fixtures, no
-                    // install side effect.
-                    s.chunks_imported += 1;
-                }
                 _ => {}
             }
         }
@@ -881,7 +1170,7 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         // withholds the signal and the leader re-sends from offset 0.
         let mut app_restored = true;
         if s.out_app_ctl >= 0 && s.body_len > 0 {
-            app_restored = emit_app_restore(s, sys, s.in_progress_term, s.in_progress_last_idx);
+            app_restored = restore_app(s, sys, s.in_progress_term, s.in_progress_last_idx);
         }
 
         if app_restored && (durable || !had_fs) && s.out_installed >= 0 {
@@ -1020,7 +1309,7 @@ unsafe fn finalize_local_snapshot(s: &mut Snapshot, sys: &SyscallTable, term: Te
     if durable {
         unlink_prev_snapshot(s, sys, prev_index, index);
     }
-    emit_install_staged(s, sys, term, index);
+    export_staged(s, sys, term, index);
     s.snapshots_taken += 1;
 }
 
@@ -1077,6 +1366,7 @@ unsafe fn emit_install_chunk(s: &mut Snapshot, sys: &SyscallTable, term: Term, i
 ///
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines.
+#[inline(never)]
 unsafe fn emit_app_restore(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) -> bool {
     if s.out_app_ctl < 0 {
         return false;
@@ -1157,6 +1447,7 @@ unsafe fn emit_app_restore(s: &mut Snapshot, sys: &SyscallTable, term: Term, ind
 ///
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines.
+#[inline(never)]
 unsafe fn emit_install_staged(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) {
     let total = s.body_len as usize;
     if total == 0 {
@@ -1209,6 +1500,124 @@ unsafe fn emit_install_staged(s: &mut Snapshot, sys: &SyscallTable, term: Term, 
         sent += chunk;
     }
     (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+}
+
+/// Hand the retained snapshot's body to the app state machine, by the
+/// path that matches how it is stored. Dispatched above either path's
+/// frame: the unsealed stream stages a page-sized buffer on the stack
+/// that the sealed one does not need.
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn restore_app(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) -> bool {
+    if s.out_app_ctl < 0 {
+        return false;
+    }
+    if sealing(s) {
+        emit_sealed_body(s, sys, term, index, s.out_app_ctl, true)
+    } else {
+        emit_app_restore(s, sys, term, index)
+    }
+}
+
+/// Ship the retained snapshot to peers, by the path that matches how it
+/// is stored (see `restore_app`).
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn export_staged(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) {
+    if sealing(s) && s.body_len > 0 {
+        if s.out_export >= 0 {
+            emit_sealed_body(s, sys, term, index, s.out_export, false);
+        }
+    } else {
+        emit_install_staged(s, sys, term, index);
+    }
+}
+
+/// Stream a sealed body as logical chunks: to the app (`restore`: a
+/// RESET, then `MSG_APP_SNAPSHOT_CHUNK`s) or to peers (InstallSnapshot).
+/// Each chunk is opened and authenticated before its plaintext leaves:
+/// the receiver seals what it keeps under its own key. The pieces,
+/// offsets and final flags are exactly the unsealed stream's. Each
+/// message is composed in place in `seal_buf`, its header written over
+/// the chunk header just ahead of the plaintext. Returns whether the
+/// whole body went out.
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+#[inline(never)]
+unsafe fn emit_sealed_body(
+    s: &mut Snapshot,
+    sys: &SyscallTable,
+    term: Term,
+    index: Index,
+    chan: i32,
+    restore: bool,
+) -> bool {
+    let total = s.body_len as usize;
+    let fd = snap_open_body(s, sys, index, 0);
+    if fd < 0 {
+        return false;
+    }
+    if restore {
+        if !wire_channels::writable(sys, chan) {
+            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            return false;
+        }
+        let mut hdr = [0u8; 16];
+        hdr[..8].copy_from_slice(&term.to_le_bytes());
+        hdr[8..].copy_from_slice(&index.to_le_bytes());
+        wire_channels::channel_write_msg(sys, chan, wire::MSG_APP_SNAPSHOT_RESET, &hdr);
+    }
+    let body = sealed::SNAP_HDR_LEN;
+    let mut r = ChunkReader::new(term, index);
+    let mut sent = 0usize;
+    let mut whole = false;
+    while !r.done {
+        let c = match read_chunk(s, sys, fd, &mut r) {
+            Ok(c) => c,
+            Err(_) => {
+                s.seal_failures = s.seal_failures.saturating_add(1);
+                dev_log(sys, 1, b"[snap] seal read FAIL".as_ptr(), 21);
+                break;
+            }
+        };
+        if c == 0 {
+            whole = r.done && sent == total;
+            continue;
+        }
+        if sent + c > total || !wire_channels::writable(sys, chan) {
+            break;
+        }
+        let done = sent + c == total;
+        let (msg, start) = if restore {
+            let start = body - wire::APP_SNAPSHOT_HDR;
+            let h = &mut s.seal_buf[start..body];
+            h[..8].copy_from_slice(&term.to_le_bytes());
+            h[8..16].copy_from_slice(&index.to_le_bytes());
+            h[16..24].copy_from_slice(&(sent as u64).to_le_bytes());
+            h[24] = u8::from(done);
+            h[25..].fill(0);
+            (wire::MSG_APP_SNAPSHOT_CHUNK, start)
+        } else {
+            let start = body - wire::INSTALL_SNAPSHOT_HDR;
+            let mut hdr = [0u8; wire::INSTALL_SNAPSHOT_HDR];
+            if wire::encode_install_snapshot(&mut hdr, term, index, term, sent as u64, done, &[])
+                == 0
+            {
+                break;
+            }
+            s.seal_buf[start..body].copy_from_slice(&hdr);
+            (wire::MSG_INSTALL_SNAPSHOT, start)
+        };
+        wire_channels::channel_write_msg(sys, chan, msg, &s.seal_buf[start..body + c]);
+        sent += c;
+        whole = r.done && sent == total;
+    }
+    sealed::destroy(sys, r.key);
+    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    whole
 }
 
 /// # Safety
@@ -1628,6 +2037,11 @@ fn next_boot_candidate(s: &mut Snapshot) {
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
+    if s.seal_fault {
+        // A sealed snapshot failed authentication: nothing below it may
+        // be rebuilt from this replica's media.
+        return false;
+    }
     match s.boot_phase {
         BOOT_PTR => {
             if collect_snap_ptr_candidates(s, sys) {
@@ -1697,6 +2111,49 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                     && c.finalize()
                         == u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
             }
+            // Sealed, a body whose CRC holds must also authenticate, chunk
+            // by chunk, before anything in it — or its header's term and
+            // index — reaches the state machine or consensus. The CRC is
+            // judged first: a torn file is a crash's leftovers, while a
+            // whole one that does not authenticate is tampering or the
+            // wrong key, and fails the replica closed.
+            let mut logical = body_len as u32;
+            if ok && sealing(s) {
+                let term = u64::from_le_bytes([
+                    hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+                ]);
+                let index = u64::from_le_bytes([
+                    hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
+                ]);
+                let start = (SNAP_HDR_LEN as i32).to_le_bytes();
+                let verdict = if (sys.provider_call)(fd, FS_SEEK, start.as_ptr() as *mut u8, 4) < 0
+                {
+                    Err(ChunkErr::Io)
+                } else {
+                    verify_sealed_body(s, sys, fd, body_len, term, index)
+                };
+                match verdict {
+                    Ok(n) => {
+                        logical = n;
+                        let epoch = u32::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35]]);
+                        s.sealed_epoch = epoch;
+                        s.done_epoch = epoch;
+                    }
+                    Err(e) => {
+                        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                        s.seal_failures = s.seal_failures.saturating_add(1);
+                        if !s.seal_fault {
+                            s.seal_fault = true;
+                            if e == ChunkErr::Key {
+                                dev_log(sys, 1, b"[snap] seal: key epoch unavailable".as_ptr(), 34);
+                            } else {
+                                dev_log(sys, 1, b"[snap] seal tag FAIL".as_ptr(), 20);
+                            }
+                        }
+                        return false;
+                    }
+                }
+            }
             (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
             if !ok {
                 // Fail CLOSED on a torn/corrupt snapshot: never replay a
@@ -1713,8 +2170,8 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             s.last_snapshot_index = u64::from_le_bytes([
                 hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
             ]);
-            s.body_len = body_len as u32;
-            s.boot_phase = if s.out_app_ctl >= 0 && body_len > 0 {
+            s.body_len = logical;
+            s.boot_phase = if s.out_app_ctl >= 0 && logical > 0 {
                 BOOT_EMIT
             } else {
                 BOOT_SIGNAL
@@ -1722,7 +2179,7 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             false
         }
         BOOT_EMIT => {
-            if emit_app_restore(s, sys, s.last_snapshot_term, s.last_snapshot_index) {
+            if restore_app(s, sys, s.last_snapshot_term, s.last_snapshot_index) {
                 dev_log(sys, 3, b"[snap] boot restored".as_ptr(), 20);
                 s.boot_phase = BOOT_SIGNAL;
             }
@@ -1933,6 +2390,9 @@ unsafe fn unlink_prev_snapshot(
         // durable: an unlink left in a volatile directory cache
         // resurrects the retired snapshot after a power cut.
         dev_log(sys, 3, b"[snap] retired".as_ptr(), 14);
+        if sealing(s) && s.done_epoch != 0 {
+            s.sealed_epoch = s.done_epoch;
+        }
     }
 }
 
@@ -1998,7 +2458,10 @@ fn snap_header(
     hdr[8..16].copy_from_slice(&term.to_le_bytes());
     hdr[16..24].copy_from_slice(&last_idx.to_le_bytes());
     hdr[24..32].copy_from_slice(&last_term.to_le_bytes());
-    hdr[32..36].copy_from_slice(&s.dek_epoch.to_le_bytes());
+    // Sealed, the epoch is the one the stream's chunks were sealed under,
+    // fixed when it began.
+    let epoch = if sealing(s) { s.wepoch } else { s.dek_epoch };
+    hdr[32..36].copy_from_slice(&epoch.to_le_bytes());
     hdr[36..40].copy_from_slice(&body_len.to_le_bytes());
     hdr
 }
@@ -2032,6 +2495,29 @@ unsafe fn snap_begin(
         // caller withholds its install signal and the source retries.
         return (false, fd != FS_E_NODEV && fd != FS_E_NOSYS);
     }
+    if sealing(s) {
+        // A fresh generation, the epoch in force, and the chunk key under
+        // both. No epoch yet (the wal has not established one) or no key
+        // refuses the stream: the caller withholds its install signal.
+        s.wepoch = s.dek_epoch;
+        s.wterm = term;
+        s.windex = last_idx;
+        let ok = s.wepoch != 0 && sealed::random_fill(sys, &mut s.wgen);
+        s.wkey = if ok {
+            snap_key(s, sys, s.wepoch, &s.wgen)
+        } else {
+            -1
+        };
+        if s.wkey < 0 {
+            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.seal_failures = s.seal_failures.saturating_add(1);
+            dev_log(sys, 2, b"[snap] seal key unavailable".as_ptr(), 27);
+            return (false, true);
+        }
+        s.wchunk = 0;
+        s.wfill = 0;
+        s.wstored = 0;
+    }
     // Placeholder header: body_len is not known until the last chunk.
     // `snap_finish` seeks back and rewrites it.
     let mut hdr = snap_header(s, term, last_idx, last_term, 0);
@@ -2039,6 +2525,8 @@ unsafe fn snap_begin(
         (sys.provider_call)(fd, FS_WRITE, hdr.as_mut_ptr(), SNAP_HDR_LEN) == SNAP_HDR_LEN as i32;
     if !ok {
         (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        sealed::destroy(sys, s.wkey);
+        s.wkey = -1;
         return (false, true);
     }
     s.wfd = fd;
@@ -2062,6 +2550,30 @@ unsafe fn snap_append(s: &mut Snapshot, sys: &SyscallTable, src: *mut u8, len: u
     if len == 0 {
         return true;
     }
+    if sealing(s) {
+        // Stage toward whole `SEAL_CHUNK_PLAIN` chunks; the remainder is
+        // sealed as the final chunk by `snap_finish`.
+        let mut done = 0usize;
+        while done < len {
+            let room = SEAL_CHUNK_PLAIN - s.wfill as usize;
+            let take = (len - done).min(room);
+            core::ptr::copy_nonoverlapping(
+                src.add(done),
+                s.seal_buf
+                    .as_mut_ptr()
+                    .add(sealed::SNAP_HDR_LEN + s.wfill as usize),
+                take,
+            );
+            s.wfill += take as u32;
+            done += take;
+            if s.wfill as usize == SEAL_CHUNK_PLAIN && !seal_chunk_out(s, sys, 0) {
+                snap_abort(s, sys);
+                return false;
+            }
+        }
+        s.wbody = s.wbody.saturating_add(len as u32);
+        return true;
+    }
     if (sys.provider_call)(s.wfd, FS_WRITE, src, len) != len as i32 {
         snap_abort(s, sys);
         return false;
@@ -2082,6 +2594,11 @@ unsafe fn snap_abort(s: &mut Snapshot, sys: &SyscallTable) {
         s.wfd = -1;
     }
     s.wbody = 0;
+    if s.wkey >= 0 {
+        sealed::destroy(sys, s.wkey);
+        s.wkey = -1;
+    }
+    s.wfill = 0;
 }
 
 /// Finalise a streamed snapshot: rewrite the header with the true body
@@ -2102,12 +2619,22 @@ unsafe fn snap_finish(s: &mut Snapshot, sys: &SyscallTable) -> bool {
         return false;
     }
     let fd = s.wfd;
-    let body_len = s.wbody;
+    let logical = s.wbody;
+    // Sealed, the body ends with the chunk carrying the final flag: the
+    // staged remainder, possibly empty, so every sealed body has an
+    // authenticated end.
+    let mut ok = !sealing(s) || seal_chunk_out(s, sys, sealed::SNAP_FLAG_FINAL);
+    if s.wkey >= 0 {
+        sealed::destroy(sys, s.wkey);
+        s.wkey = -1;
+    }
+    let body_len = if sealing(s) { s.wstored } else { logical };
     let mut hdr = snap_header(s, s.wterm, s.windex, s.wlast_term, body_len);
 
     // 1. True header at offset 0.
     let zero = 0i32.to_le_bytes();
-    let mut ok = (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4) >= 0
+    ok = ok
+        && (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4) >= 0
         && (sys.provider_call)(fd, FS_WRITE, hdr.as_mut_ptr(), SNAP_HDR_LEN) == SNAP_HDR_LEN as i32;
 
     // 2. CRC over header || body, reading the body back in chunks.
@@ -2156,8 +2683,16 @@ unsafe fn snap_finish(s: &mut Snapshot, sys: &SyscallTable) -> bool {
         ok = plen > 0 && publish_name(s, sys, plen);
     }
     if ok {
-        s.body_len = body_len;
-        s.snap_bytes_written = s.snap_bytes_written.saturating_add(body_len as u64);
+        s.body_len = logical;
+        s.snap_bytes_written = s.snap_bytes_written.saturating_add(logical as u64);
+        if sealing(s) {
+            // The previous file may survive until it is retired: keep the
+            // lower of the two epochs live until then.
+            s.done_epoch = s.wepoch;
+            if s.sealed_epoch == 0 || s.wepoch < s.sealed_epoch {
+                s.sealed_epoch = s.wepoch;
+            }
+        }
         dev_log(sys, 3, b"[snap] durable".as_ptr(), 14);
     } else {
         s.install_failures = s.install_failures.saturating_add(1);

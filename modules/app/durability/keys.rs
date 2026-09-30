@@ -5,6 +5,12 @@
 //! (delivered in-module — the epoch is stamped into snapshot
 //! manifests and headers). `cert_refresh` remains an external port
 //! for deployments that wire certificate rotation.
+//!
+//! With sealed records (`aead` set) this epoch is only a timer: the
+//! composite turns each change into a request for a new key epoch,
+//! which the wal creates, records durably and starts at its next
+//! segment boundary. Snapshots then seal under the wal's epoch, never
+//! under this counter.
 
 use super::abi::SyscallTable;
 use super::{wire, wire_channels};

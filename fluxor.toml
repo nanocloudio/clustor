@@ -99,6 +99,14 @@ reason = """include!s the SDK runtime and compiles no_std PIC module sources ver
 prefix = "tests/wal_truncate.rs"
 reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
 
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/sealed_wal.rs"
+reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/sealed_records.rs"
+reason = """mounts the SDK ABI and the no_std sealed-record codec verbatim into a host crate and drives the codec's vault client through the SyscallTable ABI; each test uses a subset of that surface."""
+
 [ci.templates]
 dir = "configs"
 # Defaults for the template-render gate (CI phase 1.5). These values

@@ -344,6 +344,42 @@ path = "tests/name_fence.rs"
 name = "raft_fault_matrix"
 path = "tests/raft_fault_matrix.rs"
 
+# An encrypted durability root: the WAL and snapshots on fat32 over
+# crypt_block over file_block (`configs/single-encrypted-root.yaml`),
+# proving the stored image carries no plaintext, plus an unencrypted
+# control run that finds the same needle in the clear. Launches
+# fluxor-linux; runtime-skips when prereqs are missing.
+[[test]]
+name = "encrypted_root"
+path = "tests/encrypted_root.rs"
+
+# Sealed-record conformance: the v1 WAL-frame and snapshot-chunk
+# known-answer vectors per AEAD suite, and the binding of every AAD
+# field. Pure host code over
+# `modules/common/sealed_record.rs` and a KEY_VAULT mock built from the
+# SDK's own primitives; no prereqs, always runs.
+[[test]]
+name = "sealed_records"
+path = "tests/sealed_records.rs"
+
+# Sealed-WAL behaviour: append and replay across key epochs,
+# torn-vs-tampered verdicts, crash
+# points around nonce reservation, byte-identical retry, truncation,
+# segment+key rotation, sealed snapshots, and identical Raft-visible
+# output sealed and unsealed. Mounts wal.rs + snapshot.rs against the
+# same mock kernel; serialised internally, always runs.
+[[test]]
+name = "sealed_wal"
+path = "tests/sealed_wal.rs"
+
+# Sealing end to end: a single-node fluxor-linux cluster with `aead` set,
+# sealing through the real kernel KEY_VAULT (persisted under a per-test
+# FLUXOR_VAULT_DIR); commit, kill, replay, and ciphertext-only segments.
+# Same skip semantics as `cluster`.
+[[test]]
+name = "sealed_e2e"
+path = "tests/sealed_e2e.rs"
+
 # Criterion benches. Each uses `harness = false` so criterion's own
 # main runs instead of the default libtest harness. Run with
 # `cargo bench` or `cargo bench --bench <name> -- --quick`. All

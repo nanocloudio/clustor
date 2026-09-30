@@ -109,6 +109,10 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | WAL staged write batch | `WRITE_BUF_SIZE` | modules/app/durability/wal.rs | 16384 | Capacity, sized to hold `group_max_pending=4` full frames so a group becomes one provider write rather than merely a grouped fsync. A frame that does not fit the REMAINING space flushes the batch first, and is stashed for the next step if the flush cannot drain. A frame larger than the whole buffer is a hard mis-sizing: it is refused and counted in `write_errors` rather than stashed, because retrying it would spin. `MAX_ENTRY_LEN` (2064) keeps that branch unreachable in a correctly composed graph. |
 | `Wal` module-state footprint | `WAL_FOOTPRINT_BUDGET` | modules/app/durability/wal.rs | — | Variant-dependent compile-time assertion, not a runtime ceiling: 320 KiB on a disk build, 600 KiB on a volatile one, each a little above the actual size. Module state comes from `module_state_size()` rather than BSS, so a ring re-inflated past the budget fails the build instead of silently costing every replica half a megabyte. |
 | WAL durability-fence ring | `FENCE_RING_MAX` | modules/app/durability/wal.rs | 8 | `fence_depth` is clamped to this capacity. A full ring delays issue/acknowledgement; it must not overwrite an unacknowledged fsync fence. |
+| Sealed-WAL live key epochs per group | `MAX_MARKS` | modules/app/durability/wal_seal.rs | 8 | Capacity (sealed WAL only): the allocator state records the first segment of each epoch still named by a retained segment. A rotation that would need a ninth is refused and counted in `rotations_refused`; the WAL keeps sealing under the current epoch until compaction retires one — except when the allocator is stale, where appends are held (fail-closed) because the current epoch may repeat a nonce. |
+| Sealed-WAL incarnation reservation stride | `INCARNATION_STRIDE` | modules/app/durability/wal_seal.rs | — | Semantic; typed value 64. Incarnation counters are reserved durably this many at a time, so one allocator-state write covers 64 segment opens or truncations. A restart abandons the unused rest of a range; the counter never wraps (exhaustion asks for a new epoch). |
+| Older-epoch masters held open for reading | `MASTER_CACHE` | modules/app/durability/wal_seal.rs | 4 | Capacity: vault handles for epochs other than the current one, opened on demand by replay, read-back and the scan. A fifth evicts (destroys the handle of) the lowest epoch; the persisted master is untouched and reopens on next use. Bounds the vault slots one group holds to current + 4 + two derived keys. |
+| Replay's incarnation-reappearance window | `SEEN_INCARNATIONS` | modules/app/durability/wal_seal.rs | 16 | Lossy detection capacity: replay remembers the last 16 incarnations it walked past to catch one reappearing in a later segment (a nonce-domain conflict). Older ones are forgotten; the allocator's never-reuse rule, not this window, is the guarantee. |
 | Raft metadata copies | `META_SLOTS` | modules/app/consensus/raft.rs | 2 | Two alternating metadata records provide recoverable publication; this is redundancy policy, not user capacity. |
 | Snapshot pointer copies | `SNAP_PTR_SLOTS` | modules/app/durability/snapshot.rs | 2 | Two alternating pointer records provide recoverable publication; this is redundancy policy, not user capacity. |
 | Raft metadata path staging | `META_PATH_MAX` | modules/app/consensus/raft.rs | 32 | Bounds internally generated per-partition metadata paths; builders and partition-id formatting must remain within it. |
@@ -320,6 +324,10 @@ MAX_SYNC_FSYNC_RECORDS | modules/app/durability/wal.rs | 4
 REPLAY_FRAMES_PER_STEP | modules/app/durability/wal.rs | 4
 SCAN_RECORDS_PER_STEP | modules/app/durability/wal.rs | 16
 COMPACT_UNLINKS_PER_STEP | modules/app/durability/wal.rs | 4
+MAX_MARKS | modules/app/durability/wal_seal.rs | 8
+INCARNATION_STRIDE | modules/app/durability/wal_seal.rs | 64
+MASTER_CACHE | modules/app/durability/wal_seal.rs | 4
+SEEN_INCARNATIONS | modules/app/durability/wal_seal.rs | 16
 TM_BATCH_MAX | modules/common/timing.rs | 8
 ```
 
@@ -345,6 +353,9 @@ CARRY_MAX | modules/app/consensus/mod.rs | -
 CARRY_MAX | modules/app/durability/mod.rs | -
 FSYNC_DIM_MAX | modules/app/durability/mod.rs | -
 MEMORY_ENTRY_BODY_CAP | modules/app/durability/wal.rs | -
+SEALED_FRAME_MAX | modules/app/durability/wal.rs | -
+SEAL_CHUNK_PLAIN | modules/app/durability/snapshot.rs | -
+SEAL_BUF | modules/app/durability/snapshot.rs | -
 MAX_ENTRY_LEN | modules/common/wal_frame.rs | -
 CMD_MAX | modules/app/operations/admin.rs | -
 EXPORT_BUDGET | modules/app/operations/telemetry.rs | -

@@ -45,7 +45,7 @@ clean:
 # `include!` the SDK sources at compile time, and `cargo clean` takes
 # the tree with it. Re-staging is a no-op when present (~50ms).
 
-# Host L0/L1 micro-benches (RFC §7.1). `--quick` keeps it CI-fast;
+# Host L0/L1 micro-benches. `--quick` keeps it CI-fast;
 # drop the flag for full criterion sampling when chasing a
 # regression.
 bench:
@@ -80,11 +80,16 @@ e2e:
 	# gate `fluxor ci` reaches for anything under tests/ (phase 4 needs
 	# a tests/harness sub-workspace, which this project does not have).
 	cargo test --test raft_meta --test wal_scan --test wal_truncate \
-	  --test snap_pointer --test name_fence --test wire_codec_truncation
+	  --test snap_pointer --test name_fence --test wire_codec_truncation \
+	  --test sealed_records --test sealed_wal
 	# The fault matrix mounts several nodes' composites in one crate
 	# against a process-global mock kernel: one test at a time.
 	cargo test --test raft_fault_matrix -- --test-threads=1
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test wal_replay -- --test-threads=$(E2E_THREADS)
+	# The sealed WAL against the real kernel vault, and the encrypted
+	# durability-root composition with its plaintext control. Each
+	# launches single-node clusters on fixed ports: one at a time.
+	CLUSTOR_REQUIRE_E2E=1 cargo test --test sealed_e2e --test encrypted_root -- --test-threads=1
 	# wal_group_fsync's 4 tests all launch single-node clusters through
 	# `Cluster::launch`, which wipes and recreates one hardcoded, shared
 	# `<workspace>/wal/` directory per launch (the WAL module resolves
