@@ -70,6 +70,31 @@ name = "metrics"
 direction = "output"
 content_type = "OctetStream"
 
+# The connections this router dials, when they go through a transport of
+# their own: a TLS client in front of the dials beside a TLS server in
+# front of the listener, each in the one role it holds. Unwired, dials
+# share `net_in`/`net_out`. Appended last so every earlier index holds.
+[[ports]]
+name = "dial_in"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "dial_out"
+direction = "output"
+content_type = "OctetStream"
+
+# Each connection's TLS identity, re-keyed to the `wire::ConnId` its
+# client frames carry, for an admission stage (operations' rbac
+# `identity` input) that judges a client's commands by its key. A slot
+# that closes is revoked. A connection's frames wait for its identity
+# when this is wired, and one whose identity cannot be delivered is
+# closed. Appended last so every earlier index holds.
+[[ports]]
+name = "client_identity"
+direction = "output"
+content_type = "OctetStream"
+
 [observability]
 # Per-peer / per-client envelope routing over TCP. All four emitted as
 # typed MSG_METRIC_SAMPLE: connections_open gauge (active

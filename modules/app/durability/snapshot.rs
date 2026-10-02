@@ -140,14 +140,15 @@ const MAGIC_SNAP: u32 = 0x534E_4150; // "SNAP" little-endian as bytes
 /// Durable snapshot file layout (crash-atomic without an FS rename, which the
 /// FS contract does not expose):
 ///   `[MAGIC_SNAP:u32][partition:u16][rsvd:u16][term:u64][last_idx:u64]`
-///   `[last_term:u64][dek_epoch:u32][body_len:u32]` = `SNAP_HDR_LEN` bytes,
+///   `[last_term:u64][dek_epoch:u32][body_len:u32]`
+///   `[membership:3 = voters, joint, learners][rsvd:5]` = `SNAP_HDR_LEN` bytes,
 ///   then `body[body_len]`, then `[body_crc32c:u32][END_MAGIC:u32]`.
 /// Written sequentially in one pass with a SINGLE trailing fsync, so a torn
 /// or interrupted write never leaves a readable trailer — `load_snapshot`
 /// rejects any file whose `END_MAGIC` or CRC doesn't check out and the node
 /// falls back to its log. Snapshot filenames are index-keyed and indices are
 /// monotonic, so a fresh install never overwrites a shorter valid file.
-const SNAP_HDR_LEN: usize = 40;
+pub const SNAP_HDR_LEN: usize = 48;
 const SNAP_TRAILER_LEN: usize = 8;
 /// Read granularity for the finalise-time CRC pass and the boot-time
 /// integrity check. A stack buffer, not module state — snapshot bodies
@@ -189,17 +190,28 @@ pub struct Snapshot {
     pub out_metrics: i32, // shares the wal's out[4] metrics port (see mod.rs)
     pub out_installed: i32, // out[8]: MSG_SNAPSHOT_INSTALLED to consensus
 
-    // Most recent snapshot (term, index) we persisted. Used to answer
-    // on-demand install requests from `replicator`.
+    // Most recent snapshot (term, index) we persisted, and the
+    // configuration as of its index. Used to answer on-demand install
+    // requests from `replicator`.
     last_snapshot_term: u64,
     last_snapshot_index: u64,
+    last_snapshot_membership: wire::Membership,
+
+    /// Seam ← wal (latest-wins, delivered by the dispatch table when it
+    /// moves): the configuration as the log has it, so a snapshot taken
+    /// at any index records the configuration as of that index.
+    pub cfg: wire::CfgTrack,
 
     /// Seam latch → wal (monotone latest-wins, drained by the dispatch
-    /// table): `(last_included_term, last_included_index)` of an
-    /// accepted peer install, so the wal fast-forwards its append
-    /// contract past the prefix the snapshot subsumes.
-    pub wal_fast_forward: (u64, u64),
+    /// table): `(last_included_term, last_included_index, configuration)`
+    /// of an accepted peer install, so the wal fast-forwards its append
+    /// contract past the prefix the snapshot subsumes and takes the
+    /// snapshot's configuration as its own.
+    pub wal_fast_forward: (u64, u64, wire::Membership),
     pub wal_fast_forward_dirty: bool,
+    /// Seam latch → wal: the configuration a snapshot restored at boot
+    /// records, as of its index — the log below it may be gone.
+    pub wal_membership: Option<(u64, wire::Membership)>,
 
     /// Seam ← wal (latest-wins): the wal's `(term, index)` high-water,
     /// delivered by the dispatch table each step via
@@ -287,6 +299,8 @@ pub struct Snapshot {
     in_progress_term: u64,
     in_progress_last_idx: u64,
     in_progress_last_term: u64,
+    /// The configuration the install being received carries.
+    in_progress_membership: wire::Membership,
     in_progress_active: bool,
     /// Next expected offset for the in-progress install. A chunk
     /// arriving with a different offset signals reordering or loss;
@@ -325,10 +339,12 @@ pub struct Snapshot {
     wfd: i32,
     /// Bytes of body written so far through `snap_append`.
     wbody: u32,
-    /// Identity of the snapshot being streamed, for the final header.
+    /// Identity of the snapshot being streamed, for the final header,
+    /// and the configuration as of its index.
     wterm: Term,
     windex: Index,
     wlast_term: Term,
+    wmembership: wire::Membership,
 
     // ── App state-machine snapshot round-trip ─────────────────────
     /// Port to the application state machine (request + restore) and
@@ -405,7 +421,12 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.out_app_ctl = -1;
     s.last_snapshot_term = 0;
     s.last_snapshot_index = 0;
-    s.wal_fast_forward = (0, 0);
+    s.wal_fast_forward = (0, 0, wire::Membership::default());
+    s.wal_membership = None;
+    s.last_snapshot_membership = wire::Membership::default();
+    s.cfg = wire::NO_CFG_TRACK;
+    s.in_progress_membership = wire::Membership::default();
+    s.wmembership = wire::Membership::default();
     s.wal_fast_forward_dirty = false;
     s.wal_high_water = (0, 0);
     s.boot_phase = BOOT_PTR;
@@ -527,6 +548,7 @@ unsafe fn seal_chunk_out(s: &mut Snapshot, sys: &SyscallTable, flags: u8) -> boo
         generation: s.wgen,
         last_term: s.wterm,
         last_index: s.windex,
+        membership: s.wmembership.encode(),
         epoch: s.wepoch,
     };
     let aad = sealed::snap_aad(&seal_identity(s), &binding, s.wchunk, flags, c as u32);
@@ -585,13 +607,14 @@ enum ChunkErr {
 }
 
 impl ChunkReader {
-    fn new(term: Term, index: Index) -> Self {
+    fn new(term: Term, index: Index, membership: wire::Membership) -> Self {
         Self {
             key: -1,
             binding: sealed::SnapBinding {
                 generation: [0; sealed::GENERATION_LEN],
                 last_term: term,
                 last_index: index,
+                membership: membership.encode(),
                 epoch: 0,
             },
             next: 0,
@@ -676,8 +699,9 @@ unsafe fn verify_sealed_body(
     stored: usize,
     term: Term,
     index: Index,
+    membership: wire::Membership,
 ) -> Result<u32, ChunkErr> {
-    let mut r = ChunkReader::new(term, index);
+    let mut r = ChunkReader::new(term, index, membership);
     let mut consumed = 0usize;
     let mut logical = 0u32;
     while !r.done {
@@ -886,7 +910,8 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                     if s.in_progress_active {
                         false
                     } else {
-                        let (started, had_fs) = snap_begin(s, sys, term, index, term);
+                        let m = s.cfg.at(index);
+                        let (started, had_fs) = snap_begin(s, sys, term, index, term, m);
                         s.capture_had_fs = had_fs;
                         started || !had_fs
                     }
@@ -1076,7 +1101,7 @@ unsafe fn emit_sample(
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize) {
-    let (term, last_idx, last_term, offset, done, hdr_len) =
+    let (term, last_idx, last_term, offset, done, membership, hdr_len) =
         match wire::decode_install_snapshot(&s.msg_buf[..plen]) {
             Some(t) => t,
             None => return,
@@ -1093,6 +1118,7 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         s.in_progress_term = term;
         s.in_progress_last_idx = last_idx;
         s.in_progress_last_term = last_term;
+        s.in_progress_membership = membership;
         s.in_progress_offset = 0;
         s.body_len = 0;
         s.install_start_ms = dev_millis(sys);
@@ -1106,7 +1132,7 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         // boot pointer) lives on `done`, and the file is not published
         // under its final name until `snap_finish`, so a partial stream
         // never shadows the artefact the boot restore reads.
-        let (started, had_fs) = snap_begin(s, sys, term, last_idx, last_term);
+        let (started, had_fs) = snap_begin(s, sys, term, last_idx, last_term, membership);
         s.install_had_fs = had_fs;
         if !started && had_fs {
             // FS present but the open failed (provider still
@@ -1181,11 +1207,13 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
                     s.in_progress_term,
                     s.in_progress_last_idx,
                     s.in_progress_last_term,
+                    s.in_progress_membership,
                 );
                 write_installed(s, sys, wire::MSG_SNAPSHOT_INSTALLED, &buf);
                 let prev_index = s.last_snapshot_index;
                 s.last_snapshot_term = s.in_progress_term;
                 s.last_snapshot_index = s.in_progress_last_idx;
+                s.last_snapshot_membership = s.in_progress_membership;
                 // Seam latch → wal: the installed prefix will never
                 // arrive on `entries`, so the wal must fast-forward its
                 // append contract to `last_idx` or the very next
@@ -1193,7 +1221,11 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
                 // expected `current_index + 1`) latches a continuity
                 // fault. Monotone latest-wins; drained by the dispatch
                 // table after this component's step.
-                s.wal_fast_forward = (s.in_progress_last_term, s.in_progress_last_idx);
+                s.wal_fast_forward = (
+                    s.in_progress_last_term,
+                    s.in_progress_last_idx,
+                    s.in_progress_membership,
+                );
                 s.wal_fast_forward_dirty = true;
                 dev_log(sys, 3, b"[snap] installed".as_ptr(), 16);
                 // Exactly-one-snapshot steady state (mirrors the local
@@ -1244,7 +1276,8 @@ unsafe fn finalize_local_snapshot(s: &mut Snapshot, sys: &SyscallTable, term: Te
     // stream in flight, so open one now for an empty body. Both end at
     // the same writer, so both emit byte-identical artefacts.
     if s.wfd < 0 {
-        let (started, had_fs) = snap_begin(s, sys, term, index, term);
+        let m = s.cfg.at(index);
+        let (started, had_fs) = snap_begin(s, sys, term, index, term, m);
         s.capture_had_fs = had_fs;
         if !started && had_fs {
             dev_log(sys, 3, b"[snap] open fail".as_ptr(), 16);
@@ -1276,6 +1309,7 @@ unsafe fn finalize_local_snapshot(s: &mut Snapshot, sys: &SyscallTable, term: Te
     dev_log(sys, 3, b"[snap] manifest".as_ptr(), 15);
     s.last_snapshot_term = term;
     s.last_snapshot_index = index;
+    s.last_snapshot_membership = s.wmembership;
     // Tell raft the local snapshot is durable so it advances the WAL
     // compaction floor (the leader-local leg of
     // `drain_snapshot_installed` — without this signal a leader never
@@ -1285,7 +1319,7 @@ unsafe fn finalize_local_snapshot(s: &mut Snapshot, sys: &SyscallTable, term: Te
     if s.out_installed >= 0 {
         if wire_channels::writable(sys, s.out_installed) {
             let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
-            wire::encode_snapshot_installed(&mut buf, term, index, term);
+            wire::encode_snapshot_installed(&mut buf, term, index, term, s.wmembership);
             write_installed(s, sys, wire::MSG_SNAPSHOT_INSTALLED, &buf);
         }
     }
@@ -1484,7 +1518,16 @@ unsafe fn emit_install_staged(s: &mut Snapshot, sys: &SyscallTable, term: Term, 
         // Header is written in place ahead of the body already staged at
         // INSTALL_SNAPSHOT_HDR, so the frame is composed with one copy.
         let mut hdr = [0u8; wire::INSTALL_SNAPSHOT_HDR];
-        let n = wire::encode_install_snapshot(&mut hdr, term, index, term, offset, done, &[]);
+        let n = wire::encode_install_snapshot(
+            &mut hdr,
+            term,
+            index,
+            term,
+            offset,
+            done,
+            membership_of(s, index),
+            &[],
+        );
         if n == 0 {
             (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
             return;
@@ -1571,7 +1614,7 @@ unsafe fn emit_sealed_body(
         wire_channels::channel_write_msg(sys, chan, wire::MSG_APP_SNAPSHOT_RESET, &hdr);
     }
     let body = sealed::SNAP_HDR_LEN;
-    let mut r = ChunkReader::new(term, index);
+    let mut r = ChunkReader::new(term, index, membership_of(s, index));
     let mut sent = 0usize;
     let mut whole = false;
     while !r.done {
@@ -1603,8 +1646,16 @@ unsafe fn emit_sealed_body(
         } else {
             let start = body - wire::INSTALL_SNAPSHOT_HDR;
             let mut hdr = [0u8; wire::INSTALL_SNAPSHOT_HDR];
-            if wire::encode_install_snapshot(&mut hdr, term, index, term, sent as u64, done, &[])
-                == 0
+            if wire::encode_install_snapshot(
+                &mut hdr,
+                term,
+                index,
+                term,
+                sent as u64,
+                done,
+                membership_of(s, index),
+                &[],
+            ) == 0
             {
                 break;
             }
@@ -1644,7 +1695,16 @@ unsafe fn emit_install_body(
             return;
         }
         let mut buf = [0u8; wire::INSTALL_SNAPSHOT_HDR];
-        let n = wire::encode_install_snapshot(&mut buf, term, index, term, 0, true, &[]);
+        let n = wire::encode_install_snapshot(
+            &mut buf,
+            term,
+            index,
+            term,
+            0,
+            true,
+            membership_of(s, index),
+            &[],
+        );
         if n > 0 {
             wire_channels::channel_write_msg(
                 sys,
@@ -1675,6 +1735,7 @@ unsafe fn emit_install_body(
             term,
             offset,
             done,
+            membership_of(s, index),
             &body[start..start + chunk],
         );
         if n == 0 {
@@ -2130,7 +2191,8 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                 {
                     Err(ChunkErr::Io)
                 } else {
-                    verify_sealed_body(s, sys, fd, body_len, term, index)
+                    let m = wire::Membership::decode(&hdr[40..43]).unwrap_or_default();
+                    verify_sealed_body(s, sys, fd, body_len, term, index, m)
                 };
                 match verdict {
                     Ok(n) => {
@@ -2170,6 +2232,10 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             s.last_snapshot_index = u64::from_le_bytes([
                 hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
             ]);
+            s.last_snapshot_membership = wire::Membership::decode(&hdr[40..43]).unwrap_or_default();
+            // The log below the snapshot may be gone: the configuration
+            // the wal replays on top of is the snapshot's.
+            s.wal_membership = Some((s.last_snapshot_index, s.last_snapshot_membership));
             s.body_len = logical;
             s.boot_phase = if s.out_app_ctl >= 0 && logical > 0 {
                 BOOT_EMIT
@@ -2199,6 +2265,7 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                 s.last_snapshot_term,
                 s.last_snapshot_index,
                 s.last_snapshot_term,
+                s.last_snapshot_membership,
             );
             // The phase advances only on a CONFIRMED write. A poll saying
             // ">=1 byte free" is not room for this frame, and BOOT_DONE is
@@ -2443,7 +2510,19 @@ unsafe fn write_installed(s: &Snapshot, sys: &SyscallTable, msg_type: u8, payloa
     )
 }
 
-/// Build the 40-byte snapshot header for `body_len` bytes of body.
+/// The configuration a snapshot at `index` records: the one being
+/// written, the last one published, or (taking one now) the log's.
+fn membership_of(s: &Snapshot, index: Index) -> wire::Membership {
+    if index == s.windex {
+        s.wmembership
+    } else if index == s.last_snapshot_index {
+        s.last_snapshot_membership
+    } else {
+        s.cfg.at(index)
+    }
+}
+
+/// Build the snapshot header for `body_len` bytes of body.
 fn snap_header(
     s: &Snapshot,
     term: Term,
@@ -2463,6 +2542,7 @@ fn snap_header(
     let epoch = if sealing(s) { s.wepoch } else { s.dek_epoch };
     hdr[32..36].copy_from_slice(&epoch.to_le_bytes());
     hdr[36..40].copy_from_slice(&body_len.to_le_bytes());
+    hdr[40..43].copy_from_slice(&s.wmembership.encode());
     hdr
 }
 
@@ -2481,8 +2561,10 @@ unsafe fn snap_begin(
     term: Term,
     last_idx: Index,
     last_term: Term,
+    membership: wire::Membership,
 ) -> (bool, bool) {
     snap_abort(s, sys);
+    s.wmembership = membership;
     let plen = build_snapshot_path(s, last_idx);
     if plen == 0 {
         return (false, false);

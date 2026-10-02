@@ -31,6 +31,7 @@ WAL_ENTRY = b"sealed wal entry"
 SNAP_GENERATION = bytes(range(0xB0, 0xC0))
 SNAP_LAST_TERM = 5
 SNAP_LAST_INDEX = 1000
+SNAP_MEMBERSHIP = bytes([0x07, 0x00, 0x08])  # voters 0-2, no joint set, learner 3
 SNAP_CHUNK = 0
 SNAP_FLAGS = 1
 SNAP_BODY = b"snapshot chunk body"
@@ -92,7 +93,9 @@ def snap_chunk(suite: int):
         CLUSTER
         + struct.pack("<QQ", PARTITION, REPLICA)
         + SNAP_GENERATION
-        + struct.pack("<QQIQB", SNAP_LAST_TERM, SNAP_LAST_INDEX, EPOCH, SNAP_CHUNK, SNAP_FLAGS)
+        + struct.pack("<QQ", SNAP_LAST_TERM, SNAP_LAST_INDEX)
+        + SNAP_MEMBERSHIP
+        + struct.pack("<IQB", EPOCH, SNAP_CHUNK, SNAP_FLAGS)
         + struct.pack("<I", len(pt))
     )
     sealed = seal(suite, key, nonce, aad, pt)

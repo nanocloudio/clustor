@@ -78,6 +78,8 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 #[path = "../../common/http_admin.rs"]
 mod http_admin;
+#[path = "../../common/peer_policy.rs"]
+mod peer_policy;
 #[path = "../../common/step_accounting.rs"]
 mod step_accounting;
 #[path = "../../common/wire.rs"]
@@ -119,6 +121,40 @@ define_params! {
 
     4, emit_interval_ms, u16, 1000
         => |s, d, len| { s.telemetry.emit_interval_ms = p_u16(d, len, 0, 1000) as u64; };
+
+    // Key fingerprints granted a role on the wire admin path: SHA-256 of
+    // the subject public key, 64 hex characters, as the `identity` input
+    // reports it. A key pinned here outranks any name rule.
+    5, operator_key0, str, 0
+        => |s, d, len| { pin_operator(s, d, len); };
+    6, operator_key1, str, 0
+        => |s, d, len| { pin_operator(s, d, len); };
+    7, operator_key2, str, 0
+        => |s, d, len| { pin_operator(s, d, len); };
+    8, operator_key3, str, 0
+        => |s, d, len| { pin_operator(s, d, len); };
+    9, observer_key0, str, 0
+        => |s, d, len| { pin_observer(s, d, len); };
+    10, observer_key1, str, 0
+        => |s, d, len| { pin_observer(s, d, len); };
+    11, observer_key2, str, 0
+        => |s, d, len| { pin_observer(s, d, len); };
+    12, observer_key3, str, 0
+        => |s, d, len| { pin_observer(s, d, len); };
+}
+
+unsafe fn pin_operator(s: &mut ModuleState, d: *const u8, len: usize) {
+    if !d.is_null() {
+        let hex = core::slice::from_raw_parts(d, len);
+        rbac::pin_role_key(&mut s.rbac.operator_keys, &mut s.rbac.operator_keys_n, hex);
+    }
+}
+
+unsafe fn pin_observer(s: &mut ModuleState, d: *const u8, len: usize) {
+    if !d.is_null() {
+        let hex = core::slice::from_raw_parts(d, len);
+        rbac::pin_role_key(&mut s.rbac.observer_keys, &mut s.rbac.observer_keys_n, hex);
+    }
 }
 
 #[repr(C)]

@@ -107,6 +107,10 @@ reason = """include!s the SDK runtime and compiles no_std PIC module sources ver
 prefix = "tests/sealed_records.rs"
 reason = """mounts the SDK ABI and the no_std sealed-record codec verbatim into a host crate and drives the codec's vault client through the SyscallTable ABI; each test uses a subset of that surface."""
 
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/rbac_identity.rs"
+reason = """include!s the SDK runtime and compiles the no_std rbac component verbatim into a host crate; each test uses a subset of that surface."""
+
 [ci.templates]
 dir = "configs"
 # Defaults for the template-render gate (CI phase 1.5). These values
@@ -114,7 +118,7 @@ dir = "configs"
 # `__KEY__` placeholders — they are *not* the production values used
 # when actually launching a node. See `fluxor up` / per-rig profiles
 # for runtime substitutions.
-vars = { SELF_ID = "0", LISTEN_PORT = "9090", PEER0_PORT = "9090", PEER1_PORT = "9091", PEER2_PORT = "9092", HTTP_PORT = "19090" }
+vars = { SELF_ID = "0", LISTEN_PORT = "9090", PEER0_PORT = "9090", PEER1_PORT = "9091", PEER2_PORT = "9092", PEER3_PORT = "9093", HTTP_PORT = "19090", PKI_DIR = "tests/fixtures/peer_pki" }
 
 [required]
 # Optional wire-ABI assertion (defense in depth). The authoritative

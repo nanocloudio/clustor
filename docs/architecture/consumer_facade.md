@@ -188,11 +188,19 @@ drains commit acks before issuing more proposals.
 ### 2) Assign
 
 When the leader flushes a batch, it emits
-`MSG_PROPOSAL_ASSIGNED { correlation_id, partition_id, wal_index }`
+`MSG_PROPOSAL_ASSIGNED { correlation_id, partition_id, wal_index, term }`
 on `proposal_assigned`. The consumer matches against its inflight
-table via `InflightTable::record_assignment(correlation_id, wal_index)`.
+table via
+`InflightTable::record_assignment(correlation_id, wal_index, term)`.
 An assignment for an unknown `correlation_id` (e.g. cancelled after
 a leader change) is silently dropped.
+
+The term is what makes the index name one entry. An index on its own
+can be overwritten by conflict repair, so a slot commits only when the
+committed entry's term matches the one it was assigned in: a slot at
+exactly that index in another term was superseded by another leader's
+entry, and a slot below it in another term waits for its own entry to
+commit.
 
 ### 3) Commit
 

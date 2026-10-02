@@ -777,6 +777,11 @@ pub struct Raft {
     /// (CP-cache lost or expired). Distinct from the frozen counter so
     /// operators can tell admin freeze vs control-plane fallback apart.
     proposals_dropped_strict: u32,
+    /// Proposals a follower relayed here that this node dropped: not the
+    /// leader (any more), frozen, or its uncommitted log full. The
+    /// relay is fire-and-forget, so a proposer offers again; this is the
+    /// count that says how often it has to.
+    pub forwards_dropped: u32,
     last_metrics_ms: u64,
     /// Append→commit timestamp ring for `clustor.raft.commit_latency_ms`.
     /// Keyed by `log_index % COMMIT_TS_RING`; the parallel `commit_ts_us`
@@ -964,6 +969,7 @@ pub fn init(s: &mut Raft) {
     s.elections_started = 0;
     s.proposals_dropped_frozen = 0;
     s.proposals_dropped_strict = 0;
+    s.forwards_dropped = 0;
     s.last_metrics_ms = 0;
     s.commit_ts_index = [0; COMMIT_TS_RING];
     s.commit_ts_us = [0; COMMIT_TS_RING];
@@ -1024,11 +1030,12 @@ pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
     for i in 0..s.voter_count {
         s.current_voters.insert(i);
     }
-    // A replica outside its own voter set can never assemble a quorum
-    // (its ballot and its match index are both discounted). That is a
-    // config error, not a state this node can recover from — say so.
+    // A replica outside the initial voter set is joining: it boots as a
+    // learner — it neither campaigns nor votes — until the group's
+    // configuration, from its log or a snapshot, says what it is.
     if !s.current_voters.contains(s.self_id) {
-        dev_log(sys, 1, b"[raft] self not in voter set".as_ptr(), 28);
+        s.learner_mode = true;
+        dev_log(sys, 3, b"[raft] joining as learner".as_ptr(), 25);
     }
     // Broadcast initial voter set once everything is wired.
     // The emission itself happens in the first step() call.
@@ -1758,7 +1765,7 @@ unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
         if msg_type != wire::MSG_SNAPSHOT_INSTALLED {
             continue;
         }
-        let (term, last_idx, last_term) =
+        let (term, last_idx, last_term, membership) =
             match wire::decode_snapshot_installed(&s.msg_buf[..plen as usize]) {
                 Some(t) => t,
                 None => continue,
@@ -1813,6 +1820,10 @@ unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
             // — it performs the `commit_index = last_idx` update itself.
             advance_follower_commit(s, sys, last_idx);
         }
+        // The snapshot subsumes the config entries up to `last_idx` too,
+        // which this replica will never apply: its configuration is the
+        // snapshot's.
+        adopt_membership(s, sys, membership);
         save_metadata(s, sys);
         // Emit the apply-pipeline reset and the WAL compact-before
         // signal. Both are post-snapshot housekeeping; ignore
@@ -2513,6 +2524,30 @@ unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
     save_metadata(s, sys);
     emit_voter_set_update(s, sys);
     dev_log(sys, 3, b"[raft] config applied".as_ptr(), 21);
+}
+
+/// Take on `m` as this replica's configuration (a snapshot's, installed
+/// past config entries it never applied), as applying them would have
+/// left it.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` per the module ABI.
+unsafe fn adopt_membership(s: &mut Raft, sys: &SyscallTable, m: wire::Membership) {
+    if m.current == 0 {
+        // No voter at all names no configuration: keep this replica's.
+        return;
+    }
+    s.current_voters = NodeSet(m.current);
+    s.joint_voters = NodeSet(m.joint);
+    s.joint_active = m.joint_active();
+    s.learners = NodeSet(m.learners);
+    s.voter_count = s.current_voters.count();
+    let voter = s.current_voters.contains(s.self_id)
+        || (s.joint_active && s.joint_voters.contains(s.self_id));
+    s.learner_mode = !voter;
+    emit_voter_set_update(s, sys);
+    dev_log(sys, 3, b"[raft] config from snapshot".as_ptr(), 27);
 }
 
 /// E10 seam: latch the voter-set update for same-step delivery to
@@ -3555,20 +3590,21 @@ unsafe fn log_p(
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn step_follower(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    // Relay client proposals to the leader before considering an
+    // election: a follower never calls `drain_proposals`, so without
+    // this they sit in the channel until this node happens to win a
+    // term. Only runs when the leader is known — with no leader there
+    // is nowhere to send, and the election below is the right response.
+    // A learner relays too: it holds no vote, but its clients write.
+    if s.forward_proposals && s.leader_id >= 0 {
+        forward_proposals_to_leader(s, sys);
+    }
     // Learner-mode followers (self removed from voter set via
     // CONFIG_CHANGE_OP_NEW) MUST NOT start elections. Re-arm the
     // deadline so we don't fire as soon as we exit learner mode.
     if s.learner_mode {
         reset_election_deadline(s, now);
         return;
-    }
-    // Relay client proposals to the leader before considering an
-    // election: a follower never calls `drain_proposals`, so without
-    // this they sit in the channel until this node happens to win a
-    // term. Only runs when the leader is known — with no leader there
-    // is nowhere to send, and the election below is the right response.
-    if s.forward_proposals && s.leader_id >= 0 {
-        forward_proposals_to_leader(s, sys);
     }
     if now >= s.election_deadline_ms {
         // Election timeout — start pre-vote
@@ -3619,10 +3655,13 @@ unsafe fn step_candidate(s: &mut Raft, sys: &SyscallTable, now: u64) {
 unsafe fn step_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // 0. Joint-consensus completeness: if a C_old,new entry has
     //    committed (apply_config_change set `pending_new_voters_set`),
-    //    auto-propose the matching C_new entry. We only emit when
-    //    the proposal batch is empty so the C_new entry gets its
-    //    own clean log slot — important for replication correctness.
-    if s.pending_new_voters_set && s.proposal_batch_count == 0 {
+    //    or this leader took office in a joint configuration
+    //    (`become_leader`), auto-propose the matching C_new entry. We
+    //    only emit when the proposal batch is empty so the C_new entry
+    //    gets its own clean log slot — important for replication
+    //    correctness — and after the term's no-op, which is the first
+    //    entry of every term.
+    if s.pending_new_voters_set && !s.noop_pending && s.proposal_batch_count == 0 {
         emit_pending_c_new(s, sys, now);
     }
 
@@ -4129,24 +4168,22 @@ unsafe fn handle_proposal_assigned_remote(s: &mut Raft, sys: &SyscallTable, plen
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI.
 unsafe fn handle_proposal_forward(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u64) {
-    if !is_leader(s) {
-        return;
-    }
-    if s.frozen || s.strict_fallback {
-        return;
-    }
-    // Same durability-backpressure gates the local drain honours; a
-    // relayed proposal is an ordinary client write once it lands.
-    if s.flush_deferred
-        || s.last_log_index.saturating_sub(s.commit_index) >= MAX_UNCOMMITTED_INFLIGHT
-    {
-        return;
-    }
     let plen = plen as usize;
     if plen == 0 {
         return;
     }
-    append_to_batch(s, sys, 0, plen, 0, ORIGIN_LOCAL, now);
+    // Same gates the local drain honours (a relayed proposal is an
+    // ordinary client write once it lands), plus leadership: one relayed
+    // to a node that has since stepped down has nowhere to go.
+    let taken = is_leader(s)
+        && !s.frozen
+        && !s.strict_fallback
+        && !s.flush_deferred
+        && s.last_log_index.saturating_sub(s.commit_index) < MAX_UNCOMMITTED_INFLIGHT
+        && append_to_batch(s, sys, 0, plen, 0, ORIGIN_LOCAL, now);
+    if !taken {
+        s.forwards_dropped = s.forwards_dropped.saturating_add(1);
+    }
 }
 
 unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
@@ -4651,6 +4688,7 @@ unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
     let count = s.proposal_batch_count as usize;
     let assigned_index = s.last_log_index;
     let pid = s.partition_id;
+    let term = s.current_term;
     for i in 0..count {
         let cid = s.correlation_ids[i];
         let origin = s.correlation_origin[i];
@@ -4666,7 +4704,7 @@ unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
         if origin != ORIGIN_LOCAL && origin != s.self_id {
             if s.out_rpc >= 0 && wire_channels::writable(sys, s.out_rpc) {
                 let mut buf = [0u8; wire::PROPOSAL_ASSIGNED_LEN];
-                wire::encode_proposal_assigned(&mut buf, cid, pid, assigned_index);
+                wire::encode_proposal_assigned(&mut buf, cid, pid, assigned_index, term);
                 wire_channels::channel_write_routed_partitioned(
                     sys,
                     s.out_rpc,
@@ -4686,7 +4724,7 @@ unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
             continue;
         }
         let mut buf = [0u8; wire::PROPOSAL_ASSIGNED_LEN];
-        wire::encode_proposal_assigned(&mut buf, cid, pid, assigned_index);
+        wire::encode_proposal_assigned(&mut buf, cid, pid, assigned_index, term);
         wire_channels::channel_write_msg(
             sys,
             s.out_proposal_assigned,
@@ -5014,6 +5052,8 @@ unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
             s.current_voters = NodeSet(rec.current_voters);
             s.joint_voters = NodeSet(rec.joint_voters);
             s.joint_active = rec.joint_active;
+            s.learner_mode = !(s.current_voters.contains(s.self_id)
+                || (s.joint_active && s.joint_voters.contains(s.self_id)));
         }
     }
     false // resolved (loaded or empty) — no retry needed
@@ -5584,6 +5624,16 @@ unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     s.noop_pending = true;
     if s.out_log >= 0 {
         s.commit_fence_out = Some((s.current_term, 0));
+    }
+
+    // Taking office in a joint configuration: the `C_new` that ends it
+    // was owed by the leader that began it, and only in that leader's
+    // memory. Owe it again. If that `C_new` is already in this log, the
+    // second applies as nothing (`apply_config_change` skips a C_new
+    // that matches the configuration it leaves).
+    if s.joint_active {
+        s.pending_new_voters = s.joint_voters;
+        s.pending_new_voters_set = true;
     }
 
     // Send immediate heartbeat to assert leadership

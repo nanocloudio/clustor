@@ -278,9 +278,11 @@ pub unsafe fn send_outbound(su: &mut Surface, sys: &SyscallTable, out: &codec::O
 }
 
 /// Emit one response to peer_router. `payload` carries the
-/// `[conn_id:u16 LE]` prefix set by the producer; it is stripped and used
-/// as the per-message routing tag. Wire bytes written:
-/// `[conn_id:u16 LE][msg_type:u8][len:u16 LE][payload-without-conn-id]`.
+/// `[conn_id:u16 LE]` prefix set by the producer. `responses` is a
+/// NetProto edge, so the write is one envelope whose payload is the
+/// routing tag followed by the client's wire frame:
+/// `[msg_type:u8][len:u16 LE] [conn_id:u16 LE] [msg_type:u8][len:u16 LE][payload-without-conn-id]`.
+/// peer_router strips the envelope and the tag and sends the rest.
 /// Returns whether the frame was written OR
 /// retained in the retry stash (either way the response will reach the
 /// wire); false means it was not accepted and, if a prior frame still
@@ -307,18 +309,20 @@ pub unsafe fn send_response(
         return false;
     }
     let inner_len = payload.len() - 2;
-    let total = 2 + wire::ENVELOPE_HDR + inner_len;
+    let body_len = 2 + wire::ENVELOPE_HDR + inner_len;
+    let total = wire::ENVELOPE_HDR + body_len;
     let mut frame = [0u8; 256];
     if total > 256 {
         return false;
     }
-    frame[..2].copy_from_slice(&payload[..2]);
-    frame[2] = msg_type;
-    let lb = (inner_len as u16).to_le_bytes();
-    frame[3] = lb[0];
-    frame[4] = lb[1];
+    let h = wire::ENVELOPE_HDR;
+    frame[0] = msg_type;
+    frame[1..3].copy_from_slice(&(body_len as u16).to_le_bytes());
+    frame[h..h + 2].copy_from_slice(&payload[..2]);
+    frame[h + 2] = msg_type;
+    frame[h + 3..h + 5].copy_from_slice(&(inner_len as u16).to_le_bytes());
     if inner_len > 0 {
-        frame[5..5 + inner_len].copy_from_slice(&payload[2..2 + inner_len]);
+        frame[h + 5..h + 5 + inner_len].copy_from_slice(&payload[2..2 + inner_len]);
     }
     let wrote = if wire_channels::writable(sys, su.out_responses) {
         (sys.channel_write)(su.out_responses, frame.as_ptr(), total)

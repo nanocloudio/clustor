@@ -306,7 +306,20 @@ commits (`modules/app/consensus/raft.rs`):
   becomes current and the overlay clears. A node absent from the new
   set steps down if it was leader and enters learner mode — no
   elections, no vote grants — and leaves learner mode again if a later
-  change re-adds it. Both ops deduplicate replayed entries.
+  change re-adds it.
+- **`CONFIG_CHANGE_OP_LEARNER`** sets the learner set: replicas that
+  receive the log and count toward no quorum. A replica named as a voter,
+  current or joint, is never also a learner.
+
+Every op's body carries the COMPLETE id set rather than a delta, so
+replaying an entry lands the configuration it names instead of applying
+a change twice.
+
+A configuration lives in the log, which compaction retires, so both
+snapshot records carry the configuration as of their index: a replica
+rebuilt from a snapshot knows the voter set without the entries that
+named it. A leader that takes over mid-change learns the joint set the
+same way.
 
 Vote responses and probe confirmations from nodes outside the active
 voter set(s) never move a tally — the guard against an ex-voter's

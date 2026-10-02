@@ -43,8 +43,16 @@
 //!
 //! nonce = "SNP0" ‖ chunk index(8)
 //! aad   = cluster(16) ‖ partition(8) ‖ source replica(8) ‖ generation(16)
-//!       ‖ last included term(8) ‖ last included index(8) ‖ epoch(4)
-//!       ‖ chunk index(8) ‖ flags(1) ‖ plaintext length(4)
+//!       ‖ last included term(8) ‖ last included index(8)
+//!       ‖ configuration(3) ‖ epoch(4) ‖ chunk index(8) ‖ flags(1)
+//!       ‖ plaintext length(4)
+//! ```
+//!
+//! The configuration (`wire::Membership`: voters, joint set, learners as
+//! of the last included index) is what a replica installing the snapshot
+//! adopts, so it is bound like the term and index it stands beside.
+//!
+//! ```text
 //! key   = HKDF(master, "clustor/snapshot",
 //!              cluster(16) ‖ partition(8) ‖ generation(16) ‖ epoch(4))
 //! ```
@@ -318,7 +326,7 @@ pub const SNAP_OFF_CT_LEN: usize = 36;
 
 pub const SNAP_NONCE_DOMAIN: [u8; 4] = *b"SNP0";
 pub const SNAP_LABEL: &[u8] = b"clustor/snapshot";
-pub const SNAP_AAD_LEN: usize = 16 + 8 + 8 + 16 + 8 + 8 + 4 + 8 + 1 + 4;
+pub const SNAP_AAD_LEN: usize = 16 + 8 + 8 + 16 + 8 + 8 + 3 + 4 + 8 + 1 + 4;
 pub const SNAP_CONTEXT_LEN: usize = 16 + 8 + 16 + 4;
 
 pub fn snap_nonce(chunk_index: u64) -> [u8; NONCE_LEN] {
@@ -348,6 +356,8 @@ pub struct SnapBinding {
     pub generation: [u8; GENERATION_LEN],
     pub last_term: u64,
     pub last_index: u64,
+    /// The configuration as of `last_index`: `[voters][joint][learners]`.
+    pub membership: [u8; 3],
     pub epoch: u32,
 }
 
@@ -365,6 +375,7 @@ pub fn snap_aad(
     at = put(&mut a, at, &b.generation);
     at = put(&mut a, at, &b.last_term.to_le_bytes());
     at = put(&mut a, at, &b.last_index.to_le_bytes());
+    at = put(&mut a, at, &b.membership);
     at = put(&mut a, at, &b.epoch.to_le_bytes());
     at = put(&mut a, at, &chunk_index.to_le_bytes());
     at = put(&mut a, at, &[flags]);

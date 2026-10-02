@@ -12,24 +12,29 @@
 //!
 //! ## Identity binding
 //!
-//! When the optional `identity` port is wired and a
-//! `MSG_PEER_IDENTITY` envelope arrives for a connection, the
-//! component records `conn_id → role` in a small in-memory table.
-//! Subsequent admin commands on the same `conn_id` are evaluated
-//! against that role rather than the module-wide `default_role`.
+//! When the optional `identity` port is wired — from `peer_router`'s
+//! `client_identity`, which re-keys each connection's TLS identity to
+//! the `wire::ConnId` its commands carry — a `MSG_PEER_IDENTITY`
+//! envelope records `conn_id → role` in a small table, and admin
+//! commands on that `conn_id` are judged by that role.
 //!
-//! Role lookup is a **prefix match against the SVID body**, driven by
-//! the `admin_svid_prefix` / `observer_svid_prefix` params.
+//! A role comes from the peer's **key**: the `operator_keyN` /
+//! `observer_keyN` params pin key fingerprints (SHA-256 of the subject
+//! public key, 64 hex characters). A verified name is consulted after
+//! the pins, as a prefix match (`admin_svid_prefix` /
+//! `observer_svid_prefix`). A verified peer matching nothing is an
+//! observer when any policy is configured, and `default_role` when none
+//! is.
 //!
-//! Bindings die with their connection. The transport emits one
-//! identity envelope per handshake (at-least-once) and an explicit
-//! revoke (`replica_id == 0xFF`, see `wire::MSG_PEER_IDENTITY`) on
-//! teardown/downgrade, so every envelope reflects the connection
-//! *currently* holding the conn_id: a revoke clears the binding and a
-//! fresh identity unconditionally rebinds — a stale OPERATOR grant is
-//! never inherited across conn_id reuse. (No transport connection-close
-//! event reaches this module directly; these two envelope semantics
-//! are the eviction path.)
+//! With identity wired, **a wire command from a connection with no
+//! binding is denied**: its identity established nothing, its binding
+//! was revoked, or the table had no room for it. A binding dies with its
+//! connection — `peer_router` revokes a closing slot, and a slot's next
+//! connection reports its own identity before any of its commands — so
+//! a grant is never inherited across slot reuse. A full table evicts its
+//! oldest binding, whose connection is then denied: overflow fails
+//! closed. Without identity wired, every wire command is judged as
+//! `default_role`.
 //!
 //! ## Origins
 //!
@@ -64,12 +69,16 @@ pub const ROLE_BREAKGLASS: u8 = 0x08;
 /// incoming SVID.
 pub const SVID_PREFIX_MAX: usize = 64;
 
-/// Number of connection identity slots. Each accepted client occupies
-/// one slot for the duration of its connection; eviction happens on
-/// the transport's explicit revoke envelope (`replica_id == 0xFF`)
-/// and by unconditional rebind when the next handshake on a reused
-/// `conn_id` emits a fresh identity envelope.
+/// Number of connection identity slots. A connection holds one from its
+/// identity until its revoke; a full table evicts the oldest, failing
+/// that connection closed.
 const IDENTITY_SLOTS: usize = 32;
+
+/// Key fingerprints pinned per role.
+pub const ROLE_KEYS_MAX: usize = 4;
+
+/// A pinned key fingerprint: SHA-256 of the subject public key.
+pub const KEY_FP_LEN: usize = 32;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -77,6 +86,8 @@ struct IdentityBinding {
     conn_id: u16,
     role: u8,
     tls_verified: bool,
+    /// Binding order, for evicting the oldest from a full table.
+    seq: u32,
     /// 0 means "no SVID stored"; otherwise length within `svid` below.
     svid_len: u8,
     svid: [u8; SVID_PREFIX_MAX],
@@ -88,6 +99,7 @@ impl IdentityBinding {
             conn_id: 0,
             role: 0,
             tls_verified: false,
+            seq: 0,
             svid_len: 0,
             svid: [0u8; SVID_PREFIX_MAX],
         }
@@ -128,9 +140,19 @@ pub struct Rbac {
     pub observer_prefix: [u8; SVID_PREFIX_MAX],
     pub observer_prefix_len: u8,
 
+    /// Key fingerprints granted operator and observer, `*_keys_n` of
+    /// each in use.
+    pub operator_keys: [[u8; KEY_FP_LEN]; ROLE_KEYS_MAX],
+    pub operator_keys_n: u8,
+    pub observer_keys: [[u8; KEY_FP_LEN]; ROLE_KEYS_MAX],
+    pub observer_keys_n: u8,
+
     /// Per-connection identity bindings. Linear scan — 32 slots is
     /// fine for the deployments we target.
     bindings: [IdentityBinding; IDENTITY_SLOTS],
+    next_seq: u32,
+    /// Bindings evicted from a full table.
+    pub bindings_evicted: u32,
 
     pub authorized_count: u32,
     pub denied_count: u32,
@@ -148,9 +170,15 @@ pub unsafe fn init(r: &mut Rbac) {
     r.admin_prefix_len = 0;
     r.observer_prefix = [0u8; SVID_PREFIX_MAX];
     r.observer_prefix_len = 0;
+    r.operator_keys = [[0; KEY_FP_LEN]; ROLE_KEYS_MAX];
+    r.operator_keys_n = 0;
+    r.observer_keys = [[0; KEY_FP_LEN]; ROLE_KEYS_MAX];
+    r.observer_keys_n = 0;
     for b in r.bindings.iter_mut() {
         *b = IdentityBinding::empty();
     }
+    r.next_seq = 0;
+    r.bindings_evicted = 0;
     r.authorized_count = 0;
     r.denied_count = 0;
 }
@@ -297,24 +325,22 @@ unsafe fn drain_identity(r: &mut Rbac, sys: &SyscallTable) {
             continue;
         };
         let conn_id = id.conn_id();
-        // A record that establishes nothing is a revoke: the peer
-        // offered no usable credential, or one that failed a check
-        // its profile required. The binding dies here; a later client
-        // reusing the conn_id evaluates as `default_role` until its
-        // own handshake binds an identity.
+        // A record that establishes nothing is a revoke: the slot
+        // closed, or its peer offered no usable credential, or one
+        // that failed a check its profile required. The binding dies
+        // here, and the conn_id's commands are denied until an
+        // identity binds it again.
         if !id.is_established() {
             clear_binding(r, conn_id);
             continue;
         }
-        // Roles are granted by NAME, so a role is granted only when
-        // the name was actually verified. `has_principal` is false
-        // unless the chain reached an anchor AND the SAN matched the
-        // profile's rule — without both, the bytes in the certificate
-        // are a claim rather than an identity, and the peer falls
-        // through to `default_role`. This is the substance of the
-        // change: the old envelope's `verified` boolean could not say
-        // which checks ran, so a name was trusted whenever any part
-        // of the handshake succeeded.
+        // A name is consulted only when it was verified: `has_principal`
+        // is false unless the chain reached an anchor AND the SAN
+        // matched the profile's rule. Without both, the bytes in the
+        // certificate are a claim rather than an identity.
+        let fp_len = id.fingerprint_len.min(KEY_FP_LEN);
+        let mut fp = [0u8; KEY_FP_LEN];
+        fp[..fp_len].copy_from_slice(&r.msg_buf[id.fingerprint_at..id.fingerprint_at + fp_len]);
         let name_len = if id.has_principal() {
             id.principal_len.min(SVID_PREFIX_MAX)
         } else {
@@ -327,32 +353,41 @@ unsafe fn drain_identity(r: &mut Rbac, sys: &SyscallTable) {
             name_local[..name_len]
                 .copy_from_slice(&r.msg_buf[id.principal_at..id.principal_at + name_len]);
         }
-        record_identity(r, conn_id, true, &name_local[..name_len]);
+        let role = role_for(r, &fp[..fp_len], &name_local[..name_len]);
+        record_identity(r, conn_id, role, &name_local[..name_len]);
     }
 }
 
-fn record_identity(r: &mut Rbac, conn_id: u16, verified: bool, svid: &[u8]) {
-    // A fresh identity envelope is a connection-establishment event:
-    // the transport emits one per handshake, so it always describes
-    // the connection currently holding this conn_id. The rebind is
-    // therefore UNCONDITIONAL — refusing to replace a TLS-verified
-    // binding with a plaintext one would let a stale
-    // OPERATOR/BREAKGLASS grant survive conn_id reuse. At-least-once
-    // redelivery of the same envelope rewrites identical state
-    // (idempotent).
-    let role = role_for_svid(r, svid);
+fn record_identity(r: &mut Rbac, conn_id: u16, role: u8, svid: &[u8]) {
+    // An identity envelope describes the connection currently holding
+    // `conn_id`, so it rebinds unconditionally; a redelivered one
+    // rewrites identical state.
     let slot_idx = match find_binding(r, conn_id) {
         Some(i) => i,
         None => match r.bindings.iter().position(|b| b.is_empty()) {
             Some(i) => i,
-            None => return, // table full; new conn loses RBAC binding.
+            None => {
+                // Full: the oldest binding goes, and its connection is
+                // denied from here on rather than this one going unbound.
+                r.bindings_evicted = r.bindings_evicted.wrapping_add(1);
+                let mut oldest = 0;
+                for (i, b) in r.bindings.iter().enumerate() {
+                    if b.seq.wrapping_sub(r.bindings[oldest].seq) > u32::MAX / 2 {
+                        oldest = i;
+                    }
+                }
+                oldest
+            }
         },
     };
     let take = svid.len().min(SVID_PREFIX_MAX);
+    let seq = r.next_seq;
+    r.next_seq = r.next_seq.wrapping_add(1);
     let b = &mut r.bindings[slot_idx];
     b.conn_id = conn_id;
     b.role = role;
-    b.tls_verified = verified;
+    b.tls_verified = true;
+    b.seq = seq;
     b.svid_len = take as u8;
     b.svid[..take].copy_from_slice(&svid[..take]);
 }
@@ -375,7 +410,44 @@ fn find_binding(r: &Rbac, conn_id: u16) -> Option<usize> {
 fn lookup_role(r: &Rbac, conn_id: u16) -> u8 {
     match find_binding(r, conn_id) {
         Some(i) => r.bindings[i].role,
+        // With identity wired, no binding is no identity: denied.
+        None if r.in_identity >= 0 => 0,
         None => r.default_role,
+    }
+}
+
+/// The role a verified peer holds: by its key's pin first, then by its
+/// verified name ([`role_for_svid`]). Once any key is pinned, a key
+/// that is none of them and a name that matches no prefix is an
+/// observer, whatever `default_role` says.
+fn role_for(r: &Rbac, fp: &[u8], svid: &[u8]) -> u8 {
+    let pinned = |keys: &[[u8; KEY_FP_LEN]; ROLE_KEYS_MAX], n: u8| {
+        keys[..n as usize].iter().any(|k| k.as_slice() == fp)
+    };
+    if pinned(&r.operator_keys, r.operator_keys_n) {
+        return ROLE_OPERATOR | ROLE_BREAKGLASS;
+    }
+    if pinned(&r.observer_keys, r.observer_keys_n) {
+        return ROLE_OBSERVER;
+    }
+    if r.operator_keys_n == 0 && r.observer_keys_n == 0 {
+        return role_for_svid(r, svid);
+    }
+    if prefix_match(svid, &r.admin_prefix, r.admin_prefix_len as usize) {
+        ROLE_OPERATOR | ROLE_BREAKGLASS
+    } else {
+        ROLE_OBSERVER
+    }
+}
+
+/// Pin `hex` (64 hex characters) as a key granted `role`'s keys; one
+/// that does not parse, or past [`ROLE_KEYS_MAX`], pins nothing.
+pub fn pin_role_key(keys: &mut [[u8; KEY_FP_LEN]; ROLE_KEYS_MAX], n: &mut u8, hex: &[u8]) {
+    if (*n as usize) < ROLE_KEYS_MAX {
+        if let Some(fp) = super::peer_policy::parse_pin(hex) {
+            keys[*n as usize] = fp;
+            *n += 1;
+        }
     }
 }
 

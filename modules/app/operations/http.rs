@@ -604,7 +604,7 @@ unsafe fn drain_proposal_assignments(h: &mut Http, sys: &SyscallTable) {
         if msg_type != wire::MSG_PROPOSAL_ASSIGNED {
             continue;
         }
-        let Some((correlation_id, _partition_id, index)) =
+        let Some((correlation_id, _partition_id, index, _term)) =
             wire::decode_proposal_assigned(&h.msg_buf[..plen as usize])
         else {
             continue;

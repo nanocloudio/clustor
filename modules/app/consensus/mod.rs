@@ -327,7 +327,7 @@ struct ModuleState {
     rpc_dropped_full: u32,
     /// Frames taken off the shared rpc channel since the last accounting
     /// line, and when that line last went out. `[raft] eng rpc=N
-    /// dropped=N misrouted=N` once a second, so a link that goes quiet
+    /// dropped=N misrouted=N … fwd_dropped=N` once a second, so a link that goes quiet
     /// shows up at the engine's door, not only as a follower timeout.
     rpc_demuxed: u32,
     /// Proposal frames (partitioned, tagged, forwarded) routed to a slot
@@ -1102,12 +1102,17 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         intake_demux(s, sys);
         if now.wrapping_sub(s.last_engine_log_ms) >= 1000 {
             s.last_engine_log_ms = now;
-            let mut line = [0u8; 96];
+            let mut line = [0u8; 128];
             let mut pos = log_fmt::log_field(&mut line, 0, b"[raft] eng rpc=", s.rpc_demuxed);
             pos = log_fmt::log_field(&mut line, pos, b" dropped=", s.rpc_dropped_full);
             pos = log_fmt::log_field(&mut line, pos, b" misrouted=", s.frames_misrouted);
             pos = log_fmt::log_field(&mut line, pos, b" prop=", s.prop_demuxed);
             pos = log_fmt::log_field(&mut line, pos, b" held=", s.prop_held);
+            // Relayed proposals this node dropped, ever, over every group.
+            let fwd = s.slots[..s.active_slots as usize]
+                .iter()
+                .fold(0u32, |n, slot| n.saturating_add(slot.raft.forwards_dropped));
+            pos = log_fmt::log_field(&mut line, pos, b" fwd_dropped=", fwd);
             dev_log(sys, 3, line.as_ptr(), pos);
             s.rpc_demuxed = 0;
             s.prop_demuxed = 0;

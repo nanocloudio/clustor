@@ -847,6 +847,11 @@ pub struct Wal {
     /// Sealed frames, the nonce-domain allocator and key
     /// epochs. Inert when the `aead` parameter is 0.
     pub seal: wal_seal::WalSeal,
+    /// The group's configuration, followed from the config entries this
+    /// log takes, and whether it moved since the dispatch table last
+    /// handed it to the snapshot component.
+    pub cfg: wire::CfgTrack,
+    pub cfg_dirty: bool,
     /// One whole sealed frame read back for serving or scanning, and the
     /// reply composed over it. In state rather than on the stack, so the
     /// sealed read paths add no page-sized frame of their own.
@@ -1035,6 +1040,8 @@ pub unsafe fn init(s: &mut Wal) {
     s.snap_trigger = (0, 0);
     s.snap_trigger_dirty = false;
     wal_seal::init(&mut s.seal);
+    s.cfg = wire::NO_CFG_TRACK;
+    s.cfg_dirty = false;
     s.seal_frame = [0; SEALED_FRAME_MAX];
 }
 
@@ -1320,6 +1327,29 @@ fn memory_slot(index: u64) -> usize {
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// An entry the log has taken at `index`, its `[term][index][body]` at
+/// `msg_buf[from..from + len]`: a config entry moves the configuration.
+fn note_config(s: &mut Wal, index: u64, from: usize, len: usize) {
+    let Some(src) = s.msg_buf.get(from + 16..from + len) else {
+        return;
+    };
+    if !wire::has_config_change_magic(src) {
+        return;
+    }
+    let mut body = [0u8; wire::CONFIG_CHANGE_HDR + wire::MEMBERSHIP_IDS as usize];
+    let n = src.len().min(body.len());
+    body[..n].copy_from_slice(&src[..n]);
+    s.cfg.note(index, &body[..n]);
+    s.cfg_dirty = true;
+}
+
+/// The configuration is `m` as of `index` (the group's initial one, at
+/// index 0).
+pub fn set_membership(s: &mut Wal, index: u64, m: wire::Membership) {
+    s.cfg.set(index, m);
+    s.cfg_dirty = true;
+}
+
 unsafe fn record_entry_loc(
     s: &mut Wal,
     index: u64,
@@ -2767,6 +2797,8 @@ unsafe fn publish_truncation(
         }
     }
     s.entry_ring_max_index = keep_through_index;
+    s.cfg.truncate(keep_through_index);
+    s.cfg_dirty = true;
 
     s.current_index = keep_through_index;
     s.current_term = new_term;
@@ -3167,6 +3199,11 @@ unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> bool 
 unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
     if before_index == 0 {
         return;
+    }
+    // Everything up to the snapshot's index is committed: its config
+    // entries are the base now.
+    if before_index <= s.current_index {
+        s.cfg.fold_through(before_index);
     }
     // `before_index` is the snapshot's index. Whatever the floors keep
     // below it, replay after a restart can start at the segment that
@@ -3828,6 +3865,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
                 entry_payload_offset,
                 entry_len as u32,
             );
+            note_config(s, index, 0, entry_len);
             note_ledger_ack(s, term, index);
 
             // Re-emit as FsyncAck — entry is already durable on disk.
@@ -4290,6 +4328,7 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
             s.entries_written = s.entries_written.saturating_add(1);
             s.bytes_written = s.bytes_written.saturating_add(payload_len as u64);
             record_entry_loc(s, index, term, 0, 0, payload_len as u32);
+            note_config(s, index, 0, payload_len);
             note_ledger_ack(s, term, index);
             if s.out_flushed >= 0 {
                 let mut ack_buf = [0u8; 17];
@@ -4373,6 +4412,7 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         entry_payload_offset,
         payload_len as u32,
     );
+    note_config(s, index, 0, payload_len);
 
     if !s.has_batch {
         s.batch_start_ms = dev_millis(sys);
@@ -5119,10 +5159,11 @@ pub fn request_key_rotation(s: &mut Wal) {
 /// then resumes from the durable prefix and the cluster re-installs,
 /// which is conservative, loud, and preferred over serving a log
 /// with a silent hole.
-pub fn on_snapshot_installed(s: &mut Wal, term: Term, index: Index) {
+pub fn on_snapshot_installed(s: &mut Wal, term: Term, index: Index, m: wire::Membership) {
     if index <= s.current_index {
         return;
     }
+    set_membership(s, index, m);
     s.current_term = term;
     s.current_index = index;
     if index.saturating_add(1) > s.entry_ring_min_index {

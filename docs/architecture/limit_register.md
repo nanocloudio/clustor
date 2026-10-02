@@ -118,9 +118,12 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Raft metadata path staging | `META_PATH_MAX` | modules/app/consensus/raft.rs | 32 | Bounds internally generated per-partition metadata paths; builders and partition-id formatting must remain within it. |
 | WAL path staging | `WAL_PATH_MAX` | modules/app/durability/wal.rs | 48 | Bounds internally generated segment/index paths; builders must not silently truncate a generated name. |
 | Snapshot path staging | `SNAP_PATH_MAX` | modules/app/durability/snapshot.rs | 64 | Bounds internally generated snapshot/pointer paths; builders must not silently truncate a generated name. |
-| Concurrent peer + client connections | `MAX_CONNS` | modules/app/peer_router/mod.rs | 16384 | A full connection table drops the accept; overflow clients never complete a handshake. This is the FIRST ceiling every client connection meets, so it must stay at or above the broker-side per-protocol tables it fronts (quantum's `protocol` MAX_CONNS / KCONNS / ACONNS) — a smaller value here silently caps the broker whatever those tables allow. Sized for a 7-node cluster's peer links plus a 10k-client broker. A `Conn` is 46 B and holds no payload buffer, so per-connection BYTES live in the protocol modules — but the table is 736 KiB of module state at this size, paid whether or not a client ever connects, which makes it the peer_router's dominant fixed cost. Hard ceiling 65536: the slot index is the app-facing `wire::ConnId` (u16). |
+| Concurrent peer + client connections | `MAX_CONNS` | modules/app/peer_router/mod.rs | 16384 | A full connection table drops the accept; overflow clients never complete a handshake. This is the FIRST ceiling every client connection meets, so it must stay at or above the broker-side per-protocol tables it fronts (quantum's `protocol` MAX_CONNS / KCONNS / ACONNS) — a smaller value here silently caps the broker whatever those tables allow. Sized for a 7-node cluster's peer links plus a 10k-client broker. A `Conn` is 72 B and holds no payload buffer, so per-connection BYTES live in the protocol modules — but the table is 1152 KiB of module state at this size, paid whether or not a client ever connects, which makes it the peer_router's dominant fixed cost. Hard ceiling 65536: the slot index is the app-facing `wire::ConnId` (u16). |
 | Transport conn-id reverse index | `CONN_ID_SPACE` | modules/app/peer_router/mod.rs | 65536 | Envelope, not a reachable ceiling: transport conn ids are u16, so `slot_by_conn` is sized to the whole id space and every per-frame conn-id lookup is O(1) rather than a walk of the table. It is a FLAT 128 KiB of module state independent of `MAX_CONNS` — raising `MAX_CONNS` does not move it, and lowering `MAX_CONNS` does not recover it. |
 | Routed peer/client frame | `ROUTE_FRAME_MAX` | modules/app/peer_router/mod.rs | 4096 | Oversized frames are dropped and counted. All gateway/peer copies must share this bound; undersizing any hop wedges replication or times out clients. |
+| Identity reports awaiting their connection | `AWAITING_IDENTITIES` | modules/app/peer_router/mod.rs | 16 | Lossy capacity: a full table drops its oldest report, counted, and that connection opens with no identity — refused wherever one is required. Reports wait at most `peer_policy::AWAIT_MS`. |
+| Queued identity revokes | `REVOKES_MAX` | modules/app/peer_router/mod.rs | 64 | Lossy capacity, safe by construction: a slot's next connection delivers its own identity before any of its frames, so a dropped revoke costs rbac a table entry, never a grant. |
+| Re-keyed identity fingerprint | `PEER_IDENTITY_FP_MAX` | modules/common/wire.rs | 32 | Shape: one SHA-256, the only fingerprint the transport reports. |
 | Per-partition output ports per router | `MAX_LOCAL_PARTITIONS` | modules/app/partition_router/mod.rs | 4 | Capacity: one untagged + one tagged port per partition, so 2N channels against fluxor's port budget. It bounds PORTS, not partitions — `pick_chan` falls back to port 0 for a partition without its own port, and the envelope's partition id is what the multi-slot engine demuxes on. |
 | Partitions a router will route to | `MAX_ROUTED_PARTITIONS` | modules/app/partition_router/mod.rs | 64 | Capacity: tracks the engine's `K_MAX`, and `num_partitions` is clamped to it at init. Deliberately not clamped to the port count — that would silently give a graph asking for 64 partitions four groups and leave sixty idle. |
 | Node-set identifier width | `NODE_SET_CAPACITY` | modules/common/types.rs | — | Typed value 8. This is the bitset envelope; active voters remain capped at `MAX_NODES` (7). |
@@ -130,7 +133,8 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Pending session-directory proposals | `MAX_PENDING` | modules/app/session_directory/mod.rs | 16 | A full table leaves requests in the input channel. If the proposal channel fills after consumption, the request is dropped and the client must recover by reply-timeout retry; slots expire after 10 seconds. |
 | Deterministic-timing owners | `TM_MAX_OWNERS` | modules/common/timing.rs | 4 | Rejects another independently drained timing owner. |
 | Timing deadline slots | `TM_MAX_DEADLINES` | modules/common/timing.rs | 64 | A `KEY_PUT` whose TTL deadline cannot register fails `SR_ST_DEADLINE_CAPACITY` without storing the key. |
-| RBAC connection identities | `IDENTITY_SLOTS` | modules/app/operations/rbac.rs | 32 | Security defect: on overflow a new connection receives no binding, and an absent binding falls back to `default_role`, currently operator by default. Until fixed, this narrower table can make peer-router connections fail open rather than merely lose identity metadata. |
+| RBAC connection identities | `IDENTITY_SLOTS` | modules/app/operations/rbac.rs | 32 | Fail-closed capacity: a full table evicts its oldest binding, and with identity wired a connection with no binding is denied (never judged as `default_role`); the eviction is counted. Bindings die with their slot's revoke, so the table holds only connections that reported a verified identity and are still open. |
+| RBAC role keys | `ROLE_KEYS_MAX` | modules/app/operations/rbac.rs | 4 | Key fingerprints pinned per role (`operator_keyN`, `observer_keyN`); a fifth pins nothing. |
 | RBAC SVID prefix | `SVID_PREFIX_MAX` | modules/app/operations/rbac.rs | 64 | Identity matching sees at most this prefix; longer identities are truncated for role matching and require collision-safe provisioning. |
 | Telemetry metric slots | `METRIC_SLOTS` | modules/app/operations/telemetry.rs | 320 | LRU-evicts the oldest metric and increments an eviction counter. This can remove readiness/diagnostic evidence under high-cardinality instrumentation. |
 | Metrics export payload | `SAFE_EXPORT_MAX` | modules/app/operations/telemetry.rs | 7400 | The export must fit one atomic channel frame; records past the budget are dropped and counted in the eviction metric. |
@@ -208,10 +212,6 @@ Failure to reschedule deferred work is a correctness defect.
   fill, but the eight-slot reply seam can silently drop a confirmation. Make
   this path lossless or explicitly rejected before treating strict reads as
   complete under saturation.
-- The RBAC identity table is half the peer connection table. Its overflow path
-  discards a new binding and missing bindings currently fall back to the
-  operator-default role. This must become explicit fail-closed denial (and be
-  saturation-tested) before the connection profile is safe.
 - The 2048-byte WAL body binds before the facade's nominal 4096-byte command.
   Either narrow the advertised facade contract or introduce deterministic
   chunking above consensus.
@@ -306,6 +306,9 @@ SNAP_PATH_MAX | modules/app/durability/snapshot.rs | 64
 MAX_CONNS | modules/app/peer_router/mod.rs | 16384
 CONN_ID_SPACE | modules/app/peer_router/mod.rs | 65536
 ROUTE_FRAME_MAX | modules/app/peer_router/mod.rs | 4096
+AWAITING_IDENTITIES | modules/app/peer_router/mod.rs | 16
+REVOKES_MAX | modules/app/peer_router/mod.rs | 64
+PEER_IDENTITY_FP_MAX | modules/common/wire.rs | 32
 MAX_LOCAL_PARTITIONS | modules/app/partition_router/mod.rs | 4
 MAX_ROUTED_PARTITIONS | modules/app/partition_router/mod.rs | 64
 NODE_SET_CAPACITY | modules/common/types.rs | 8
@@ -316,6 +319,7 @@ MAX_PENDING | modules/app/session_directory/mod.rs | 16
 TM_MAX_OWNERS | modules/common/timing.rs | 4
 TM_MAX_DEADLINES | modules/common/timing.rs | 64
 IDENTITY_SLOTS | modules/app/operations/rbac.rs | 32
+ROLE_KEYS_MAX | modules/app/operations/rbac.rs | 4
 SVID_PREFIX_MAX | modules/app/operations/rbac.rs | 64
 METRIC_SLOTS | modules/app/operations/telemetry.rs | 320
 SAFE_EXPORT_MAX | modules/app/operations/telemetry.rs | 7400

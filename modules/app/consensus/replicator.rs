@@ -1206,7 +1206,7 @@ unsafe fn forward_snapshots(s: &mut Repl, sys: &SyscallTable) {
         // peer, and so a later broadcast push is not captured by it.
         let last_chunk = msg_type == wire::MSG_INSTALL_SNAPSHOT
             && wire::decode_install_snapshot(&s.msg_buf[..plen as usize])
-                .is_some_and(|(_, _, _, _, done, _)| done);
+                .is_some_and(|(_, _, _, _, done, _, _)| done);
         if wire_channels::writable(sys, s.out_net) {
             let w = wire_channels::channel_write_routed_partitioned(
                 sys,

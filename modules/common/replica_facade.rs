@@ -79,9 +79,9 @@ pub const MAX_COMMAND_BYTES: usize = 4096;
 pub const TAGGED_PROPOSAL_HDR: usize = 8;
 
 /// MSG_PROPOSAL_ASSIGNED payload size (matches
-/// `wire::PROPOSAL_ASSIGNED_LEN`): correlation_id(8) + partition_id(2)
-/// + wal_index(8).
-pub const PROPOSAL_ASSIGNED_LEN: usize = 18;
+/// `wire::PROPOSAL_ASSIGNED_LEN`): `[correlation_id:u64]
+/// [partition_id:u16][wal_index:u64][term:u64]`.
+pub const PROPOSAL_ASSIGNED_LEN: usize = 26;
 
 /// MSG_COMMITTED_BATCH payload size: term(8) + index(8).
 pub const COMMITTED_BATCH_LEN: usize = 16;
@@ -393,10 +393,10 @@ pub fn build_tagged_proposal(
 }
 
 /// Decode a `MSG_PROPOSAL_ASSIGNED` payload. Returns `Some((correlation_id,
-/// partition_id, wal_index))` if the payload is well-formed; `None`
+/// partition_id, wal_index, term))` if the payload is well-formed; `None`
 /// otherwise. Mirrors `wire::decode_proposal_assigned` but does not pull
 /// in the SyscallTable.
-pub fn decode_proposal_assigned(payload: &[u8]) -> Option<(u64, u16, u64)> {
+pub fn decode_proposal_assigned(payload: &[u8]) -> Option<(u64, u16, u64, u64)> {
     if payload.len() < PROPOSAL_ASSIGNED_LEN {
         return None;
     }
@@ -415,7 +415,17 @@ pub fn decode_proposal_assigned(payload: &[u8]) -> Option<(u64, u16, u64)> {
         payload[16],
         payload[17],
     ]);
-    Some((correlation_id, partition_id, wal_index))
+    let term = u64::from_le_bytes([
+        payload[18],
+        payload[19],
+        payload[20],
+        payload[21],
+        payload[22],
+        payload[23],
+        payload[24],
+        payload[25],
+    ]);
+    Some((correlation_id, partition_id, wal_index, term))
 }
 
 // ── In-flight correlation table ────────────────────────────────────────────
@@ -429,11 +439,15 @@ pub enum InflightState {
     Assigned,
     /// Commit horizon advanced past `assigned_index`; ready to drain.
     Committed,
+    /// Another term's entry committed at `assigned_index`: the proposal
+    /// never will. Drained by [`InflightTable::take_superseded`].
+    Superseded,
 }
 
 const STATE_PENDING: u8 = 0;
 const STATE_ASSIGNED: u8 = 1;
 const STATE_COMMITTED: u8 = 2;
+const STATE_SUPERSEDED: u8 = 3;
 
 #[derive(Clone, Copy)]
 struct InflightSlot {
@@ -521,14 +535,20 @@ impl<const N: usize> InflightTable<N> {
         Err(ProposeError::InflightTableFull { capacity: N })
     }
 
-    /// Bind a previously registered correlation to its `wal_index`.
-    /// Returns `Some(wal_index)` if the assignment was recorded, `None`
-    /// if no matching slot existed (likely a duplicate
+    /// Bind a previously registered correlation to its entry, `wal_index`
+    /// in `term`. Returns `Some(wal_index)` if the assignment was
+    /// recorded, `None` if no matching slot existed (likely a duplicate
     /// `MSG_PROPOSAL_ASSIGNED` after a retry).
-    pub fn record_assignment(&mut self, correlation_id: u64, wal_index: u64) -> Option<u64> {
+    pub fn record_assignment(
+        &mut self,
+        correlation_id: u64,
+        wal_index: u64,
+        term: u64,
+    ) -> Option<u64> {
         for s in self.slots.iter_mut() {
             if s.correlation_id == correlation_id && s.state == STATE_PENDING {
                 s.assigned_index = wal_index;
+                s.assigned_term = term;
                 s.state = STATE_ASSIGNED;
                 return Some(wal_index);
             }
@@ -536,22 +556,41 @@ impl<const N: usize> InflightTable<N> {
         None
     }
 
-    /// Promote every assigned slot whose `assigned_index <= committed_index`
-    /// to `Committed`, storing `committed_term`. Returns the count of
-    /// newly committed slots.
+    /// The entry at `committed_index`, appended in `committed_term`, has
+    /// committed. Every assigned slot of the same term at or below that
+    /// index is committed with it: one leader assigns a term's entries,
+    /// and two logs that agree on an entry agree on everything before it.
+    /// A slot of another term at exactly that index was superseded — the
+    /// position went to another leader's entry. A slot of another term
+    /// below it is left for the commit of its own entry (or of a later
+    /// one in its term). Returns the count of newly committed slots.
     pub fn record_commit(&mut self, committed_term: u64, committed_index: u64) -> usize {
         let mut n = 0;
         for s in self.slots.iter_mut() {
-            if s.correlation_id != 0
-                && s.state == STATE_ASSIGNED
-                && s.assigned_index <= committed_index
-            {
-                s.assigned_term = committed_term;
+            if s.correlation_id == 0 || s.state != STATE_ASSIGNED {
+                continue;
+            }
+            if s.assigned_term == committed_term && s.assigned_index <= committed_index {
                 s.state = STATE_COMMITTED;
                 n += 1;
+            } else if s.assigned_index == committed_index {
+                s.state = STATE_SUPERSEDED;
             }
         }
         n
+    }
+
+    /// Drain the next superseded slot, freeing it: its correlation id,
+    /// for the caller to answer (and resubmit if it chooses).
+    pub fn take_superseded(&mut self) -> Option<u64> {
+        for s in self.slots.iter_mut() {
+            if s.correlation_id != 0 && s.state == STATE_SUPERSEDED {
+                let id = s.correlation_id;
+                *s = InflightSlot::empty();
+                return Some(id);
+            }
+        }
+        None
     }
 
     /// Drain the next committed slot, freeing it. Returns
@@ -584,7 +623,8 @@ impl<const N: usize> InflightTable<N> {
                 let state = match s.state {
                     STATE_PENDING => InflightState::Pending,
                     STATE_ASSIGNED => InflightState::Assigned,
-                    _ => InflightState::Committed,
+                    STATE_COMMITTED => InflightState::Committed,
+                    _ => InflightState::Superseded,
                 };
                 return Some((state, s.assigned_term, s.assigned_index));
             }
@@ -605,9 +645,9 @@ impl<const N: usize> InflightTable<N> {
         false
     }
 
-    /// Cancel all inflights. Returns the count freed. Use after the
-    /// consumer observes a term jump on the leader — the prior term's
-    /// pending proposals were dropped by the new leader.
+    /// Cancel all inflights. Returns the count freed. For a consumer that
+    /// gives up on every proposal at a term jump rather than waiting for
+    /// each to commit or be superseded.
     pub fn cancel_all(&mut self) -> usize {
         let mut n = 0;
         for s in self.slots.iter_mut() {
@@ -1122,11 +1162,13 @@ mod tests {
         correlation_id: u64,
         partition_id: u16,
         wal_index: u64,
+        term: u64,
     ) -> [u8; PROPOSAL_ASSIGNED_LEN] {
         let mut buf = [0u8; PROPOSAL_ASSIGNED_LEN];
         buf[0..8].copy_from_slice(&correlation_id.to_le_bytes());
         buf[8..10].copy_from_slice(&partition_id.to_le_bytes());
         buf[10..18].copy_from_slice(&wal_index.to_le_bytes());
+        buf[18..26].copy_from_slice(&term.to_le_bytes());
         buf
     }
 
@@ -1217,13 +1259,13 @@ mod tests {
         assert_eq!((t, i), (0, 0));
 
         // Record assignment for 11.
-        assert_eq!(table.record_assignment(11, 100), Some(100));
+        assert_eq!(table.record_assignment(11, 100, 5), Some(100));
         let (state, t, i) = table.lookup(11).unwrap();
         assert_eq!(state, InflightState::Assigned);
-        assert_eq!((t, i), (0, 100));
+        assert_eq!((t, i), (5, 100));
 
         // Record assignment for 22.
-        assert_eq!(table.record_assignment(22, 101), Some(101));
+        assert_eq!(table.record_assignment(22, 101, 5), Some(101));
 
         // Commit advance to 100 only promotes 11.
         assert_eq!(table.record_commit(5, 100), 1);
@@ -1279,9 +1321,39 @@ mod tests {
         let mut table: InflightTable<4> = InflightTable::new();
         table.register(11).unwrap();
         table.register(22).unwrap();
-        table.record_assignment(11, 100);
+        table.record_assignment(11, 100, 1);
         assert_eq!(table.cancel_all(), 2);
         assert!(table.is_empty());
+    }
+
+    /// A leader change can put another entry at a proposal's index: the
+    /// index alone is not the proposal.
+    #[test]
+    fn a_commit_in_another_term_does_not_commit_a_proposal() {
+        let mut table: InflightTable<4> = InflightTable::new();
+        table.register(11).unwrap();
+        table.register(22).unwrap();
+        // Both assigned by the leader of term 4.
+        table.record_assignment(11, 100, 4);
+        table.record_assignment(22, 101, 4);
+        // Term 5's leader committed its own entry at 100: 11 was
+        // superseded; 101 is not decided by it.
+        assert_eq!(table.record_commit(5, 100), 0);
+        assert_eq!(
+            table.lookup(11).map(|l| l.0),
+            Some(InflightState::Superseded)
+        );
+        assert_eq!(table.lookup(22).map(|l| l.0), Some(InflightState::Assigned));
+        assert!(table.take_committed().is_none());
+        assert_eq!(table.take_superseded(), Some(11));
+        assert!(table.lookup(11).is_none());
+        // A later term-5 commit past 101 still says nothing of term 4's
+        // entry there…
+        assert_eq!(table.record_commit(5, 200), 0);
+        assert_eq!(table.lookup(22).map(|l| l.0), Some(InflightState::Assigned));
+        // …its own term's commit at or past it does.
+        assert_eq!(table.record_commit(4, 101), 1);
+        assert_eq!(table.take_committed().map(|c| c.0), Some(22));
     }
 
     #[test]
@@ -1290,21 +1362,26 @@ mod tests {
         // Late MSG_PROPOSAL_ASSIGNED for a correlation we never
         // registered (e.g. cancelled after a leader change). The
         // table refuses silently — None means "drop the assignment".
-        assert!(table.record_assignment(999, 42).is_none());
+        assert!(table.record_assignment(999, 42, 1).is_none());
     }
 
     #[test]
     fn decode_proposal_assigned_matches_wire() {
-        let buf = make_proposal_assigned(0x1234, 7, 0xABCD);
-        let (cid, partition, idx) = decode_proposal_assigned(&buf).unwrap();
+        let buf = make_proposal_assigned(0x1234, 7, 0xABCD, 9);
+        let (cid, partition, idx, term) = decode_proposal_assigned(&buf).unwrap();
         assert_eq!(cid, 0x1234);
         assert_eq!(partition, 7);
         assert_eq!(idx, 0xABCD);
+        assert_eq!(term, 9);
     }
 
     #[test]
     fn decode_proposal_assigned_rejects_short() {
         assert!(decode_proposal_assigned(&[0u8; 10]).is_none());
+        assert!(
+            decode_proposal_assigned(&[0u8; 18]).is_none(),
+            "an assignment names its term"
+        );
     }
 
     #[test]
@@ -1549,10 +1626,10 @@ mod tests {
         inflight.register(0xABCD).unwrap();
 
         // 2) consensus assigns wal_index=1 and emits MSG_PROPOSAL_ASSIGNED.
-        let assigned = make_proposal_assigned(0xABCD, 0, 1);
-        let (cid, _pid, wal_index) = decode_proposal_assigned(&assigned).unwrap();
+        let assigned = make_proposal_assigned(0xABCD, 0, 1, 1);
+        let (cid, _pid, wal_index, term) = decode_proposal_assigned(&assigned).unwrap();
         assert_eq!(cid, 0xABCD);
-        inflight.record_assignment(cid, wal_index);
+        inflight.record_assignment(cid, wal_index, term);
 
         // 3) Local durability acks; consensus advances to 1.
         let batch = make_committed_batch(1, 1);
@@ -1583,9 +1660,9 @@ mod tests {
         inflight.register(0xA1).unwrap();
         inflight.register(0xA2).unwrap();
         inflight.register(0xA3).unwrap();
-        inflight.record_assignment(0xA1, 10);
-        inflight.record_assignment(0xA2, 11);
-        inflight.record_assignment(0xA3, 12);
+        inflight.record_assignment(0xA1, 10, 1);
+        inflight.record_assignment(0xA2, 11, 1);
+        inflight.record_assignment(0xA3, 12, 1);
 
         // consensus emits horizon=10 first.
         sub.ingest_committed_batch(&make_committed_batch(1, 10))
@@ -1779,12 +1856,12 @@ mod tests {
         // Propose two tagged commands.
         inflight.register(0x11).unwrap();
         inflight.register(0x22).unwrap();
-        let assign_a = make_proposal_assigned(0x11, 0, 1);
-        let assign_b = make_proposal_assigned(0x22, 0, 2);
-        let (cid_a, _, idx_a) = decode_proposal_assigned(&assign_a).unwrap();
-        let (cid_b, _, idx_b) = decode_proposal_assigned(&assign_b).unwrap();
-        inflight.record_assignment(cid_a, idx_a);
-        inflight.record_assignment(cid_b, idx_b);
+        let assign_a = make_proposal_assigned(0x11, 0, 1, 3);
+        let assign_b = make_proposal_assigned(0x22, 0, 2, 3);
+        let (cid_a, _, idx_a, term_a) = decode_proposal_assigned(&assign_a).unwrap();
+        let (cid_b, _, idx_b, term_b) = decode_proposal_assigned(&assign_b).unwrap();
+        inflight.record_assignment(cid_a, idx_a, term_a);
+        inflight.record_assignment(cid_b, idx_b, term_b);
 
         // Per-entry stream delivers the commands in commit order.
         let body_a = b"PUT key=foo val=1";

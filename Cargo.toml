@@ -192,6 +192,13 @@ path = "tests/facade_stress.rs"
 name = "cluster"
 path = "tests/cluster.rs"
 
+# Peer links under mTLS with pinned replica identities: a 3-replica
+# cluster forms and commits, and an unpinned key's claim is refused.
+# Needs fluxor-linux + built modules; runtime-skips otherwise.
+[[test]]
+name = "peer_mtls"
+path = "tests/peer_mtls.rs"
+
 [[test]]
 name = "partition"
 path = "tests/partition.rs"
@@ -314,6 +321,20 @@ path = "tests/wal_truncate.rs"
 [[test]]
 name = "snap_pointer"
 path = "tests/snap_pointer.rs"
+
+# Host-side unit coverage for the peer identity policy peer_router
+# applies: pinned binding, expiry on trusted time, partition scope.
+# Pure functions pulled in via `#[path]`; always runs.
+[[test]]
+name = "peer_policy"
+path = "tests/peer_policy.rs"
+
+# Host-side coverage for wire admin admission by peer identity: role by
+# pinned key, fail-closed when unbound, revoke, eviction on overflow.
+# Mounts operations/rbac.rs via `#[path]` against a mock SyscallTable.
+[[test]]
+name = "rbac_identity"
+path = "tests/rbac_identity.rs"
 
 # Host-side unit coverage for raft's write-then-adopt metadata
 # persistence discipline. Pulls `modules/app/consensus/raft.rs` in via

@@ -754,6 +754,13 @@ fn fan_slot_identity(s: &mut ModuleState, i: usize) {
         ledger::clamp_voters(&mut s.slots[i].ledger);
     }
     wal::arm(&mut s.slots[i].wal);
+    // The group's configuration before any config entry: its first
+    // `voter_count` replicas.
+    wal::set_membership(
+        &mut s.slots[i].wal,
+        0,
+        wire::Membership::initial(s.slots[i].voter_count),
+    );
     // After `arm`: the volatile variant has no durable records to seal.
     s.slots[i].snapshot.seal_suite = if wal::sealed(&s.slots[i].wal) {
         s.slots[i].wal.seal.suite
@@ -830,7 +837,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // running restore is Burst — its cold FS_OPEN is the same
             // tens-of-ms first touch the wal replay path is forgiven for.
             let t0 = dev_micros(sys);
-            let slot_wal_rc = if snapshot::boot_restore(&mut s.slots[i].snapshot, sys) {
+            let restored = snapshot::boot_restore(&mut s.slots[i].snapshot, sys);
+            // A restored snapshot's configuration is the base the wal
+            // replays on top of (the log below it may be gone).
+            if let Some((index, m)) = s.slots[i].snapshot.wal_membership.take() {
+                wal::set_membership(&mut s.slots[i].wal, index, m);
+            }
+            let slot_wal_rc = if restored {
                 wal::step(&mut s.slots[i].wal, sys)
             } else {
                 STEP_BURST
@@ -868,6 +881,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let _ = s.slots[i].wal.voter_out.take();
             }
 
+            // The configuration as the log has it, for the snapshot a
+            // trigger or a capture takes.
+            if s.slots[i].wal.cfg_dirty {
+                s.slots[i].wal.cfg_dirty = false;
+                s.slots[i].snapshot.cfg = s.slots[i].wal.cfg;
+            }
             if s.slots[i].wal.snap_trigger_dirty {
                 s.slots[i].wal.snap_trigger_dirty = false;
                 let (term, index) = s.slots[i].wal.snap_trigger;
@@ -889,8 +908,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // at `last_idx + 1` must be contiguous, not a continuity fault).
             if s.slots[i].snapshot.wal_fast_forward_dirty {
                 s.slots[i].snapshot.wal_fast_forward_dirty = false;
-                let (ff_term, ff_index) = s.slots[i].snapshot.wal_fast_forward;
-                wal::on_snapshot_installed(&mut s.slots[i].wal, ff_term, ff_index);
+                let (ff_term, ff_index, ff_membership) = s.slots[i].snapshot.wal_fast_forward;
+                wal::on_snapshot_installed(&mut s.slots[i].wal, ff_term, ff_index, ff_membership);
             }
             s.comp_step[3].record(dev_micros(sys).wrapping_sub(t0));
 

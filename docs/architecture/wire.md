@@ -137,7 +137,7 @@ under its own ids; there is no `high_rtt` field.
 | 0x10 | `MSG_CLIENT_PROPOSAL` | body is opaque; tagged form prefixes `[correlation_id:u64 LE]` (must be non-zero) on the `proposals_tagged` port |
 | 0x11 | `MSG_CLIENT_RESPONSE` | commit ack; internal v2 `[partition_id:u16][term:u64][index:u64]` |
 | 0x12 / 0x13 | `MSG_ADMIN_COMMAND` / `_RESPONSE` | response's first byte is an `ADMIN_STATUS_*` code |
-| 0x14 | `MSG_PROPOSAL_ASSIGNED` | `[correlation_id:u64][partition_id:u16][wal_index:u64]` (18 B) — binds a tagged proposal to its log index |
+| 0x14 | `MSG_PROPOSAL_ASSIGNED` | `[correlation_id:u64][partition_id:u16][wal_index:u64][term:u64]` (26 B) — binds a tagged proposal to its log index. The term is what makes the index name one entry: an index alone can be overwritten by conflict repair, so a proposer tracking acks matches on both |
 | 0x15 | `MSG_CLIENT_REJECT` | structured rejection, 11 B — see [errors.md](errors.md) |
 | 0x16 | `MSG_CLIENT_READ_REQUEST` | linearizable read: `[read_id:u64 LE][body]` after the gateway's conn_id prefix |
 | 0x17 | `MSG_CLIENT_REJECT_INTERNAL` | throttle → codec rejection, 18 B — see [errors.md](errors.md) |
@@ -180,13 +180,20 @@ byte), `MSG_FALLBACK_SIGNAL` (0x32), `MSG_READ_PERMIT` (0x33).
 | Id | Message | Notes |
 |---|---|---|
 | 0x50–0x52 | `MSG_SNAPSHOT_CHUNK` / `_MANIFEST` / `_TRIGGER` | snapshot plumbing |
-| 0x53 | `MSG_INSTALL_SNAPSHOT` | 33-byte header `[term:u64][last_included_index:u64][last_included_term:u64][offset:u64][done:u8]` + data |
+| 0x53 | `MSG_INSTALL_SNAPSHOT` | 36-byte header `[term:u64][last_included_index:u64][last_included_term:u64][offset:u64][done:u8][membership:3]` + data |
 | 0x54 | `MSG_INSTALL_SNAPSHOT_RESP` | `[term:u64][success:u8]` |
-| 0x55 | `MSG_SNAPSHOT_INSTALLED` | `[term:u64][last_included_index:u64][last_included_term:u64]` (24 B) |
+| 0x55 | `MSG_SNAPSHOT_INSTALLED` | `[term:u64][last_included_index:u64][last_included_term:u64][membership:3]` (27 B) |
 | 0x56 | `MSG_SNAPSHOT_INSTALL_REQUEST` | `[target_replica_id:u8]` (0xFF = broadcast) — follower fell below the WAL retention floor |
 | 0x57 | `MSG_APP_SNAPSHOT_CHUNK` | 28-byte header `[term:u64][last_included_index:u64][offset:u64][done:u8][reserved:u8;3]` + opaque body |
 | 0x58 / 0x59 | `MSG_APP_SNAPSHOT_REQUEST` / `_RESET` | `[term:u64][last_included_index:u64]` |
 | 0x5A | `MSG_PEER_IDENTITY` | `[session_id:u32][verification_result:u8][credential_kind:u8][profile_id:u16][not_before:u64][not_after:u64][verification_flags:u32][key_fp_alg:u8][key_fp_len:u8][principal_len:u16][key_fingerprint][principal]` — TLS identity binding to `peer_router`; the record is fluxor's and this is a mirror of it |
+
+`membership:3` above is a group's configuration as three bitmasks of
+replica ids, `[current:u8][joint:u8][learners:u8]`: the voters, the
+joint set while a change is under way (empty otherwise), and the
+learners. Carrying it on both snapshot records is what lets a replica
+rebuilt from a snapshot know who the voters are, since the
+configuration entries that named them were compacted away.
 
 ### Key management, telemetry, and membership (0x60–0x76)
 

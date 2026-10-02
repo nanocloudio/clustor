@@ -50,19 +50,26 @@ the `platform.net` stack. The rest are clustor's own.
 ### `peer_router`
 
 Multi-peer connection routing. Maps replica_id to TCP connections,
-manages outbound CMD_CONNECT with reconnection backoff, demuxes
-routed envelopes per peer, and splits inbound traffic between the
-client path (`cleartext` → `gateway.requests`) and the peer paths
-(`peer_rx` → `consensus.ack`, `raft_rpc` → `consensus.rpc`).
-Outbound peer traffic arrives on `peer_tx` / `repl_tx`; client
-responses on `client_resp`. `tls_identity` carries TLS-verified
-`conn_id → replica_id` bindings when the TLS module is wired.
+dials peers by authority with reconnection backoff, demuxes routed
+envelopes per peer, and splits inbound traffic between the client path
+(`cleartext` → `gateway.requests`) and the peer paths (`peer_rx` →
+`consensus.ack`, `raft_rpc` → `consensus.rpc`). Outbound peer traffic
+arrives on `peer_tx` / `repl_tx`; client responses on `client_resp`.
+
+`tls_identity` carries each handshake's outcome, and the router decides
+which replica a connection may claim to be from the key it presented
+(see [security.md](security.md#peer-identity)). `dial_in` / `dial_out`
+give the dialled links a transport of their own, so a TLS client can sit
+in front of them while a TLS server fronts the listener, each module in
+the one role it holds; unwired, dials share `net_in` / `net_out`.
+`client_identity` re-keys each connection's identity to the id its
+client frames carry, for an admission stage that judges commands by key.
 
 | | |
 |---|---|
-| Inputs | `net_in`, `peer_tx`, `repl_tx`, `client_resp`, `tls_identity` |
-| Outputs | `net_out`, `cleartext`, `peer_rx`, `raft_rpc`, `metrics` |
-| Params | `self_id`, `peer_count`, `listen_port`, `peer{0..4}_port`, `peer{0..4}_host` |
+| Inputs | `net_in`, `peer_tx`, `repl_tx`, `client_resp`, `tls_identity`, `dial_in` |
+| Outputs | `net_out`, `cleartext`, `peer_rx`, `raft_rpc`, `metrics`, `dial_out`, `client_identity` |
+| Params | `self_id`, `peer_count`, `listen_port`, `peer{0..4}`, `peer{0..4}_key`, `require_identity`, `partitions`, `max_link_s` |
 | Metrics | `bytes_in`, `bytes_out`, `connections.open`, `frames_dropped` |
 
 ### `consensus`
@@ -261,7 +268,7 @@ HTTP diagnostic surface.
 
 | Component | Responsibility |
 |---|---|
-| `rbac` | Evaluates RBAC roles (Operator / TenantAdmin / Observer / BreakGlass) by SPIFFE-SVID prefix match against `admin_svid_prefix` / `observer_svid_prefix` — an admin match grants Operator plus BreakGlass; writes the audit stream on `audit_events`. |
+| `rbac` | Evaluates RBAC roles (Operator / TenantAdmin / Observer / BreakGlass) from the commanding connection's identity: key fingerprints pinned by `operator_keyN` / `observer_keyN` first, then a verified name as a prefix match against `admin_svid_prefix` / `observer_svid_prefix`. An operator match also grants BreakGlass. Writes the audit stream on `audit_events`. |
 | `admin` | Idempotency-keyed admin envelope. Routes `FREEZE` / `THAW` / `DURABILITY_MODE` through the log, `TRANSFER_LEADER` / `SNAPSHOT` and the membership ops directly to `consensus`, and the migration / placement / tenant-quota / shard-map ops to the control-plane controller. Replies `ADMIN_STATUS_OK` / `ADMIN_STATUS_DUPLICATE`; the joint-consensus path is documented in [lifecycle.md](lifecycle.md#membership-changes-and-joint-consensus). |
 | `telemetry` | Metrics fan-in with fixed histogram buckets, incident correlation under a storm guard, feature-gate state, and the `/readyz` / `/why` / `/metrics` payloads. |
 | `http` | Owns what each request means: serves `/readyz`, `/why`, `/metrics`, `POST /admin/<op>` and `POST /propose` over wave `HttpRequest`/`HttpResponse` envelopes. HTTP mechanics live in wave's `http` module on a dedicated listener — by convention `LISTEN_PORT + 10000`. See [../net_http.md](../guides/net_http.md). |
@@ -287,7 +294,7 @@ tick. An authorized command delivers into `admin` in the same step
 |---|---|
 | Inputs | `admin_req`, `identity`, `admin_applied`, `admin_requests`, `ingest`, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request`† |
 | Outputs | `responses`, `denied`, `audit_events`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `authorized`, `response`† |
-| Params | `admin_svid_prefix`, `observer_svid_prefix`, `default_role`, `emit_interval_ms` |
+| Params | `admin_svid_prefix`, `observer_svid_prefix`, `default_role`, `emit_interval_ms`, `operator_key{0..3}`, `observer_key{0..3}` |
 | Variants | `diag` (default), `headless` |
 
 † Present in the `diag` variant only.

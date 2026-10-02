@@ -92,9 +92,9 @@
 
 use super::sealed as sr;
 use super::{
-    dev_log, note_ledger_ack, publish_name, record_entry_loc, wal_frame, wire, wire_channels,
-    write_part, Wal, FS_CLOSE, FS_FSYNC, FS_MKDIR, FS_OPEN, FS_OPEN_CREATE, FS_READ, FS_WRITE,
-    STEP_BURST, WAL_PATH_MAX,
+    dev_log, note_config, note_ledger_ack, publish_name, record_entry_loc, wal_frame, wire,
+    wire_channels, write_part, Wal, FS_CLOSE, FS_FSYNC, FS_MKDIR, FS_OPEN, FS_OPEN_CREATE, FS_READ,
+    FS_WRITE, STEP_BURST, WAL_PATH_MAX,
 };
 use crate::abi::contracts::key_vault as kv;
 use crate::abi::SyscallTable;
@@ -1359,6 +1359,7 @@ pub unsafe fn replay_frames(s: &mut Wal, sys: &SyscallTable, max_frames: usize) 
                     frame_start + sr::WAL_HDR_LEN as u32,
                     ct_len,
                 );
+                note_config(s, index, sr::WAL_HDR_LEN, ct_len as usize);
                 note_ledger_ack(s, term, index);
                 if s.out_flushed >= 0 {
                     let mut ack = [0u8; 17];

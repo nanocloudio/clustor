@@ -617,6 +617,180 @@ pub fn decode_config_change(buf: &[u8]) -> Option<(u8, usize, usize)> {
     Some((op_code, 10, n))
 }
 
+/// Replica ids a configuration names: `types::MAX_NODES`. An id at or
+/// above it is ignored wherever a configuration is applied.
+pub const MEMBERSHIP_IDS: u8 = 7;
+
+/// A group's configuration as bitmasks of replica ids: the voters, the
+/// joint set while a change is under way (empty otherwise), and the
+/// learners. On the wire, `[current:u8][joint:u8][learners:u8]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Membership {
+    pub current: u8,
+    pub joint: u8,
+    pub learners: u8,
+}
+
+pub const MEMBERSHIP_LEN: usize = 3;
+
+impl Membership {
+    /// The first `voters` replicas, as a group starts.
+    pub fn initial(voters: u8) -> Self {
+        let n = voters.min(MEMBERSHIP_IDS);
+        Membership {
+            current: ((1u16 << n) - 1) as u8,
+            joint: 0,
+            learners: 0,
+        }
+    }
+
+    pub fn joint_active(&self) -> bool {
+        self.joint != 0
+    }
+
+    /// Apply a committed config-change body, as consensus applies it:
+    /// JOINT layers the joint set, NEW installs the voters and ends the
+    /// joint state (a new voter stops being a learner), LEARNER replaces
+    /// the learners (never a voter). Anything else changes nothing.
+    pub fn apply_config(&mut self, body: &[u8]) {
+        let Some((op, off, n)) = decode_config_change(body) else {
+            return;
+        };
+        let mut set = 0u8;
+        for &id in &body[off..off + n] {
+            if id < MEMBERSHIP_IDS {
+                set |= 1 << id;
+            }
+        }
+        match op {
+            CONFIG_CHANGE_OP_JOINT => self.joint = set,
+            CONFIG_CHANGE_OP_NEW => {
+                self.current = set;
+                self.joint = 0;
+                self.learners &= !set;
+            }
+            CONFIG_CHANGE_OP_LEARNER => self.learners = set & !self.current & !self.joint,
+            _ => {}
+        }
+    }
+
+    pub fn encode(&self) -> [u8; MEMBERSHIP_LEN] {
+        [self.current, self.joint, self.learners]
+    }
+
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        Some(Membership {
+            current: *b.first()?,
+            joint: *b.get(1)?,
+            learners: *b.get(2)?,
+        })
+    }
+}
+
+/// Config entries the log holds above its configuration base. Raft
+/// takes one membership change at a time, so all but the newest one or
+/// two are committed; when the list is full the oldest is folded into
+/// the base.
+const CFG_LOG: usize = 16;
+
+/// The configuration after the config entry at `index`.
+#[derive(Clone, Copy)]
+struct CfgPoint {
+    index: u64,
+    membership: Membership,
+}
+
+const NO_CFG_POINT: CfgPoint = CfgPoint {
+    index: 0,
+    membership: Membership {
+        current: 0,
+        joint: 0,
+        learners: 0,
+    },
+};
+
+/// A group's configuration as a log has it: as of `base_index`, and
+/// after each config entry above it (oldest first), so a snapshot at any
+/// index the log holds records the configuration as of that index.
+#[derive(Clone, Copy)]
+pub struct CfgTrack {
+    base: Membership,
+    base_index: u64,
+    points: [CfgPoint; CFG_LOG],
+    len: u8,
+}
+
+pub const NO_CFG_TRACK: CfgTrack = CfgTrack {
+    base: Membership {
+        current: 0,
+        joint: 0,
+        learners: 0,
+    },
+    base_index: 0,
+    points: [NO_CFG_POINT; CFG_LOG],
+    len: 0,
+};
+
+impl CfgTrack {
+    /// The configuration as of `index` (at most the newest the log holds).
+    pub fn at(&self, index: u64) -> Membership {
+        let mut m = self.base;
+        for p in &self.points[..self.len as usize] {
+            if p.index > index {
+                break;
+            }
+            m = p.membership;
+        }
+        m
+    }
+
+    /// The configuration is `m` as of `index`: a snapshot's, or the
+    /// group's initial one. Nothing the log held at or below it says
+    /// otherwise.
+    pub fn set(&mut self, index: u64, m: Membership) {
+        let n = self.len as usize;
+        let keep = self.points[..n].iter().filter(|p| p.index > index).count();
+        self.points.copy_within(n - keep..n, 0);
+        self.len = keep as u8;
+        self.base = m;
+        self.base_index = index;
+    }
+
+    /// A config entry, `body`, taken at `index` (above every one held).
+    pub fn note(&mut self, index: u64, body: &[u8]) {
+        if index <= self.base_index {
+            return;
+        }
+        let mut m = self.at(index);
+        m.apply_config(body);
+        if self.len as usize == CFG_LOG {
+            let oldest = self.points[0];
+            self.set(oldest.index, oldest.membership);
+        }
+        self.points[self.len as usize] = CfgPoint {
+            index,
+            membership: m,
+        };
+        self.len += 1;
+    }
+
+    /// Everything through `index` is committed: its config entries are
+    /// the base now.
+    pub fn fold_through(&mut self, index: u64) {
+        if index > self.base_index {
+            let m = self.at(index);
+            self.set(index, m);
+        }
+    }
+
+    /// The log above `keep` is gone: so are its config entries.
+    pub fn truncate(&mut self, keep: u64) {
+        while self.len > 0 && self.points[self.len as usize - 1].index > keep {
+            self.len -= 1;
+        }
+    }
+}
+
 /// Magic prefix of a deterministic-timing substrate entry. Followed by
 /// `[op:u8 (1 = TimeAdvance, 2 = TimeDrain)][time_ms:u64 LE]`. TimeAdvance
 /// carries the proposed logical time; TimeDrain carries `through_time_ms`,
@@ -1117,6 +1291,8 @@ pub const PEER_CHECK_KEY_POSSESSION: u32 = 0x0000_0010;
 pub struct PeerIdentity {
     pub session_id: u32,
     pub result: u8,
+    /// End of the credential's validity, Unix seconds (0: none stated).
+    pub not_after: u64,
     pub flags: u32,
     /// Offset and length of the key fingerprint within the payload.
     pub fingerprint_at: usize,
@@ -1156,6 +1332,15 @@ impl PeerIdentity {
     pub fn conn_id(&self) -> ConnId {
         (self.session_id & 0xFFFF) as ConnId
     }
+
+    /// The session generation the transport numbered this session with
+    /// (the high half of the session id; 0: none). It matches the one the
+    /// session's `MSG_ACCEPTED` / `MSG_CONNECTED` carried.
+    #[inline]
+    #[must_use]
+    pub fn generation(&self) -> u16 {
+        (self.session_id >> 16) as u16
+    }
 }
 
 #[inline]
@@ -1164,10 +1349,9 @@ pub fn decode_peer_identity(buf: &[u8]) -> Option<PeerIdentity> {
     let mut r = Reader::new(buf, PEER_IDENTITY_HDR)?;
     let session_id = r.u32();
     let result = r.u8();
-    // `credential_kind:u8`, `profile_id:u16`, `not_before:u64`,
-    // `not_after:u64` — on the wire and counted in PEER_IDENTITY_HDR,
-    // but nothing downstream of this decoder consumes them.
-    r.skip(1 + 2 + 8 + 8);
+    // `credential_kind:u8`, `profile_id:u16`, `not_before:u64`.
+    r.skip(1 + 2 + 8);
+    let not_after = r.u64();
     let flags = r.u32();
     r.skip(1); // key_fp_alg
     let fingerprint_len = r.u8() as usize;
@@ -1180,12 +1364,59 @@ pub fn decode_peer_identity(buf: &[u8]) -> Option<PeerIdentity> {
     Some(PeerIdentity {
         session_id,
         result,
+        not_after,
         flags,
         fingerprint_at,
         fingerprint_len,
         principal_at,
         principal_len,
     })
+}
+
+/// The widest fingerprint [`encode_peer_identity`] carries (SHA-256).
+pub const PEER_IDENTITY_FP_MAX: usize = 32;
+
+/// `MSG_PEER_IDENTITY` result for a session that established no
+/// identity (the transport's `NO_CREDENTIAL`).
+pub const PEER_RESULT_NO_CREDENTIAL: u8 = 1;
+
+/// Encode a `MSG_PEER_IDENTITY` payload re-keyed to `session_id`: an
+/// established key `fp` (an mTLS certificate whose chain and key
+/// possession were checked; SHA-256 fingerprint), or — with
+/// `fp` `None` — no identity, which clears any binding the id held. No
+/// principal is carried. `out` holds at least `PEER_IDENTITY_HDR +
+/// PEER_IDENTITY_FP_MAX`; returns the payload length.
+pub fn encode_peer_identity(
+    out: &mut [u8],
+    session_id: u32,
+    fp: Option<&[u8]>,
+    not_after: u64,
+) -> usize {
+    let fp = fp.map_or(&[][..], |f| &f[..f.len().min(PEER_IDENTITY_FP_MAX)]);
+    // `(result, credential_kind, flags, key_fp_alg)`
+    let (result, kind, flags, alg) = if fp.is_empty() {
+        (PEER_RESULT_NO_CREDENTIAL, 0, 0, 0)
+    } else {
+        (
+            PEER_RESULT_OK,
+            1,
+            PEER_CHECK_CHAIN | PEER_CHECK_KEY_POSSESSION,
+            1,
+        )
+    };
+    Writer::new(out)
+        .u32(session_id)
+        .u8(result)
+        .u8(kind)
+        .u16(0) // profile_id
+        .u64(0) // not_before
+        .u64(not_after)
+        .u32(flags)
+        .u8(alg)
+        .u8(fp.len() as u8)
+        .u16(0) // principal_len
+        .bytes(fp);
+    PEER_IDENTITY_HDR + fp.len()
 }
 
 /// State-machine snapshot chunk sent from a downstream consumer to
@@ -1263,9 +1494,14 @@ pub fn decode_app_snapshot_chunk(buf: &[u8]) -> Option<(u64, u64, u64, bool, usi
     Some((term, idx, offset, done, APP_SNAPSHOT_HDR))
 }
 
-pub const INSTALL_SNAPSHOT_HDR: usize = 33;
+/// `[term:u64][last_included_index:u64][last_included_term:u64]
+/// [offset:u64][done:u8][membership:3]`, then the data: the snapshot's
+/// configuration travels with every chunk, so the install that ends the
+/// stream knows it.
+pub const INSTALL_SNAPSHOT_HDR: usize = 33 + MEMBERSHIP_LEN;
 
 #[inline]
+#[expect(clippy::too_many_arguments, reason = "one wire header's fields")]
 pub fn encode_install_snapshot(
     buf: &mut [u8],
     term: u64,
@@ -1273,6 +1509,7 @@ pub fn encode_install_snapshot(
     last_included_term: u64,
     offset: u64,
     done: bool,
+    membership: Membership,
     data: &[u8],
 ) -> usize {
     let total = INSTALL_SNAPSHOT_HDR + data.len();
@@ -1284,33 +1521,43 @@ pub fn encode_install_snapshot(
         .u64(last_included_index)
         .u64(last_included_term)
         .u64(offset)
-        .u8(if done { 1 } else { 0 });
+        .u8(if done { 1 } else { 0 })
+        .bytes(&membership.encode());
     if !data.is_empty() {
         buf[INSTALL_SNAPSHOT_HDR..total].copy_from_slice(data);
     }
     total
 }
 
+/// An install chunk's header: `(term, last_idx, last_term, offset, done,
+/// membership)` and where the data begins.
+pub type InstallSnapshotHdr = (u64, u64, u64, u64, bool, Membership, usize);
+
 #[inline]
-pub fn decode_install_snapshot(buf: &[u8]) -> Option<(u64, u64, u64, u64, bool, usize)> {
+pub fn decode_install_snapshot(buf: &[u8]) -> Option<InstallSnapshotHdr> {
     let mut r = Reader::new(buf, INSTALL_SNAPSHOT_HDR)?;
     let term = r.u64();
     let last_idx = r.u64();
     let last_term = r.u64();
     let offset = r.u64();
     let done = r.bool();
+    let membership = Membership::decode(&buf[33..INSTALL_SNAPSHOT_HDR])?;
     Some((
         term,
         last_idx,
         last_term,
         offset,
         done,
+        membership,
         INSTALL_SNAPSHOT_HDR,
     ))
 }
 
-/// `MSG_SNAPSHOT_INSTALLED` payload size: 24 bytes.
-pub const SNAPSHOT_INSTALLED_LEN: usize = 24;
+/// `MSG_SNAPSHOT_INSTALLED` payload: `[term:u64][last_included_index:u64]
+/// [last_included_term:u64][membership:3]` — the configuration as of the
+/// snapshot's index, which a replica installing it past config entries
+/// it never applied adopts.
+pub const SNAPSHOT_INSTALLED_LEN: usize = 24 + MEMBERSHIP_LEN;
 
 #[inline]
 pub fn encode_snapshot_installed(
@@ -1318,20 +1565,23 @@ pub fn encode_snapshot_installed(
     term: u64,
     last_included_index: u64,
     last_included_term: u64,
+    membership: Membership,
 ) {
     Writer::new(buf)
         .u64(term)
         .u64(last_included_index)
-        .u64(last_included_term);
+        .u64(last_included_term)
+        .bytes(&membership.encode());
 }
 
 #[inline]
-pub fn decode_snapshot_installed(buf: &[u8]) -> Option<(u64, u64, u64)> {
+pub fn decode_snapshot_installed(buf: &[u8]) -> Option<(u64, u64, u64, Membership)> {
     let mut r = Reader::new(buf, SNAPSHOT_INSTALLED_LEN)?;
     let term = r.u64();
     let last_idx = r.u64();
     let last_term = r.u64();
-    Some((term, last_idx, last_term))
+    let membership = Membership::decode(&buf[24..SNAPSHOT_INSTALLED_LEN])?;
+    Some((term, last_idx, last_term, membership))
 }
 
 // Key management
@@ -2983,9 +3233,12 @@ pub fn decode_keyed_proposal(buf: &[u8]) -> Option<(u32, usize)> {
     Some((shard_id, KEYED_PROPOSAL_HDR))
 }
 
-/// MSG_PROPOSAL_ASSIGNED payload size (18 bytes):
-///   correlation_id(8 LE) + partition_id(2 LE) + wal_index(8 LE)
-pub const PROPOSAL_ASSIGNED_LEN: usize = 18;
+/// MSG_PROPOSAL_ASSIGNED payload size (26 bytes): `[correlation_id:u64]
+/// [partition_id:u16][wal_index:u64][term:u64]`, all LE. The term is the
+/// one the entry was appended in: an index names an entry only together
+/// with its term, since a leader change can put another entry at the
+/// same index.
+pub const PROPOSAL_ASSIGNED_LEN: usize = 26;
 
 /// Encode a MSG_PROPOSAL_ASSIGNED payload. `partition_id` is the slot
 /// that assigned the index — proposers that route the same logical
@@ -2998,17 +3251,20 @@ pub fn encode_proposal_assigned(
     correlation_id: u64,
     partition_id: u16,
     wal_index: u64,
+    term: u64,
 ) {
     Writer::new(dst)
         .u64(correlation_id)
         .u16(partition_id)
-        .u64(wal_index);
+        .u64(wal_index)
+        .u64(term);
 }
 
-/// Decode a MSG_PROPOSAL_ASSIGNED payload (18 bytes) —
-/// `(correlation_id, partition_id, wal_index)`, or `None` on a short frame.
+/// Decode a MSG_PROPOSAL_ASSIGNED payload —
+/// `(correlation_id, partition_id, wal_index, term)`, or `None` on a short
+/// frame.
 #[inline]
-pub fn decode_proposal_assigned(buf: &[u8]) -> Option<(u64, u16, u64)> {
-    let mut r = Reader::new(buf, 18)?;
-    Some((r.u64(), r.u16(), r.u64()))
+pub fn decode_proposal_assigned(buf: &[u8]) -> Option<(u64, u16, u64, u64)> {
+    let mut r = Reader::new(buf, PROPOSAL_ASSIGNED_LEN)?;
+    Some((r.u64(), r.u16(), r.u64(), r.u64()))
 }

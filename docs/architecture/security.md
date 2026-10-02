@@ -11,27 +11,54 @@ actively lie.
 
 Clustor does not implement TLS itself. Transport security is
 delegated to fluxor's foundation `tls` module: `peer_router` sits on
-the cleartext side of that module and routes decrypted traffic to
-the gateway or to per-partition consensus instances
-(`modules/app/peer_router/mod.rs`). The graph position is:
+the cleartext side and routes decrypted traffic to the gateway or to
+per-partition consensus instances (`modules/app/peer_router/mod.rs`).
+`configs/multi-3node-mtls.yaml` is the mutually authenticated
+composition:
 
 ```
-ip ↔ tls (foundation) ↔ peer_router ↔ { gateway, consensus_pN }
+linux_net ↔ tls (server, verify_peer) ↔ peer_router.net_*   accepted links
+linux_net ↔ tls (client)              ↔ peer_router.dial_*  dialled links
 ```
 
-The localhost and rig graphs wire
-`peer_router` directly to the network module with no TLS at all;
-whether a deployment is encrypted is a property of its module graph,
-not of clustor code.
+Each `tls` holds the one role it is built for, and peer_router keeps
+their connections apart. Graphs that wire `peer_router` straight to the
+network module carry no TLS at all: whether a deployment is encrypted
+is a property of its module graph, not of clustor code.
 
-Peer identity crosses the boundary via the `MSG_PEER_IDENTITY`
-envelope (`modules/common/wire.rs`): the transport layer stamps a
-connection with `{conn_id, replica_id, verified flag, SPIFFE SVID
-string}`, and `peer_router` refuses to honour any in-band plaintext
-handshake that disagrees with it. Until fluxor's TLS module exposes
-certificate SVIDs, this envelope is the binding contract; a
-deployment can populate it from a sidecar that reads certificate
-metadata directly.
+### Peer identity
+
+`tls` reports each handshake's outcome as `MSG_PEER_IDENTITY`
+(`modules/common/wire.rs`): which checks ran and the SHA-256 of the
+peer's subject public key. Under `peer_auth: pinned` the key must be one
+of the `trust` anchors, which says the peer is *some* member; it does
+not say which replica. peer_router decides that
+(`modules/common/peer_policy.rs`):
+
+- **Pinned binding.** `peerN_key` pins replica N's key. A claim of
+  replica N binds only from a verified identity under that key, whatever
+  the policy; with `require_identity: pinned`, a claim without a
+  verified identity, or of a replica with no pin, binds nothing.
+- **The bind waits for the identity.** The report travels on its own
+  channel and can trail the claim; a claim that needs it is held until
+  it lands, and refused after `peer_policy::AWAIT_MS`. A report that
+  arrives before its connection opens waits for it the same way.
+- **One identity per connection.** A transport that numbers its sessions
+  puts the number on both the connection and the report, so a report
+  outliving its session and landing on a recycled connection id is
+  recognised as another session's and dropped. A second report that
+  contradicts the one a live session already gave closes it.
+- **Expiry.** A link closes at its credential's `not_after` on trusted
+  time, counting the time's uncertainty against it, or after
+  `max_link_s` when the end cannot be judged; the peer redials and
+  handshakes again.
+- **Partition scope.** A bound peer's frames may name only the groups the
+  graph hosts, as `partitions` declares; a frame naming another is dropped.
+  Default 0 leaves the id unchecked.
+
+Refusals and closes are counted on the `[pr] id` line. A compromised key
+is contained by removing its pin and anchor; there is no revocation
+feed.
 
 ## RBAC
 
@@ -41,11 +68,20 @@ and `ROLE_BREAKGLASS`.
 
 Identity resolution depends on the request origin:
 
-- **Wire** connections are mapped to roles by matching the SVID from
-  `MSG_PEER_IDENTITY` against configured prefixes
-  (`admin_svid_prefix`, `observer_svid_prefix`, at most 64 bytes
-  compared). Bindings live in a 32-slot table keyed by connection id
-  and are cleared by the transport's revoke envelope.
+- **Wire** commands are judged by the commanding connection's key.
+  peer_router's `client_identity` output re-keys each connection's
+  identity to the id its commands carry, and revokes the id when the
+  connection closes; wired to rbac's `identity` input, it binds
+  `conn_id → role`. `operator_keyN` / `observer_keyN` pin key
+  fingerprints to roles; a verified name is consulted after them, as a
+  prefix match (`admin_svid_prefix`, `observer_svid_prefix`). Once keys
+  are pinned, a key matching none is an observer. With identity wired,
+  a connection with no binding is **denied**: a 32-slot table that
+  fills evicts its oldest binding rather than leaving a new one
+  unbound, so overflow fails closed. A connection's frames reach the
+  admission stage only after its identity, so a grant is never
+  inherited across connection reuse. Without identity wired, wire
+  commands evaluate as `default_role`.
 - **HTTP** requests carry no peer identity and always evaluate as
   the module-wide `default_role`, which defaults to operator. A
   deployment that must not accept HTTP admin sets `default_role` to
@@ -53,7 +89,7 @@ Identity resolution depends on the request origin:
 
 Administrative commands are authorised when the resolved role
 carries `ROLE_OPERATOR` or `ROLE_BREAKGLASS`. Each evaluation emits
-a 3-byte audit envelope `{authorized, role, conn_id}` on the
+an audit envelope `{authorized, role, conn_id}` on the
 `audit_events` channel for external consumers; there is no on-disk
 audit log.
 
@@ -142,8 +178,8 @@ only what its own container does.
 
 The following do not exist in the codebase:
 
-- mTLS/SPIFFE certificate validation, OCSP or CRL revocation
-  checking, and revocation-driven quarantine.
+- SPIFFE identities, OCSP or CRL revocation checking, and
+  revocation-driven quarantine; a key is removed by removing its pin.
 - KEK/DEK fetching from a control plane, attachment envelopes and
   recovery shares for the WAL master; with `aead = 0` the `dek_epoch`
   is a local timer label with no key material behind it.

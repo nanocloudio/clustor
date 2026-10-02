@@ -93,6 +93,9 @@ struct CorrEntry {
 struct IdxEntry {
     partition_id: u16,
     wal_index: u64,
+    /// The term the entry was appended in: the index names this
+    /// proposal's entry only in that term.
+    term: u64,
     /// dev_millis stamp at insertion, for the TTL backstop.
     born_ms: u64,
     conn_id: u16,
@@ -123,6 +126,9 @@ pub struct Codec {
     stale_epoch_rejected: u32,
     corr_misses: u32,
     idx_misses: u32,
+    /// Committed-entry responses whose position a waiting proposal held
+    /// in an earlier term: the proposal was superseded and refused.
+    idx_superseded: u32,
     /// Entries reclaimed by the TTL backstop (lost close notice or
     /// lost response) — non-zero means clients hung on those replies.
     corr_expired: u32,
@@ -157,6 +163,7 @@ pub unsafe fn init(c: &mut Codec) {
     c.stale_epoch_rejected = 0;
     c.corr_misses = 0;
     c.idx_misses = 0;
+    c.idx_superseded = 0;
     c.corr_expired = 0;
     c.last_ttl_sweep_ms = 0;
     c.next_corr_id = 1; // correlation_id MUST be non-zero
@@ -173,6 +180,7 @@ pub unsafe fn init(c: &mut Codec) {
         *slot = IdxEntry {
             partition_id: 0,
             wal_index: 0,
+            term: 0,
             born_ms: 0,
             conn_id: 0,
         };
@@ -296,14 +304,14 @@ unsafe fn drain_proposal_assigned(c: &mut Codec, sys: &SyscallTable) {
         if msg_type != wire::MSG_PROPOSAL_ASSIGNED {
             continue;
         }
-        let Some((corr_id, partition_id, wal_index)) =
+        let Some((corr_id, partition_id, wal_index, term)) =
             wire::decode_proposal_assigned(&c.msg_buf[..plen as usize])
         else {
             continue;
         };
         // Look up the conn_id we recorded when emitting this proposal.
         if let Some(conn_id) = take_corr(c, corr_id) {
-            put_idx(c, partition_id, wal_index, conn_id, now_ms);
+            put_idx(c, partition_id, wal_index, term, conn_id, now_ms);
         } else {
             c.corr_misses += 1;
         }
@@ -567,11 +575,27 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
             };
             let mut body = [0u8; 16];
             body.copy_from_slice(&c.msg_buf[term_off..term_off + 16]);
+            let term = u64::from_le_bytes([
+                body[0], body[1], body[2], body[3], body[4], body[5], body[6], body[7],
+            ]);
             let index = u64::from_le_bytes([
                 body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
             ]);
-            let conn_id = match take_idx(c, partition_id, index) {
-                Some(v) => v,
+            let conn_id = match take_idx(c, partition_id, index, term) {
+                Some((v, true)) => v,
+                Some((v, false)) => {
+                    // Its position went to another leader's entry: it did
+                    // not commit, and the client resubmits to the leader.
+                    c.idx_superseded += 1;
+                    return Some(build_reject_wire(
+                        v,
+                        wire::CLIENT_REJECT_NOT_LEADER,
+                        0,
+                        0,
+                        0,
+                        c.leader_id,
+                    ));
+                }
                 None => {
                     c.idx_misses += 1;
                     return next_applied_skip();
@@ -703,23 +727,28 @@ fn take_corr(c: &mut Codec, corr_id: u64) -> Option<u16> {
     None
 }
 
-fn put_idx(c: &mut Codec, partition_id: u16, wal_index: u64, conn_id: u16, now_ms: u64) {
+fn put_idx(c: &mut Codec, partition_id: u16, wal_index: u64, term: u64, conn_id: u16, now_ms: u64) {
     let slot = (c.idx_head as usize) % IDX_RING;
     c.idx_ring[slot] = IdxEntry {
         partition_id,
         wal_index,
+        term,
         born_ms: now_ms,
         conn_id,
     };
     c.idx_head = c.idx_head.wrapping_add(1);
 }
 
-fn take_idx(c: &mut Codec, partition_id: u16, wal_index: u64) -> Option<u16> {
+/// The connection waiting on the entry at `wal_index`, and whether the
+/// entry that applied there (in `term`) is its own: one of another term
+/// took the position after a leader change, and the proposal waiting on
+/// it never committed.
+fn take_idx(c: &mut Codec, partition_id: u16, wal_index: u64, term: u64) -> Option<(u16, bool)> {
     for slot in c.idx_ring.iter_mut() {
         if slot.wal_index == wal_index && slot.partition_id == partition_id && slot.wal_index != 0 {
             let v = slot.conn_id;
             slot.wal_index = 0;
-            return Some(v);
+            return Some((v, slot.term == term));
         }
     }
     None
