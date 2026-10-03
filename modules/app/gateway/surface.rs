@@ -2,8 +2,10 @@
 //!
 //! Routes inbound Clustor wire envelopes from peer_router to the raft RPC
 //! port, the [`codec`](super::codec) component (client traffic) or the admin
-//! port, based on `msg_type`. Returns responses to peer_router with
-//! per-message `[conn_id:u16 LE]` routing tags. This component does NOT parse
+//! port, based on `msg_type`. Returns responses with per-message
+//! `[conn_id:u16 LE]` routing tags, each toward the namespace its
+//! conn_id belongs to: peer_router's on `responses`, a `client_requests`
+//! producer's on `client_responses`. This component does NOT parse
 //! HTTP — the operations module owns the HTTP diagnostic surface.
 
 use super::abi::SyscallTable;
@@ -45,6 +47,14 @@ pub struct Surface {
     pub out_raft_rpc: i32,  // out: Raft RPC to consensus
     pub out_admin_req: i32, // out: admin requests to operations
     pub out_responses: i32, // out: responses back to peer_router
+    /// out: responses to `client_requests` producers. Unwired, they
+    /// share `responses` — a graph with one namespace only.
+    pub out_client_responses: i32,
+    /// The `client_requests` producers read no replies (param
+    /// `client_replies` = 0): theirs are discarded and counted, so a
+    /// graph of fire-and-forget producers needs no reader beside its
+    /// wire clients.
+    pub client_replies_unread: bool,
 
     requests_routed: u32,
     responses_sent: u32,
@@ -54,10 +64,14 @@ pub struct Surface {
     /// Retained and flushed ahead of any new send so acks are never
     /// silently lost under saturation. Length 0 = empty.
     retry_len: u16,
+    /// The port the retained frame is owed to.
+    retry_port: i32,
     retry_frame: [u8; 256],
     /// Responses dropped because the retry slot was still occupied
     /// when another send arrived (bounded stash, counted loss).
     responses_dropped: u32,
+    /// Replies to `client_requests` producers that read none, discarded.
+    client_replies_discarded: u32,
     /// Must hold peer_router's largest MSG_CLIENT_FRAME payload:
     /// the u16 LE conn_id + a full 4 KiB client record.
     /// `channel_read_msg` silently discards any payload larger than
@@ -72,10 +86,14 @@ pub unsafe fn init(su: &mut Surface) {
     su.out_raft_rpc = -1;
     su.out_admin_req = -1;
     su.out_responses = -1;
+    su.out_client_responses = -1;
+    su.client_replies_unread = false;
     su.requests_routed = 0;
     su.responses_sent = 0;
     su.retry_len = 0;
+    su.retry_port = -1;
     su.responses_dropped = 0;
+    su.client_replies_discarded = 0;
 }
 
 pub fn work_count(su: &Surface) -> u32 {
@@ -262,7 +280,33 @@ pub unsafe fn finish_step(su: &mut Surface, sys: &SyscallTable) {
     forward_admin_responses(su, sys);
 }
 
-/// Send one codec-resolved [`codec::Outbound`] to peer_router.
+/// Whether every reply can reach the namespace that asked. Wire clients
+/// (`requests`) and a `client_requests` producer number their
+/// connections independently, so with both wired the producer's replies
+/// need their own port, or none at all when the producers read no
+/// replies: on a shared `responses` a reply would reach the other
+/// namespace's connection of the same number.
+pub fn replies_separable(su: &Surface, client_requests: i32) -> bool {
+    su.in_requests < 0
+        || client_requests < 0
+        || su.out_client_responses >= 0
+        || su.client_replies_unread
+}
+
+/// Replies discarded because their producers read none.
+pub fn client_replies_discarded(su: &Surface) -> u32 {
+    su.client_replies_discarded
+}
+
+/// The port a response to a connection of `origin` leaves on.
+fn egress(su: &Surface, origin: codec::Origin) -> i32 {
+    match origin {
+        codec::Origin::Client if su.out_client_responses >= 0 => su.out_client_responses,
+        _ => su.out_responses,
+    }
+}
+
+/// Send one codec-resolved [`codec::Outbound`] toward its namespace.
 /// Returns whether the frame was written, so the dispatch table can
 /// report the outcome back to the codec's counters.
 ///
@@ -274,7 +318,12 @@ pub unsafe fn send_outbound(su: &mut Surface, sys: &SyscallTable, out: &codec::O
     if out.len == 0 {
         return false;
     }
-    send_response(su, sys, out.msg_type, &out.buf[..out.len as usize])
+    if su.client_replies_unread && matches!(out.origin, codec::Origin::Client) {
+        su.client_replies_discarded = su.client_replies_discarded.wrapping_add(1);
+        return false;
+    }
+    let port = egress(su, out.origin);
+    send_response(su, sys, port, out.msg_type, &out.buf[..out.len as usize])
 }
 
 /// Emit one response to peer_router. `payload` carries the
@@ -295,10 +344,11 @@ pub unsafe fn send_outbound(su: &mut Surface, sys: &SyscallTable, out: &codec::O
 pub unsafe fn send_response(
     su: &mut Surface,
     sys: &SyscallTable,
+    port: i32,
     msg_type: u8,
     payload: &[u8],
 ) -> bool {
-    if su.out_responses < 0 || payload.len() < 2 {
+    if port < 0 || payload.len() < 2 {
         return false;
     }
     // A previously retained frame goes first (ordering). If it still
@@ -324,8 +374,8 @@ pub unsafe fn send_response(
     if inner_len > 0 {
         frame[h + 5..h + 5 + inner_len].copy_from_slice(&payload[2..2 + inner_len]);
     }
-    let wrote = if wire_channels::writable(sys, su.out_responses) {
-        (sys.channel_write)(su.out_responses, frame.as_ptr(), total)
+    let wrote = if wire_channels::writable(sys, port) {
+        (sys.channel_write)(port, frame.as_ptr(), total)
     } else {
         0
     };
@@ -339,6 +389,7 @@ pub unsafe fn send_response(
     // success on an unchecked write here hangs the client forever.
     su.retry_frame[..total].copy_from_slice(&frame[..total]);
     su.retry_len = total as u16;
+    su.retry_port = port;
     true
 }
 
@@ -354,14 +405,15 @@ unsafe fn flush_retry(su: &mut Surface, sys: &SyscallTable) -> bool {
     if total == 0 {
         return true;
     }
-    if su.out_responses < 0 {
+    let port = su.retry_port;
+    if port < 0 {
         su.retry_len = 0;
         return true;
     }
-    if !wire_channels::writable(sys, su.out_responses) {
+    if !wire_channels::writable(sys, port) {
         return false;
     }
-    let wrote = (sys.channel_write)(su.out_responses, su.retry_frame.as_ptr(), total);
+    let wrote = (sys.channel_write)(port, su.retry_frame.as_ptr(), total);
     if wrote == total as i32 {
         su.retry_len = 0;
         su.responses_sent += 1;
@@ -372,7 +424,8 @@ unsafe fn flush_retry(su: &mut Surface, sys: &SyscallTable) -> bool {
 }
 
 /// True when the response egress can take a new frame right now: the
-/// retry stash is clear AND the channel reports writable. The dispatch
+/// retry stash is clear AND every wired response port reports
+/// writable. The dispatch
 /// table gates the applied-response drain on this, because pulling an
 /// applied response retires its correlation entry — it must only be
 /// consumed when its ack can actually leave.
@@ -382,14 +435,13 @@ unsafe fn flush_retry(su: &mut Surface, sys: &SyscallTable) -> bool {
 /// Caller must hold an exclusive `&mut Surface` and supply a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn ready_to_send(su: &mut Surface, sys: &SyscallTable) -> bool {
-    if su.out_responses < 0 {
-        // Unwired responses port: nothing to flush, nothing to gate.
-        return true;
-    }
     if !flush_retry(su, sys) {
         return false;
     }
-    wire_channels::writable(sys, su.out_responses)
+    // The response's namespace is known only once it is pulled, so
+    // every wired egress must have room. An unwired port gates nothing.
+    (su.out_responses < 0 || wire_channels::writable(sys, su.out_responses))
+        && (su.out_client_responses < 0 || wire_channels::writable(sys, su.out_client_responses))
 }
 
 /// Forward admin responses from the `admin_responses` port. Each
@@ -423,6 +475,6 @@ unsafe fn forward_admin_responses(su: &mut Surface, sys: &SyscallTable) {
             continue;
         }
         local[..pl].copy_from_slice(&su.msg_buf[..pl]);
-        send_response(su, sys, msg_type, &local[..pl]);
+        send_response(su, sys, su.out_responses, msg_type, &local[..pl]);
     }
 }

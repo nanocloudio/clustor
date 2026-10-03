@@ -111,6 +111,10 @@ reason = """mounts the SDK ABI and the no_std sealed-record codec verbatim into 
 prefix = "tests/rbac_identity.rs"
 reason = """include!s the SDK runtime and compiles the no_std rbac component verbatim into a host crate; each test uses a subset of that surface."""
 
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/gateway_namespaces.rs"
+reason = """include!s the SDK runtime and compiles the gateway's no_std codec and surface verbatim into a host crate against a mock SyscallTable; each test uses a subset of that surface."""
+
 [ci.templates]
 dir = "configs"
 # Defaults for the template-render gate (CI phase 1.5). These values

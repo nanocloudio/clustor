@@ -15,10 +15,15 @@ no() { echo "  FAIL  $1: $2"; fail=$((fail + 1)); }
 finish() { echo "== $pass passed, $fail failed =="; [ "$fail" -eq 0 ]; }
 want() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac }
 
-timeout 900 "$FLX" modules build --target bcm2712 >/dev/null 2>&1 \
-  || { no cli "fluxor modules build failed"; finish; exit; }
-timeout 300 "$FLX" install packaging/cli/workload.toml >/dev/null 2>&1 \
-  || { no cli "applet install failed"; finish; exit; }
+# A prereq that fails takes its own output with it, so its tail is
+# reported: "build failed" with nothing else names no cause, and these
+# two run before any assertion this script makes.
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+timeout 900 "$FLX" modules build --target bcm2712 >"$log" 2>&1 \
+  || { no cli "fluxor modules build failed: $(tail -3 "$log" | tr '\n' ' ')"; finish; exit; }
+timeout 300 "$FLX" install packaging/cli/workload.toml >"$log" 2>&1 \
+  || { no cli "applet install failed: $(tail -3 "$log" | tr '\n' ' ')"; finish; exit; }
 
 got=$(timeout 30 "$FLX" exec clustor -- help 2>/dev/null)
 if want "$got" "wal-scan <segment_hex>"; then

@@ -336,6 +336,15 @@ path = "tests/peer_policy.rs"
 name = "rbac_identity"
 path = "tests/rbac_identity.rs"
 
+# Host-side coverage for the gateway's two connection namespaces: wire
+# clients' and client_requests producers' replies each leave toward the
+# namespace that asked, and a wire close purges only wire entries.
+# Mounts gateway/{codec,surface}.rs via `#[path]` against a mock
+# SyscallTable.
+[[test]]
+name = "gateway_namespaces"
+path = "tests/gateway_namespaces.rs"
+
 # Host-side unit coverage for raft's write-then-adopt metadata
 # persistence discipline. Pulls `modules/app/consensus/raft.rs` in via
 # `#[path]` against a mock SyscallTable (in-memory FS with fault

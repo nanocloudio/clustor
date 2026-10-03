@@ -65,6 +65,13 @@ the one role it holds; unwired, dials share `net_in` / `net_out`.
 `client_identity` re-keys each connection's identity to the id its
 client frames carry, for an admission stage that judges commands by key.
 
+A client response is only ever written to a client's connection. A
+response tagged with a slot holding a replica link is dropped and
+counted: a peer link carries partitioned peer records, and a client
+frame written onto it would be read as a record header and desync the
+stream. A tag like that belongs to no wire client — another namespace's
+connection number, or one already closed.
+
 | | |
 |---|---|
 | Inputs | `net_in`, `peer_tx`, `repl_tx`, `client_resp`, `tls_identity`, `dial_in` |
@@ -185,7 +192,7 @@ Client envelope routing, framing/correlation and admission.
 
 | Component | Responsibility |
 |---|---|
-| `surface` | Demuxes inbound clustor wire envelopes from `peer_router` to the raft-RPC, client and admin routes; frames outbound responses, rejects and telemetry payloads back to the wire. Not an HTTP parser — `operations` owns HTTP framing. |
+| `surface` | Demuxes inbound clustor wire envelopes from `peer_router` to the raft-RPC, client and admin routes; frames outbound responses, rejects and telemetry payloads back toward the connection namespace that asked. Not an HTTP parser — `operations` owns HTTP framing. |
 | `codec` | Request framer and `conn_id` correlation hub: stamps correlation ids (dense from 1, bit 63 clear), binds them to assigned WAL indices, applies leader redirect and placement-epoch fencing. |
 | `throttle` | Credit-based admission. Consumes credits from `admission` and rejects or admits requests against the throttle envelope. |
 
@@ -200,8 +207,8 @@ design, rather than inheriting a hidden bootstrap ceiling.
 | | |
 |---|---|
 | Inputs | `requests`, `admin_responses`, `readyz_data`, `why_data`, `metrics_data`, `applied`, `placement`, `proposal_assigned`, `leader_state`, `credit_supply`, `proposals`, `client_requests` |
-| Outputs | `raft_rpc`, `responses`, `admin_req`, `proposals_tagged`, `rejected`, `reads`, `metrics` |
-| Params | `self_id`, `min_epoch` |
+| Outputs | `raft_rpc`, `responses`, `admin_req`, `proposals_tagged`, `rejected`, `reads`, `metrics`, `client_responses` |
+| Params | `self_id`, `min_epoch`, `client_replies` |
 | Metrics | `requests_admitted`, `requests_rejected` |
 
 `proposals` is the external injection point for already-correlated
@@ -212,8 +219,20 @@ intake for producers that own their own connection namespace and
 have already demuxed the request — `[conn_id:u16 LE][body]` framed as
 `MSG_CLIENT_PROPOSAL` or `MSG_CLIENT_READ_REQUEST`, drained in the
 dispatch table after `surface` and handed straight to the codec.
-Replies to all three intakes leave on `responses` through the
-codec's correlation rings.
+
+Wire clients and a `client_requests` producer number their connections
+independently, so a reply leaves toward the namespace that asked: wire
+clients on `responses`, producers on `client_responses`. Each
+correlation entry carries its namespace, which is what decides the
+egress. A graph with producers only may leave `client_responses`
+unwired and take their replies on `responses`; a graph wiring both
+intakes must wire it, or declare `client_replies = 0`, and otherwise
+refuses to start — on a shared port a reply would reach whichever
+namespace held that connection number. `client_replies = 0` says the
+producers read no replies at all, so theirs are discarded and counted.
+Traffic on `proposals` arrives already correlated by its producer, and
+the gateway answers only correlations it issued itself; a reply it
+cannot place is dropped and counted rather than misrouted.
 
 ### `admission`
 

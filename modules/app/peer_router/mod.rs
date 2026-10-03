@@ -2366,7 +2366,8 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         // it is checked BEFORE the 3-byte minimum every data frame has.
         if msg_type == wire::MSG_CONN_CLOSE_REQUEST && len >= 2 {
             let slot = u16::from_le_bytes([s.buf[0], s.buf[1]]) as usize;
-            if slot < MAX_CONNS && s.conns[slot].active {
+            // Clients are closed this way; a replica's link is not.
+            if slot < MAX_CONNS && s.conns[slot].active && s.conns[slot].replica_id < 0 {
                 let cid = s.conns[slot].conn_id;
                 // Same teardown a peer-initiated close takes, so the
                 // downstream MSG_CONN_CLOSED notice still fires and no
@@ -2385,6 +2386,15 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         // drops the response — there is nowhere valid to send it.
         let slot = u16::from_le_bytes([s.buf[0], s.buf[1]]) as usize;
         if slot >= MAX_CONNS || !s.conns[slot].active {
+            continue;
+        }
+        // A replica's link carries partitioned peer records only: a
+        // client response written onto it is read by the peer as a
+        // record header, desyncing the stream. Such a tag is no wire
+        // client's (another namespace's conn_id, or a stale one).
+        if s.conns[slot].replica_id >= 0 {
+            s.frames_dropped = s.frames_dropped.wrapping_add(1);
+            dev_log(sys, 2, b"[pr] client resp to a peer link".as_ptr(), 31);
             continue;
         }
         let conn_id = s.conns[slot].conn_id;

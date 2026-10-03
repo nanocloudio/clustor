@@ -13,6 +13,13 @@
 //! internal index/correlation_id back into the conn_id the surface
 //! needs to route the response.
 //!
+//! Two connection namespaces meet here: the surface's (peer_router's
+//! slots, for wire clients) and each `client_requests` producer's own.
+//! Every correlation entry records which one its conn_id belongs to,
+//! and every response carries that [`Origin`] back out, so a reply
+//! leaves toward the namespace that asked and a wire connection's
+//! close purges only wire entries.
+//!
 //! Correlation-id namespace: dense from 1, bit 63 clear. The
 //! operations module's HTTP write bridge owns the bit-63-set half —
 //! both feed the same raft proposal stream.
@@ -48,6 +55,16 @@ const CORR_TTL_MS: u64 = 30_000;
 /// TTL sweep cadence — expiry is a backstop, not a hot path.
 const CORR_SWEEP_INTERVAL_MS: u64 = 1000;
 
+/// Whose connection namespace a conn_id belongs to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Origin {
+    /// The surface's: a peer_router slot (wire clients).
+    Wire = 0,
+    /// A `client_requests` producer's own.
+    Client = 1,
+}
+
 /// One resolved outbound wire response. The codec never talks to the
 /// surface directly — it returns one of these and the dispatch table
 /// hands it to `surface::send_response` (message-shaped seam,
@@ -57,6 +74,8 @@ const CORR_SWEEP_INTERVAL_MS: u64 = 1000;
 pub struct Outbound {
     pub msg_type: u8,
     pub len: u8,
+    /// The namespace `buf[0..2]` names a connection in.
+    pub origin: Origin,
     pub buf: [u8; 64],
 }
 
@@ -86,6 +105,7 @@ struct CorrEntry {
     /// dev_millis stamp at insertion, for the TTL backstop.
     born_ms: u64,
     conn_id: u16,
+    origin: Origin,
 }
 
 #[repr(C)]
@@ -99,6 +119,7 @@ struct IdxEntry {
     /// dev_millis stamp at insertion, for the TTL backstop.
     born_ms: u64,
     conn_id: u16,
+    origin: Origin,
 }
 
 #[repr(C)]
@@ -174,6 +195,7 @@ pub unsafe fn init(c: &mut Codec) {
             corr_id: 0,
             born_ms: 0,
             conn_id: 0,
+            origin: Origin::Wire,
         };
     }
     for slot in c.idx_ring.iter_mut() {
@@ -183,6 +205,7 @@ pub unsafe fn init(c: &mut Codec) {
             term: 0,
             born_ms: 0,
             conn_id: 0,
+            origin: Origin::Wire,
         };
     }
 }
@@ -232,19 +255,20 @@ unsafe fn expire_stale(c: &mut Codec, sys: &SyscallTable) {
     }
 }
 
-/// Purge every correlation entry bound to a closed connection — the
-/// dispatch table calls this on the surface's
+/// Purge every correlation entry bound to a closed wire connection —
+/// the dispatch table calls this on the surface's
 /// [`super::surface::Inbound::ConnClosed`] notice. peer_router reuses
 /// conn_ids, so a stale entry would route some later client's
-/// response to the wrong connection.
+/// response to the wrong connection. A `client_requests` producer's
+/// conn_id of the same number is another connection, and is kept.
 pub fn purge_conn(c: &mut Codec, conn_id: u16) {
     for slot in c.corr_ring.iter_mut() {
-        if slot.corr_id != 0 && slot.conn_id == conn_id {
+        if slot.corr_id != 0 && slot.origin == Origin::Wire && slot.conn_id == conn_id {
             slot.corr_id = 0;
         }
     }
     for slot in c.idx_ring.iter_mut() {
-        if slot.wal_index != 0 && slot.conn_id == conn_id {
+        if slot.wal_index != 0 && slot.origin == Origin::Wire && slot.conn_id == conn_id {
             slot.wal_index = 0;
         }
     }
@@ -310,8 +334,8 @@ unsafe fn drain_proposal_assigned(c: &mut Codec, sys: &SyscallTable) {
             continue;
         };
         // Look up the conn_id we recorded when emitting this proposal.
-        if let Some(conn_id) = take_corr(c, corr_id) {
-            put_idx(c, partition_id, wal_index, term, conn_id, now_ms);
+        if let Some((conn_id, origin)) = take_corr(c, corr_id) {
+            put_idx(c, partition_id, wal_index, term, conn_id, origin, now_ms);
         } else {
             c.corr_misses += 1;
         }
@@ -326,8 +350,10 @@ unsafe fn drain_proposal_assigned(c: &mut Codec, sys: &SyscallTable) {
 /// surface's `requests` port carries peer_router's `MSG_CLIENT_FRAME`
 /// envelope instead and is routed by message type there; this path
 /// skips the surface entirely and enters the correlation hub
-/// directly. Responses return through the same rings and leave on
-/// `responses`.
+/// directly. Responses return through the same rings, marked
+/// [`Origin::Client`], and leave on `client_responses` — on
+/// `responses` when that port is unwired, which is a graph carrying no
+/// wire clients to confuse them with.
 ///
 /// Consumes at most ONE frame per call so the dispatch table's loop
 /// bound counts every read, malformed frames included. Unknown types are treated as
@@ -378,6 +404,7 @@ pub unsafe fn next_client_request(
 pub unsafe fn on_request(
     c: &mut Codec,
     sys: &SyscallTable,
+    origin: Origin,
     msg_type: u8,
     payload: &[u8],
     proposal_out: &mut [u8; 2048],
@@ -402,6 +429,7 @@ pub unsafe fn on_request(
                 // a structured reject.
                 c.reads_rejected += 1;
                 return Route::Respond(build_reject_wire(
+                    origin,
                     conn_id,
                     wire::CLIENT_REJECT_READ_UNSUPPORTED,
                     0,
@@ -415,6 +443,7 @@ pub unsafe fn on_request(
                 // follower, redirect.
                 c.not_leader_rejected += 1;
                 return Route::Respond(build_reject_wire(
+                    origin,
                     conn_id,
                     wire::CLIENT_REJECT_NOT_LEADER,
                     0,
@@ -429,6 +458,7 @@ pub unsafe fn on_request(
                 // waiting on a reply that never comes.
                 c.too_large_rejected += 1;
                 return Route::Respond(build_reject_wire(
+                    origin,
                     conn_id,
                     wire::CLIENT_REJECT_TOO_LARGE,
                     0,
@@ -456,7 +486,7 @@ pub unsafe fn on_request(
                 &framed[..total],
             );
             if wrote > 0 {
-                put_corr(c, corr_id, conn_id, dev_millis(sys));
+                put_corr(c, corr_id, conn_id, origin, dev_millis(sys));
                 c.requests_parsed += 1;
             }
             Route::Done
@@ -468,6 +498,7 @@ pub unsafe fn on_request(
             if c.min_epoch != 0 && (c.placement_epoch as u32) < c.min_epoch {
                 c.stale_epoch_rejected += 1;
                 return Route::Respond(build_reject_wire(
+                    origin,
                     conn_id,
                     wire::CLIENT_REJECT_STALE_EPOCH,
                     0,
@@ -482,6 +513,7 @@ pub unsafe fn on_request(
             if c.leader_id != LEADER_UNKNOWN && c.leader_id != c.self_id {
                 c.not_leader_rejected += 1;
                 return Route::Respond(build_reject_wire(
+                    origin,
                     conn_id,
                     wire::CLIENT_REJECT_NOT_LEADER,
                     0,
@@ -501,6 +533,7 @@ pub unsafe fn on_request(
             if total > wal_frame::MAX_ENTRY_BODY {
                 c.too_large_rejected += 1;
                 return Route::Respond(build_reject_wire(
+                    origin,
                     conn_id,
                     wire::CLIENT_REJECT_TOO_LARGE,
                     0,
@@ -510,7 +543,7 @@ pub unsafe fn on_request(
                 ));
             }
             let corr_id = next_corr_id(c);
-            put_corr(c, corr_id, conn_id, dev_millis(sys));
+            put_corr(c, corr_id, conn_id, origin, dev_millis(sys));
             proposal_out[0..8].copy_from_slice(&corr_id.to_le_bytes());
             proposal_out[8..total].copy_from_slice(&body[..body_len]);
             c.requests_parsed += 1;
@@ -525,7 +558,7 @@ pub unsafe fn on_request(
 /// response is dropped and counted — fail-open, never misroute).
 pub fn on_reject_internal(c: &mut Codec, env: &[u8]) -> Option<Outbound> {
     let (corr_id, status, retry, entry, byte) = wire::decode_client_reject_internal(env)?;
-    let conn_id = match take_corr(c, corr_id) {
+    let (conn_id, origin) = match take_corr(c, corr_id) {
         Some(v) => v,
         None => {
             c.corr_misses += 1;
@@ -534,7 +567,9 @@ pub fn on_reject_internal(c: &mut Codec, env: &[u8]) -> Option<Outbound> {
     };
     // Throttle rejects don't carry leader_id; the reserved byte is 0
     // for non-NotLeader rejects.
-    Some(build_reject_wire(conn_id, status, retry, entry, byte, 0))
+    Some(build_reject_wire(
+        origin, conn_id, status, retry, entry, byte, 0,
+    ))
 }
 
 /// Drain ONE apply-pipeline response off the `applied` port and
@@ -581,13 +616,14 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
             let index = u64::from_le_bytes([
                 body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
             ]);
-            let conn_id = match take_idx(c, partition_id, index, term) {
-                Some((v, true)) => v,
-                Some((v, false)) => {
+            let (conn_id, origin) = match take_idx(c, partition_id, index, term) {
+                Some((v, origin, true)) => (v, origin),
+                Some((v, origin, false)) => {
                     // Its position went to another leader's entry: it did
                     // not commit, and the client resubmits to the leader.
                     c.idx_superseded += 1;
                     return Some(build_reject_wire(
+                        origin,
                         v,
                         wire::CLIENT_REJECT_NOT_LEADER,
                         0,
@@ -604,6 +640,7 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
             let mut out = Outbound {
                 msg_type: wire::MSG_CLIENT_RESPONSE,
                 len: 18,
+                origin,
                 buf: [0u8; 64],
             };
             out.buf[..2].copy_from_slice(&conn_id.to_le_bytes());
@@ -628,7 +665,7 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
                 c.msg_buf[6],
                 c.msg_buf[7],
             ]);
-            let conn_id = match take_corr(c, corr_id) {
+            let (conn_id, origin) = match take_corr(c, corr_id) {
                 Some(v) => v,
                 None => {
                     c.corr_misses += 1;
@@ -641,6 +678,7 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
             let mut out = Outbound {
                 msg_type: wire::MSG_CLIENT_READ_RESPONSE,
                 len: 2,
+                origin,
                 buf: [0u8; 64],
             };
             out.buf[..2].copy_from_slice(&conn_id.to_le_bytes());
@@ -659,11 +697,13 @@ fn next_applied_skip() -> Option<Outbound> {
     Some(Outbound {
         msg_type: 0,
         len: 0,
+        origin: Origin::Wire,
         buf: [0u8; 64],
     })
 }
 
 fn build_reject_wire(
+    origin: Origin,
     conn_id: u16,
     status: u8,
     retry_after_ms: u16,
@@ -684,16 +724,26 @@ fn build_reject_wire(
     let mut out = Outbound {
         msg_type: wire::MSG_CLIENT_REJECT,
         len: wire::CLIENT_REJECT_WIRE_LEN as u8,
+        origin,
         buf: [0u8; 64],
     };
     out.buf[..wire::CLIENT_REJECT_WIRE_LEN].copy_from_slice(&env);
     out
 }
 
-/// Wire reject for a record whose payload exceeds the proposal cap.
-/// No correlation state is involved — the record was never admitted.
+/// Wire reject for a surface record whose payload exceeds the proposal
+/// cap. No correlation state is involved — the record was never
+/// admitted.
 pub fn reject_too_large(conn_id: u16) -> Outbound {
-    build_reject_wire(conn_id, wire::CLIENT_REJECT_TOO_LARGE, 0, 0, 0, 0)
+    build_reject_wire(
+        Origin::Wire,
+        conn_id,
+        wire::CLIENT_REJECT_TOO_LARGE,
+        0,
+        0,
+        0,
+        0,
+    )
 }
 
 fn next_corr_id(c: &mut Codec) -> u64 {
@@ -706,28 +756,36 @@ fn next_corr_id(c: &mut Codec) -> u64 {
     id
 }
 
-fn put_corr(c: &mut Codec, corr_id: u64, conn_id: u16, now_ms: u64) {
+fn put_corr(c: &mut Codec, corr_id: u64, conn_id: u16, origin: Origin, now_ms: u64) {
     let slot = (c.corr_head as usize) % CORR_RING;
     c.corr_ring[slot] = CorrEntry {
         corr_id,
         born_ms: now_ms,
         conn_id,
+        origin,
     };
     c.corr_head = c.corr_head.wrapping_add(1);
 }
 
-fn take_corr(c: &mut Codec, corr_id: u64) -> Option<u16> {
+fn take_corr(c: &mut Codec, corr_id: u64) -> Option<(u16, Origin)> {
     for slot in c.corr_ring.iter_mut() {
         if slot.corr_id == corr_id {
-            let v = slot.conn_id;
             slot.corr_id = 0; // mark consumed
-            return Some(v);
+            return Some((slot.conn_id, slot.origin));
         }
     }
     None
 }
 
-fn put_idx(c: &mut Codec, partition_id: u16, wal_index: u64, term: u64, conn_id: u16, now_ms: u64) {
+fn put_idx(
+    c: &mut Codec,
+    partition_id: u16,
+    wal_index: u64,
+    term: u64,
+    conn_id: u16,
+    origin: Origin,
+    now_ms: u64,
+) {
     let slot = (c.idx_head as usize) % IDX_RING;
     c.idx_ring[slot] = IdxEntry {
         partition_id,
@@ -735,20 +793,25 @@ fn put_idx(c: &mut Codec, partition_id: u16, wal_index: u64, term: u64, conn_id:
         term,
         born_ms: now_ms,
         conn_id,
+        origin,
     };
     c.idx_head = c.idx_head.wrapping_add(1);
 }
 
-/// The connection waiting on the entry at `wal_index`, and whether the
-/// entry that applied there (in `term`) is its own: one of another term
-/// took the position after a leader change, and the proposal waiting on
-/// it never committed.
-fn take_idx(c: &mut Codec, partition_id: u16, wal_index: u64, term: u64) -> Option<(u16, bool)> {
+/// The connection waiting on the entry at `wal_index`, its namespace,
+/// and whether the entry that applied there (in `term`) is its own: one
+/// of another term took the position after a leader change, and the
+/// proposal waiting on it never committed.
+fn take_idx(
+    c: &mut Codec,
+    partition_id: u16,
+    wal_index: u64,
+    term: u64,
+) -> Option<(u16, Origin, bool)> {
     for slot in c.idx_ring.iter_mut() {
         if slot.wal_index == wal_index && slot.partition_id == partition_id && slot.wal_index != 0 {
-            let v = slot.conn_id;
             slot.wal_index = 0;
-            return Some((v, slot.term == term));
+            return Some((slot.conn_id, slot.origin, slot.term == term));
         }
     }
     None

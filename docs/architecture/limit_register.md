@@ -35,7 +35,8 @@ absent so that "absent here is a bug" stays a checkable claim:
   header; `CMD_MAX` derives from `ENV_BUF`, `EXPORT_BUDGET` and
   `METRICS_CACHE` from `SAFE_EXPORT_MAX` (via the named
   `METRICS_CACHE_SLACK` delta, kept so the cap has one source rather
-  than a second literal), `SEND_STAGE_MAX` from
+  than a second literal), `RESP_BODY_MAX` from the HTTP application
+  record's own bounds, `SEND_STAGE_MAX` from
   `ROUTE_FRAME_MAX`, `SR_MAX_CMD` from `SR_MAX_WRAPPED_KEY`,
   `SNAP_PTR_CANDIDATES` from `SNAP_PTR_SLOTS`, and `EXPORT_TAIL_RECORDS`
   and `COMP_STEP_BUCKETS` from histogram bucket counts.
@@ -99,8 +100,7 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Admin envelope staging | `ENV_BUF` | modules/app/operations/admin.rs | 1024 | Shape: every envelope staging buffer in the admin component, matching the 1 KiB channel-message scratch. The longest command it can carry is `CMD_MAX = ENV_BUF - 12`, because the replicated form prepends `ADMIN_MAGIC` (8) and `command_id` (4) inside the same buffer. |
 | HTTP request body accepted | `MAX_EXT_BODY` | modules/app/operations/http.rs | 1024 | A larger forwarded body is answered 413, never truncated. Wire-side body/connection bounds are wave's (`max_body_kib`, per-target slot tables). |
 | HTTP request path accepted | `MAX_EXT_PATH` | modules/app/operations/http.rs | 64 | A longer path is answered 404 — nothing this surface serves is longer. |
-| Complete HTTP request staging | `MAX_EXT_REQUEST` | modules/app/operations/http.rs | 8192 | Bounds the assembled external request/envelope. Requests that do not fit are refused rather than partially interpreted. |
-| Single-envelope response body / `/metrics` stream slice | `RESP_SLICE` | modules/app/operations/http.rs | 3072 | Sized under wave's per-connection send buffer; larger bodies stream via MORE_BODY. |
+| Exchanges awaiting a request body | `REQ_PENDING` | modules/app/operations/http.rs | 4 | Capacity: slots held between a request HEAD that announces a body and the BODY record that completes it. A HEAD arriving with none free is answered 503 rather than held unanswered, and a slot whose body never lands ages out at `REQ_BODY_TIMEOUT_MS`. Bodies are never stored — one record carries any body this surface accepts — so a slot costs its path, not its payload. |
 | Concurrent HTTP `/propose` requests | `HTTP_INFLIGHT` | modules/app/operations/http.rs | 64 | Slot exhaustion answers 503 "propose queue unavailable". |
 | Admin op body via HTTP | `ADMIN_BODY_MAX` | modules/common/http_admin.rs | 1021 | Capacity: the 1 KiB `admin_env` staging buffer less the 3-byte envelope header (`conn_id:u16 LE` + `op_code`). An oversize admin POST is answered 503 before any work is staged, and counted in `admin_dropped`. |
 | Volatile WAL retention window | `VOLATILE_RETENTION_SLOTS` | modules/app/durability/wal.rs | 256 | Lossy capacity: how far back a volatile replica can serve a random-access refetch. Sizes both WAL rings on that variant, so it is also the knob that sets its module-state cost (2064 B per slot). An index below the floor answers NOT_FOUND and escalates to snapshot install. |
@@ -276,6 +276,7 @@ MAX_ACTIVE | modules/app/control_plane/migration.rs | 1
 TRUNCATE_HOLD_TIMEOUTS | modules/app/consensus/raft.rs | 3
 VOTING_LAG_THRESHOLD | modules/app/consensus/replicator.rs | 64
 ENVELOPE_CACHE | modules/app/operations/http.rs | 1024
+REQ_PENDING | modules/app/operations/http.rs | 4
 SNAP_VERIFY_CHUNK | modules/app/durability/snapshot.rs | 1024
 SNAP_CHUNK | modules/app/session_directory/mod.rs | 1024
 PEER_AUTHORITY_MAX | modules/app/peer_router/mod.rs | 64
@@ -288,8 +289,6 @@ APP_CAPTURE_TIMEOUT_TICKS | modules/app/durability/snapshot.rs | 2000
 ENV_BUF | modules/app/operations/admin.rs | 1024
 MAX_EXT_BODY | modules/app/operations/http.rs | 1024
 MAX_EXT_PATH | modules/app/operations/http.rs | 64
-MAX_EXT_REQUEST | modules/app/operations/http.rs | 8192
-RESP_SLICE | modules/app/operations/http.rs | 3072
 HTTP_INFLIGHT | modules/app/operations/http.rs | 64
 ADMIN_BODY_MAX | modules/common/http_admin.rs | 1021
 VOLATILE_RETENTION_SLOTS | modules/app/durability/wal.rs | 256
@@ -362,6 +361,7 @@ SEAL_CHUNK_PLAIN | modules/app/durability/snapshot.rs | -
 SEAL_BUF | modules/app/durability/snapshot.rs | -
 MAX_ENTRY_LEN | modules/common/wal_frame.rs | -
 CMD_MAX | modules/app/operations/admin.rs | -
+RESP_BODY_MAX | modules/app/operations/http.rs | -
 EXPORT_BUDGET | modules/app/operations/telemetry.rs | -
 CLIENT_FRAME_MAX | modules/app/peer_router/mod.rs | -
 INB_STASH_MAX | modules/app/peer_router/mod.rs | -

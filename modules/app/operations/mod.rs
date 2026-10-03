@@ -76,6 +76,25 @@ use abi::SyscallTable;
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
+// The HTTP application record codec and the method vocabulary, mounted
+// from the contracts that define them rather than mirrored: the server
+// and every module that answers its application routes decode one
+// layout, so there is no second copy to drift from it.
+#[allow(
+    unused_imports,
+    dead_code,
+    reason = "see file-level allow: a mounted contract's surface is shared and each consumer uses a subset"
+)]
+#[path = "../../../target/fluxor/wave-common/http_app.rs"]
+mod http_app;
+#[allow(
+    unused_imports,
+    dead_code,
+    reason = "see file-level allow: a mounted contract's surface is shared and each consumer uses a subset"
+)]
+#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/net/http_exchange.rs"]
+mod http_exchange;
+
 #[path = "../../common/http_admin.rs"]
 mod http_admin;
 #[path = "../../common/peer_policy.rs"]
@@ -384,8 +403,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s,
                         sys,
                         now,
-                        ext.conn_id,
-                        ext.stream_id,
+                        ext.id,
                         ext.method,
                         ext.path_len as usize,
                         ext.body_len as usize,
@@ -478,8 +496,7 @@ unsafe fn route_http_request(
     s: &mut ModuleState,
     sys: &SyscallTable,
     now: u64,
-    conn_id: u16,
-    stream_id: u16,
+    id: http_app::AppId,
     method: u8,
     path_len: usize,
     body_len: usize,
@@ -489,8 +506,7 @@ unsafe fn route_http_request(
     match http::on_request(
         &mut s.http,
         sys,
-        conn_id,
-        stream_id,
+        id,
         method,
         &path[..path_len],
         &body[..body_len],
@@ -501,7 +517,7 @@ unsafe fn route_http_request(
             let src = http::admin_env(&s.http, len);
             env[..src.len()].copy_from_slice(src);
             let authorized = route_admin(s, sys, now, rbac::Origin::Http, len as usize, &env);
-            http::finish_admin(&mut s.http, sys, conn_id, stream_id, op_code, authorized);
+            http::finish_admin(&mut s.http, sys, id, op_code, authorized);
         }
     }
 }

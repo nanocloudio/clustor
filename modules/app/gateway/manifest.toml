@@ -80,8 +80,9 @@ rate_class_max = "transaction"
 # already owns the connection namespace and does its own request
 # routing. `requests` (in[0]) carries peer_router's MSG_CLIENT_FRAME
 # envelope and is demuxed by the surface; this port bypasses that and
-# feeds the codec directly. Responses return on `responses` through
-# the codec's existing correlation rings, identical to wire traffic.
+# feeds the codec directly. Responses return through the codec's
+# correlation rings, each marked with this namespace, and leave on
+# `client_responses` (on `responses` when that is unwired).
 
 [[ports]]
 name = "raft_rpc"
@@ -137,6 +138,19 @@ rate_class_max = "transaction"
 name = "metrics"
 direction = "output"
 content_type = "OctetStream"
+
+[[ports]]
+name = "client_responses"
+direction = "output"
+# Responses to `client_requests` producers, framed as on `responses`.
+# Their conn_ids are the producer's own, not peer_router's slots, so a
+# graph that also carries wire clients (`requests`) must wire this:
+# the gateway refuses to start otherwise, unless param `client_replies`
+# is 0 (the producers read no replies, which are then discarded).
+# Unwired in a graph with no wire clients, these responses leave on
+# `responses`.
+content_type = "NetProto"
+rate_class_default = "transaction"
 
 [observability]
 # Admission counters from the throttle component. Surface/codec

@@ -31,21 +31,36 @@
 //! back on the wire. Both edges run in mailbox mode (`buffer_group`
 //! in the graph), so one channel write is one whole envelope.
 //!
-//! A response is correlated by `(conn_id, stream_id)` — wave echoes
-//! the pair so a deferred `/propose` reply can never land on a
-//! client that merely inherited a recycled conn id. The
-//! backpressure contract is preserved: the dispatch table gates
-//! every pull — requests and proposal feedback alike — on
-//! [`response_writable`], so nothing is consumed without somewhere
-//! to answer.
+//! A response is correlated by the exchange's [`AppId`], which the
+//! server chooses and this component echoes verbatim, so a deferred
+//! `/propose` reply can never land on a client that merely inherited
+//! a recycled connection number. The backpressure contract is
+//! preserved: the dispatch table gates every pull — requests and
+//! proposal feedback alike — on [`response_writable`], so nothing is
+//! consumed without somewhere to answer.
 //!
-//! `/metrics` exceeds one wave send buffer, so it is streamed: the
-//! first envelope carries `MORE_BODY`, a `Content-Length` header and
-//! the first slice; continuation envelopes carry the rest, advanced
-//! by [`step`] as the port drains. One export streams at a time —
-//! a concurrent `/metrics` answers 503 until the slot frees.
+//! Every reply this surface produces is ONE record: a response HEAD
+//! with its body inline and no continuation. The largest of them is a
+//! `/metrics` export, capped by `telemetry::SAFE_EXPORT_MAX` well
+//! inside what one record carries, so nothing here streams and
+//! nothing here spends response credit — a HEAD's inline body is not
+//! body bytes under the contract's flow control. The server derives
+//! `Content-Length` from the record itself.
+//!
+//! A request body is the other direction's business. It never rides
+//! the HEAD: a request that has one sets MORE and its bytes follow as
+//! BODY records, which the server sends only once this component has
+//! granted credit. The bodies this surface accepts are bounded well
+//! inside one record, so one grant and one BODY record carry any of
+//! them, and a body spanning records is over the bound by definition.
 
 use super::abi::SyscallTable;
+use super::http_app::{
+    app_abort, app_flag, app_kind, app_origin, app_parse_request, app_write_credit,
+    app_write_response_head, AppId, AppRecord, AppResponseHead, APP_HDR, APP_RECORD_MAX,
+    APP_RESP_HEAD_FIXED,
+};
+use super::http_exchange::METHOD_POST;
 use super::{dev_log, dev_millis, dev_report_step_effect, step_effect};
 use super::{http_admin, telemetry, wire, wire_channels};
 
@@ -67,45 +82,33 @@ pub const METRICS_CACHE: usize = telemetry::SAFE_EXPORT_MAX + METRICS_CACHE_SLAC
 // operational probe cannot exhaust the mapping space during a burst.
 const HTTP_INFLIGHT: usize = 64;
 
-/// Wave `HttpRequest` envelope head:
-/// `[conn_id:u16][stream_id:u16][method:u8][flags:u8]
-/// [path_len:u16][hdr_len:u16][body_len:u16]`, all LE, then the
-/// path, the raw header block and the body
-/// (wave `modules/foundation/http/server/app.rs`).
-const REQ_HDR: usize = 12;
-/// Wave `HttpResponse` envelope head:
-/// `[conn_id:u16][stream_id:u16][status:u16][flags:u8][ct_len:u8]
-/// [hdr_len:u16][body_len:u16]`, then the content type, headers
-/// and body.
-const RESP_HDR: usize = 12;
-/// `flags` bit 0 on both envelopes: the body continues in further
-/// envelopes (wave `FLAG_MORE_BODY`).
-const FLAG_MORE_BODY: u8 = 0x01;
-
-// Wave's method-byte encoding (`modules/foundation/http/wire.rs`).
-// Mirrored rather than imported — the two projects share no source —
-// and small enough that drift would fail the e2e admin tests
-// immediately. Only POST is gated on: the diagnostic paths match on
-// path alone and answer any verb.
-const METHOD_POST: u8 = 3;
-
 /// Content type stamped on every reply this component produces.
 const CT_TEXT: &[u8] = b"text/plain";
 
-/// Largest single-envelope response body, and the `/metrics` stream
-/// slice. Must stay under wave's per-connection send buffer
-/// (`SEND_BUF_SIZE` = 4100) with room for the response head, or wave
-/// truncates the envelope and closes the connection.
-const RESP_SLICE: usize = 3072;
+/// Largest reply body one record carries: the record bound less its
+/// prefix, the response head's fixed part and the content type. Every
+/// path here answers inside it — `/metrics` is the largest and
+/// `telemetry::SAFE_EXPORT_MAX` caps it well below this.
+const RESP_BODY_MAX: usize = APP_RECORD_MAX - APP_HDR - APP_RESP_HEAD_FIXED - CT_TEXT.len();
 
 /// Bounds on an externally-parsed request. The body bound matches the
-/// 1 KiB admin envelope.
+/// 1 KiB admin envelope, and sits inside one BODY record, so a body
+/// that spans records is over the bound by definition.
 const MAX_EXT_PATH: usize = 64;
 const MAX_EXT_BODY: usize = 1024;
-/// Largest `request` envelope accepted — wave's `req_out`
-/// `max_record`. The excess over path+body bounds is the forwarded
-/// header block, which this component skips.
-const MAX_EXT_REQUEST: usize = 8192;
+
+/// Exchanges whose request body this surface is waiting for. A body
+/// arrives only after a credit grant, so a slot is held from the HEAD
+/// that announced one until its BODY record lands, its exchange
+/// aborts, or it ages out. Bodies themselves are never stored: one
+/// record carries any body this surface accepts, so the record is
+/// dispatched where it is read.
+const REQ_PENDING: usize = 4;
+
+/// How long a pending request body may stay unfinished. The server
+/// aborts a stalled exchange on its own deadline; this frees the slot
+/// if that abort never arrives.
+const REQ_BODY_TIMEOUT_MS: u64 = 10_000;
 
 /// Correlation-id prefix on a `/propose` frame handed to the gateway.
 const CORR_ID_LEN: usize = 8;
@@ -138,13 +141,20 @@ pub fn admin_env(h: &Http, len: u16) -> &[u8] {
     &h.admin_env[..len as usize]
 }
 
+/// The exchange a deferred reply is owed to, as the contract names it.
+/// Zeroed is unused: an exchange's origin is never zero.
+const NO_EXCHANGE: AppId = AppId {
+    origin: 0,
+    conn: 0,
+    stream: 0,
+};
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct CorrSlot {
     correlation_id: u64,
     started_ms: u64,
-    conn_id: u16,
-    stream_id: u16,
+    id: AppId,
 }
 
 impl CorrSlot {
@@ -152,8 +162,7 @@ impl CorrSlot {
         Self {
             correlation_id: 0,
             started_ms: 0,
-            conn_id: 0,
-            stream_id: 0,
+            id: NO_EXCHANGE,
         }
     }
 }
@@ -163,8 +172,7 @@ impl CorrSlot {
 struct IndexSlot {
     index: u64,
     started_ms: u64,
-    conn_id: u16,
-    stream_id: u16,
+    id: AppId,
 }
 
 impl IndexSlot {
@@ -172,8 +180,31 @@ impl IndexSlot {
         Self {
             index: 0,
             started_ms: 0,
-            conn_id: 0,
-            stream_id: 0,
+            id: NO_EXCHANGE,
+        }
+    }
+}
+
+/// One exchange whose request body has been consented to and not yet
+/// arrived. Holds what the HEAD said, never the body.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PendingReq {
+    id: AppId,
+    started_ms: u64,
+    method: u8,
+    path_len: u16,
+    path: [u8; MAX_EXT_PATH],
+}
+
+impl PendingReq {
+    const fn empty() -> Self {
+        Self {
+            id: NO_EXCHANGE,
+            started_ms: 0,
+            method: 0,
+            path_len: 0,
+            path: [0; MAX_EXT_PATH],
         }
     }
 }
@@ -201,20 +232,14 @@ pub struct Http {
     metrics_buf: [u8; METRICS_CACHE],
     metrics_len: u16,
 
-    /// The in-progress `/metrics` stream: one export at a time.
-    /// `st_active` gates [`cache_export`]'s metrics refresh so the
-    /// body cannot change length mid-stream.
-    st_active: u8,
-    st_head_sent: u8,
-    st_conn: u16,
-    st_stream: u16,
-    st_off: u32,
+    /// Exchanges awaiting a request body this component consented to.
+    pending: [PendingReq; REQ_PENDING],
 
-    /// Staging for one inbound `request` envelope and one outbound
-    /// `response` envelope. State-resident: both exceed what the
-    /// module's step path should put on the stack.
-    req_frame: [u8; MAX_EXT_REQUEST],
-    resp_frame: [u8; RESP_HDR + 64 + RESP_SLICE],
+    /// Staging for one inbound record and one outbound record.
+    /// State-resident: both exceed what the module's step path should
+    /// put on the stack.
+    req_frame: [u8; APP_RECORD_MAX],
+    resp_frame: [u8; APP_RECORD_MAX],
 
     requests_handled: u32,
     requests_404: u32,
@@ -239,6 +264,11 @@ pub struct Http {
     /// telemetry component so sustained refusal is operationally
     /// visible.
     admin_dropped: u32,
+    /// Request bodies refused: over the bound, spanning records, or
+    /// arriving with no slot to assemble them in.
+    bodies_refused: u32,
+    /// Records naming an exchange this component is not holding.
+    records_unmatched: u32,
     /// Set when a step advanced a request, reply or stream slice;
     /// consumed by the dispatch table's burst classification.
     worked: u8,
@@ -263,11 +293,9 @@ pub unsafe fn init(h: &mut Http) {
     h.readyz_len = 0;
     h.why_len = 0;
     h.metrics_len = 0;
-    h.st_active = 0;
-    h.st_head_sent = 0;
-    h.st_conn = 0;
-    h.st_stream = 0;
-    h.st_off = 0;
+    h.pending = [PendingReq::empty(); REQ_PENDING];
+    h.bodies_refused = 0;
+    h.records_unmatched = 0;
     h.requests_handled = 0;
     h.requests_404 = 0;
     h.inflight_high_water = 0;
@@ -304,51 +332,52 @@ pub fn take_worked(h: &mut Http) -> bool {
     w
 }
 
-/// Frame and write ONE wave `HttpResponse` envelope on `response`.
-/// All-or-nothing (the port runs in mailbox mode); a refused write
-/// counts as a dropped reply — the client surfaces it as wave's 504.
+/// Answer `id` with ONE response record: a HEAD carrying the whole
+/// body, no continuation. All-or-nothing (the port runs in mailbox
+/// mode); a refused write counts as a dropped reply, which the client
+/// surfaces as the server's 504.
 ///
-/// The body rides as a raw pointer so callers can hand slices of
-/// `h`'s own caches (`metrics_buf`, `readyz_buf`) without staging
-/// them through a stack buffer first — the frame is composed in the
-/// state-resident `resp_frame`.
+/// The head is laid down by the contract's own writer and the body
+/// copied in behind it, so the layout has one author. The body rides
+/// as a raw pointer because its source is usually another field of
+/// `h` (`metrics_buf`, `readyz_buf`) and the record is composed in
+/// `h.resp_frame`.
 ///
 /// # Safety
 ///
 /// `body_ptr..body_ptr+body_len` must be readable and must not alias
 /// `h.resp_frame`.
-unsafe fn emit_envelope(
+unsafe fn emit_response(
     h: &mut Http,
     sys: &SyscallTable,
-    conn_id: u16,
-    stream_id: u16,
+    id: AppId,
     status: u16,
-    flags: u8,
-    ct: &[u8],
-    headers: &[u8],
     body_ptr: *const u8,
     body_len: usize,
 ) -> bool {
     if h.out_response < 0 {
         return false;
     }
-    let total = RESP_HDR + ct.len() + headers.len() + body_len;
-    if total > h.resp_frame.len() {
+    let head = AppResponseHead {
+        id,
+        flags: 0,
+        status,
+        content_type: CT_TEXT,
+        headers: &[],
+        body: &[],
+    };
+    let Some(at) = app_write_response_head(&head, &mut h.resp_frame) else {
+        h.responses_dropped = h.responses_dropped.saturating_add(1);
+        return false;
+    };
+    // The body is the head record's tail, so it appends behind what the
+    // writer laid down. Checked here because the writer sized itself
+    // for the empty body it was handed.
+    let total = at.saturating_add(body_len);
+    if total > h.resp_frame.len() || total > APP_RECORD_MAX {
         h.responses_dropped = h.responses_dropped.saturating_add(1);
         return false;
     }
-    h.resp_frame[0..2].copy_from_slice(&conn_id.to_le_bytes());
-    h.resp_frame[2..4].copy_from_slice(&stream_id.to_le_bytes());
-    h.resp_frame[4..6].copy_from_slice(&status.to_le_bytes());
-    h.resp_frame[6] = flags;
-    h.resp_frame[7] = ct.len() as u8;
-    h.resp_frame[8..10].copy_from_slice(&(headers.len() as u16).to_le_bytes());
-    h.resp_frame[10..12].copy_from_slice(&(body_len as u16).to_le_bytes());
-    let mut at = RESP_HDR;
-    h.resp_frame[at..at + ct.len()].copy_from_slice(ct);
-    at += ct.len();
-    h.resp_frame[at..at + headers.len()].copy_from_slice(headers);
-    at += headers.len();
     if body_len > 0 {
         core::ptr::copy_nonoverlapping(body_ptr, h.resp_frame.as_mut_ptr().add(at), body_len);
     }
@@ -361,38 +390,18 @@ unsafe fn emit_envelope(
     true
 }
 
-/// Answer one request with a small (single-envelope) reply.
-unsafe fn finish(
-    h: &mut Http,
-    sys: &SyscallTable,
-    conn_id: u16,
-    stream_id: u16,
-    status: u16,
-    body: &[u8],
-) {
-    let n = body.len().min(RESP_SLICE);
-    emit_envelope(
-        h,
-        sys,
-        conn_id,
-        stream_id,
-        status,
-        0,
-        CT_TEXT,
-        &[],
-        body.as_ptr(),
-        n,
-    );
+/// Answer one request from a borrowed body.
+unsafe fn finish(h: &mut Http, sys: &SyscallTable, id: AppId, status: u16, body: &[u8]) {
+    let n = body.len().min(RESP_BODY_MAX);
+    emit_response(h, sys, id, status, body.as_ptr(), n);
 }
 
-/// One request pulled off the `request` port, handed to the dispatch
-/// table for [`on_request`] routing.
+/// One complete request pulled off the `request` port, handed to the
+/// dispatch table for [`on_request`] routing.
 #[repr(C)]
 pub struct ExtReq {
-    pub conn_id: u16,
-    pub stream_id: u16,
+    pub id: AppId,
     pub method: u8,
-    pub flags: u8,
     pub path_len: u16,
     pub body_len: u16,
     pub path: [u8; MAX_EXT_PATH],
@@ -402,10 +411,8 @@ pub struct ExtReq {
 impl ExtReq {
     pub const fn new() -> Self {
         Self {
-            conn_id: 0,
-            stream_id: 0,
+            id: NO_EXCHANGE,
             method: 0,
-            flags: 0,
             path_len: 0,
             body_len: 0,
             path: [0; MAX_EXT_PATH],
@@ -421,12 +428,20 @@ pub enum ExtPulled {
     Request,
 }
 
-/// Read ONE wave `HttpRequest` envelope off the `request` port. The
-/// forwarded header block is skipped — every path this component
-/// serves is defined by its verb, path and body alone. `Skipped`
-/// marks a consumed unusable envelope so the loop bound counts it; a
-/// bounds violation the producer would not commit (path or body over
-/// this component's caps) is answered rather than dropped.
+/// Read ONE record off the `request` port and, when it completes a
+/// request, hand it over in `req`.
+///
+/// A HEAD with no body is a request outright. A HEAD that announces
+/// one takes a pending slot and is answered with a credit grant — the
+/// grant is this surface's consent to receive the body — and the BODY
+/// record that follows completes the request. Everything a request
+/// here means is its verb, path and body, so the forwarded header
+/// block and the peer fingerprint are read past.
+///
+/// `Skipped` marks a record consumed without completing a request, so
+/// the caller's loop bound counts it either way. A bound this surface
+/// sets — a path or body past its caps — is answered rather than
+/// dropped silently.
 ///
 /// # Safety
 ///
@@ -443,58 +458,182 @@ pub unsafe fn next_external_request(
     if !wire_channels::readable(sys, h.in_request) {
         return ExtPulled::Empty;
     }
-    let n = (sys.channel_read)(h.in_request, h.req_frame.as_mut_ptr(), MAX_EXT_REQUEST);
-    if n < REQ_HDR as i32 {
+    let n = (sys.channel_read)(h.in_request, h.req_frame.as_mut_ptr(), APP_RECORD_MAX);
+    if n <= 0 {
         return ExtPulled::Skipped;
     }
-    let buf = &h.req_frame[..n as usize];
-    let conn_id = u16::from_le_bytes([buf[0], buf[1]]);
-    let stream_id = u16::from_le_bytes([buf[2], buf[3]]);
-    let method = buf[4];
-    let flags = buf[5];
-    let path_len = u16::from_le_bytes([buf[6], buf[7]]) as usize;
-    let hdr_len = u16::from_le_bytes([buf[8], buf[9]]) as usize;
-    let body_len = u16::from_le_bytes([buf[10], buf[11]]) as usize;
-    let need = REQ_HDR
-        .saturating_add(path_len)
-        .saturating_add(hdr_len)
-        .saturating_add(body_len);
-    if need > buf.len() {
-        return ExtPulled::Skipped; // truncated — a producer framing error
+
+    // Decode under an immutable borrow, copying out everything needed
+    // before anything mutates `h`. `req` is the caller's, disjoint
+    // from the frame the record was read into.
+    enum Pull {
+        /// A request is complete in `req`.
+        Ready,
+        /// A HEAD announcing a body: hold it and grant credit.
+        WantBody {
+            id: AppId,
+            method: u8,
+            path_len: usize,
+        },
+        /// Over a bound this surface sets.
+        TooLarge(AppId),
+        PathTooLong(AppId),
+        /// A body for an exchange no slot is holding.
+        Stray,
+        /// Ends an exchange: free whatever is held for it.
+        Ended(AppId),
+        /// Consumed, nothing owed.
+        Ignore,
     }
-    if path_len > MAX_EXT_PATH {
-        // Longer than any path this surface serves.
-        h.requests_404 = h.requests_404.saturating_add(1);
-        finish(h, sys, conn_id, stream_id, 404, b"not found");
-        return ExtPulled::Skipped;
+
+    let pull = {
+        let Some(rec) = app_parse_request(&h.req_frame[..n as usize]) else {
+            return ExtPulled::Skipped; // malformed: one read is one record
+        };
+        match rec {
+            AppRecord::Head(head) => {
+                if head.target.len() > MAX_EXT_PATH {
+                    Pull::PathTooLong(head.id)
+                } else if head.flags & app_flag::MORE != 0 {
+                    req.path[..head.target.len()].copy_from_slice(head.target);
+                    Pull::WantBody {
+                        id: head.id,
+                        method: head.method,
+                        path_len: head.target.len(),
+                    }
+                } else {
+                    req.id = head.id;
+                    req.method = head.method;
+                    req.path_len = head.target.len() as u16;
+                    req.body_len = 0;
+                    req.path[..head.target.len()].copy_from_slice(head.target);
+                    Pull::Ready
+                }
+            }
+            AppRecord::Body { id, flags, data } => {
+                match h.pending.iter().position(|p| p.id == id) {
+                    None => Pull::Stray,
+                    Some(slot) => {
+                        // One record carries any body this surface
+                        // accepts, so a continuation is over the bound.
+                        if data.len() > MAX_EXT_BODY || flags & app_flag::MORE != 0 {
+                            Pull::TooLarge(id)
+                        } else {
+                            let held = h.pending[slot];
+                            req.id = id;
+                            req.method = held.method;
+                            req.path_len = held.path_len;
+                            req.body_len = data.len() as u16;
+                            req.path = held.path;
+                            req.body[..data.len()].copy_from_slice(data);
+                            Pull::Ready
+                        }
+                    }
+                }
+            }
+            AppRecord::Abort { id, .. } => Pull::Ended(id),
+            // The server granting response credit, which nothing here
+            // spends: every reply is one record with its body inline.
+            AppRecord::Credit { .. } | AppRecord::Datagram { .. } => Pull::Ignore,
+        }
+    };
+
+    match pull {
+        Pull::Ready => {
+            release_pending(h, req.id);
+            ExtPulled::Request
+        }
+        Pull::WantBody {
+            id,
+            method,
+            path_len,
+        } => {
+            let Some(slot) = h.pending.iter().position(|p| p.id == NO_EXCHANGE) else {
+                // Nowhere to assemble it: refused, not held unanswered.
+                h.bodies_refused = h.bodies_refused.saturating_add(1);
+                finish(h, sys, id, 503, b"request bodies busy");
+                return ExtPulled::Skipped;
+            };
+            h.pending[slot] = PendingReq {
+                id,
+                started_ms: dev_millis(sys),
+                method,
+                path_len: path_len as u16,
+                path: {
+                    let mut p = [0u8; MAX_EXT_PATH];
+                    p[..path_len].copy_from_slice(&req.path[..path_len]);
+                    p
+                },
+            };
+            if !grant_request_body(h, sys, id) {
+                h.pending[slot] = PendingReq::empty();
+                h.bodies_refused = h.bodies_refused.saturating_add(1);
+                finish(h, sys, id, 503, b"request body credit unavailable");
+            }
+            ExtPulled::Skipped
+        }
+        Pull::TooLarge(id) => {
+            release_pending(h, id);
+            h.bodies_refused = h.bodies_refused.saturating_add(1);
+            finish(h, sys, id, 413, b"body too large");
+            ExtPulled::Skipped
+        }
+        Pull::PathTooLong(id) => {
+            h.requests_404 = h.requests_404.saturating_add(1);
+            finish(h, sys, id, 404, b"not found");
+            ExtPulled::Skipped
+        }
+        Pull::Stray => {
+            h.records_unmatched = h.records_unmatched.saturating_add(1);
+            ExtPulled::Skipped
+        }
+        Pull::Ended(id) => {
+            release_pending(h, id);
+            ExtPulled::Skipped
+        }
+        Pull::Ignore => ExtPulled::Skipped,
     }
-    if body_len > MAX_EXT_BODY || (flags & FLAG_MORE_BODY) != 0 {
-        // Over the admin envelope bound, or a streamed request body —
-        // nothing here takes one. Refusing beats truncating a
-        // proposal. Continuation envelopes for a refused stream
-        // parse as requests for unknown paths and answer 404.
-        finish(h, sys, conn_id, stream_id, 413, b"body too large");
-        return ExtPulled::Skipped;
+}
+
+/// Free the slot holding `id`, if any.
+fn release_pending(h: &mut Http, id: AppId) {
+    if let Some(slot) = h
+        .pending
+        .iter()
+        .position(|p| p.id == id && p.id != NO_EXCHANGE)
+    {
+        h.pending[slot] = PendingReq::empty();
     }
-    let body_off = REQ_HDR + path_len + hdr_len;
-    req.conn_id = conn_id;
-    req.stream_id = stream_id;
-    req.method = method;
-    req.flags = flags;
-    req.path_len = path_len as u16;
-    req.body_len = body_len as u16;
-    req.path[..path_len].copy_from_slice(&h.req_frame[REQ_HDR..REQ_HDR + path_len]);
-    req.body[..body_len].copy_from_slice(&h.req_frame[body_off..body_off + body_len]);
-    ExtPulled::Request
+}
+
+/// Grant `id` enough credit for the largest body this surface takes.
+/// The grant is also the consent a `100 Continue` is answered on.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Http` and a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn grant_request_body(h: &mut Http, sys: &SyscallTable, id: AppId) -> bool {
+    if h.out_response < 0 || !wire_channels::writable(sys, h.out_response) {
+        return false;
+    }
+    let Some(total) = app_write_credit(&id, MAX_EXT_BODY as u32, &mut h.resp_frame) else {
+        return false;
+    };
+    let wrote = (sys.channel_write)(h.out_response, h.resp_frame.as_ptr(), total);
+    if wrote <= 0 {
+        return false;
+    }
+    h.worked = 1;
+    true
 }
 
 /// Refresh the diagnostic caches from the telemetry component's
 /// snapshot values. Called by the dispatch table on exactly the steps
 /// telemetry emitted, so cache freshness matches the export cadence —
-/// the http component never sees the telemetry struct itself. The
-/// metrics body is left untouched while a `/metrics` stream is in
-/// flight (its declared `Content-Length` must stay true); the next
-/// emit tick lands normally.
+/// the http component never sees the telemetry struct itself. A
+/// scrape answers from whatever the last tick cached, whole, in one
+/// record.
 pub fn cache_export(h: &mut Http, ready: bool, timing_pause: u8, export: &[u8]) {
     h.readyz_buf[0] = ready as u8;
     h.readyz_len = 1;
@@ -503,9 +642,6 @@ pub fn cache_export(h: &mut Http, ready: bool, timing_pause: u8, export: &[u8]) 
     h.why_buf[0] = 1;
     h.why_buf[1] = timing_pause;
     h.why_len = 2;
-    if h.st_active != 0 {
-        return;
-    }
     let len = export.len().min(METRICS_CACHE);
     if len > 0 {
         h.metrics_buf[..len].copy_from_slice(&export[..len]);
@@ -529,66 +665,6 @@ pub fn cache_export(h: &mut Http, ready: bool, timing_pause: u8, export: &[u8]) 
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn step(h: &mut Http, sys: &SyscallTable) {
     drain_proposal_assignments(h, sys);
-    stream_step(h, sys);
-}
-
-/// Advance the in-flight `/metrics` stream as far as the `response`
-/// port allows this step. The head envelope declares the total via
-/// `Content-Length` so wave frames the whole transfer and keep-alive
-/// survives; continuation envelopes carry body slices only.
-unsafe fn stream_step(h: &mut Http, sys: &SyscallTable) {
-    while h.st_active != 0 {
-        if !response_writable(h, sys) {
-            return;
-        }
-        let total = h.metrics_len as usize;
-        if h.st_head_sent == 0 {
-            let mut hdrs = [0u8; 32];
-            let hn = format_content_length(&mut hdrs, total);
-            let n = total.min(RESP_SLICE);
-            let body = h.metrics_buf.as_ptr();
-            if !emit_envelope(
-                h,
-                sys,
-                h.st_conn,
-                h.st_stream,
-                200,
-                FLAG_MORE_BODY,
-                CT_TEXT,
-                &hdrs[..hn],
-                body,
-                n,
-            ) {
-                return;
-            }
-            h.st_head_sent = 1;
-            h.st_off = n as u32;
-        } else {
-            let off = h.st_off as usize;
-            let rest = total.saturating_sub(off);
-            let n = rest.min(RESP_SLICE);
-            let flags = if off + n < total { FLAG_MORE_BODY } else { 0 };
-            let body = h.metrics_buf.as_ptr().add(off);
-            if !emit_envelope(
-                h,
-                sys,
-                h.st_conn,
-                h.st_stream,
-                200,
-                flags,
-                &[],
-                &[],
-                body,
-                n,
-            ) {
-                return;
-            }
-            h.st_off = (off + n) as u32;
-        }
-        if h.st_off as usize >= total {
-            h.st_active = 0;
-        }
-    }
 }
 
 unsafe fn drain_proposal_assignments(h: &mut Http, sys: &SyscallTable) {
@@ -621,8 +697,7 @@ unsafe fn drain_proposal_assignments(h: &mut Http, sys: &SyscallTable) {
                 h.indices[i] = IndexSlot {
                     index,
                     started_ms: corr.started_ms,
-                    conn_id: corr.conn_id,
-                    stream_id: corr.stream_id,
+                    id: corr.id,
                 };
             }
             (None, _) => {
@@ -668,10 +743,10 @@ pub unsafe fn next_rejection(h: &mut Http, sys: &SyscallTable) -> Feedback {
         .iter()
         .position(|slot| slot.correlation_id == correlation_id && correlation_id != 0)
     {
-        let (conn_id, stream_id) = (h.correlations[pos].conn_id, h.correlations[pos].stream_id);
+        let id = h.correlations[pos].id;
         h.correlations[pos] = CorrSlot::empty();
         h.proposal_rejections = h.proposal_rejections.saturating_add(1);
-        finish(h, sys, conn_id, stream_id, 503, b"proposal rejected");
+        finish(h, sys, id, 503, b"proposal rejected");
     }
     Feedback::Handled
 }
@@ -709,17 +784,18 @@ pub unsafe fn next_applied(h: &mut Http, sys: &SyscallTable) -> Feedback {
         h.msg_buf[index_off + 7],
     ]);
     if let Some(pos) = h.indices.iter().position(|slot| slot.index == index) {
-        let (conn_id, stream_id) = (h.indices[pos].conn_id, h.indices[pos].stream_id);
+        let id = h.indices[pos].id;
         h.indices[pos] = IndexSlot::empty();
         h.committed = h.committed.saturating_add(1);
-        finish(h, sys, conn_id, stream_id, 200, b"committed");
+        finish(h, sys, id, 200, b"committed");
     } else {
         h.applies_unmatched = h.applies_unmatched.saturating_add(1);
     }
     Feedback::Handled
 }
 
-/// One expiry check per step (a corr timeout, else an index timeout).
+/// One expiry check per step (a corr timeout, an index timeout, else a
+/// pending request body).
 /// The dispatch table gates the call on [`response_writable`].
 ///
 /// # Safety
@@ -730,29 +806,34 @@ pub unsafe fn expire_step(h: &mut Http, sys: &SyscallTable, now: u64) {
     if let Some(pos) = h.correlations.iter().position(|slot| {
         slot.correlation_id != 0 && now.wrapping_sub(slot.started_ms) >= HTTP_PROPOSAL_TIMEOUT_MS
     }) {
-        let (conn_id, stream_id) = (h.correlations[pos].conn_id, h.correlations[pos].stream_id);
+        let id = h.correlations[pos].id;
         h.correlations[pos] = CorrSlot::empty();
         h.proposal_timeouts = h.proposal_timeouts.saturating_add(1);
-        finish(h, sys, conn_id, stream_id, 503, b"proposal timeout");
+        finish(h, sys, id, 503, b"proposal timeout");
         return;
     }
     if let Some(pos) = h.indices.iter().position(|slot| {
         slot.index != 0 && now.wrapping_sub(slot.started_ms) >= HTTP_PROPOSAL_TIMEOUT_MS
     }) {
-        let (conn_id, stream_id) = (h.indices[pos].conn_id, h.indices[pos].stream_id);
+        let id = h.indices[pos].id;
         h.indices[pos] = IndexSlot::empty();
         h.commit_timeouts = h.commit_timeouts.saturating_add(1);
-        finish(h, sys, conn_id, stream_id, 503, b"commit timeout");
+        finish(h, sys, id, 503, b"commit timeout");
+        return;
+    }
+    if let Some(pos) = h
+        .pending
+        .iter()
+        .position(|p| p.id != NO_EXCHANGE && now.wrapping_sub(p.started_ms) >= REQ_BODY_TIMEOUT_MS)
+    {
+        let id = h.pending[pos].id;
+        h.pending[pos] = PendingReq::empty();
+        h.bodies_refused = h.bodies_refused.saturating_add(1);
+        finish(h, sys, id, 408, b"request body timeout");
     }
 }
 
-unsafe fn emit_http_proposal(
-    h: &mut Http,
-    sys: &SyscallTable,
-    conn_id: u16,
-    stream_id: u16,
-    body: &[u8],
-) -> bool {
+unsafe fn emit_http_proposal(h: &mut Http, sys: &SyscallTable, id: AppId, body: &[u8]) -> bool {
     if h.out_proposal < 0 || body.len() > MAX_EXT_BODY {
         return false;
     }
@@ -786,8 +867,7 @@ unsafe fn emit_http_proposal(
     h.correlations[slot] = CorrSlot {
         correlation_id,
         started_ms: dev_millis(sys),
-        conn_id,
-        stream_id,
+        id,
     };
     let occupied = h
         .correlations
@@ -813,8 +893,7 @@ unsafe fn emit_http_proposal(
 pub unsafe fn on_request(
     h: &mut Http,
     sys: &SyscallTable,
-    conn_id: u16,
-    stream_id: u16,
+    id: AppId,
     method: u8,
     path: &[u8],
     body: &[u8],
@@ -822,16 +901,9 @@ pub unsafe fn on_request(
     // POST /propose — synchronous write bridge. The response is
     // deferred until apply acknowledges the assigned WAL index.
     if method == METHOD_POST && path == b"/propose" {
-        if !emit_http_proposal(h, sys, conn_id, stream_id, body) {
+        if !emit_http_proposal(h, sys, id, body) {
             h.queue_unavailable = h.queue_unavailable.saturating_add(1);
-            finish(
-                h,
-                sys,
-                conn_id,
-                stream_id,
-                503,
-                b"propose queue unavailable",
-            );
+            finish(h, sys, id, 503, b"propose queue unavailable");
         }
         h.requests_handled = h.requests_handled.saturating_add(1);
         h.worked = 1;
@@ -851,15 +923,15 @@ pub unsafe fn on_request(
             Some(op_code) => {
                 if !http_admin::admin_body_fits(body.len()) {
                     h.admin_dropped = h.admin_dropped.saturating_add(1);
-                    finish(h, sys, conn_id, stream_id, 503, b"admin body too large");
+                    finish(h, sys, id, 503, b"admin body too large");
                     ReqOut::Done
                 } else {
                     // The admin envelope keeps its wire form
                     // (`[conn_id:u16 LE][op_code][body]`); the conn
                     // id is a log breadcrumb there, never a reply
-                    // route — HTTP replies correlate on the full
-                    // `(conn_id, stream_id)` held here.
-                    h.admin_env[..2].copy_from_slice(&conn_id.to_le_bytes());
+                    // route — an HTTP reply correlates on the whole
+                    // exchange id held here.
+                    h.admin_env[..2].copy_from_slice(&(id.conn as u16).to_le_bytes());
                     h.admin_env[2] = op_code;
                     h.admin_env[3..3 + body.len()].copy_from_slice(body);
                     ReqOut::Admin {
@@ -870,7 +942,7 @@ pub unsafe fn on_request(
             }
             None => {
                 h.requests_404 = h.requests_404.saturating_add(1);
-                finish(h, sys, conn_id, stream_id, 400, b"unknown admin op");
+                finish(h, sys, id, 400, b"unknown admin op");
                 ReqOut::Done
             }
         };
@@ -884,32 +956,22 @@ pub unsafe fn on_request(
         // 200 if the cached readyz byte is non-zero; 503 otherwise.
         let ready_byte = if h.readyz_len > 0 { h.readyz_buf[0] } else { 0 };
         let status = if ready_byte != 0 { 200 } else { 503 };
-        finish(h, sys, conn_id, stream_id, status, &[ready_byte]);
+        finish(h, sys, id, status, &[ready_byte]);
     } else if path == b"/why" {
         let mut body = [0u8; 2];
         let n = h.why_len as usize;
         body[..n].copy_from_slice(&h.why_buf[..n]);
-        finish(h, sys, conn_id, stream_id, 200, &body[..n]);
+        finish(h, sys, id, 200, &body[..n]);
     } else if path == b"/metrics" {
-        if h.st_active != 0 {
-            // One export streams at a time; the slot is bounded and
-            // the next scrape lands after this one drains.
-            finish(h, sys, conn_id, stream_id, 503, b"metrics busy");
-        } else if (h.metrics_len as usize) <= RESP_SLICE {
-            let n = h.metrics_len as usize;
-            let body = h.metrics_buf.as_ptr();
-            emit_envelope(h, sys, conn_id, stream_id, 200, 0, CT_TEXT, &[], body, n);
-        } else {
-            h.st_active = 1;
-            h.st_head_sent = 0;
-            h.st_conn = conn_id;
-            h.st_stream = stream_id;
-            h.st_off = 0;
-            stream_step(h, sys);
-        }
+        // The whole export, in one record: `METRICS_CACHE` is sized
+        // off the telemetry export cap, which sits inside
+        // `RESP_BODY_MAX`, so there is no case here that does not fit.
+        let n = (h.metrics_len as usize).min(RESP_BODY_MAX);
+        let body = h.metrics_buf.as_ptr();
+        emit_response(h, sys, id, 200, body, n);
     } else {
         h.requests_404 = h.requests_404.saturating_add(1);
-        finish(h, sys, conn_id, stream_id, 404, b"not found");
+        finish(h, sys, id, 404, b"not found");
     }
     h.requests_handled = h.requests_handled.saturating_add(1);
     h.worked = 1;
@@ -928,8 +990,7 @@ pub unsafe fn on_request(
 pub unsafe fn finish_admin(
     h: &mut Http,
     sys: &SyscallTable,
-    conn_id: u16,
-    stream_id: u16,
+    id: AppId,
     op_code: u8,
     authorized: bool,
 ) {
@@ -941,12 +1002,12 @@ pub unsafe fn finish_admin(
         // `CorrSlot`) admin ops have no async reply to observe
         // instead.
         let mut log = [0u8; 48];
-        let n = format_admin_route_log(&mut log, op_code, conn_id);
+        let n = format_admin_route_log(&mut log, op_code, id.conn as u16);
         dev_log(sys, 3, log.as_ptr(), n);
-        finish(h, sys, conn_id, stream_id, 202, b"accepted");
+        finish(h, sys, id, 202, b"accepted");
     } else {
         h.admin_dropped = h.admin_dropped.saturating_add(1);
-        finish(h, sys, conn_id, stream_id, 403, b"forbidden");
+        finish(h, sys, id, 403, b"forbidden");
     }
 }
 
@@ -1038,18 +1099,6 @@ pub fn take_metrics(h: &mut Http, now: u64) -> Option<[(u16, u8, i64); 15]> {
         ),
     ];
     Some(samples)
-}
-
-/// `Content-Length: N\r\n` into `dst`; wave reads it as the streamed
-/// body's declared total and emits the wire header itself.
-fn format_content_length(dst: &mut [u8], n: usize) -> usize {
-    let head = b"Content-Length: ";
-    let mut pos = head.len();
-    dst[..pos].copy_from_slice(head);
-    pos += push_usize(&mut dst[pos..], n);
-    dst[pos] = b'\r';
-    dst[pos + 1] = b'\n';
-    pos + 2
 }
 
 /// `[http] admin op=N conn_id=M` — see the call site's

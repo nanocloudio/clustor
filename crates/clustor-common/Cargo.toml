@@ -51,12 +51,9 @@ path = "src/lib.rs"
 [dependencies]
 
 # Inline lints rather than `workspace = true` because cargo doesn't
-# allow mixing `lints.workspace = true` with per-lint overrides, and
-# the facade crate compiles `replica_facade.rs`, whose embedded
-# `#[cfg(test)]` blocks use `.unwrap()` / `panic!()` legitimately.
-# Mirror the workspace baseline minus the lints that conflict with
-# that shape; `unsafe_code` escalates from the workspace `deny` to
-# `forbid` per lints.md §5 (no-unsafe crate).
+# allow mixing `lints.workspace = true` with per-lint overrides.
+# Mirror the workspace baseline; `unsafe_code` escalates from the
+# workspace `deny` to `forbid` per lints.md §5 (no-unsafe crate).
 [lints.rust]
 unsafe_code               = "forbid"
 unused_must_use           = "deny"
@@ -77,9 +74,8 @@ dbg_macro     = "deny"
 todo          = "warn"
 unimplemented = "warn"
 
-# `#[cfg(test)]` blocks inside `replica_facade.rs` use these.
-unwrap_used   = "allow"
-expect_used   = "allow"
-panic         = "allow"
-print_stdout  = "allow"
-print_stderr  = "allow"
+unwrap_used   = "deny"
+expect_used   = "warn"
+panic         = "warn"
+print_stdout  = "deny"
+print_stderr  = "deny"

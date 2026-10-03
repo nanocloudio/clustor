@@ -37,7 +37,11 @@
 //!   4. `codec` `client_requests` loop (≤8) — pre-demuxed client
 //!      traffic from producers that own their own connection
 //!      namespace, entering the correlation hub on the same terms as
-//!      step 3's wire frames.
+//!      step 3's wire frames. Each correlation entry keeps its
+//!      namespace, and a reply leaves toward it: wire clients on
+//!      `responses`, producers on `client_responses` (on `responses`
+//!      when unwired — a graph with no wire clients). A graph wiring
+//!      both inputs without `client_responses` refuses to start.
 //!
 //! The dispatch table brackets each section with `dev_micros` reads
 //! and publishes a per-component step-time histogram each second
@@ -93,6 +97,14 @@ define_params! {
     // configs that don't yet plumb placement.
     2, min_epoch, u32, 0
         => |s, d, len| { s.codec.min_epoch = p_u32(d, len, 0, 0); };
+
+    // Whether the `client_requests` producers read their replies (1).
+    // 0 declares they read none (a store's clock and sweeps, which see
+    // their effect in the committed log): their replies are discarded
+    // and counted, and `client_responses` may stay unwired beside wire
+    // clients.
+    3, client_replies, u8, 1
+        => |s, d, len| { s.surface.client_replies_unread = p_u8(d, len, 0, 1) == 0; };
 }
 
 #[repr(C)]
@@ -170,6 +182,7 @@ pub extern "C" fn module_new(
         s.throttle.out_rejected = dev_channel_port(sys, 1, 4);
         s.codec.out_reads = dev_channel_port(sys, 1, 5);
         s.throttle.out_metrics = dev_channel_port(sys, 1, 6);
+        s.surface.out_client_responses = dev_channel_port(sys, 1, 7);
 
         s.comp_step = [step_accounting::CompStepHist::new(); 3];
         s.comp_step_last_ms = 0;
@@ -177,6 +190,12 @@ pub extern "C" fn module_new(
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
+        }
+
+        if !surface::replies_separable(&s.surface, s.codec.in_client_requests) {
+            let m = b"[gate] requests and client_requests wired: client_responses must be too, or client_replies 0";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return -3;
         }
 
         dev_log(sys, 3, b"[surface] init".as_ptr(), 14);
@@ -258,7 +277,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 surface::Inbound::Empty => break,
                 surface::Inbound::Handled => {}
                 surface::Inbound::Client { msg_type, len } => {
-                    route_client(s, sys, msg_type, len, &frame);
+                    route_client(s, sys, codec::Origin::Wire, msg_type, len, &frame);
                 }
                 surface::Inbound::Oversize { conn_id } => {
                     let out = codec::reject_too_large(conn_id);
@@ -285,7 +304,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 codec::Pulled::Empty => break,
                 codec::Pulled::Skipped => {}
                 codec::Pulled::Frame(msg_type, len) => {
-                    route_client(s, sys, msg_type, len, &frame);
+                    route_client(s, sys, codec::Origin::Client, msg_type, len, &frame);
                 }
             }
         }
@@ -318,9 +337,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
     }
 }
 
-/// Route one client record `[conn_id:u16 LE][body]` through the
-/// codec → throttle → codec → surface chain. Cross-component order
-/// lives here, in the composition layer, not in any component.
+/// Route one client record `[conn_id:u16 LE][body]`, its conn_id in
+/// `origin`'s namespace, through the codec → throttle → codec → surface
+/// chain. Cross-component order lives here, in the composition layer,
+/// not in any component.
 ///
 /// # Safety
 ///
@@ -329,12 +349,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 unsafe fn route_client(
     s: &mut ModuleState,
     sys: &SyscallTable,
+    origin: codec::Origin,
     msg_type: u8,
     len: usize,
     frame: &[u8; wal_frame::MAX_ENTRY_BODY],
 ) {
     let mut proposal = [0u8; wal_frame::MAX_ENTRY_BODY];
-    match codec::on_request(&mut s.codec, sys, msg_type, &frame[..len], &mut proposal) {
+    match codec::on_request(
+        &mut s.codec,
+        sys,
+        origin,
+        msg_type,
+        &frame[..len],
+        &mut proposal,
+    ) {
         codec::Route::Done => {}
         codec::Route::Respond(out) => {
             if surface::send_outbound(&mut s.surface, sys, &out) {
