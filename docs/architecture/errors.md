@@ -77,13 +77,20 @@ listener.
 - Malformed HTTP is answered by wave at the wire; an unknown
   `/admin/<op>` name is answered 400 `unknown admin op`; any other
   unknown path is 404 `not found`.
-- A forwarded body over `MAX_EXT_BODY` (1 KiB), or a body wave has
-  split across envelopes, is answered 413 `body too large` — never
-  truncated. Requests too large for wave's own wire buffers never
-  reach this module; wave answers those itself.
-- `GET /metrics` streams across several envelopes and only one
-  export streams at a time; a concurrent scrape is answered 503
-  `metrics busy` until the slot frees.
+- Requests are collected whole by the exchange contract's
+  `Collector`: a body over `MAX_EXT_BODY` (1 KiB), a target over
+  `MAX_EXT_TARGET` (256 bytes) or a header block over
+  `MAX_EXT_HEADERS` (2 KiB) is answered 413 `request too large` —
+  never truncated; a request arriving while all `REQ_SLOTS` (4)
+  exchanges are being collected is answered 503 `request slots busy`;
+  a record out of order for its exchange is answered 400
+  `bad request`; a body announced with MORE that does not finish
+  within 10 s is answered 408 `request body timeout`. Requests too
+  large for wave's own wire buffers never reach this module; wave
+  answers those itself.
+- `GET /metrics` answers the whole cached export in one record.
+- A requester ABORT ends the exchange: nothing is written for it,
+  including a deferred `/propose` answer.
 - `POST /propose` (the synchronous write bridge) answers 200
   `committed` once apply acknowledges the assigned WAL index, and 503
   with a reason body otherwise: `propose queue unavailable` (the

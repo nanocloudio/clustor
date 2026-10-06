@@ -345,6 +345,16 @@ path = "tests/rbac_identity.rs"
 name = "gateway_namespaces"
 path = "tests/gateway_namespaces.rs"
 
+# Host-side coverage for operations' HTTP surface as an exchange
+# provider: whole and collected requests, bounds refused with the
+# collector's status, the 408 body deadline, deferred /propose answers
+# and requester ABORT, and answers held (never dropped) when
+# `response_out` has no room. Mounts operations/http.rs via `#[path]`
+# against a mock SyscallTable with framed exchange channels.
+[[test]]
+name = "operations_exchange"
+path = "tests/operations_exchange.rs"
+
 # Host-side unit coverage for raft's write-then-adopt metadata
 # persistence discipline. Pulls `modules/app/consensus/raft.rs` in via
 # `#[path]` against a mock SyscallTable (in-memory FS with fault

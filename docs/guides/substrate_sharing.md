@@ -164,8 +164,8 @@ likewise stay unwired.
 
 | Direction | Ports |
 |---|---|
-| in | `admin_req`, `admin_requests`, `identity`, `admin_applied`, `ingest`, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request`† |
-| out | `responses`, `denied`, `audit_events`, `authorized`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `response`† |
+| in | `admin_req`, `admin_requests`, `identity`, `admin_applied`, `ingest`, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request_in`† |
+| out | `responses`, `denied`, `audit_events`, `authorized`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `response_out`† |
 
 † `diag` variant only. The `headless` variant omits the HTTP ports
 entirely; readiness and metrics still publish on `readyz`, `why`
@@ -184,13 +184,13 @@ best-effort and never gates or delays that delivery.
 `ingest` is the metric fan-in every other palette module's
 `metrics` output feeds.
 
-`request` / `response` are the HTTP seam. This module owns what a
-request means, never the mechanics: wave's `http` module (`app`
-variant) terminates the wire and hands each matched request over as
-an `HttpRequest` envelope, and replies leave as `HttpResponse`
-envelopes. Both graph edges run in mailbox mode (a distinct non-zero
-`buffer_group` each), so one write is one whole envelope; replies
-are correlated on the echoed `(conn_id, stream_id)` pair. See
+`request_in` / `response_out` are the HTTP seam: the provider side of
+the fluxor SDK exchange contract (`ExchangeRequest` /
+`ExchangeResponse`). This module owns what a request means, never the
+mechanics: wave's `http` server (`app` variant) terminates the wire and
+is the requester, wired `http.request_out → operations.request_in` and
+`operations.response_out → http.response_in` with nothing else on
+either edge. Answers echo the exchange id the server chose. See
 [net_http.md](net_http.md).
 
 ## Why search paths, not hardlinks

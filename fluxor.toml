@@ -108,6 +108,10 @@ prefix = "tests/sealed_records.rs"
 reason = """mounts the SDK ABI and the no_std sealed-record codec verbatim into a host crate and drives the codec's vault client through the SyscallTable ABI; each test uses a subset of that surface."""
 
 [[ci.hygiene.allow_crate_root]]
+prefix = "tests/operations_exchange.rs"
+reason = """include!s the SDK runtime and compiles operations' no_std http component verbatim into a host crate against a mock SyscallTable; each test uses a subset of that surface."""
+
+[[ci.hygiene.allow_crate_root]]
 prefix = "tests/rbac_identity.rs"
 reason = """include!s the SDK runtime and compiles the no_std rbac component verbatim into a host crate; each test uses a subset of that surface."""
 

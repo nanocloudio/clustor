@@ -9,11 +9,11 @@
 //!   - [`telemetry`] — metrics fan-in, readiness, /metrics export.
 //!   - [`http`]      — diagnostic + write-bridge request handling
 //!                     (`http` feature). HTTP mechanics live outside
-//!                     the module: wave's `http` module (`app`
-//!                     variant) parses the wire and delivers
-//!                     `HttpRequest` envelopes on `request`; replies
-//!                     leave as `HttpResponse` envelopes on
-//!                     `response`.
+//!                     the module: wave's `http` server parses the
+//!                     wire and is the requester of an exchange
+//!                     (SDK `contracts/exchange.rs`) whose provider is
+//!                     this component — request records on
+//!                     `request_in`, answers on `response_out`.
 //!
 //! Every admin command — wire or HTTP — is admitted through the rbac
 //! component; there is no path around it. The `headless` variant
@@ -38,13 +38,13 @@
 //!      loop (≤4): each authorized envelope delivers into `admin`
 //!      same-step, here.
 //!   4. `admin` — apply acknowledgements, direct-inject commands.
-//!   5. `http`  — proposal feedback loops (assignments, the
-//!      `/metrics` stream, ≤8 rejections, ≤16 applies, one expiry —
-//!      each pull gated on `response` writability), self-telemetry
-//!      into `telemetry`.
-//!   6. `http` `request` loop (≤8) — wave `HttpRequest` envelopes,
-//!      each pull likewise gated on `response` writability; replies
-//!      egress on `response`.
+//!   5. `http`  — proposal feedback loops (assignments, ≤8
+//!      rejections, ≤16 applies, one expiry — each pull gated on
+//!      `http::ready_to_answer`, which first places any record the
+//!      `response_out` port had no room for), self-telemetry into
+//!      `telemetry`.
+//!   6. `http` `request_in` loop (≤8) — exchange request records,
+//!      each pull likewise gated; answers egress on `response_out`.
 //!
 //! Per-component step bounds are documented on each component's
 //! `step`; the sum stays well inside the runtime step guard.
@@ -75,25 +75,6 @@ use abi::SyscallTable;
 
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
-
-// The HTTP application record codec and the method vocabulary, mounted
-// from the contracts that define them rather than mirrored: the server
-// and every module that answers its application routes decode one
-// layout, so there is no second copy to drift from it.
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: a mounted contract's surface is shared and each consumer uses a subset"
-)]
-#[path = "../../../target/fluxor/wave-common/http_app.rs"]
-mod http_app;
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: a mounted contract's surface is shared and each consumer uses a subset"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/contracts/net/http_exchange.rs"]
-mod http_exchange;
 
 #[path = "../../common/http_admin.rs"]
 mod http_admin;
@@ -341,13 +322,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         #[cfg(feature = "http")]
         {
-            // http: own drains, then the response-producing feedback
-            // loops — each pull gated on `response` writability, so
-            // feedback is consumed only with somewhere to answer.
+            // http: own drains, then the answer-producing feedback
+            // loops — each pull gated on `ready_to_answer`, so
+            // feedback is consumed only with nothing already owed.
             let t0 = dev_micros(sys);
             http::step(&mut s.http, sys);
             for _ in 0..8 {
-                if !http::response_writable(&s.http, sys) {
+                if !http::ready_to_answer(&mut s.http, sys) {
                     break;
                 }
                 match http::next_rejection(&mut s.http, sys) {
@@ -356,7 +337,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
             for _ in 0..16 {
-                if !http::response_writable(&s.http, sys) {
+                if !http::ready_to_answer(&mut s.http, sys) {
                     break;
                 }
                 match http::next_applied(&mut s.http, sys) {
@@ -364,7 +345,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     http::Feedback::Handled => {}
                 }
             }
-            if http::response_writable(&s.http, sys) {
+            if http::ready_to_answer(&mut s.http, sys) {
                 http::expire_step(&mut s.http, sys, now);
             }
             if let Some(samples) = http::take_metrics(&mut s.http, now) {
@@ -381,19 +362,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
 
-            // Requests off the `request` port (wave HttpRequest
-            // envelopes). Gated on `response` writability like the
-            // feedback loops — a request is never consumed without
-            // somewhere to answer, so wave applies the backpressure
-            // instead of the reply being dropped.
+            // Exchange request records off `request_in`. Gated like the
+            // feedback loops — a request is never consumed while an
+            // answer is still owed, so the server feels the
+            // backpressure instead of an answer being lost.
             //
-            // Stale reply state needs no connection-boundary purge
-            // here: wave's per-request `stream_id` generation keeps a
-            // late answer from matching a recycled conn id, and the
-            // 10 s proposal timeout frees the slots.
+            // Deferred answers need no connection-boundary purge: the
+            // exchange id the server chose names one request, so a late
+            // answer cannot match a recycled connection, and the 10 s
+            // proposal timeout frees the slots.
             let mut ext = http::ExtReq::new();
             for _ in 0..8 {
-                if !http::response_writable(&s.http, sys) {
+                if !http::ready_to_answer(&mut s.http, sys) {
                     break;
                 }
                 match http::next_external_request(&mut s.http, sys, &mut ext) {
@@ -496,7 +476,7 @@ unsafe fn route_http_request(
     s: &mut ModuleState,
     sys: &SyscallTable,
     now: u64,
-    id: http_app::AppId,
+    id: abi::contracts::exchange::ExchangeId,
     method: u8,
     path_len: usize,
     body_len: usize,

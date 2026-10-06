@@ -290,7 +290,7 @@ HTTP diagnostic surface.
 | `rbac` | Evaluates RBAC roles (Operator / TenantAdmin / Observer / BreakGlass) from the commanding connection's identity: key fingerprints pinned by `operator_keyN` / `observer_keyN` first, then a verified name as a prefix match against `admin_svid_prefix` / `observer_svid_prefix`. An operator match also grants BreakGlass. Writes the audit stream on `audit_events`. |
 | `admin` | Idempotency-keyed admin envelope. Routes `FREEZE` / `THAW` / `DURABILITY_MODE` through the log, `TRANSFER_LEADER` / `SNAPSHOT` and the membership ops directly to `consensus`, and the migration / placement / tenant-quota / shard-map ops to the control-plane controller. Replies `ADMIN_STATUS_OK` / `ADMIN_STATUS_DUPLICATE`; the joint-consensus path is documented in [lifecycle.md](lifecycle.md#membership-changes-and-joint-consensus). |
 | `telemetry` | Metrics fan-in with fixed histogram buckets, incident correlation under a storm guard, feature-gate state, and the `/readyz` / `/why` / `/metrics` payloads. |
-| `http` | Owns what each request means: serves `/readyz`, `/why`, `/metrics`, `POST /admin/<op>` and `POST /propose` over wave `HttpRequest`/`HttpResponse` envelopes. HTTP mechanics live in wave's `http` module on a dedicated listener — by convention `LISTEN_PORT + 10000`. See [../net_http.md](../guides/net_http.md). |
+| `http` | Owns what each request means: serves `/readyz`, `/why`, `/metrics`, `POST /admin/<op>` and `POST /propose` as the provider of wave `http`'s application-route exchanges (fluxor SDK exchange contract). HTTP mechanics live in wave's `http` module on a dedicated listener — by convention `LISTEN_PORT + 10000`. See [../net_http.md](../guides/net_http.md). |
 
 Every admin command is admitted through `rbac` and there is no
 path around it. Wire commands arriving on `admin_req` are
@@ -311,19 +311,20 @@ tick. An authorized command delivers into `admin` in the same step
 
 | | |
 |---|---|
-| Inputs | `admin_req`, `identity`, `admin_applied`, `admin_requests`, `ingest`, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request`† |
-| Outputs | `responses`, `denied`, `audit_events`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `authorized`, `response`† |
+| Inputs | `admin_req`, `identity`, `admin_applied`, `admin_requests`, `ingest`, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request_in`† |
+| Outputs | `responses`, `denied`, `audit_events`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `authorized`, `response_out`† |
 | Params | `admin_svid_prefix`, `observer_svid_prefix`, `default_role`, `emit_interval_ms`, `operator_key{0..3}`, `observer_key{0..3}` |
 | Variants | `diag` (default), `headless` |
 
 † Present in the `diag` variant only.
 
-`request` / `response` carry wave's `HttpRequest`/`HttpResponse`
-envelopes from the `http` module's `HANDLER_APP` fan-out; both graph
-edges run in mailbox mode (`buffer_group`). Replies are correlated
-on the echoed `(conn_id, stream_id)` pair, so a deferred `/propose`
-answer can never land on a client that merely inherited a recycled
-conn id.
+`request_in` / `response_out` are the provider side of the fluxor
+SDK exchange contract (`ExchangeRequest` / `ExchangeResponse`), wired
+to wave `http`'s `request_out` / `response_in`. Requests are
+collected whole with the contract's `Collector` and every answer is
+one record placed through `ExchangeOutbox`. Answers echo the exchange
+id the server chose, so a deferred `/propose` answer can never land on
+a client that merely inherited a recycled connection.
 
 `diag` carries the full HTTP diagnostic surface. `headless`
 compiles the `http` component out and omits its ports entirely;

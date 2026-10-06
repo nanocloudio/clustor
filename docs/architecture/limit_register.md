@@ -35,7 +35,7 @@ absent so that "absent here is a bug" stays a checkable claim:
   header; `CMD_MAX` derives from `ENV_BUF`, `EXPORT_BUDGET` and
   `METRICS_CACHE` from `SAFE_EXPORT_MAX` (via the named
   `METRICS_CACHE_SLACK` delta, kept so the cap has one source rather
-  than a second literal), `RESP_BODY_MAX` from the HTTP application
+  than a second literal), `RESP_BODY_MAX` from the exchange contract
   record's own bounds, `SEND_STAGE_MAX` from
   `ROUTE_FRAME_MAX`, `SR_MAX_CMD` from `SR_MAX_WRAPPED_KEY`,
   `SNAP_PTR_CANDIDATES` from `SNAP_PTR_SLOTS`, and `EXPORT_TAIL_RECORDS`
@@ -98,9 +98,10 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | WAL replay segment-gap tolerance | `REPLAY_GAP_TOLERANCE` | modules/app/durability/wal.rs | — | Semantic; typed value 16. Consecutive missing segment sequence numbers replay probes before declaring the log ended, which bounds startup cost on an empty WAL. It covers INTERIOR gaps left by compaction. The leading-gap case — a long-lived log whose first surviving segment sits far past seq 1 — is not left to this budget: replay consults the persisted floor sidecar once per pass and starts from it, because exhausting the miss budget before reaching the survivors would orphan the whole durable log. |
 | App-snapshot capture wait | `APP_CAPTURE_TIMEOUT_TICKS` | modules/app/durability/snapshot.rs | — | Semantic; typed value 2000 (~2 s at the rig's 1 ms tick). On expiry the capture is abandoned and counted in `app_captures_timed_out`, so a wedged app costs one rotation's snapshot rather than stalling the snapshot engine. |
 | Admin envelope staging | `ENV_BUF` | modules/app/operations/admin.rs | 1024 | Shape: every envelope staging buffer in the admin component, matching the 1 KiB channel-message scratch. The longest command it can carry is `CMD_MAX = ENV_BUF - 12`, because the replicated form prepends `ADMIN_MAGIC` (8) and `command_id` (4) inside the same buffer. |
-| HTTP request body accepted | `MAX_EXT_BODY` | modules/app/operations/http.rs | 1024 | A larger forwarded body is answered 413, never truncated. Wire-side body/connection bounds are wave's (`max_body_kib`, per-target slot tables). |
-| HTTP request path accepted | `MAX_EXT_PATH` | modules/app/operations/http.rs | 64 | A longer path is answered 404 — nothing this surface serves is longer. |
-| Exchanges awaiting a request body | `REQ_PENDING` | modules/app/operations/http.rs | 4 | Capacity: slots held between a request HEAD that announces a body and the BODY record that completes it. A HEAD arriving with none free is answered 503 rather than held unanswered, and a slot whose body never lands ages out at `REQ_BODY_TIMEOUT_MS`. Bodies are never stored — one record carries any body this surface accepts — so a slot costs its path, not its payload. |
+| HTTP request body accepted | `MAX_EXT_BODY` | modules/app/operations/http.rs | 1024 | The exchange `Collector`'s body bound: a larger body, inline or across BODY records, is answered 413, never truncated. Wire-side body/connection bounds are wave's (`max_body_kib`, per-target slot tables). |
+| HTTP request target accepted | `MAX_EXT_TARGET` | modules/app/operations/http.rs | 256 | Path and query. A longer target is answered 413 by the collector; every route this surface serves is far shorter. |
+| HTTP forwarded header block | `MAX_EXT_HEADERS` | modules/app/operations/http.rs | 2048 | The header block the server forwards is collected and read past; a larger block is answered 413. |
+| Exchanges collected at once | `REQ_SLOTS` | modules/app/operations/http.rs | 4 | Capacity: a slot is held from a request HEAD until the request is whole and handed over — at once for an inline body, at the last BODY record otherwise. A HEAD arriving with none free is answered 503 rather than held unanswered, and a body that never finishes ages out at `REQ_BODY_TIMEOUT_MS` with 408. |
 | Concurrent HTTP `/propose` requests | `HTTP_INFLIGHT` | modules/app/operations/http.rs | 64 | Slot exhaustion answers 503 "propose queue unavailable". |
 | Admin op body via HTTP | `ADMIN_BODY_MAX` | modules/common/http_admin.rs | 1021 | Capacity: the 1 KiB `admin_env` staging buffer less the 3-byte envelope header (`conn_id:u16 LE` + `op_code`). An oversize admin POST is answered 503 before any work is staged, and counted in `admin_dropped`. |
 | Volatile WAL retention window | `VOLATILE_RETENTION_SLOTS` | modules/app/durability/wal.rs | 256 | Lossy capacity: how far back a volatile replica can serve a random-access refetch. Sizes both WAL rings on that variant, so it is also the knob that sets its module-state cost (2064 B per slot). An index below the floor answers NOT_FOUND and escalates to snapshot install. |
@@ -276,7 +277,7 @@ MAX_ACTIVE | modules/app/control_plane/migration.rs | 1
 TRUNCATE_HOLD_TIMEOUTS | modules/app/consensus/raft.rs | 3
 VOTING_LAG_THRESHOLD | modules/app/consensus/replicator.rs | 64
 ENVELOPE_CACHE | modules/app/operations/http.rs | 1024
-REQ_PENDING | modules/app/operations/http.rs | 4
+REQ_SLOTS | modules/app/operations/http.rs | 4
 SNAP_VERIFY_CHUNK | modules/app/durability/snapshot.rs | 1024
 SNAP_CHUNK | modules/app/session_directory/mod.rs | 1024
 PEER_AUTHORITY_MAX | modules/app/peer_router/mod.rs | 64
@@ -288,7 +289,8 @@ REPLAY_GAP_TOLERANCE | modules/app/durability/wal.rs | 16
 APP_CAPTURE_TIMEOUT_TICKS | modules/app/durability/snapshot.rs | 2000
 ENV_BUF | modules/app/operations/admin.rs | 1024
 MAX_EXT_BODY | modules/app/operations/http.rs | 1024
-MAX_EXT_PATH | modules/app/operations/http.rs | 64
+MAX_EXT_TARGET | modules/app/operations/http.rs | 256
+MAX_EXT_HEADERS | modules/app/operations/http.rs | 2048
 HTTP_INFLIGHT | modules/app/operations/http.rs | 64
 ADMIN_BODY_MAX | modules/common/http_admin.rs | 1021
 VOLATILE_RETENTION_SLOTS | modules/app/durability/wal.rs | 256

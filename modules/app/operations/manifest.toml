@@ -10,10 +10,11 @@ hardware_targets = ["bcm2712"]
 #
 # Components: rbac, admin, telemetry, and — behind the `http`
 # feature — http (request handling). HTTP mechanics live outside the
-# module: wave's `http` module (`app` variant) terminates the wire
-# and exchanges `HttpRequest`/`HttpResponse` envelopes with this one
-# over `request`/`response`. This module owns what a request MEANS —
-# paths, admission, the /propose bridge — and none of the framing.
+# module: wave's `http` server terminates the wire and is the
+# requester of an exchange (fluxor SDK `contracts/exchange.rs`) whose
+# provider is this module — request records on `request_in`, answers
+# on `response_out`. This module owns what a request MEANS — paths,
+# admission, the /propose bridge — and none of the framing.
 #
 # Every admin command is admitted through rbac: wire commands on
 # `admin_req` (evaluated against identity bindings), HTTP
@@ -40,7 +41,7 @@ name = "headless"
 # marker satisfies the variant-is-a-feature-set rule without gating
 # any code of its own.
 features = ["headless"]
-omit_ports = ["proposal_assigned", "applied", "proposal_rejected", "request", "proposal", "response"]
+omit_ports = ["proposal_assigned", "applied", "proposal_rejected", "request_in", "proposal", "response_out"]
 
 [[variant]]
 name = "diag"
@@ -90,18 +91,15 @@ direction = "input"
 content_type = "OctetStream"
 
 [[ports]]
-name = "request"
+name = "request_in"
 direction = "input"
-content_type = "HttpRequest"
+content_type = "ExchangeRequest"
 buffer_size = 16384
-# One wave `req_out` envelope — the producer's own `max_record`; the
-# reader's frame buffer (MAX_EXT_REQUEST) matches it exactly.
+# One exchange record: the contract's `RECORD_MAX`, which the reader's
+# frame buffer matches exactly. Requests from the `http` server's
+# application routes; answers leave on `response_out`.
 max_record = 8192
 rate_class_max = "transaction"
-# Wave `HttpRequest` envelopes from the `http` module's HANDLER_APP
-# fan-out. The graph edge needs a non-zero `buffer_group` (mailbox
-# mode) so one write is one whole envelope; replies leave on
-# `response`.
 
 # ── outputs ──────────────────────────────────────────────────
 
@@ -180,19 +178,14 @@ rate_class_max = "transaction"
 # gating the in-module delivery. `denied` is its negative counterpart.
 
 [[ports]]
-name = "response"
+name = "response_out"
 direction = "output"
-content_type = "HttpResponse"
+content_type = "ExchangeResponse"
 buffer_size = 16384
-# Envelope head (12) + content type + a Content-Length header line +
-# one body slice (`http::RESP_SLICE` = 3072, sized under wave's
-# per-connection send buffer). Larger bodies — `/metrics` — stream
-# across several envelopes via MORE_BODY.
-max_record = 3200
+# One exchange record. Every answer is a single response HEAD with its
+# body inline; the largest, a `/metrics` export, is bounded inside it.
+max_record = 8192
 rate_class_max = "transaction"
-# Wave `HttpResponse` envelopes answering `request` traffic. Same
-# mailbox-mode requirement as `request`; the two edges take distinct
-# `buffer_group` values.
 
 [observability]
 # The /propose bridge's request + proposal-correlation health, plus

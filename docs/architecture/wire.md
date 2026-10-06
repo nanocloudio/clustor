@@ -205,8 +205,8 @@ management. The telemetry family:
   `[module_id:u8][partition_id:u16][metric_id:u16][kind:u8][value:i64]`
   with `kind` 0 = counter, 1 = gauge, 2 = histogram bucket.
 - 0x74, 0x75 and 0x79 are retired and reserved. HTTP framing is
-  wave's, not clustor's: the `operations` `request` / `response` ports
-  carry wave's `HttpRequest` / `HttpResponse` envelopes, described in
+  not clustor's: the `operations` `request_in` / `response_out` ports
+  carry the fluxor SDK exchange contract's records, described in
   [../guides/net_http.md](../guides/net_http.md).
 - `MSG_VOTER_SET_UPDATE` (0x76):
   `[current_set:u8][joint_set:u8][joint_active:u8]` bitmasks.

@@ -10,12 +10,14 @@ formula with no separate allocator.
 
 HTTP mechanics and HTTP meaning live in different modules. Wave's
 `http` module (`app` variant) terminates the wire — parsing, framing,
-connection state, bounded bodies — and forwards each matched request
-to `operations` as an `HttpRequest` envelope on its `HANDLER_APP`
-fan-out. `operations`' `http` component owns what the request means:
-the diagnostic paths, admin admission, and the `/propose` bridge.
-Neither module knows the other's internals; the seam is the two
-envelope ports.
+connection state, bounded bodies — and hands each matched request to
+`operations` as an exchange: wave's `http` is the requester and
+`operations` the provider, speaking the fluxor SDK exchange contract
+(`contracts/exchange.rs`, described in fluxor's
+`docs/architecture/exchange.md`). `operations`' `http` component owns
+what the request means: the diagnostic paths, admin admission, and the
+`/propose` bridge. Neither module knows the other's internals; the seam
+is the exchange port pair.
 
 The listener rides the target's network module: `linux_net` on the
 Linux host target, the `ip` module (over the target's NIC driver) on
@@ -26,19 +28,19 @@ accepting local port, and each anchor claims only connections
 accepted on its own listen port.
 
 ```
-curl ──tcp──▶ net module ──▶ http (wave) ──req_out───▶ operations.request
-curl ◀──tcp── net module ◀── http (wave) ◀──resp_in─── operations.response
+curl ──tcp──▶ net module ──▶ http (wave) ──request_out──▶ operations.request_in
+curl ◀──tcp── net module ◀── http (wave) ◀──response_in── operations.response_out
 ```
 
 The graph carries four edges (the "HTTP diagnostic surface" group in
 every diag config under `configs/`):
 
 - `<net>.net_out` → `http.net_in` and `http.net_out` → `<net>.net_in`
-- `http.req_out` → `operations.request` and
-  `operations.response` → `http.resp_in`, each with a distinct
-  non-zero `buffer_group` — mailbox mode, one write = one whole
-  envelope. Omitting the group does not fail loudly; it delivers
-  fragmented envelopes.
+- `http.request_out` → `operations.request_in` and
+  `operations.response_out` → `http.response_in`. Both are framed
+  `ExchangeRequest`/`ExchangeResponse` edges, so the build gives each a
+  mailbox of its own and one channel record is one whole exchange
+  record; the wiring names nothing else.
 
 The wave module block is uniform across the configs:
 
@@ -52,15 +54,16 @@ The wave module block is uniform across the configs:
       app: true      # catch-all: operations owns the 404
 ```
 
-Responses are correlated by `(conn_id, stream_id)` — wave stamps a
-per-request generation into `stream_id` and `operations` echoes it,
-so a reply deferred through Raft (`/propose`) can never land on a
-client that merely inherited a recycled conn id.
+Answers are correlated by the 14-byte exchange id wave chooses for each
+request and `operations` echoes verbatim. The id names one request, so
+an answer deferred through Raft (`/propose`) can never land on a client
+that merely inherited a recycled connection. `operations` treats the id
+as opaque.
 
 The `http` component ships only in the `diag` variant of
 `operations`. A deployment that must not expose an HTTP surface
 selects `variant: headless`, which compiles it out and omits the
-HTTP ports (`request`, `response`, `proposal`, `proposal_assigned`,
+HTTP ports (`request_in`, `response_out`, `proposal`, `proposal_assigned`,
 `applied`, `proposal_rejected`) from the module's port set; readiness
 and metrics still publish on `readyz`, `why` and `export`. Such a
 graph carries no wave modules at all.
@@ -70,16 +73,15 @@ graph carries no wave modules at all.
 The endpoint surface is the GET diagnostics `/readyz`, `/why` and
 `/metrics`, plus `POST /admin/<op>` and `POST /propose`. Routing in
 `http::on_request` is method-gated only for the two POST paths
-(wave's method byte must be `METHOD_POST`); the diagnostic paths
-match on path alone, so a POST to `/metrics` is answered like a GET.
-Unknown paths answer 404.
+(the request HEAD's method must be `METHOD_POST`); the diagnostic
+paths match on the target alone, so a POST to `/metrics` is answered
+like a GET. Unknown targets answer 404. Every answer is `text/plain`.
 
-`/metrics` exceeds one wave send buffer, so `operations` streams it:
-the first envelope carries `MORE_BODY`, a `Content-Length` header and
-the first slice; continuation envelopes carry the rest as the
-`response` port drains. One export streams at a time — a concurrent
-`/metrics` answers 503 until the slot frees, and the cached export is
-not refreshed mid-stream so the declared length stays true.
+Every answer is one response record: a HEAD with the whole body inline
+and no MORE. `/metrics` is the largest — the telemetry export, capped
+by `telemetry::SAFE_EXPORT_MAX` — and a compile-time assertion holds it
+inside one record, so nothing streams and no response credit is spent.
+Wave derives `Content-Length` from the record.
 
 `POST /admin/<op>` is admitted through the `rbac` component like
 every other admin command. HTTP carries no peer identity, so it
@@ -89,7 +91,8 @@ graph wiring. An authorised command answers 202 immediately: 202
 means the envelope reached the admin component, and the command's
 real outcome still answers on the module's `responses` port rather
 than over HTTP. An unknown op name answers 400; a body exceeding the
-1 KiB admin envelope answers 503.
+1 KiB admin envelope answers 503 (or 413 past the request body bound
+below).
 
 ## POST /propose — the write bridge
 
@@ -123,19 +126,32 @@ answers `503 propose queue unavailable`.
 
 The wire-side limits are wave's (see wave's
 `modules/foundation/http/README.md` and its per-target sizing):
-connection slots, receive/send buffers, keep-alive, and the 30 s
-application timeout that answers 504 when `operations` never
-replies. On the meaning side, `operations` enforces its own bounds:
-request paths over 64 bytes answer 404, and bodies over the 1 KiB
-admin envelope — or streamed request bodies, which nothing here
-accepts — answer 413.
+connection slots, receive/send buffers, keep-alive, and the
+application timeout that answers 504 when `operations` never answers.
 
-`operations` pulls a request only when its `response` port can take
-the answer, so a saturated reply path stalls the pull rather than
-losing the reply, and wave applies the backpressure. The
-`responses_dropped` counter records a reply the port refused anyway;
-it should stay at zero, and a rising count means the `response` edge
-is undersized.
+On the meaning side, `operations` collects each request whole with the
+contract's `Collector` and enforces its own bounds:
+
+| Bound | Value | Past it |
+|---|---|---|
+| exchanges collected at once | 4 | 503 |
+| request target (path and query) | 256 bytes | 413 |
+| forwarded header block | 2048 bytes | 413 |
+| request body | 1024 bytes | 413 |
+| body announced with MORE, unfinished | 10 s | 408 |
+
+Wave inlines a body it already holds whole in the request HEAD; a body
+announced with MORE is granted the rest of the 1024-byte bound at once,
+and the request is handled when its last BODY record arrives. A record
+out of order for its exchange answers 400. A requester ABORT frees the
+exchange, and a deferred `/propose` answer for it is never written.
+
+Every record `operations` writes is placed through the SDK's
+`ExchangeOutbox`: a record `response_out` has no room for is held and
+placed on a later step, never dropped, and no request or feedback is
+pulled while one is held — so a saturated answer path stalls the pull
+and wave feels the backpressure. The `responses_dropped` counter
+records an answer that could not be composed; it stays at zero.
 
 The surface is sized for the control-plane and diagnostic endpoints
 and assumes trusted clients inside the cluster perimeter.
@@ -148,7 +164,7 @@ Signals the surface emits on stderr:
 |---|---|
 | `[linux_net] listening on port 19090` | the network module bound the HTTP listen port (host target; the `ip` module logs the bare-metal equivalent) |
 | `[http] bound, waiting for connections` | wave's bind acknowledgement reached the module |
-| `[http] admin op=N conn_id=M` | admin request authorised and routed to the admin component |
+| `[http] admin op=N conn_id=M` | admin request authorised and routed to the admin component; `M` is the HTTP surface's admin sequence, the breadcrumb the admin envelope carries |
 
 Per-request logging is intentionally absent on both sides: logging
 every health-check hit would violate the per-packet severity

@@ -84,7 +84,7 @@ modules:
   - name: admission
   - name: operations
   # wave http (`app` variant): terminates the diagnostic listener and
-  # exchanges HttpRequest/HttpResponse envelopes with operations.
+  # is the exchange requester toward operations, its route provider.
   - name: http
     variant: app
     port: __HTTP_PORT__
@@ -223,14 +223,11 @@ wiring:
     to: http.net_in
   - from: http.net_out
     to: linux_net.net_in
-  # Mailbox mode (`buffer_group`) is REQUIRED on both envelope
-  # edges: one write = one whole envelope; distinct groups.
-  - from: http.req_out
-    to: operations.request
-    buffer_group: 1
-  - from: operations.response
-    to: http.resp_in
-    buffer_group: 2
+  # Exchange edges: http asks, operations answers.
+  - from: http.request_out
+    to: operations.request_in
+  - from: operations.response_out
+    to: http.response_in
 EOF
 ```
 
@@ -298,7 +295,7 @@ modules:
   - name: admission
   - name: operations
   # wave http (`app` variant): terminates the diagnostic listener and
-  # exchanges HttpRequest/HttpResponse envelopes with operations.
+  # is the exchange requester toward operations, its route provider.
   - name: http
     variant: app
     port: __HTTP_PORT__
@@ -447,14 +444,11 @@ wiring:
     to: http.net_in
   - from: http.net_out
     to: linux_net.net_in
-  # Mailbox mode (`buffer_group`) is REQUIRED on both envelope
-  # edges: one write = one whole envelope; distinct groups.
-  - from: http.req_out
-    to: operations.request
-    buffer_group: 1
-  - from: operations.response
-    to: http.resp_in
-    buffer_group: 2
+  # Exchange edges: http asks, operations answers.
+  - from: http.request_out
+    to: operations.request_in
+  - from: operations.response_out
+    to: http.response_in
 EOF
 ```
 

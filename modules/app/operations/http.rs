@@ -24,43 +24,60 @@
 //! ## Transport
 //!
 //! This component owns the MEANING of each request and none of the
-//! HTTP mechanics. Requests arrive on the `request` port as wave
-//! `HttpRequest` envelopes, parsed and framed by wave's `http`
-//! module (`app` variant) wired in front of this one; replies leave
-//! on `response` as wave `HttpResponse` envelopes and wave puts them
-//! back on the wire. Both edges run in mailbox mode (`buffer_group`
-//! in the graph), so one channel write is one whole envelope.
+//! HTTP mechanics. It is a provider under the SDK exchange contract
+//! (`abi::contracts::exchange`): wave's `http` server, wired in front
+//! of it, terminates the wire and writes request records on
+//! `request_in`; this component answers on `response_out`. Both are
+//! framed edges, so one channel record is one whole exchange record.
 //!
-//! A response is correlated by the exchange's [`AppId`], which the
-//! server chooses and this component echoes verbatim, so a deferred
-//! `/propose` reply can never land on a client that merely inherited
-//! a recycled connection number. The backpressure contract is
-//! preserved: the dispatch table gates every pull — requests and
-//! proposal feedback alike — on [`response_writable`], so nothing is
-//! consumed without somewhere to answer.
+//! An answer is correlated by the exchange id, which the server
+//! chooses and this component echoes verbatim, so a deferred
+//! `/propose` answer can never land on a client that merely inherited
+//! a recycled connection. Every record this component writes is placed
+//! through an [`ExchangeOutbox`]: a record the port has no room for is
+//! held and placed on a later step, never dropped, and the dispatch
+//! table gates every pull — requests and proposal feedback alike — on
+//! [`ready_to_answer`], so nothing is consumed while an earlier record
+//! is still owed.
 //!
-//! Every reply this surface produces is ONE record: a response HEAD
-//! with its body inline and no continuation. The largest of them is a
-//! `/metrics` export, capped by `telemetry::SAFE_EXPORT_MAX` well
-//! inside what one record carries, so nothing here streams and
-//! nothing here spends response credit — a HEAD's inline body is not
-//! body bytes under the contract's flow control. The server derives
-//! `Content-Length` from the record itself.
+//! Every answer is ONE record: a response HEAD with its body inline
+//! and no MORE. The largest is a `/metrics` export, capped by
+//! `telemetry::SAFE_EXPORT_MAX` inside what one record carries (a
+//! compile-time assertion below holds the two together), so nothing
+//! here streams and nothing spends response credit — a HEAD's inline
+//! body is not credit-counted. The server derives `Content-Length`
+//! from the record. Every answer's content type is `text/plain`.
 //!
-//! A request body is the other direction's business. It never rides
-//! the HEAD: a request that has one sets MORE and its bytes follow as
-//! BODY records, which the server sends only once this component has
-//! granted credit. The bodies this surface accepts are bounded well
-//! inside one record, so one grant and one BODY record carry any of
-//! them, and a body spanning records is over the bound by definition.
+//! Requests are collected whole by the contract's `Collector`, sized
+//! to what this surface serves: up to [`REQ_SLOTS`] exchanges at once,
+//! a target of [`MAX_EXT_TARGET`] bytes, a header block of
+//! [`MAX_EXT_HEADERS`] and a body of [`MAX_EXT_BODY`]. A body the
+//! server has whole rides inline in the HEAD; one announced with MORE
+//! is granted the rest of the body bound at once, and the request is
+//! handled when its last BODY record lands. Statuses this surface
+//! answers on its own account:
+//!
+//! | Status | When |
+//! |--------|------|
+//! | 400 | an unknown `/admin/<op>`, or a record out of order for its exchange |
+//! | 403 | rbac refused an `/admin/<op>` command |
+//! | 404 | no route for the method and target |
+//! | 408 | a request body announced with MORE did not finish within [`REQ_BODY_TIMEOUT_MS`] |
+//! | 413 | target, headers or body past the bounds above |
+//! | 503 | every request slot busy, the propose queue unavailable, a proposal rejected or timed out |
+//!
+//! A requester ABORT ends its exchange here too: a request being
+//! collected is freed, and a deferred `/propose` answer is never
+//! written. The header block and the mutual-TLS peer fingerprint are
+//! collected and read past — a request here means its verb, target and
+//! body.
 
-use super::abi::SyscallTable;
-use super::http_app::{
-    app_abort, app_flag, app_kind, app_origin, app_parse_request, app_write_credit,
-    app_write_response_head, AppId, AppRecord, AppResponseHead, APP_HDR, APP_RECORD_MAX,
-    APP_RESP_HEAD_FIXED,
+use super::abi::contracts::exchange::{
+    abort, parse_request, response_body_at, seal_response, status, write_abort, write_credit,
+    Collector, ExchangeId, Record, Refuse, METHOD_POST, RECORD_MAX,
 };
-use super::http_exchange::METHOD_POST;
+use super::abi::SyscallTable;
+use super::ExchangeOutbox;
 use super::{dev_log, dev_millis, dev_report_step_effect, step_effect};
 use super::{http_admin, telemetry, wire, wire_channels};
 
@@ -77,38 +94,41 @@ const METRICS_CACHE_SLACK: usize = 200;
 /// slack.
 pub const METRICS_CACHE: usize = telemetry::SAFE_EXPORT_MAX + METRICS_CACHE_SLACK;
 
-// Two bounded phase tables (correlation→connection and index→connection).
+// Two bounded phase tables (correlation→exchange and index→exchange).
 // Sized above wave's default working set so phase handoff and an
 // operational probe cannot exhaust the mapping space during a burst.
 const HTTP_INFLIGHT: usize = 64;
 
-/// Content type stamped on every reply this component produces.
+/// Content type stamped on every answer this component produces.
 const CT_TEXT: &[u8] = b"text/plain";
 
-/// Largest reply body one record carries: the record bound less its
-/// prefix, the response head's fixed part and the content type. Every
-/// path here answers inside it — `/metrics` is the largest and
-/// `telemetry::SAFE_EXPORT_MAX` caps it well below this.
-const RESP_BODY_MAX: usize = APP_RECORD_MAX - APP_HDR - APP_RESP_HEAD_FIXED - CT_TEXT.len();
+/// Largest answer body one record carries: the record bound less the
+/// response HEAD in front of the body.
+const RESP_BODY_MAX: usize = RECORD_MAX - response_body_at(CT_TEXT.len());
 
-/// Bounds on an externally-parsed request. The body bound matches the
-/// 1 KiB admin envelope, and sits inside one BODY record, so a body
-/// that spans records is over the bound by definition.
-const MAX_EXT_PATH: usize = 64;
-const MAX_EXT_BODY: usize = 1024;
+// The whole `/metrics` cache answers in one record.
+const _: () = assert!(METRICS_CACHE <= RESP_BODY_MAX);
 
-/// Exchanges whose request body this surface is waiting for. A body
-/// arrives only after a credit grant, so a slot is held from the HEAD
-/// that announced one until its BODY record lands, its exchange
-/// aborts, or it ages out. Bodies themselves are never stored: one
-/// record carries any body this surface accepts, so the record is
-/// dispatched where it is read.
-const REQ_PENDING: usize = 4;
+/// Exchanges collected at once.
+pub const REQ_SLOTS: usize = 4;
+/// Largest request target (path and query) this surface takes. Every
+/// route is far shorter; the bound is room for a client's query.
+pub const MAX_EXT_TARGET: usize = 256;
+/// Largest forwarded header block this surface takes. Collected and
+/// read past, so it bounds what a client may send rather than what
+/// any route reads.
+pub const MAX_EXT_HEADERS: usize = 2048;
+/// Largest request body: the 1 KiB admin envelope bound, which is also
+/// the `/propose` body bound.
+pub const MAX_EXT_BODY: usize = 1024;
 
-/// How long a pending request body may stay unfinished. The server
-/// aborts a stalled exchange on its own deadline; this frees the slot
-/// if that abort never arrives.
-const REQ_BODY_TIMEOUT_MS: u64 = 10_000;
+/// The request collector this surface answers from.
+type Requests = Collector<REQ_SLOTS, MAX_EXT_TARGET, MAX_EXT_HEADERS, MAX_EXT_BODY>;
+
+/// How long a request body announced with MORE may stay unfinished.
+/// The server aborts a stalled exchange on its own deadline; this
+/// frees the slot, and answers, if that abort never arrives.
+pub const REQ_BODY_TIMEOUT_MS: u64 = 10_000;
 
 /// Correlation-id prefix on a `/propose` frame handed to the gateway.
 const CORR_ID_LEN: usize = 8;
@@ -117,14 +137,14 @@ const HTTP_PROPOSAL_TIMEOUT_MS: u64 = 10_000;
 const METRICS_INTERVAL_MS: u64 = 250;
 
 /// Terminal route for one HTTP request, resolved by [`on_request`].
-/// Every reply egresses on `response` inside the producing call;
+/// Every answer egresses on `response_out` inside the producing call;
 /// only the admin admission round trip leaves the component.
 pub enum ReqOut {
-    /// Fully handled (proposal emitted, reply sent, dropped).
+    /// Fully handled (proposal emitted, answer sent).
     Done,
     /// A `POST /admin/<op>` envelope staged in the admin buffer
     /// ([`admin_env`]); the dispatch table routes it through
-    /// rbac → admin and completes the reply via [`finish_admin`].
+    /// rbac → admin and completes the answer via [`finish_admin`].
     Admin { op_code: u8, len: u16 },
 }
 
@@ -141,20 +161,15 @@ pub fn admin_env(h: &Http, len: u16) -> &[u8] {
     &h.admin_env[..len as usize]
 }
 
-/// The exchange a deferred reply is owed to, as the contract names it.
-/// Zeroed is unused: an exchange's origin is never zero.
-const NO_EXCHANGE: AppId = AppId {
-    origin: 0,
-    conn: 0,
-    stream: 0,
-};
-
+/// The exchange a deferred answer is owed to. [`ExchangeId::NONE`] is
+/// both an unused slot and one whose requester aborted: the all-zero id
+/// names no exchange.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct CorrSlot {
     correlation_id: u64,
     started_ms: u64,
-    id: AppId,
+    id: ExchangeId,
 }
 
 impl CorrSlot {
@@ -162,7 +177,7 @@ impl CorrSlot {
         Self {
             correlation_id: 0,
             started_ms: 0,
-            id: NO_EXCHANGE,
+            id: ExchangeId::NONE,
         }
     }
 }
@@ -172,7 +187,7 @@ impl CorrSlot {
 struct IndexSlot {
     index: u64,
     started_ms: u64,
-    id: AppId,
+    id: ExchangeId,
 }
 
 impl IndexSlot {
@@ -180,31 +195,26 @@ impl IndexSlot {
         Self {
             index: 0,
             started_ms: 0,
-            id: NO_EXCHANGE,
+            id: ExchangeId::NONE,
         }
     }
 }
 
-/// One exchange whose request body has been consented to and not yet
-/// arrived. Holds what the HEAD said, never the body.
+/// An exchange whose request body was granted and has not finished
+/// arriving: when the grant went out, so a body that never comes is
+/// answered rather than held.
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct PendingReq {
-    id: AppId,
+struct AwaitBody {
+    id: ExchangeId,
     started_ms: u64,
-    method: u8,
-    path_len: u16,
-    path: [u8; MAX_EXT_PATH],
 }
 
-impl PendingReq {
+impl AwaitBody {
     const fn empty() -> Self {
         Self {
-            id: NO_EXCHANGE,
+            id: ExchangeId::NONE,
             started_ms: 0,
-            method: 0,
-            path_len: 0,
-            path: [0; MAX_EXT_PATH],
         }
     }
 }
@@ -214,9 +224,9 @@ pub struct Http {
     pub in_proposal_assigned: i32, // in: correlation_id → WAL index from Raft
     pub in_applied: i32,           // in: per-index apply acknowledgements
     pub in_proposal_rejected: i32, // in: throttle rejection by correlation id
-    pub in_request: i32,           // in: wave HttpRequest envelopes
+    pub in_request: i32,           // in: exchange request records (`request_in`)
     pub out_proposal: i32,         // out: tagged proposal → gateway.proposals
-    pub out_response: i32,         // out: wave HttpResponse envelopes
+    pub out_response: i32,         // out: exchange response records (`response_out`)
 
     next_correlation_id: u64,
     correlations: [CorrSlot; HTTP_INFLIGHT],
@@ -232,14 +242,21 @@ pub struct Http {
     metrics_buf: [u8; METRICS_CACHE],
     metrics_len: u16,
 
-    /// Exchanges awaiting a request body this component consented to.
-    pending: [PendingReq; REQ_PENDING],
+    /// Requests being collected, and the ones among them whose body is
+    /// still arriving.
+    requests: Requests,
+    awaiting: [AwaitBody; REQ_SLOTS],
 
     /// Staging for one inbound record and one outbound record.
     /// State-resident: both exceed what the module's step path should
-    /// put on the stack.
-    req_frame: [u8; APP_RECORD_MAX],
-    resp_frame: [u8; APP_RECORD_MAX],
+    /// put on the stack. `resp_frame` holds whatever `outbox` owes.
+    req_frame: [u8; RECORD_MAX],
+    resp_frame: [u8; RECORD_MAX],
+    outbox: ExchangeOutbox,
+
+    /// Sequence stamped as the breadcrumb on HTTP-origin admin
+    /// envelopes (`[conn_id:u16 LE]`); the exchange id is opaque.
+    admin_seq: u16,
 
     requests_handled: u32,
     requests_404: u32,
@@ -252,10 +269,10 @@ pub struct Http {
     proposal_rejections: u32,
     queue_unavailable: u32,
     committed: u32,
-    /// Replies the `response` port refused. Every pull is gated on
-    /// [`response_writable`], so this should stay at zero; a rising
-    /// count means the response edge is undersized. The client sees
-    /// wave's 504.
+    /// Answers that could not be composed or found the outbox already
+    /// owing a record. Every pull is gated on [`ready_to_answer`] and
+    /// every body is bounded inside one record, so this stays at zero;
+    /// a rising count is a bug in this component.
     responses_dropped: u32,
     last_metrics_ms: u64,
     /// Count of `POST /admin/<op>` requests refused before admission —
@@ -264,13 +281,13 @@ pub struct Http {
     /// telemetry component so sustained refusal is operationally
     /// visible.
     admin_dropped: u32,
-    /// Request bodies refused: over the bound, spanning records, or
-    /// arriving with no slot to assemble them in.
+    /// Requests refused by the collector (busy, too large) or timed
+    /// out awaiting their body.
     bodies_refused: u32,
     /// Records naming an exchange this component is not holding.
     records_unmatched: u32,
-    /// Set when a step advanced a request, reply or stream slice;
-    /// consumed by the dispatch table's burst classification.
+    /// Set when a step advanced a request or answer; consumed by the
+    /// dispatch table's burst classification.
     worked: u8,
     /// Scratch for draining the proposal-feedback channels (small
     /// fixed-size frames).
@@ -293,7 +310,10 @@ pub unsafe fn init(h: &mut Http) {
     h.readyz_len = 0;
     h.why_len = 0;
     h.metrics_len = 0;
-    h.pending = [PendingReq::empty(); REQ_PENDING];
+    h.requests = Requests::new();
+    h.awaiting = [AwaitBody::empty(); REQ_SLOTS];
+    h.outbox = ExchangeOutbox::new();
+    h.admin_seq = 0;
     h.bodies_refused = 0;
     h.records_unmatched = 0;
     h.requests_handled = 0;
@@ -314,34 +334,46 @@ pub unsafe fn init(h: &mut Http) {
     h.admin_env = [0u8; 1024];
 }
 
-/// Whether the `response` port can take an envelope right now. The
-/// dispatch table gates every feedback pull on this, preserving the
-/// rule that feedback is never consumed without somewhere to answer.
-pub unsafe fn response_writable(h: &Http, sys: &SyscallTable) -> bool {
+/// Whether this component may take on work that answers: the
+/// `response_out` port is wired and nothing is owed on it. Places a
+/// held record first. The dispatch table gates every request and
+/// feedback pull on this, so nothing is consumed while an earlier
+/// record still waits for room.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Http` and a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn ready_to_answer(h: &mut Http, sys: &SyscallTable) -> bool {
     if h.out_response < 0 {
         return false;
     }
-    wire_channels::writable(sys, h.out_response)
+    h.outbox.flush(sys, h.out_response, &h.resp_frame)
 }
 
 /// Consume the burst flag: whether this component advanced a
-/// request, reply or stream slice since the last call.
+/// request or answer since the last call.
 pub fn take_worked(h: &mut Http) -> bool {
     let w = h.worked != 0;
     h.worked = 0;
     w
 }
 
+/// Place the `len`-byte record composed in `resp_frame`, or hold it.
+unsafe fn place(h: &mut Http, sys: &SyscallTable, len: usize) {
+    h.outbox.send(sys, h.out_response, &h.resp_frame, len);
+    h.worked = 1;
+}
+
 /// Answer `id` with ONE response record: a HEAD carrying the whole
-/// body, no continuation. All-or-nothing (the port runs in mailbox
-/// mode); a refused write counts as a dropped reply, which the client
-/// surfaces as the server's 504.
-///
-/// The head is laid down by the contract's own writer and the body
-/// copied in behind it, so the layout has one author. The body rides
-/// as a raw pointer because its source is usually another field of
-/// `h` (`metrics_buf`, `readyz_buf`) and the record is composed in
+/// body, no MORE. The body is copied into place behind the head the
+/// contract's writer seals, so the layout has one author. It rides as
+/// a raw pointer because its source is usually another field of `h`
+/// (`metrics_buf`, `readyz_buf`) and the record is composed in
 /// `h.resp_frame`.
+///
+/// An exchange whose requester aborted ([`ExchangeId::NONE`]) is owed
+/// nothing and gets nothing.
 ///
 /// # Safety
 ///
@@ -350,98 +382,82 @@ pub fn take_worked(h: &mut Http) -> bool {
 unsafe fn emit_response(
     h: &mut Http,
     sys: &SyscallTable,
-    id: AppId,
+    id: ExchangeId,
     status: u16,
     body_ptr: *const u8,
     body_len: usize,
 ) -> bool {
-    if h.out_response < 0 {
+    if h.out_response < 0 || id == ExchangeId::NONE {
         return false;
     }
-    let head = AppResponseHead {
-        id,
-        flags: 0,
-        status,
-        content_type: CT_TEXT,
-        headers: &[],
-        body: &[],
-    };
-    let Some(at) = app_write_response_head(&head, &mut h.resp_frame) else {
-        h.responses_dropped = h.responses_dropped.saturating_add(1);
-        return false;
-    };
-    // The body is the head record's tail, so it appends behind what the
-    // writer laid down. Checked here because the writer sized itself
-    // for the empty body it was handed.
-    let total = at.saturating_add(body_len);
-    if total > h.resp_frame.len() || total > APP_RECORD_MAX {
+    // Refused rather than cut short: a body past one record would be a
+    // truncated answer. Every caller is bounded below `RESP_BODY_MAX`.
+    if body_len > RESP_BODY_MAX || h.outbox.holding() {
         h.responses_dropped = h.responses_dropped.saturating_add(1);
         return false;
     }
+    let at = response_body_at(CT_TEXT.len());
     if body_len > 0 {
         core::ptr::copy_nonoverlapping(body_ptr, h.resp_frame.as_mut_ptr().add(at), body_len);
     }
-    let wrote = (sys.channel_write)(h.out_response, h.resp_frame.as_ptr(), total);
-    if wrote <= 0 {
+    let Some(len) = seal_response(&id, status, CT_TEXT, body_len, &mut h.resp_frame) else {
         h.responses_dropped = h.responses_dropped.saturating_add(1);
         return false;
-    }
-    h.worked = 1;
+    };
+    place(h, sys, len);
     true
 }
 
 /// Answer one request from a borrowed body.
-unsafe fn finish(h: &mut Http, sys: &SyscallTable, id: AppId, status: u16, body: &[u8]) {
-    let n = body.len().min(RESP_BODY_MAX);
-    emit_response(h, sys, id, status, body.as_ptr(), n);
+unsafe fn finish(h: &mut Http, sys: &SyscallTable, id: ExchangeId, status: u16, body: &[u8]) {
+    emit_response(h, sys, id, status, body.as_ptr(), body.len());
 }
 
-/// One complete request pulled off the `request` port, handed to the
+/// One complete request pulled off `request_in`, handed to the
 /// dispatch table for [`on_request`] routing.
 #[repr(C)]
 pub struct ExtReq {
-    pub id: AppId,
+    pub id: ExchangeId,
     pub method: u8,
     pub path_len: u16,
     pub body_len: u16,
-    pub path: [u8; MAX_EXT_PATH],
+    pub path: [u8; MAX_EXT_TARGET],
     pub body: [u8; MAX_EXT_BODY],
 }
 
 impl ExtReq {
     pub const fn new() -> Self {
         Self {
-            id: NO_EXCHANGE,
+            id: ExchangeId::NONE,
             method: 0,
             path_len: 0,
             body_len: 0,
-            path: [0; MAX_EXT_PATH],
+            path: [0; MAX_EXT_TARGET],
             body: [0; MAX_EXT_BODY],
         }
     }
 }
 
-/// One pull off the `request` port.
+/// One pull off `request_in`.
 pub enum ExtPulled {
     Empty,
     Skipped,
     Request,
 }
 
-/// Read ONE record off the `request` port and, when it completes a
-/// request, hand it over in `req`.
+/// Read ONE record off `request_in` and, when it completes a request,
+/// hand it over in `req`.
 ///
-/// A HEAD with no body is a request outright. A HEAD that announces
-/// one takes a pending slot and is answered with a credit grant — the
-/// grant is this surface's consent to receive the body — and the BODY
-/// record that follows completes the request. Everything a request
-/// here means is its verb, path and body, so the forwarded header
-/// block and the peer fingerprint are read past.
+/// The record goes to the collector, which answers for the contract's
+/// mechanics: a HEAD without MORE is a request outright; a HEAD with
+/// MORE is granted the rest of the body bound, which is also this
+/// surface's consent to it, and the BODY record without MORE completes
+/// the request. A request past a bound or past the slots is answered
+/// with the collector's status, never dropped.
 ///
 /// `Skipped` marks a record consumed without completing a request, so
-/// the caller's loop bound counts it either way. A bound this surface
-/// sets — a path or body past its caps — is answered rather than
-/// dropped silently.
+/// the caller's loop bound counts it either way. The caller gates this
+/// on [`ready_to_answer`]: a pull writes at most one record.
 ///
 /// # Safety
 ///
@@ -458,174 +474,118 @@ pub unsafe fn next_external_request(
     if !wire_channels::readable(sys, h.in_request) {
         return ExtPulled::Empty;
     }
-    let n = (sys.channel_read)(h.in_request, h.req_frame.as_mut_ptr(), APP_RECORD_MAX);
+    let n = (sys.channel_read)(h.in_request, h.req_frame.as_mut_ptr(), RECORD_MAX);
     if n <= 0 {
         return ExtPulled::Skipped;
     }
+    let n = n as usize;
 
-    // Decode under an immutable borrow, copying out everything needed
-    // before anything mutates `h`. `req` is the caller's, disjoint
-    // from the frame the record was read into.
-    enum Pull {
-        /// A request is complete in `req`.
-        Ready,
-        /// A HEAD announcing a body: hold it and grant credit.
-        WantBody {
-            id: AppId,
-            method: u8,
-            path_len: usize,
-        },
-        /// Over a bound this surface sets.
-        TooLarge(AppId),
-        PathTooLong(AppId),
-        /// A body for an exchange no slot is holding.
-        Stray,
-        /// Ends an exchange: free whatever is held for it.
-        Ended(AppId),
-        /// Consumed, nothing owed.
-        Ignore,
+    // A requester ABORT ends the exchange wherever it is held: the
+    // collector frees a request it is collecting, and a deferred
+    // answer is never written.
+    if let Some(Record::Abort { id, .. }) = parse_request(&h.req_frame[..n]) {
+        forget_exchange(h, id);
     }
 
-    let pull = {
-        let Some(rec) = app_parse_request(&h.req_frame[..n as usize]) else {
-            return ExtPulled::Skipped; // malformed: one read is one record
-        };
-        match rec {
-            AppRecord::Head(head) => {
-                if head.target.len() > MAX_EXT_PATH {
-                    Pull::PathTooLong(head.id)
-                } else if head.flags & app_flag::MORE != 0 {
-                    req.path[..head.target.len()].copy_from_slice(head.target);
-                    Pull::WantBody {
-                        id: head.id,
-                        method: head.method,
-                        path_len: head.target.len(),
-                    }
-                } else {
-                    req.id = head.id;
-                    req.method = head.method;
-                    req.path_len = head.target.len() as u16;
-                    req.body_len = 0;
-                    req.path[..head.target.len()].copy_from_slice(head.target);
-                    Pull::Ready
-                }
-            }
-            AppRecord::Body { id, flags, data } => {
-                match h.pending.iter().position(|p| p.id == id) {
-                    None => Pull::Stray,
-                    Some(slot) => {
-                        // One record carries any body this surface
-                        // accepts, so a continuation is over the bound.
-                        if data.len() > MAX_EXT_BODY || flags & app_flag::MORE != 0 {
-                            Pull::TooLarge(id)
-                        } else {
-                            let held = h.pending[slot];
-                            req.id = id;
-                            req.method = held.method;
-                            req.path_len = held.path_len;
-                            req.body_len = data.len() as u16;
-                            req.path = held.path;
-                            req.body[..data.len()].copy_from_slice(data);
-                            Pull::Ready
-                        }
-                    }
-                }
-            }
-            AppRecord::Abort { id, .. } => Pull::Ended(id),
-            // The server granting response credit, which nothing here
-            // spends: every reply is one record with its body inline.
-            AppRecord::Credit { .. } | AppRecord::Datagram { .. } => Pull::Ignore,
-        }
-    };
-
-    match pull {
-        Pull::Ready => {
-            release_pending(h, req.id);
-            ExtPulled::Request
-        }
-        Pull::WantBody {
-            id,
-            method,
-            path_len,
-        } => {
-            let Some(slot) = h.pending.iter().position(|p| p.id == NO_EXCHANGE) else {
-                // Nowhere to assemble it: refused, not held unanswered.
-                h.bodies_refused = h.bodies_refused.saturating_add(1);
-                finish(h, sys, id, 503, b"request bodies busy");
+    let taken = h.requests.accept(&h.req_frame[..n]);
+    let grant = h.requests.take_grant();
+    let refusal = h.requests.take_refusal();
+    match taken {
+        Ok(Some(at)) => {
+            let Some(r) = h.requests.request(at) else {
+                h.requests.release(at);
                 return ExtPulled::Skipped;
             };
-            h.pending[slot] = PendingReq {
-                id,
-                started_ms: dev_millis(sys),
-                method,
-                path_len: path_len as u16,
-                path: {
-                    let mut p = [0u8; MAX_EXT_PATH];
-                    p[..path_len].copy_from_slice(&req.path[..path_len]);
-                    p
-                },
-            };
-            if !grant_request_body(h, sys, id) {
-                h.pending[slot] = PendingReq::empty();
-                h.bodies_refused = h.bodies_refused.saturating_add(1);
-                finish(h, sys, id, 503, b"request body credit unavailable");
+            // The collector's bounds are this struct's, so both fit.
+            req.id = r.id;
+            req.method = r.method;
+            req.path_len = r.target.len() as u16;
+            req.body_len = r.body.len() as u16;
+            req.path[..r.target.len()].copy_from_slice(r.target);
+            req.body[..r.body.len()].copy_from_slice(r.body);
+            h.requests.release(at);
+            clear_await(h, req.id);
+            ExtPulled::Request
+        }
+        Ok(None) => {
+            if let Some((id, bytes)) = grant {
+                await_body(h, id, dev_millis(sys));
+                if let Some(len) = write_credit(&id, bytes, &mut h.resp_frame) {
+                    place(h, sys, len);
+                }
             }
             ExtPulled::Skipped
         }
-        Pull::TooLarge(id) => {
-            release_pending(h, id);
-            h.bodies_refused = h.bodies_refused.saturating_add(1);
-            finish(h, sys, id, 413, b"body too large");
+        Err(_) => {
+            match refusal {
+                Some((id, why)) => {
+                    clear_await(h, id);
+                    h.bodies_refused = h.bodies_refused.saturating_add(1);
+                    let body: &[u8] = match why {
+                        Refuse::Busy => b"request slots busy",
+                        Refuse::TooLarge => b"request too large",
+                        Refuse::Unexpected => b"bad request",
+                    };
+                    finish(h, sys, id, why.status(), body);
+                }
+                // A record naming no exchange this surface holds — a
+                // stray body, one past its exchange's end — or one that
+                // does not parse: there is nobody to answer.
+                None => {
+                    h.records_unmatched = h.records_unmatched.saturating_add(1);
+                }
+            }
             ExtPulled::Skipped
         }
-        Pull::PathTooLong(id) => {
-            h.requests_404 = h.requests_404.saturating_add(1);
-            finish(h, sys, id, 404, b"not found");
-            ExtPulled::Skipped
-        }
-        Pull::Stray => {
-            h.records_unmatched = h.records_unmatched.saturating_add(1);
-            ExtPulled::Skipped
-        }
-        Pull::Ended(id) => {
-            release_pending(h, id);
-            ExtPulled::Skipped
-        }
-        Pull::Ignore => ExtPulled::Skipped,
     }
 }
 
-/// Free the slot holding `id`, if any.
-fn release_pending(h: &mut Http, id: AppId) {
-    if let Some(slot) = h
-        .pending
+/// Note that `id`'s body is being awaited from `now`.
+fn await_body(h: &mut Http, id: ExchangeId, now: u64) {
+    let at = h
+        .awaiting
         .iter()
-        .position(|p| p.id == id && p.id != NO_EXCHANGE)
-    {
-        h.pending[slot] = PendingReq::empty();
+        .position(|a| a.id == id)
+        .or_else(|| h.awaiting.iter().position(|a| a.id == ExchangeId::NONE));
+    if let Some(i) = at {
+        h.awaiting[i] = AwaitBody {
+            id,
+            started_ms: now,
+        };
     }
 }
 
-/// Grant `id` enough credit for the largest body this surface takes.
-/// The grant is also the consent a `100 Continue` is answered on.
-///
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Http` and a valid
-/// `&SyscallTable` per the module ABI.
-unsafe fn grant_request_body(h: &mut Http, sys: &SyscallTable, id: AppId) -> bool {
-    if h.out_response < 0 || !wire_channels::writable(sys, h.out_response) {
-        return false;
+/// Stop awaiting `id`'s body, if it was.
+fn clear_await(h: &mut Http, id: ExchangeId) {
+    if id == ExchangeId::NONE {
+        return;
     }
-    let Some(total) = app_write_credit(&id, MAX_EXT_BODY as u32, &mut h.resp_frame) else {
-        return false;
-    };
-    let wrote = (sys.channel_write)(h.out_response, h.resp_frame.as_ptr(), total);
-    if wrote <= 0 {
-        return false;
+    for a in h.awaiting.iter_mut() {
+        if a.id == id {
+            *a = AwaitBody::empty();
+        }
     }
-    h.worked = 1;
-    true
+}
+
+/// The requester aborted `id`: nothing further is written for it. A
+/// deferred `/propose` keeps its slot until its feedback or deadline
+/// comes — the proposal itself is already in flight — but the answer
+/// has nowhere to go.
+fn forget_exchange(h: &mut Http, id: ExchangeId) {
+    if id == ExchangeId::NONE {
+        return;
+    }
+    clear_await(h, id);
+    for c in h.correlations.iter_mut() {
+        if c.id == id {
+            c.id = ExchangeId::NONE;
+        }
+    }
+    for i in h.indices.iter_mut() {
+        if i.id == id {
+            i.id = ExchangeId::NONE;
+        }
+    }
 }
 
 /// Refresh the diagnostic caches from the telemetry component's
@@ -651,11 +611,10 @@ pub fn cache_export(h: &mut Http, ready: bool, timing_pause: u8, export: &[u8]) 
     h.metrics_len = len as u16;
 }
 
-/// Own-state drains: ≤16 proposal assignments, then the in-flight
-/// `/metrics` stream. The response-producing feedback loops (≤8
+/// Own-state drains: ≤16 proposal assignments. The answer-producing feedback loops (≤8
 /// rejections, ≤16 applies, one expiry) are driven by the dispatch
 /// table through [`next_rejection`] / [`next_applied`] /
-/// [`expire_step`], each pull gated there on [`response_writable`] —
+/// [`expire_step`], each pull gated there on [`ready_to_answer`] —
 /// feedback is never consumed without somewhere to answer. The
 /// 250 ms self-metrics tick rides [`take_metrics`].
 ///
@@ -714,7 +673,7 @@ unsafe fn drain_proposal_assignments(h: &mut Http, sys: &SyscallTable) {
 
 /// Pull ONE throttle rejection off the `proposal_rejected` port. The
 /// dispatch table drives the ≤8/step loop and gates each pull on
-/// [`response_writable`] — do not consume a rejection unless the
+/// [`ready_to_answer`] — do not consume a rejection unless the
 /// response has somewhere to go.
 ///
 /// # Safety
@@ -753,7 +712,7 @@ pub unsafe fn next_rejection(h: &mut Http, sys: &SyscallTable) -> Feedback {
 
 /// Pull ONE apply acknowledgement off the `applied` port. The
 /// dispatch table drives the ≤16/step loop, gating each pull on
-/// [`response_writable`].
+/// [`ready_to_answer`].
 ///
 /// # Safety
 ///
@@ -795,8 +754,8 @@ pub unsafe fn next_applied(h: &mut Http, sys: &SyscallTable) -> Feedback {
 }
 
 /// One expiry check per step (a corr timeout, an index timeout, else a
-/// pending request body).
-/// The dispatch table gates the call on [`response_writable`].
+/// request body still arriving).
+/// The dispatch table gates the call on [`ready_to_answer`].
 ///
 /// # Safety
 ///
@@ -821,19 +780,27 @@ pub unsafe fn expire_step(h: &mut Http, sys: &SyscallTable, now: u64) {
         finish(h, sys, id, 503, b"commit timeout");
         return;
     }
-    if let Some(pos) = h
-        .pending
-        .iter()
-        .position(|p| p.id != NO_EXCHANGE && now.wrapping_sub(p.started_ms) >= REQ_BODY_TIMEOUT_MS)
-    {
-        let id = h.pending[pos].id;
-        h.pending[pos] = PendingReq::empty();
+    if let Some(pos) = h.awaiting.iter().position(|a| {
+        a.id != ExchangeId::NONE && now.wrapping_sub(a.started_ms) >= REQ_BODY_TIMEOUT_MS
+    }) {
+        let id = h.awaiting[pos].id;
+        h.awaiting[pos] = AwaitBody::empty();
+        // The collector frees an exchange on its ABORT; this one is
+        // owed to the collector by this surface's own deadline.
+        if let Some(len) = write_abort(&id, abort::STALLED, &mut h.req_frame) {
+            let _ = h.requests.accept(&h.req_frame[..len]);
+        }
         h.bodies_refused = h.bodies_refused.saturating_add(1);
         finish(h, sys, id, 408, b"request body timeout");
     }
 }
 
-unsafe fn emit_http_proposal(h: &mut Http, sys: &SyscallTable, id: AppId, body: &[u8]) -> bool {
+unsafe fn emit_http_proposal(
+    h: &mut Http,
+    sys: &SyscallTable,
+    id: ExchangeId,
+    body: &[u8],
+) -> bool {
     if h.out_proposal < 0 || body.len() > MAX_EXT_BODY {
         return false;
     }
@@ -881,8 +848,8 @@ unsafe fn emit_http_proposal(h: &mut Http, sys: &SyscallTable, id: AppId, body: 
     true
 }
 
-/// Handle one request pulled off the `request` port. Every reply
-/// egresses on `response` inside this call except the admin round
+/// Handle one request pulled off `request_in`. Every answer egresses
+/// on `response_out` inside this call except the admin round
 /// trip: admin commands come back as [`ReqOut::Admin`] for the
 /// rbac → admin route, completed by [`finish_admin`].
 ///
@@ -893,7 +860,7 @@ unsafe fn emit_http_proposal(h: &mut Http, sys: &SyscallTable, id: AppId, body: 
 pub unsafe fn on_request(
     h: &mut Http,
     sys: &SyscallTable,
-    id: AppId,
+    id: ExchangeId,
     method: u8,
     path: &[u8],
     body: &[u8],
@@ -927,11 +894,13 @@ pub unsafe fn on_request(
                     ReqOut::Done
                 } else {
                     // The admin envelope keeps its wire form
-                    // (`[conn_id:u16 LE][op_code][body]`); the conn
-                    // id is a log breadcrumb there, never a reply
-                    // route — an HTTP reply correlates on the whole
-                    // exchange id held here.
-                    h.admin_env[..2].copy_from_slice(&(id.conn as u16).to_le_bytes());
+                    // (`[conn_id:u16 LE][op_code][body]`); for an
+                    // HTTP-origin command the conn id is this
+                    // surface's admin sequence, a log breadcrumb and
+                    // never a reply route — the answer correlates on
+                    // the exchange id held by the caller.
+                    h.admin_seq = h.admin_seq.wrapping_add(1);
+                    h.admin_env[..2].copy_from_slice(&h.admin_seq.to_le_bytes());
                     h.admin_env[2] = op_code;
                     h.admin_env[3..3 + body.len()].copy_from_slice(body);
                     ReqOut::Admin {
@@ -964,9 +933,9 @@ pub unsafe fn on_request(
         finish(h, sys, id, 200, &body[..n]);
     } else if path == b"/metrics" {
         // The whole export, in one record: `METRICS_CACHE` is sized
-        // off the telemetry export cap, which sits inside
+        // off the telemetry export cap and asserted inside
         // `RESP_BODY_MAX`, so there is no case here that does not fit.
-        let n = (h.metrics_len as usize).min(RESP_BODY_MAX);
+        let n = h.metrics_len as usize;
         let body = h.metrics_buf.as_ptr();
         emit_response(h, sys, id, 200, body, n);
     } else {
@@ -990,7 +959,7 @@ pub unsafe fn on_request(
 pub unsafe fn finish_admin(
     h: &mut Http,
     sys: &SyscallTable,
-    id: AppId,
+    id: ExchangeId,
     op_code: u8,
     authorized: bool,
 ) {
@@ -1002,7 +971,7 @@ pub unsafe fn finish_admin(
         // `CorrSlot`) admin ops have no async reply to observe
         // instead.
         let mut log = [0u8; 48];
-        let n = format_admin_route_log(&mut log, op_code, id.conn as u16);
+        let n = format_admin_route_log(&mut log, op_code, h.admin_seq);
         dev_log(sys, 3, log.as_ptr(), n);
         finish(h, sys, id, 202, b"accepted");
     } else {

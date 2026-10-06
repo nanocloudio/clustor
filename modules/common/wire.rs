@@ -1607,8 +1607,8 @@ pub const MSG_WHY: u8 = 0x72;
 /// taking on negative values all use the same slot.
 pub const MSG_METRIC_SAMPLE: u8 = 0x73;
 // 0x74, 0x75 and 0x79 are retired and reserved. HTTP framing is not
-// clustor's: the `operations` request/response ports carry wave's own
-// `HttpRequest` / `HttpResponse` envelopes, and readiness reaches the
+// clustor's: the `operations` request_in/response_out ports carry the
+// fluxor SDK exchange contract's records, and readiness reaches the
 // http component as an interior seam — seams carry no opcode and no
 // stability promise (standards fluxor-modules.md §8). Do not reuse
 // these ids until the sibling repos confirm no reader remains.

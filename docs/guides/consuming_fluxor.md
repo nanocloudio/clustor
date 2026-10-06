@@ -30,7 +30,7 @@ step in pinned mode; builds materialise on their own.
 |---|---|---|
 | `fluxor-abi` source | `target/fluxor/fluxor-abi/sdk/{abi,wire,...}.rs` | `modules/app/*/mod.rs` via `#[path]` |
 | `fluxor-contracts` source | `target/fluxor/fluxor-contracts/src/` | Materialised because the lock pins it; no clustor source mounts it today |
-| `wave-common` source | `target/fluxor/wave-common/` (protocol cores: `ws_core.rs`, `rtp_core.rs`, ...) | Materialised via the `wave` pin; no clustor source mounts it today |
+| `wave-common` source | `target/fluxor/wave-common/` (protocol cores: `ws_core.rs`, `rtp_core.rs`, ...) | Materialised via the `wave` pin; no clustor source mounts it |
 | Fluxor's published fmod palette | `target/fluxor/<silicon>/modules/<name>.fmod` (every fmod fluxor publishes — foundation, drivers, builtin, probes) | Deployment yamls wire subsets by name; unused fmods sit on disk unmounted |
 | `fluxor-linux` runtime | `target/aarch64-unknown-linux-gnu/release/fluxor-linux` | `fluxor run` execs it per node |
 | `module.ld` linker script | `target/fluxor/fluxor-abi/sdk/module.ld` | `fluxor modules build` picks it up automatically |
