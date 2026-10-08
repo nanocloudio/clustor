@@ -182,11 +182,18 @@ byte), `MSG_FALLBACK_SIGNAL` (0x32), `MSG_READ_PERMIT` (0x33).
 | 0x50–0x52 | `MSG_SNAPSHOT_CHUNK` / `_MANIFEST` / `_TRIGGER` | snapshot plumbing |
 | 0x53 | `MSG_INSTALL_SNAPSHOT` | 36-byte header `[term:u64][last_included_index:u64][last_included_term:u64][offset:u64][done:u8][membership:3]` + data |
 | 0x54 | `MSG_INSTALL_SNAPSHOT_RESP` | `[term:u64][success:u8]` |
-| 0x55 | `MSG_SNAPSHOT_INSTALLED` | `[term:u64][last_included_index:u64][last_included_term:u64][membership:3]` (27 B) |
-| 0x56 | `MSG_SNAPSHOT_INSTALL_REQUEST` | `[target_replica_id:u8]` (0xFF = broadcast) — follower fell below the WAL retention floor |
+| 0x55 | `MSG_SNAPSHOT_INSTALLED` | `[term:u64][last_included_index:u64][last_included_term:u64][membership:3][state:u8]` (28 B). `state` = 1 when the snapshot carries application state now held, 0 for a manifest alone; see below |
+| 0x56 | `MSG_SNAPSHOT_INSTALL_REQUEST` | `[target_replica_id:u8][commit_index:u64]` (9 B) — a follower fell below the WAL retention floor; the leader's commit index bounds what is shipped, since the follower adopts the installed index as committed |
 | 0x57 | `MSG_APP_SNAPSHOT_CHUNK` | 28-byte header `[term:u64][last_included_index:u64][offset:u64][done:u8][reserved:u8;3]` + opaque body |
 | 0x58 / 0x59 | `MSG_APP_SNAPSHOT_REQUEST` / `_RESET` | `[term:u64][last_included_index:u64]` |
 | 0x5A | `MSG_PEER_IDENTITY` | `[session_id:u32][verification_result:u8][credential_kind:u8][profile_id:u16][not_before:u64][not_after:u64][verification_flags:u32][key_fp_alg:u8][key_fp_len:u8][principal_len:u16][key_fingerprint][principal]` — TLS identity binding to `peer_router`; the record is fluxor's and this is a mirror of it |
+
+`state` separates two kinds of index. Application state is captured at
+an applied index, so a snapshot carrying it is committed by construction
+and raft may take its index as a base: commit is at least there, and
+apply starts above it. A manifest alone marks the log position a
+rotation reached, which may run ahead of commit, so it can only raise
+the compaction floor as far as commit already stands.
 
 `membership:3` above is a group's configuration as three bitmasks of
 replica ids, `[current:u8][joint:u8][learners:u8]`: the voters, the

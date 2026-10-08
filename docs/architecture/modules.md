@@ -93,7 +93,7 @@ explicitly until a fluxor validator/resolver consumes the name.
 | `raft` | Elections with pre-vote, proposal batching, follower log matching and §5.3 conflict repair, admin/config apply, two-slot CRC metadata persistence (`RAFT<pppp>.M<slot>`). |
 | `replicator` | AppendEntries pipelining to followers, ack processing, WAL read-back catch-up, snapshot chunk transfer. |
 | `commit` | Fuses quorum match indices with durability acks into the commit horizon, gated on durability mode (strict / group_fsync / relaxed). |
-| `apply` | Ordered, deduplicated delivery of committed entries plus the linearizable-read queue. |
+| `apply` | Ordered, deduplicated delivery of committed entries plus the linearizable-read queue. Committed entries wait in a bounded buffer. When it is full, the entry strict order is waiting for displaces the newest buffered entry that has not begun delivery; the displaced entry is still durable in the WAL and is refetched once it is the head, so a long replay behind live commits cannot wedge the head out of the buffer. |
 
 The dispatch order is `raft → replicator → commit → apply`. The
 hot edges between them — AppendEntries fan-out, log-body
@@ -176,7 +176,7 @@ carries only the ring its retention model uses: a disk build holds
 the 8192-slot entry-location map and a single body slot, a
 volatile build holds `VOLATILE_RETENTION_SLOTS` of each. `Wal` is
 the largest component either way, so it is the dominant term:
-`size_of::<Wal>()` is 285,664 B on a disk build and 558,032 B on a
+`size_of::<Wal>()` is 291,912 B on a disk build and 564,280 B on a
 volatile one, bounded at compile time by `WAL_FOOTPRINT_BUDGET`.
 The kernel allocates module state from `module_state_size()` rather
 than BSS, so nothing in the linker output would show a regression

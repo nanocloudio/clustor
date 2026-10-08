@@ -903,6 +903,15 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if snapshot::step(&mut s.slots[i].snapshot, sys) {
                 cold_fs = true;
             }
+            // 4c. A lagging follower's install whose manifest ran ahead of
+            //     the leader's commit ships at the commit index, with the
+            //     term the wal holds there: the follower adopts what it
+            //     installs as committed.
+            {
+                let slot = &mut s.slots[i];
+                let (snap, wal) = (&mut slot.snapshot, &slot.wal);
+                snapshot::resolve_install(snap, sys, |index| wal::term_at(wal, index));
+            }
             // Return seam: an accepted peer install fast-forwards the wal's
             // append contract past the subsumed prefix (next step's appends
             // at `last_idx + 1` must be contiguous, not a continuity fault).

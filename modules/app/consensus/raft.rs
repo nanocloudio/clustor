@@ -1103,6 +1103,12 @@ pub fn log_tip(s: &Raft) -> Index {
     s.last_log_index
 }
 
+/// The commit index: the highest index a quorum has acknowledged, or the
+/// base a state-carrying snapshot established.
+pub fn commit_index(s: &Raft) -> Index {
+    s.commit_index
+}
+
 /// Leadership snapshot for the replicator's E11 hint: (is_leader,
 /// current_term, commit_index). Catch-up AEs must carry the LEADER's
 /// term, not a read-back entry's term, and `commit_index` is the only
@@ -1765,15 +1771,11 @@ unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
         if msg_type != wire::MSG_SNAPSHOT_INSTALLED {
             continue;
         }
-        let (term, last_idx, last_term, membership) =
+        let (term, last_idx, last_term, membership, state) =
             match wire::decode_snapshot_installed(&s.msg_buf[..plen as usize]) {
                 Some(t) => t,
                 None => continue,
             };
-        // Stale snapshot from an old term: ignore.
-        if term < s.current_term {
-            continue;
-        }
         // At or past this snapshot point already → this is a LOCAL
         // snapshot of our own log (the leader/steady-state path: wal's
         // rotation trigger → snapshot component → installed_local), not a
@@ -1788,6 +1790,23 @@ unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
         // `compact_before` is idempotent/monotonic, so duplicate or
         // out-of-order installs are harmless here.
         if last_idx <= s.last_log_index {
+            // A snapshot that carries application state is captured at an
+            // applied index, so everything at or below `last_idx` is
+            // committed and the state machine already holds it. When that
+            // sits above `commit_index`, commit is at least there and apply
+            // starts above it. The case is a boot restore: `load_metadata`
+            // seeds `last_log_index` from the persisted durable watermark,
+            // above the snapshot the state was rebuilt from, while
+            // `commit_index` is still 0; left there, apply asks for the log
+            // below the snapshot, which the floor retired, and the replay
+            // wedges. A manifest alone must not base anything: its index
+            // is where a rotation reached, which can run ahead of commit,
+            // and only the floor clamp below applies to it.
+            if state && last_idx > s.commit_index {
+                dev_log(sys, 3, b"[raft] snap base".as_ptr(), 16);
+                advance_follower_commit(s, sys, last_idx);
+                emit_apply_reset(s, sys, last_term, last_idx);
+            }
             let floor = if last_idx < s.commit_index {
                 last_idx
             } else {
@@ -1797,6 +1816,13 @@ unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
                 dev_log(sys, 3, b"[raft] snap local".as_ptr(), 17);
                 emit_wal_compact_before(s, sys, floor);
             }
+            continue;
+        }
+        // A peer's snapshot from an old term: ignore. (An own-log
+        // snapshot took the branch above whatever its term: a boot
+        // restores one captured in an earlier term, and it is this log's
+        // own state all the same.)
+        if term < s.current_term {
             continue;
         }
         dev_log(sys, 3, b"[raft] snap install".as_ptr(), 19);

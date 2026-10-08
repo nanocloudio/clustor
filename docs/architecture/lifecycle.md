@@ -73,6 +73,16 @@ comment in the deployment graph records why it must never be
 multiplexed onto `wal.flushed`, which also fans out durability
 acknowledgements.
 
+A persisted snapshot that carries application state is the boot's
+base. Durability replays its body to the state machine first, then
+signals the snapshot to raft before the WAL tail replays. Raft takes
+the snapshot's index as committed, since state is captured at an
+applied index, and starts apply above it: the state machine already
+holds everything below, and the log below was retired by compaction,
+so apply must never ask for it. A manifest-only snapshot bases nothing
+at boot; it places the compaction floor, clamped to commit, exactly as
+it does in steady state.
+
 Raft persists its own metadata (current term, vote, durable index and
 its term) as two CRC-protected slot records in separate files:
 `RAFT<pppp>.M0` / `RAFT<pppp>.M1` on bare-metal FAT32, `raft/meta0` /
@@ -143,6 +153,13 @@ and are flushed when any of three conditions is met: the batch reaches
 entries arrive, so a quiescent writer drains its tail), or a
 truncation terminator has been staged. Segment rotation always flushes
 first so acknowledgements stay ordered relative to the close.
+
+A segment that has reached `segment_bytes` rotates once it is
+quiescent: no staged batch, no fence awaited, no fence ticket
+outstanding against it. That check runs every step, not only after an
+append, because an append that crosses the limit always has its own
+batch still in flight, and on a provider whose flushes are asynchronous
+an append-time check alone would never fire.
 
 On filesystem providers with the async durable-write tier, flushes are
 fence-pipelined: up to `fence_depth` fsync fences stay outstanding at
@@ -245,7 +262,20 @@ below the leader's WAL retention floor. That request is held open per
 follower for `SNAPSHOT_REQUEST_HOLD` steps: the follower's read-backs
 pause while it stands, a successful ack releases it, and the hold
 expiring re-raises it, so an unreachable follower costs one routed
-manifest per hold rather than one per step. Every trigger passes the
+manifest per hold rather than one per step. The request carries the
+leader's commit index, and durability ships a manifest no higher than
+it: a manifest marks the log position a rotation reached, which can run
+ahead of commit, and a follower adopts whatever index it installs as
+committed. A manifest at or below commit ships as it stands; one above
+it ships at the commit index, with the term the WAL holds for that
+entry, so the follower's log matching succeeds at the next append. The
+WAL answers that term from its entry-location ring while the index is
+in it and from its term-boundary table once it is not: the table holds
+the first index of each of the last `TERM_BOUNDARIES` terms, and a term
+changes only at an election, so a commit index any distance behind the
+append edge resolves. An index older than every boundary ships nothing
+and counts as `installs_unresolved` until commit moves. A snapshot
+carrying application state is at an applied index and needs no clamp. Every trigger passes the
 retention-floor gate: a snapshot at index *n* implies compaction below
 *n*, so any registered consumer floor still below *n* defers the
 trigger.
@@ -265,8 +295,9 @@ authorisation port (`durability.manifest_auth`) broadcasts the durable
 manifest to peers.
 
 **Install transfer.** Leaders stream `MSG_INSTALL_SNAPSHOT` chunks —
-a 33-byte header `[term][last_included_index][last_included_term]
-[offset][done]` followed by up to 4 KiB of data — which the follower
+a 36-byte header `[term][last_included_index][last_included_term]
+[offset][done][membership]` followed by up to 4 KiB of data, at the
+committed point described under triggers — which the follower
 accumulates strictly in order; a gap or oversize aborts the attempt
 and waits for the leader to restart it. On `done`, the follower
 durably persists the snapshot before signalling

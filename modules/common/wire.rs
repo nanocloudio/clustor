@@ -1235,10 +1235,37 @@ pub const MSG_SNAPSHOT_INSTALLED: u8 = 0x55;
 /// `replicator` → `durability` on-demand catch-up trigger. The replicator
 /// emits this when a follower's `next_index` falls below the leader's WAL
 /// retention floor (a NOT_FOUND `MSG_WAL_ENTRY_REPLY` is the canonical
-/// signal). `durability` responds by emitting `MSG_INSTALL_SNAPSHOT` chunks
-/// at the most recent snapshot point. Payload (1 byte):
-/// `[target_replica_id:u8]` (0xFF = broadcast).
+/// signal). Payload: `[target_replica_id:u8][commit_index:u64]` — the
+/// replica to install, and the leader's commit index. `durability`
+/// answers with `MSG_INSTALL_SNAPSHOT` at its snapshot, or, for a
+/// manifest whose index runs ahead of commit, at the commit index: a
+/// follower adopts the installed index as committed, so what is shipped
+/// must be committed. A snapshot carrying state is at an applied index
+/// and needs no clamp; a manifest's index is where a rotation reached.
 pub const MSG_SNAPSHOT_INSTALL_REQUEST: u8 = 0x56;
+pub const SNAPSHOT_INSTALL_REQUEST_LEN: usize = 9;
+
+#[inline]
+pub fn encode_snapshot_install_request(
+    buf: &mut [u8; SNAPSHOT_INSTALL_REQUEST_LEN],
+    target: u8,
+    commit_index: u64,
+) {
+    buf[0] = target;
+    buf[1..9].copy_from_slice(&commit_index.to_le_bytes());
+}
+
+/// `(target, commit_index)`, or `None` on a short frame.
+#[inline]
+pub fn decode_snapshot_install_request(buf: &[u8]) -> Option<(u8, u64)> {
+    if buf.len() < SNAPSHOT_INSTALL_REQUEST_LEN {
+        return None;
+    }
+    let commit = u64::from_le_bytes([
+        buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
+    ]);
+    Some((buf[0], commit))
+}
 
 /// TLS peer identity from the foundation `tls` module to
 /// `peer_router` and `operations`' RBAC. Fired once per accepted or
@@ -1554,10 +1581,17 @@ pub fn decode_install_snapshot(buf: &[u8]) -> Option<InstallSnapshotHdr> {
 }
 
 /// `MSG_SNAPSHOT_INSTALLED` payload: `[term:u64][last_included_index:u64]
-/// [last_included_term:u64][membership:3]` — the configuration as of the
-/// snapshot's index, which a replica installing it past config entries
-/// it never applied adopts.
-pub const SNAPSHOT_INSTALLED_LEN: usize = 24 + MEMBERSHIP_LEN;
+/// [last_included_term:u64][membership:3][state:u8]`. The membership is
+/// the configuration as of the snapshot's index, which a replica
+/// installing it past config entries it never applied adopts. `state`
+/// says whether the snapshot carries application state that is now
+/// held (1) or is a manifest alone (0). The two name different kinds
+/// of index: state is captured at an applied index, so one that carries
+/// it is committed by construction and raft may base commit and apply
+/// on it; a manifest marks the log position a rotation reached, which
+/// may run ahead of commit, so it can only raise the compaction floor
+/// as far as commit already stands.
+pub const SNAPSHOT_INSTALLED_LEN: usize = 24 + MEMBERSHIP_LEN + 1;
 
 #[inline]
 pub fn encode_snapshot_installed(
@@ -1566,22 +1600,27 @@ pub fn encode_snapshot_installed(
     last_included_index: u64,
     last_included_term: u64,
     membership: Membership,
+    state: bool,
 ) {
     Writer::new(buf)
         .u64(term)
         .u64(last_included_index)
         .u64(last_included_term)
-        .bytes(&membership.encode());
+        .bytes(&membership.encode())
+        .u8(u8::from(state));
 }
 
+/// `(term, last_included_index, last_included_term, membership, state)`,
+/// or `None` on a short frame.
 #[inline]
-pub fn decode_snapshot_installed(buf: &[u8]) -> Option<(u64, u64, u64, Membership)> {
+pub fn decode_snapshot_installed(buf: &[u8]) -> Option<(u64, u64, u64, Membership, bool)> {
     let mut r = Reader::new(buf, SNAPSHOT_INSTALLED_LEN)?;
     let term = r.u64();
     let last_idx = r.u64();
     let last_term = r.u64();
-    let membership = Membership::decode(&buf[24..SNAPSHOT_INSTALLED_LEN])?;
-    Some((term, last_idx, last_term, membership))
+    let membership = Membership::decode(&buf[24..24 + MEMBERSHIP_LEN])?;
+    let state = buf[24 + MEMBERSHIP_LEN] != 0;
+    Some((term, last_idx, last_term, membership, state))
 }
 
 // Key management

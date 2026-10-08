@@ -9,8 +9,9 @@ formats text or touches floating point.
 ## Table of Contents
 
 1. [Metrics and telemetry](#metrics-and-telemetry)
-2. [HTTP surface](#http-surface)
-3. [Host-side tooling](#host-side-tooling)
+2. [Heartbeat lines](#heartbeat-lines)
+3. [HTTP surface](#http-surface)
+4. [Host-side tooling](#host-side-tooling)
 
 ---
 
@@ -169,6 +170,32 @@ fallback held. The cache state is not exported as a metric of its
 own; the raft gauge is where it surfaces in `/metrics`.
 
 ---
+
+## Heartbeat lines
+
+Each substrate component logs one line of counters on a fixed cadence,
+whatever the telemetry wiring. Together they place a node from its log
+alone, which is the observation channel on a rig with no metrics
+collector: the question a heartbeat answers is read off, not inferred
+from silence. Counters are cumulative since boot unless a field is a
+state. Every field is `tag=value`; a 64-bit index is logged as its low
+32 bits.
+
+| Line | Cadence | Fields |
+|---|---|---|
+| `[wal] hb` | 1 s | `mode` fsync mode (0 per entry, 1 group); `fs` a segment file is open; `seg` current segment sequence; `entries` written; `batch` a group batch is staged; `pending` entries in it; `lim` the segment limit; `cur` write cursor within the segment; `rot` rotations this boot. The last three answer whether a segment is rotating: a `cur` past `lim` with `rot` unmoving is a segment that will not close. |
+| `[wal] scan` | 1 s | The below-floor cold-read scan that serves apply and the replicator from disk. `act` a scan is active; `found` it located its target; `tgt` the target index; `seg` the segment being walked; `oldest` the oldest segment on disk; `walked` the last index walked. `nf` entry requests answered not-found, `nf_open` of those where the segment would not open. `ring_min` and `rmax` the lowest and highest index the location ring covers; `rep_first` the first index replayed at boot; `floor` the compaction floor; `req` the last index asked for; `cur` the append index; `slot` the index the ring holds in `req`'s slot. A miss at or above the floor is explained by the last four. |
+| `[snap] hb` | 5 s | The capture path as counts, so a snapshot that never lands is placed at the link that dropped it. `trig` triggers reaching the component; `req` capture requests written to the application; `unwr` requests its control channel refused; `pend` a capture is in flight; `bodies` bodies received; `tmo` captures timed out; `def` triggers deferred behind one in flight; `taken` snapshots taken; `last` the last durable snapshot's index; `hw` the WAL high-water the next capture would use; `unres` installs that could not be shipped because the commit index had left the WAL's location ring. |
+| `[commit] hb` | 1 s | `commit` the committed index; `m` match-index updates received; `d` the quorum-durable index. `m` separates a replication stall (matches not advancing) from a durability stall (matches advancing, `d` pinned), which neither the commit index nor the log tells apart. |
+| `[raft] eng` | 1 s | The consensus engine across every hosted group: `rpc` RPC frames demuxed; `dropped` RPCs dropped on a full inbox; `misrouted` frames naming a group this node does not host; `prop` proposals demuxed; `held` proposals held back; `fwd_dropped` relayed proposals dropped. |
+| `[pr] hb` | 1 s | `rx` and `tx` frames per replica slot, `/`-separated from replica 0; `ev` network events drained; `stall` inbound stalls, a destination that refused mid-chunk; `refused` outbound sends refused; `cref` client frames refused. |
+| `[pr] id` | 1 s | The peer identity policy's refusals and closes: `claims_refused`, `conflicts`, `dropped`, `fwd_failed`, `parts_refused`, `expired` (see [security.md](security.md#peer-identity)). |
+
+`[raft] hb late` and `[raft] hb skipped` are not heartbeats but
+alarms on the same prefix: a heartbeat the leader sent late, or skipped,
+with the partition and the lag. One-shot lines such as `[raft] snap
+base`, `[snap] manifest` and `[wal] serve CRC FAIL` mark single events
+and are what the integration harness waits on.
 
 ## HTTP surface
 

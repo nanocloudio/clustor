@@ -88,7 +88,14 @@ the frame in strict order:
    zero-length terminator so replay never resurrects the discarded
    suffix, fsyncs, retires every segment file above the keep point, and
    only then publishes its own high-water and answers
-   `MSG_WAL_TRUNCATE_ACK` (`modules/app/durability/wal.rs`).
+   `MSG_WAL_TRUNCATE_ACK` (`modules/app/durability/wal.rs`). The WAL
+   finds the kept entry's frame in its entry-location ring while that
+   still covers it; a keep point below the ring is located on disk by
+   the same paced segment walk that serves old entry requests, opened
+   at the segment the WAL's segment-start table names, with the
+   truncation parked until the walk answers. Only an entry in no
+   durable segment refuses the truncation, as that log cannot hold what
+   the requester keeps.
 
    The follower keeps its old tip until that ack arrives. While the
    truncation is outstanding it answers every AppendEntries `busy`,

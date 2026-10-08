@@ -1030,7 +1030,11 @@ unsafe fn request_snapshot_install(s: &mut Repl, sys: &SyscallTable, target: u8)
     if !wire_channels::writable(sys, s.out_snapshot_request) {
         return;
     }
-    let buf = [target; 1];
+    // The commit index rides along: the follower adopts whatever index
+    // it installs as committed, so durability ships a manifest no higher
+    // than this.
+    let mut buf = [0u8; wire::SNAPSHOT_INSTALL_REQUEST_LEN];
+    wire::encode_snapshot_install_request(&mut buf, target, s.commit_hint);
     wire_channels::channel_write_partitioned(
         sys,
         s.out_snapshot_request,

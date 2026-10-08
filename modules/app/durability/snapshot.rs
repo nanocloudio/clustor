@@ -16,7 +16,7 @@
 use super::abi::SyscallTable;
 use super::collections::Crc32c;
 use super::types::{Index, Term};
-use super::{dev_log, dev_millis, wire, wire_channels};
+use super::{dev_log, dev_millis, fmt_u32_raw, wire, wire_channels};
 use crate::abi::contracts::key_vault as kv;
 
 #[path = "../../common/sealed_record.rs"]
@@ -362,6 +362,24 @@ pub struct Snapshot {
     app_capture_ticks: u32,
     app_bodies_received: u32,
     app_captures_timed_out: u32,
+    /// The capture path, counted at each link so a snapshot that never
+    /// lands can be placed: triggers that reached `on_trigger`, capture
+    /// requests written to the app, requests the control channel refused
+    /// (not writable). Reported on `[snap] hb`.
+    triggers_seen: u32,
+    app_captures_requested: u32,
+    app_captures_unwritable: u32,
+    last_hb_ms: u64,
+    /// A lagging follower's install waiting on the composite: the
+    /// leader's commit index from the request, below this component's
+    /// manifest, so the install must be shipped at that index with the
+    /// term the WAL holds there. 0 = none pending. Latest wins; one per
+    /// step is served.
+    install_wanted: u64,
+    /// Installs the composite could not resolve: the commit index had
+    /// left the WAL's location ring. Counted on `[snap] hb`; the
+    /// replicator re-raises the request.
+    installs_unresolved: u32,
     /// Body staged for the next install emit. Owned by state (not a
     /// borrow of msg_buf) so `finalize_snapshot` can take `&mut s`.
     /// True when the in-flight capture has a real FS provider behind it.
@@ -470,6 +488,12 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.app_capture_ticks = 0;
     s.app_bodies_received = 0;
     s.app_captures_timed_out = 0;
+    s.triggers_seen = 0;
+    s.app_captures_requested = 0;
+    s.app_captures_unwritable = 0;
+    s.last_hb_ms = 0;
+    s.install_wanted = 0;
+    s.installs_unresolved = 0;
     s.app_body_len = 0;
     s.seal_suite = 0;
     s.seal_cluster = [0; sealed::CLUSTER_LEN];
@@ -736,6 +760,19 @@ pub fn on_wal_high_water(s: &mut Snapshot, term: Term, index: Index) {
     s.wal_high_water = (term, index);
 }
 
+/// One ` tag=value` field of the heartbeat; returns the new write position.
+/// Panic-free: a field that would not fit is left out.
+fn hb_field(buf: &mut [u8], at: usize, tag: &[u8], val: u32) -> usize {
+    if at + tag.len() + 10 > buf.len() {
+        return at;
+    }
+    buf[at..at + tag.len()].copy_from_slice(tag);
+    let p = at + tag.len();
+    // SAFETY: `fmt_u32_raw` writes at most 10 digits, and the bound
+    // above left room for them past `p` inside `buf`.
+    p + unsafe { fmt_u32_raw(buf.as_mut_ptr().add(p), val) }
+}
+
 /// Handle one snapshot trigger at `(term, index)` — the single
 /// admission point for triggers regardless of origin (the wal
 /// component's segment rotation, or the external `trigger` port).
@@ -746,6 +783,7 @@ pub fn on_wal_high_water(s: &mut Snapshot, term: Term, index: Index) {
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn on_trigger(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) -> bool {
+    s.triggers_seen = s.triggers_seen.saturating_add(1);
     // No retention gate here. A snapshot is the STATE at `index` and
     // is always safe to take; what a retention floor protects is the
     // ENTRIES below it, and those are retired by the wal's segment
@@ -803,6 +841,32 @@ pub unsafe fn on_trigger(s: &mut Snapshot, sys: &SyscallTable, term: Term, index
 pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     let (hw_term, hw_index) = s.wal_high_water;
     let mut cold_fs = false;
+    // `[snap] hb` — the capture path's links as counts, on the same
+    // cadence as `[wal] hb`, so a snapshot that never lands is placed
+    // from a capture rather than reasoned about: triggers reaching this
+    // component, requests written to the app, requests its channel
+    // refused, bodies back, timeouts, deferred triggers, snapshots
+    // taken, and the last durable index.
+    let now = dev_millis(sys);
+    if now.wrapping_sub(s.last_hb_ms) >= 5000 {
+        s.last_hb_ms = now;
+        // Sequential fields, not a table of literals: an array of byte
+        // slices is never relocated in a PIC module.
+        let mut hb = [0u8; 192];
+        let mut p = 0usize;
+        p = hb_field(&mut hb, p, b"[snap] hb trig=", s.triggers_seen);
+        p = hb_field(&mut hb, p, b" req=", s.app_captures_requested);
+        p = hb_field(&mut hb, p, b" unwr=", s.app_captures_unwritable);
+        p = hb_field(&mut hb, p, b" pend=", s.app_capture_pending as u32);
+        p = hb_field(&mut hb, p, b" bodies=", s.app_bodies_received);
+        p = hb_field(&mut hb, p, b" tmo=", s.app_captures_timed_out);
+        p = hb_field(&mut hb, p, b" def=", s.triggers_deferred);
+        p = hb_field(&mut hb, p, b" taken=", s.snapshots_taken);
+        p = hb_field(&mut hb, p, b" last=", s.last_snapshot_index as u32);
+        p = hb_field(&mut hb, p, b" hw=", hw_index as u32);
+        p = hb_field(&mut hb, p, b" unres=", s.installs_unresolved);
+        dev_log(sys, 3, hb.as_ptr(), p);
+    }
 
     // 1. External snapshot triggers.
     if s.in_trigger >= 0 {
@@ -842,16 +906,29 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             let Some((msg_type, plen)) = s.inbox_install_req.next(sys, &mut s.msg_buf) else {
                 break;
             };
-            if msg_type != wire::MSG_SNAPSHOT_INSTALL_REQUEST || (plen as usize) < 1 {
+            if msg_type != wire::MSG_SNAPSHOT_INSTALL_REQUEST {
                 continue;
             }
-            if s.last_snapshot_index > 0 {
-                // The install is broadcast, not routed: the request's
-                // target byte is decoded but unused until a routed
-                // snapshot port exists.
+            let Some((_target, commit)) =
+                wire::decode_snapshot_install_request(&s.msg_buf[..plen as usize])
+            else {
+                continue;
+            };
+            if s.last_snapshot_index == 0 {
+                demand_trigger = true;
+            } else if s.last_snapshot_index <= commit {
+                // The snapshot is committed, by its index: ship it as it
+                // stands. (The install is broadcast, not routed: the
+                // request's target is unused until a routed snapshot port
+                // exists.)
                 emit_install_chunk(s, sys, s.last_snapshot_term, s.last_snapshot_index);
             } else {
-                demand_trigger = true;
+                // The manifest marks a rotation point past the leader's
+                // commit. The follower would adopt it as committed, so the
+                // install is shipped at the commit index instead — with the
+                // term the WAL holds there, which the composite resolves
+                // ([`resolve_install`]).
+                s.install_wanted = commit;
             }
         }
         // At most one demand capture per step, and none while an app
@@ -986,6 +1063,43 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     emit_metrics(s, sys);
 
     cold_fs
+}
+
+/// Ship the install a lagging follower is waiting on when the manifest
+/// ran ahead of the leader's commit: at the commit index, with the term
+/// `term_at` reports for it. The composite calls this after [`step`]
+/// with the WAL's lookup, which holds a term for every index its
+/// location ring covers. An index the ring no longer covers cannot be
+/// shipped with a true term; it is counted and the request is left for
+/// the replicator to re-raise, by when commit will have moved.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Snapshot` and supply a valid
+/// `&SyscallTable` per the module ABI.
+pub unsafe fn resolve_install<F: Fn(Index) -> Option<Term>>(
+    s: &mut Snapshot,
+    sys: &SyscallTable,
+    term_at: F,
+) {
+    let commit = s.install_wanted;
+    if commit == 0 {
+        return;
+    }
+    s.install_wanted = 0;
+    if s.last_snapshot_index <= commit {
+        emit_install_chunk(s, sys, s.last_snapshot_term, s.last_snapshot_index);
+        return;
+    }
+    match term_at(commit) {
+        Some(term) => emit_install_chunk(s, sys, term, commit),
+        None => {
+            s.installs_unresolved = s.installs_unresolved.saturating_add(1);
+            if s.installs_unresolved == 1 {
+                dev_log(sys, 2, b"[snap] install unresolved".as_ptr(), 25);
+            }
+        }
+    }
 }
 
 /// Emit snapshot counters and the transfer-time histogram as typed samples.
@@ -1194,8 +1308,9 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         // to last_idx; if the app never received the state it could
         // then never catch up. A refused hand-off (channel full)
         // withholds the signal and the leader re-sends from offset 0.
+        let carries_state = s.out_app_ctl >= 0 && s.body_len > 0;
         let mut app_restored = true;
-        if s.out_app_ctl >= 0 && s.body_len > 0 {
+        if carries_state {
             app_restored = restore_app(s, sys, s.in_progress_term, s.in_progress_last_idx);
         }
 
@@ -1208,6 +1323,7 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
                     s.in_progress_last_idx,
                     s.in_progress_last_term,
                     s.in_progress_membership,
+                    carries_state,
                 );
                 write_installed(s, sys, wire::MSG_SNAPSHOT_INSTALLED, &buf);
                 let prev_index = s.last_snapshot_index;
@@ -1319,7 +1435,7 @@ unsafe fn finalize_local_snapshot(s: &mut Snapshot, sys: &SyscallTable, term: Te
     if s.out_installed >= 0 {
         if wire_channels::writable(sys, s.out_installed) {
             let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
-            wire::encode_snapshot_installed(&mut buf, term, index, term, s.wmembership);
+            wire::encode_snapshot_installed(&mut buf, term, index, term, s.wmembership, blen > 0);
             write_installed(s, sys, wire::MSG_SNAPSHOT_INSTALLED, &buf);
         }
     }
@@ -1365,12 +1481,14 @@ unsafe fn request_app_capture(
         return false;
     }
     if !wire_channels::writable(sys, s.out_app_ctl) {
+        s.app_captures_unwritable = s.app_captures_unwritable.saturating_add(1);
         return false;
     }
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&term.to_le_bytes());
     buf[8..].copy_from_slice(&index.to_le_bytes());
     wire_channels::channel_write_msg(sys, s.out_app_ctl, wire::MSG_APP_SNAPSHOT_REQUEST, &buf);
+    s.app_captures_requested = s.app_captures_requested.saturating_add(1);
     true
 }
 
@@ -2266,6 +2384,7 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                 s.last_snapshot_index,
                 s.last_snapshot_term,
                 s.last_snapshot_membership,
+                s.out_app_ctl >= 0 && s.body_len > 0,
             );
             // The phase advances only on a CONFIRMED write. A poll saying
             // ">=1 byte free" is not room for this frame, and BOOT_DONE is

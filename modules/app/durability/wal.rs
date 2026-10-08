@@ -153,6 +153,36 @@ const ENTRY_LOC_RING_SIZE: usize = if VOLATILE {
 };
 const ENTRY_LOC_RING_MASK: u64 = (ENTRY_LOC_RING_SIZE as u64) - 1;
 
+/// Term boundaries kept: the first index of each of this many recent
+/// terms. A term changes only at an election, so the table answers the
+/// term of any index since the oldest boundary it holds, however far
+/// that index has fallen behind the location ring — which is what an
+/// install clamped to a lagging commit index needs.
+const TERM_BOUNDARIES: usize = 32;
+
+/// The first index the log holds at `term`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct TermBoundary {
+    index: u64,
+    term: u64,
+}
+
+/// Segment starts kept: the first index of each of this many recent
+/// segment files. A walk for an index below the location ring opens
+/// the segment that holds it instead of the oldest one, so locating
+/// an old entry — a lagging refetch, or a truncation whose keep point
+/// has left the ring — costs one segment, not the whole retained log.
+const SEGMENT_STARTS: usize = 64;
+
+/// The first index written to segment `seq`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct SegmentStart {
+    first_index: u64,
+    seq: u32,
+}
+
 /// Footprint budget for `Wal`, enforced at compile time.
 ///
 /// `Wal` is by far the largest component in the durability composite,
@@ -464,6 +494,9 @@ pub struct Wal {
     /// to 0 on segment rotation. See `MSG_WAL_TRUNCATE_AFTER`.
     seg_high_water: u32,
     pub segment_limit: u32, // from params (default 64 MiB)
+    /// Segment rotations this boot — on `[wal] hb` with the limit and the
+    /// cursor, so a segment that never rotates is read, not inferred.
+    pub rotations: u32,
     /// Oldest segment_seq still on disk after compaction. Requests for
     /// entries in segments < `oldest_segment_seq` return NOT_FOUND, which
     /// triggers the snapshot-install fallback on the leader.
@@ -487,6 +520,19 @@ pub struct Wal {
     memory_entries: [MemoryEntry; MEMORY_RING_SIZE],
     entry_ring_max_index: u64,
     entry_ring_min_index: u64,
+    /// The first index of each recent term, ascending, newest last
+    /// (see `TERM_BOUNDARIES`). Seeded by replay, extended on append,
+    /// trimmed with a suffix discard, restarted by a snapshot install.
+    term_bounds: [TermBoundary; TERM_BOUNDARIES],
+    term_bounds_len: u8,
+    /// The first index of each recent segment, ascending by both seq
+    /// and index, newest last (see `SEGMENT_STARTS`). Seeded by replay,
+    /// extended by the first append into a rotated segment, trimmed
+    /// with a suffix discard.
+    seg_starts: [SegmentStart; SEGMENT_STARTS],
+    seg_starts_len: u8,
+    /// The last index an entry request asked for (telemetry).
+    last_req_index: u64,
 
     // File I/O
     fd: i32, // file descriptor for current segment, -1 = not open
@@ -757,6 +803,17 @@ pub struct Wal {
     /// Diagnostic: entry requests served (hit) vs not-found.
     entryreq_served: u32,
     entryreq_notfound: u32,
+    /// Serves refused because the segment would not open (telemetry).
+    entryreq_open_fail: u32,
+    /// The read fd an entry serve holds open on a SEALED segment, and
+    /// that segment. A catch-up asks for a segment's entries one by one,
+    /// and on a FAT32 root every open is a directory scan that can answer
+    /// `E_AGAIN`, so opening per entry caps a catch-up at the scan rate
+    /// and refuses some serves outright. The live segment is never held
+    /// (its size grows under the writer); a retired segment drops its fd
+    /// before the unlink.
+    serve_fd: i32,
+    serve_seg: u32,
     /// Diagnostic: entry requests served via the below-floor segment scan.
     entryreq_scan_served: u32,
 
@@ -792,6 +849,17 @@ pub struct Wal {
     scan_last_term: u64,
     /// Term of the record at `scan_target - 1`, captured while walking.
     scan_prev_term: u64,
+    /// The scan is locating a truncation's keep point (see
+    /// `begin_truncate_locate`): its hit resumes the truncation and is
+    /// never delivered as an entry reply, and its miss refuses the
+    /// truncation.
+    scan_for_truncate: bool,
+    /// A truncation is parked on the scan: the keep point left the
+    /// location ring and is being located on disk. The control channel
+    /// is not drained past it, so later requests keep their order.
+    trunc_locating: bool,
+    trunc_locate_keep: u64,
+    trunc_locate_req: u32,
     /// Location of the found target (valid while `scan_found`).
     scan_loc: EntryLoc,
     /// Indices below this were compacted away (`MSG_WAL_COMPACT_BEFORE`)
@@ -909,10 +977,19 @@ pub unsafe fn init(s: &mut Wal) {
     s.cursor = 0;
     s.seg_high_water = 0;
     s.segment_limit = 67_108_864;
+    s.rotations = 0;
     s.dek_epoch = 0;
     s.encoding = 0;
     s.entry_ring_max_index = 0;
     s.entry_ring_min_index = 0;
+    s.term_bounds = [TermBoundary { index: 0, term: 0 }; TERM_BOUNDARIES];
+    s.term_bounds_len = 0;
+    s.seg_starts = [SegmentStart {
+        first_index: 0,
+        seq: 0,
+    }; SEGMENT_STARTS];
+    s.seg_starts_len = 0;
+    s.last_req_index = 0;
     s.truncate_failures = 0;
     s.trunc_ack_pending = false;
     s.trunc_ack_index = 0;
@@ -966,6 +1043,9 @@ pub unsafe fn init(s: &mut Wal) {
     s.replay_first_size = 0;
     s.entryreq_served = 0;
     s.entryreq_notfound = 0;
+    s.entryreq_open_fail = 0;
+    s.serve_fd = -1;
+    s.serve_seg = 0;
     s.entryreq_scan_served = 0;
     s.scan_active = false;
     s.scan_found = false;
@@ -980,6 +1060,10 @@ pub unsafe fn init(s: &mut Wal) {
     s.scan_last_term = 0;
     s.scan_prev_term = 0;
     s.scan_loc = EntryLoc::zero();
+    s.scan_for_truncate = false;
+    s.trunc_locating = false;
+    s.trunc_locate_keep = 0;
+    s.trunc_locate_req = 0;
     s.compact_floor = 0;
     s.entryreq_unservable_logged = false;
     s.continuity_fault = false;
@@ -1167,6 +1251,22 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
         if s.fence_pending || now.wrapping_sub(s.batch_start_ms) >= s.group_window_ms as u64 {
             flush_batch(s, sys);
         }
+    }
+    // Rotate a full segment once it is quiescent, independent of an
+    // append. The append path checks the limit only right after it
+    // appended, while the batch it just staged is still outstanding, and
+    // on a device whose flushes are asynchronous that is always the case:
+    // the check never fires, the segment grows without bound, and the
+    // snapshot a rotation triggers never lands. Quiescent means nothing
+    // in flight: no staged batch, no fence awaited, no fence ticket
+    // outstanding against this segment.
+    if s.fd >= 0
+        && s.cursor >= s.segment_limit
+        && !s.has_batch
+        && !s.fence_pending
+        && s.fence_ring_count == 0
+    {
+        rotate_segment(s, sys);
     }
 
     // Normal operation
@@ -1361,6 +1461,8 @@ unsafe fn record_entry_loc(
     if index == 0 {
         return;
     }
+    note_term_boundary(s, index, term);
+    note_segment_start(s, seg_seq, index);
     let slot = (index & ENTRY_LOC_RING_MASK) as usize;
     s.entry_ring[slot] = EntryLoc {
         index,
@@ -1380,6 +1482,115 @@ unsafe fn record_entry_loc(
     if floor > s.entry_ring_min_index {
         s.entry_ring_min_index = floor;
     }
+}
+
+/// The term of the entry at `index`, while the location ring still
+/// covers it. The composite resolves a lagging follower's install
+/// against this: a manifest shipped at the leader's commit index must
+/// carry that entry's term, or the follower's log matching fails at the
+/// very next append.
+pub fn term_at(s: &Wal, index: u64) -> Option<u64> {
+    if index == 0 || index > s.current_index {
+        return None;
+    }
+    if index >= s.entry_ring_min_index && index <= s.entry_ring_max_index {
+        let loc = s.entry_ring[(index & ENTRY_LOC_RING_MASK) as usize];
+        if loc.index == index {
+            return Some(loc.term);
+        }
+    }
+    // Older than the ring: the term of the latest boundary at or below
+    // it, if the table reaches back that far.
+    let n = s.term_bounds_len as usize;
+    let mut i = n;
+    while i > 0 {
+        i -= 1;
+        let b = s.term_bounds[i];
+        if b.index <= index {
+            return Some(b.term);
+        }
+    }
+    None
+}
+
+/// Record `index` as a term boundary when its term differs from the
+/// log's last. Entries arrive in index order on both append and replay,
+/// so the table stays ascending; a full table lets the oldest go.
+fn note_term_boundary(s: &mut Wal, index: u64, term: u64) {
+    let n = s.term_bounds_len as usize;
+    if n > 0 && s.term_bounds[n - 1].term == term {
+        return;
+    }
+    if n == TERM_BOUNDARIES {
+        s.term_bounds.copy_within(1.., 0);
+        s.term_bounds[TERM_BOUNDARIES - 1] = TermBoundary { index, term };
+        return;
+    }
+    s.term_bounds[n] = TermBoundary { index, term };
+    s.term_bounds_len = (n + 1) as u8;
+}
+
+/// Forget boundaries above `keep_through`: a discarded suffix takes its
+/// terms with it, and whatever is appended there next records its own.
+fn trim_term_boundaries(s: &mut Wal, keep_through: u64) {
+    let mut n = s.term_bounds_len as usize;
+    while n > 0 && s.term_bounds[n - 1].index > keep_through {
+        n -= 1;
+    }
+    s.term_bounds_len = n as u8;
+}
+
+/// Record `index` as the first entry of segment `seq` when the segment
+/// differs from the last recorded. Entries arrive in index order, and
+/// segment sequences rise with them, so the table stays ascending on
+/// both; a full table lets the oldest go. The in-memory posture has no
+/// segment files and records nothing.
+fn note_segment_start(s: &mut Wal, seq: u32, index: u64) {
+    if seq == 0 {
+        return;
+    }
+    let n = s.seg_starts_len as usize;
+    if n > 0 && s.seg_starts[n - 1].seq == seq {
+        return;
+    }
+    if n == SEGMENT_STARTS {
+        s.seg_starts.copy_within(1.., 0);
+        s.seg_starts[SEGMENT_STARTS - 1] = SegmentStart {
+            first_index: index,
+            seq,
+        };
+        return;
+    }
+    s.seg_starts[n] = SegmentStart {
+        first_index: index,
+        seq,
+    };
+    s.seg_starts_len = (n + 1) as u8;
+}
+
+/// Forget the starts of segments a suffix discard retires: every
+/// segment whose first entry is above `keep_through`.
+fn trim_segment_starts(s: &mut Wal, keep_through: u64) {
+    let mut n = s.seg_starts_len as usize;
+    while n > 0 && s.seg_starts[n - 1].first_index > keep_through {
+        n -= 1;
+    }
+    s.seg_starts_len = n as u8;
+}
+
+/// The segment a forward walk for `index` starts in: the newest
+/// segment that began at or below it, never below the retained floor.
+/// An index older than every recorded start walks from the floor.
+fn segment_for(s: &Wal, index: u64) -> u32 {
+    let mut i = s.seg_starts_len as usize;
+    while i > 0 {
+        i -= 1;
+        let start = s.seg_starts[i];
+        if start.first_index <= index {
+            return start.seq.max(s.oldest_segment_seq);
+        }
+    }
+    s.oldest_segment_seq
 }
 
 /// # Safety
@@ -1482,6 +1693,7 @@ unsafe fn locate_for_serve(
     reply_chan: i32,
     allow_scan: bool,
 ) -> Option<EntryLoc> {
+    s.last_req_index = wal_index;
     if reply_chan < 0 || !wire_channels::writable(sys, reply_chan) {
         return None;
     }
@@ -1670,18 +1882,49 @@ unsafe fn serve_clear(
         return;
     }
 
-    let read_fd = if loc.seg_seq == s.segment_seq && s.fd >= 0 {
-        s.fd
+    // A serve reads through a fd of its own, the live segment included.
+    // Reading through the writer's fd seeks it across its own write-back
+    // sector, and a frame's trailing bytes can then be read before they
+    // land. A sealed segment's fd is kept for the next serve; the live
+    // segment's is opened and closed per serve.
+    let sealed = loc.seg_seq != s.segment_seq;
+    let read_fd = if sealed && s.serve_fd >= 0 && s.serve_seg == loc.seg_seq {
+        s.serve_fd
     } else {
+        if s.serve_fd >= 0 {
+            (sys.provider_call)(s.serve_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            s.serve_fd = -1;
+        }
         let mut path = [0u8; WAL_PATH_MAX];
         let plen = encode_segment_path(s.partition_id, loc.seg_seq, s.root_path != 0, &mut path);
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
         if fd < 0 {
             s.entryreq_notfound = s.entryreq_notfound.saturating_add(1);
+            s.entryreq_open_fail = s.entryreq_open_fail.saturating_add(1);
+            // The first few: which segment, and the provider's answer.
+            if s.entryreq_open_fail <= 3 {
+                let mut line = [0u8; 120];
+                let mut p = 0usize;
+                p += emit_field(
+                    line.as_mut_ptr(),
+                    p,
+                    b"[wal] serve open FAIL idx=",
+                    wal_index as u32,
+                );
+                p += emit_field(line.as_mut_ptr(), p, b" seg=", loc.seg_seq);
+                p += emit_field(line.as_mut_ptr(), p, b" rc=-", fd.unsigned_abs());
+                p += emit_field(line.as_mut_ptr(), p, b" live_seg=", s.segment_seq);
+                p += emit_field(line.as_mut_ptr(), p, b" oldest=", s.oldest_segment_seq);
+                dev_log(sys, 2, line.as_ptr(), p);
+            }
             let mut hdr = [0u8; wire::WAL_ENTRY_REPLY_HDR];
             wire::encode_wal_entry_reply_hdr(&mut hdr, request_id, 0, wal_index, 0);
             write_part(s, sys, reply_chan, wire::MSG_WAL_ENTRY_REPLY, &hdr);
             return;
+        }
+        if sealed {
+            s.serve_fd = fd;
+            s.serve_seg = loc.seg_seq;
         }
         fd
     };
@@ -1712,16 +1955,33 @@ unsafe fn serve_clear(
         if entry_len32 as usize != payload_len || actual_crc != stored_crc {
             s.checksum_failures = s.checksum_failures.saturating_add(1);
             dev_log(sys, 2, b"[wal] serve CRC FAIL".as_ptr(), 20);
+            // The first few, in detail: what was asked, what the frame
+            // header said, and what the bytes hashed to.
+            if s.checksum_failures <= 3 {
+                let mut line = [0u8; 160];
+                let mut p = 0usize;
+                p += emit_field(
+                    line.as_mut_ptr(),
+                    p,
+                    b"[wal] serve detail idx=",
+                    wal_index as u32,
+                );
+                p += emit_field(line.as_mut_ptr(), p, b" seg=", loc.seg_seq);
+                p += emit_field(line.as_mut_ptr(), p, b" off=", hdr_off as u32);
+                p += emit_field(line.as_mut_ptr(), p, b" want=", payload_len as u32);
+                p += emit_field(line.as_mut_ptr(), p, b" hdr_len=", entry_len32);
+                p += emit_field(line.as_mut_ptr(), p, b" crc_stored=", stored_crc);
+                p += emit_field(line.as_mut_ptr(), p, b" crc_read=", actual_crc);
+                p += emit_field(line.as_mut_ptr(), p, b" cur=", s.cursor);
+                dev_log(sys, 2, line.as_ptr(), p);
+            }
             ok = false;
         }
     }
 
-    // Restore write-fd position to end-of-segment so the next write
-    // appends correctly. We always FS_SEEK to `s.cursor`.
-    if read_fd == s.fd {
-        let restore = (s.cursor as i32).to_le_bytes();
-        (sys.provider_call)(read_fd, FS_SEEK, restore.as_ptr() as *mut u8, 4);
-    } else {
+    // A per-serve fd (the live segment's) closes here; the held sealed
+    // fd stays open for the next serve.
+    if read_fd != s.serve_fd {
         (sys.provider_call)(read_fd, FS_CLOSE, core::ptr::null_mut(), 0);
     }
 
@@ -2195,7 +2455,7 @@ unsafe fn begin_entry_scan(s: &mut Wal, sys: &SyscallTable, request_id: u32, wal
     let warm = s.scan_fd >= 0 && s.scan_last_index > 0 && wal_index > s.scan_last_index;
     if !warm {
         reset_scan_cursor(s, sys);
-        s.scan_seg = s.oldest_segment_seq;
+        s.scan_seg = segment_for(s, wal_index);
     }
     s.scan_prev_term = if warm && s.scan_last_index + 1 == wal_index {
         s.scan_last_term
@@ -2247,6 +2507,18 @@ unsafe fn reset_scan_cursor(s: &mut Wal, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn fail_entry_scan(s: &mut Wal, sys: &SyscallTable) {
+    if s.scan_for_truncate {
+        // The walk proved the keep point is in no durable segment: the
+        // log does not hold the entry the requester keeps, and no
+        // rewind point can be guessed.
+        s.scan_active = false;
+        s.scan_found = false;
+        s.scan_target = 0;
+        s.scan_for_truncate = false;
+        s.trunc_locating = false;
+        refuse_truncate_unlocatable(s, sys, s.trunc_locate_keep, s.trunc_locate_req);
+        return;
+    }
     let request_id = s.scan_request_id;
     let wal_index = s.scan_target;
     s.scan_active = false;
@@ -2434,6 +2706,11 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
 /// # Safety
 /// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
 unsafe fn deliver_scan(s: &mut Wal, sys: &SyscallTable) {
+    if s.scan_for_truncate {
+        // The hit is a keep point; the control drain resumes the
+        // truncation with it (see `resume_truncate`).
+        return;
+    }
     if wal_seal::enabled(s) {
         deliver_scan_reply_sealed(s, sys);
     } else {
@@ -2570,6 +2847,22 @@ unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) -> bool {
     if s.in_compact_before < 0 {
         return false;
     }
+    // A truncation parked on the segment walk owns the control channel:
+    // nothing behind it is drained, and no compaction retires files the
+    // walk may be in, until the walk answers. Its hit resumes the
+    // truncation under the same in-flight gate as a fresh request.
+    if s.trunc_locating {
+        if !(s.scan_found && s.scan_for_truncate) {
+            return false;
+        }
+        if s.has_batch || s.fence_pending || s.fence_ring_count > 0 {
+            flush_batch(s, sys);
+            if s.has_batch || s.fence_pending || s.fence_ring_count > 0 {
+                return false;
+            }
+        }
+        return resume_truncate(s, sys);
+    }
 
     // Continue any unlink work a previous compaction left pending
     // (paced COMPACT_UNLINKS_PER_STEP per step).
@@ -2639,11 +2932,12 @@ unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) -> bool {
                 }
                 // One truncation may leave state the next one in this
                 // drain would destroy: an ack the channel could not take
-                // yet (the park slot holds exactly one answer) or a
+                // yet (the park slot holds exactly one answer), a
                 // segment range still being retired (whose write state
-                // is parked, not published). End the drain and let the
-                // next step resume — the frames stay queued.
-                if s.trunc_ack_pending || s.retire_active {
+                // is parked, not published), or a keep point still
+                // being located on disk. End the drain and let a later
+                // step resume — the frames stay queued.
+                if s.trunc_ack_pending || s.retire_active || s.trunc_locating {
                     break;
                 }
             }
@@ -2682,31 +2976,142 @@ unsafe fn truncate_after(
     }
 
     // Locate the keep point. `keep == 0` discards the whole log (no frame
-    // to rewind to). Otherwise the offset ring must still hold the keep
-    // entry: raft only truncates its uncommitted tail, bounded by the
-    // in-flight window (≪ ENTRY_LOC_RING_SIZE). A miss means upstream
-    // state corruption — fail-stop rather than guess a rewind point, since
-    // a wrong one leaves the suffix on disk for replay to resurrect.
-    let mut keep_seg: u32 = 0;
-    let mut new_cursor: u32 = 0;
-    let mut new_term: Term = 0;
-    if keep_through_index > 0 {
-        match lookup_entry_loc(s, keep_through_index) {
-            Some(loc) => {
-                keep_seg = loc.seg_seq;
-                new_cursor = loc.payload_offset + loc.payload_len + wal_seal::payload_trail(s);
-                new_term = loc.term;
+    // to rewind to). Otherwise the location ring answers while it still
+    // covers the keep entry; an entry below the ring is still in a
+    // durable segment, and the paced segment walk locates it across
+    // steps with the truncation parked on it. A miss anywhere else — a
+    // gap inside the ring, an index below the compaction floor, or the
+    // in-memory posture, whose ring is its whole retention — means the
+    // log does not hold the entry the requester keeps: refuse rather
+    // than guess a rewind point, since a wrong one leaves the suffix on
+    // disk for replay to resurrect.
+    if keep_through_index == 0 {
+        return truncate_at(s, sys, 0, 0, 0, keep_through_index, req_id);
+    }
+    match lookup_entry_loc(s, keep_through_index) {
+        Some(loc) => truncate_at(
+            s,
+            sys,
+            loc.seg_seq,
+            loc.payload_offset + loc.payload_len + wal_seal::payload_trail(s),
+            loc.term,
+            keep_through_index,
+            req_id,
+        ),
+        None => {
+            if keep_through_index < s.entry_ring_min_index
+                && keep_through_index >= s.compact_floor
+                && !s.no_fs
+                && !VOLATILE
+            {
+                begin_truncate_locate(s, sys, keep_through_index, req_id);
+            } else {
+                refuse_truncate_unlocatable(s, sys, keep_through_index, req_id);
             }
-            None => {
-                s.fence_failed = true;
-                s.write_errors = s.write_errors.saturating_add(1);
-                dev_log(sys, 1, b"[wal] FATAL truncate unlocatable".as_ptr(), 31);
-                send_truncate_ack(s, sys, keep_through_index, req_id, false);
-                return false;
-            }
+            false
         }
     }
+}
 
+/// Park a truncation on the segment walk: the keep point has left the
+/// location ring, so its frame is located on disk the way a below-floor
+/// entry request is. The walk preempts any entry request on it (the
+/// requester re-asks), and the control channel is not drained past the
+/// truncation until the walk answers. Raft holds its tip meanwhile; the
+/// hold is bounded only by the correlated ack, so a long walk delays
+/// repair without abandoning it.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn begin_truncate_locate(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    keep_through_index: u64,
+    req_id: u32,
+) {
+    s.scan_found = false;
+    s.scan_active = false;
+    s.scan_target = 0;
+    begin_entry_scan(s, sys, req_id, keep_through_index);
+    s.scan_for_truncate = true;
+    s.trunc_locating = true;
+    s.trunc_locate_keep = keep_through_index;
+    s.trunc_locate_req = req_id;
+    dev_log(sys, 3, b"[wal] truncate locate".as_ptr(), 21);
+}
+
+/// Resume a parked truncation with the keep frame the walk located.
+/// The walk's descriptor is dropped first: the keep segment is
+/// reopened for writing by the truncation itself. Returns whether any
+/// segment was retired here.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn resume_truncate(s: &mut Wal, sys: &SyscallTable) -> bool {
+    let loc = s.scan_loc;
+    let keep_through_index = s.trunc_locate_keep;
+    let req_id = s.trunc_locate_req;
+    s.scan_found = false;
+    s.scan_target = 0;
+    s.scan_for_truncate = false;
+    s.trunc_locating = false;
+    reset_scan_cursor(s, sys);
+    if s.current_index <= keep_through_index {
+        send_truncate_ack(s, sys, keep_through_index, req_id, true);
+        return false;
+    }
+    truncate_at(
+        s,
+        sys,
+        loc.seg_seq,
+        loc.payload_offset + loc.payload_len + wal_seal::payload_trail(s),
+        loc.term,
+        keep_through_index,
+        req_id,
+    )
+}
+
+/// Refuse a truncation whose keep entry the log does not hold, and
+/// latch fail-stop: the requester keeps an entry this log never had,
+/// which no rewind point can reconcile.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn refuse_truncate_unlocatable(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    keep_through_index: u64,
+    req_id: u32,
+) {
+    s.fence_failed = true;
+    s.write_errors = s.write_errors.saturating_add(1);
+    dev_log(sys, 1, b"[wal] FATAL truncate unlocatable".as_ptr(), 32);
+    send_truncate_ack(s, sys, keep_through_index, req_id, false);
+}
+
+/// Persist and publish a truncation whose keep frame is known: the
+/// segment it ends in (`keep_seg`, 0 for a whole-log discard), the
+/// cursor just past it, and its term.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn truncate_at(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    keep_seg: u32,
+    new_cursor: u32,
+    new_term: Term,
+    keep_through_index: u64,
+    req_id: u32,
+) -> bool {
     // ── Persist the new tail BEFORE publishing it ───────────────
     // The high-water, the offset rings and the scan cursor stay as the
     // requester last saw them until the new tail is on stable storage.
@@ -2759,6 +3164,8 @@ unsafe fn publish_truncation(
     // entry-request serves no longer surface the discarded suffix. The
     // per-index walk is clamped to one ring revolution: past that, slots
     // repeat and a full-array sweep is both cheaper and complete.
+    trim_term_boundaries(s, keep_through_index);
+    trim_segment_starts(s, keep_through_index);
     if s.entry_ring_max_index > keep_through_index {
         let span = s.entry_ring_max_index - keep_through_index;
         if span >= ENTRY_LOC_RING_SIZE as u64 {
@@ -2797,6 +3204,13 @@ unsafe fn publish_truncation(
         }
     }
     s.entry_ring_max_index = keep_through_index;
+    // A keep point below the ring's floor leaves the ring empty, every
+    // slot swept above. The floor follows the tail, so the replacement
+    // suffix is ring-served from its first entry instead of walked
+    // until the log regrows past the old floor.
+    if s.entry_ring_min_index > keep_through_index.saturating_add(1) {
+        s.entry_ring_min_index = keep_through_index.saturating_add(1);
+    }
     s.cfg.truncate(keep_through_index);
     s.cfg_dirty = true;
 
@@ -2819,7 +3233,7 @@ unsafe fn publish_truncation(
             s.scan_active = false;
             s.scan_target = 0;
         } else {
-            s.scan_seg = s.oldest_segment_seq;
+            s.scan_seg = segment_for(s, s.scan_target);
         }
     }
 
@@ -3123,6 +3537,20 @@ unsafe fn continue_retirement(s: &mut Wal, sys: &SyscallTable) -> bool {
 /// first frame header with a zero-length terminator so replay stops at
 /// offset 0 even though the file still exists.
 ///
+/// Close the held serve-path read fd if it is on segment `seq`, which is
+/// about to be unlinked or rewritten.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Wal` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn drop_serve_fd(s: &mut Wal, sys: &SyscallTable, seq: u32) {
+    if s.serve_fd >= 0 && s.serve_seg == seq {
+        (sys.provider_call)(s.serve_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.serve_fd = -1;
+    }
+}
+
 /// Retirement is only complete once the REMOVAL of the name is itself
 /// durable: an unlink whose directory entry stays in a volatile cache
 /// resurrects the segment after a power cut, and the discarded suffix
@@ -3136,6 +3564,7 @@ unsafe fn continue_retirement(s: &mut Wal, sys: &SyscallTable) -> bool {
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> bool {
+    drop_serve_fd(s, sys, seq);
     let mut path = [0u8; WAL_PATH_MAX];
     let plen = encode_segment_path(s.partition_id, seq, s.root_path != 0, &mut path);
     let mut unlinked = false;
@@ -3445,6 +3874,7 @@ unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) -> bool {
         && unlinks < COMPACT_UNLINKS_PER_STEP
     {
         if fs_unlink_supported(s, sys) {
+            drop_serve_fd(s, sys, s.oldest_segment_seq);
             let mut path = [0u8; WAL_PATH_MAX];
             let plen = encode_segment_path(
                 s.partition_id,
@@ -4479,6 +4909,7 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn rotate_segment(s: &mut Wal, sys: &SyscallTable) {
+    s.rotations = s.rotations.saturating_add(1);
     flush_block(s, sys);
     fsync_segment(s, sys);
     close_segment(s, sys);
@@ -5169,6 +5600,9 @@ pub fn on_snapshot_installed(s: &mut Wal, term: Term, index: Index, m: wire::Mem
     if index.saturating_add(1) > s.entry_ring_min_index {
         s.entry_ring_min_index = index.saturating_add(1);
     }
+    // The snapshot's last entry is the only term boundary the log knows.
+    s.term_bounds[0] = TermBoundary { index, term };
+    s.term_bounds_len = 1;
     note_ledger_ack(s, term, index);
 }
 
@@ -5254,7 +5688,7 @@ unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
     // heartbeat cadence. Survives log_net's history-skip (drain_net
     // seeds TAIL_NET=HEAD on first call), which discards init-time
     // one-shot markers. Fires regardless of out_metrics wiring.
-    let mut hb = [0u8; 96];
+    let mut hb = [0u8; 160];
     let mut pos = 0usize;
     pos += emit_field(hb.as_mut_ptr(), pos, b"[wal] hb mode=", s.fsync_mode as u32);
     // Durability state on the heartbeat, not only in the one-shot
@@ -5267,7 +5701,60 @@ unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
     pos += emit_field(hb.as_mut_ptr(), pos, b" entries=", s.entries_written);
     pos += emit_field(hb.as_mut_ptr(), pos, b" batch=", s.has_batch as u32);
     pos += emit_field(hb.as_mut_ptr(), pos, b" pending=", s.pending_count as u32);
+    // The rotation question, answered rather than inferred: the limit the
+    // params gave, where the cursor stands, how often this boot rotated.
+    pos += emit_field(hb.as_mut_ptr(), pos, b" lim=", s.segment_limit);
+    pos += emit_field(hb.as_mut_ptr(), pos, b" cur=", s.cursor);
+    pos += emit_field(hb.as_mut_ptr(), pos, b" rot=", s.rotations);
     dev_log(sys, 3, hb.as_ptr(), pos);
+
+    // The below-floor entry scan (cold reads that serve apply and the
+    // replicator from disk): a scan that never finds, or never replies,
+    // stops every apply behind it, and downstream that reads only as
+    // silence.
+    let mut sc = [0u8; 224];
+    let mut sp = 0usize;
+    sp += emit_field(
+        sc.as_mut_ptr(),
+        sp,
+        b"[wal] scan act=",
+        s.scan_active as u32,
+    );
+    sp += emit_field(sc.as_mut_ptr(), sp, b" found=", s.scan_found as u32);
+    sp += emit_field(sc.as_mut_ptr(), sp, b" tgt=", s.scan_target as u32);
+    sp += emit_field(sc.as_mut_ptr(), sp, b" seg=", s.scan_seg);
+    sp += emit_field(sc.as_mut_ptr(), sp, b" oldest=", s.oldest_segment_seq);
+    sp += emit_field(sc.as_mut_ptr(), sp, b" walked=", s.scan_last_index as u32);
+    sp += emit_field(sc.as_mut_ptr(), sp, b" nf=", s.entryreq_notfound);
+    sp += emit_field(sc.as_mut_ptr(), sp, b" nf_open=", s.entryreq_open_fail);
+    sp += emit_field(
+        sc.as_mut_ptr(),
+        sp,
+        b" ring_min=",
+        s.entry_ring_min_index as u32,
+    );
+    sp += emit_field(
+        sc.as_mut_ptr(),
+        sp,
+        b" rep_first=",
+        s.replay_first_index as u32,
+    );
+    sp += emit_field(sc.as_mut_ptr(), sp, b" floor=", s.compact_floor as u32);
+    // The last index asked for, the log's own position, the ring's reach,
+    // and what the ring holds in that index's slot: a miss at or above
+    // the floor is otherwise unexplainable from outside.
+    let req = s.last_req_index;
+    sp += emit_field(sc.as_mut_ptr(), sp, b" req=", req as u32);
+    sp += emit_field(sc.as_mut_ptr(), sp, b" cur=", s.current_index as u32);
+    sp += emit_field(
+        sc.as_mut_ptr(),
+        sp,
+        b" rmax=",
+        s.entry_ring_max_index as u32,
+    );
+    let held = s.entry_ring[(req & ENTRY_LOC_RING_MASK) as usize].index;
+    sp += emit_field(sc.as_mut_ptr(), sp, b" slot=", held as u32);
+    dev_log(sys, 3, sc.as_ptr(), sp);
 
     if s.out_metrics < 0 {
         return;

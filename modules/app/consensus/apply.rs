@@ -292,6 +292,9 @@ pub struct Apply {
     entries_applied: u32,
     entries_buffered: u32,
     entries_evicted: u32,
+    /// Later entries displaced so the strict-order head could be buffered
+    /// (see `store_pending`); each is re-read from the WAL as the head.
+    entries_displaced: u32,
     /// Counter: passes that ended holding a committed entry a
     /// destination refused. NOT a loss count — the entry keeps its slot
     /// and is re-offered next step. A value that climbs steadily means a
@@ -352,6 +355,7 @@ pub fn init(s: &mut Apply) {
     s.entries_applied = 0;
     s.entries_buffered = 0;
     s.entries_evicted = 0;
+    s.entries_displaced = 0;
     s.delivery_stalls = 0;
     s.last_stall_log_ms = 0;
     s.last_metrics_ms = 0;
@@ -780,10 +784,41 @@ unsafe fn store_pending(
             return true;
         }
     }
-    // Fail closed: never discard the oldest entry required by strict-order
-    // apply. Observer reads normally stop before reaching this branch; WAL
-    // replies can race a full buffer, in which case the retry timer will ask
-    // for the entry again after committed entries free capacity.
+    // The entry strict-order apply is waiting for must never be the one
+    // refused. Behind a long log (a restart that replays tens of thousands
+    // of entries) the slots fill with LATER commits from the live fan-out,
+    // none of which can apply before this one: refusing it would leave the
+    // head refetched and refused forever while nothing else can move. So
+    // the head displaces the newest buffered entry that has not begun
+    // delivery — still durable in the WAL, and asked for again by
+    // `request_missing_entry` the moment it becomes the head itself, which
+    // is the only time apply needs it.
+    if index == s.apply_index + 1 {
+        let mut newest: Option<usize> = None;
+        let mut newest_index: Index = index;
+        for (i, slot) in s.pending.iter().enumerate() {
+            if !slot.is_empty() && slot.index > newest_index && slot.delivered == 0 {
+                newest = Some(i);
+                newest_index = slot.index;
+            }
+        }
+        if let Some(i) = newest {
+            let slot = &mut s.pending[i];
+            if !slot.body.is_null() {
+                heap_free(sys, slot.body);
+            }
+            slot.index = index;
+            slot.term = term;
+            slot.body_len = body_len as u16;
+            slot.delivered = 0;
+            slot.body = fresh;
+            s.entries_displaced = s.entries_displaced.saturating_add(1);
+            return true;
+        }
+    }
+    // Fail closed otherwise: a refused entry is still durable in the WAL,
+    // and is asked for again once it is the head (above) or once committed
+    // entries free capacity.
     if !fresh.is_null() {
         heap_free(sys, fresh);
     }
