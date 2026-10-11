@@ -2,7 +2,7 @@ version = "0.1.0"
 timer_class = "wall_clock"
 type = "Transformer"
 entry = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # durability — WAL, quorum durability ledger, snapshots and key
 # epochs as one composite module (standards fluxor-modules.md §8).

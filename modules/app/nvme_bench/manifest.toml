@@ -1,7 +1,7 @@
 version = "0.1.0"
 type = "Transformer"
 entry = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Unused start trigger. The bench auto-runs on startup; this input
 # exists so the module conforms to the Transformer shape and can later

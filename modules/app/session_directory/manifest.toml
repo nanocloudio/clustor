@@ -5,7 +5,7 @@ version = "0.1.0"
 timer_class = "wall_clock"
 type = "Transformer"
 entry = "mod.rs"
-hardware_targets = ["bcm2712"]
+hardware_targets = ["bcm2712", "linux"]
 
 # Session directory / reservation authority — the durable single-writer
 # role fluxor's session protocol defines, backed by the replica group. State machine: modules/common/session_registry.rs;
