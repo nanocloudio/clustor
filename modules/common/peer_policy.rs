@@ -145,6 +145,46 @@ pub fn partition_admitted(partitions: u16, partition: u16) -> bool {
     partitions == 0 || partition < partitions
 }
 
+/// The longest principal (a SPIFFE URI) a report carries; a longer one is
+/// not carried at all, and so names no replica.
+pub const PRINCIPAL_MAX: usize = 128;
+
+/// Does `principal` name replica `id` under `prefix`? It must be exactly
+/// `prefix` + the decimal id, or that followed by `.` and a role — a node
+/// certifies a key per direction (`replica-1.server`, `replica-1.client`).
+/// `replica-1` never matches `replica-10`. An empty prefix names nothing.
+pub fn principal_names(prefix: &[u8], id: u8, principal: &[u8]) -> bool {
+    if prefix.is_empty() {
+        return false;
+    }
+    let mut digits = [0u8; 3];
+    let mut n = 0;
+    let mut v = id;
+    loop {
+        digits[n] = b'0' + v % 10;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let Some(rest) = principal.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut i = 0;
+    while i < n {
+        if rest.get(i) != Some(&digits[n - 1 - i]) {
+            return false;
+        }
+        i += 1;
+    }
+    match rest.get(n) {
+        None => true,
+        Some(&b'.') => rest.len() > n + 1,
+        Some(_) => false,
+    }
+}
+
 /// One identity report from the TLS layer, copied out of the frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Report {
@@ -160,6 +200,10 @@ pub struct Report {
     pub not_after: u64,
     /// When the report arrived (monotonic ms).
     pub at_ms: u64,
+    /// The verified principal (the leaf's URI SAN under a CA profile);
+    /// empty when the profile verified none.
+    pub principal: [u8; PRINCIPAL_MAX],
+    pub principal_len: u8,
 }
 
 impl Report {

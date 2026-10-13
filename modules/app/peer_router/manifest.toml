@@ -95,6 +95,15 @@ name = "client_identity"
 direction = "output"
 content_type = "OctetStream"
 
+# out[7]: ADD_LEARNER for a learner slot (`voters`) whose principal bound,
+# as MSG_ADMIN_COMMAND for operations.admin_requests (the local, already-
+# authorized path). Left unwired, a bound learner slot is not admitted.
+[[ports]]
+name = "learner_admin"
+direction = "output"
+index = 7
+content_type = "OctetStream"
+
 [observability]
 # Per-peer / per-client envelope routing over TCP. All four emitted as
 # typed MSG_METRIC_SAMPLE: connections_open gauge (active

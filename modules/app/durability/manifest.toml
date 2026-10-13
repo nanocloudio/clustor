@@ -263,3 +263,12 @@ content_type = "OctetStream"
 name = "cold_read_reply"
 direction = "output"
 content_type = "OctetStream"
+
+# in[11]: the app's install acknowledgements (`MSG_APP_SNAPSHOT_INSTALLED`,
+# lattice's `install_ack_out`). With it wired a peer install is told to
+# raft only once the app holds the state; unwired, once it was handed over.
+# Declared LAST so no existing port index shifts.
+[[ports]]
+name = "app_install_ack"
+direction = "input"
+content_type = "OctetStream"

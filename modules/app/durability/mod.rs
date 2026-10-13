@@ -421,6 +421,8 @@ pub extern "C" fn module_new(
         // Declared LAST in the manifest, so these take the highest
         // indices and nothing above shifted.
         s.slots[0].wal.in_cold_read = dev_channel_port(sys, 0, 10);
+        // Input 11: the app's install acknowledgements (declared last).
+        s.slots[0].snapshot.in_app_ack = dev_channel_port(sys, 0, 11);
         s.slots[0].wal.out_cold_reply = dev_channel_port(sys, 1, 11);
         s.slots[0].wal.out_compaction = dev_channel_port(sys, 1, 3);
         s.slots[0].wal.out_metrics = dev_channel_port(sys, 1, 4);
@@ -702,6 +704,9 @@ fn clone_slot_from_zero(
     dst.snapshot.in_import = src.snapshot.in_import;
     dst.snapshot.in_trigger = src.snapshot.in_trigger;
     dst.snapshot.in_install_request = src.snapshot.in_install_request;
+    // `in_app_ack` is not mirrored: the app's channel is not partitioned,
+    // and a slot reading it would consume another's acknowledgement. The
+    // other slots' installs are signalled once handed over.
     dst.wal.in_retention_floor = src.wal.in_retention_floor;
     dst.snapshot.in_app_body = src.snapshot.in_app_body;
     dst.snapshot.out_export = src.snapshot.out_export;
@@ -903,6 +908,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             if snapshot::step(&mut s.slots[i].snapshot, sys) {
                 cold_fs = true;
             }
+            // Seam → wal: a peer's portable transfer replays the log from
+            // its copy's position; nothing after it is retired meanwhile.
+            s.slots[i].wal.xfer_floor = snapshot::xfer_floor(&s.slots[i].snapshot, now);
             // 4c. A lagging follower's install whose manifest ran ahead of
             //     the leader's commit ships at the commit index, with the
             //     term the wal holds there: the follower adopts what it

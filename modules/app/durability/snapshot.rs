@@ -420,10 +420,95 @@ pub struct Snapshot {
     /// Scratch for one sealed chunk (in state: bodies stream).
     seal_buf: [u8; SEAL_BUF],
 
+    // ── Portable transfer to a peer (leader) ─────────────────────
+    //
+    // A lagging peer's install is the app's PORTABLE copy of its state,
+    // asked for on demand (`MSG_APP_SNAPSHOT_EXPORT_REQUEST`) and relayed
+    // chunk for frame as it streams back — never this node's stored
+    // body, which for a disk-backed store certifies only this node's own
+    // files. One transfer at a time; another peer's request is answered
+    // when its hold re-raises it.
+    xfer_phase: u8,
+    xfer_target: u8,
+    xfer_id: u32,
+    xfer_leader_term: u64,
+    xfer_ticks: u32,
+    xfer_expect_off: u64,
+    /// The log position the copy in flight is labelled with: the wal keeps
+    /// what follows it (the peer replays from there) while the transfer
+    /// runs and for `XFER_HOLD_MS` after.
+    xfer_floor_index: u64,
+    xfer_floor_until_ms: u64,
+    /// The peer a copy last went to, and until when its requests are not
+    /// answered again: it is installing that copy, and its hold re-raises
+    /// the request long before the install lands. Answering would start a
+    /// new stream, whose first frame aborts the install under way.
+    xfer_sent_target: u8,
+    xfer_sent_until_ms: u64,
+    xfers_started: u32,
+    xfers_completed: u32,
+    xfers_abandoned: u32,
+    /// A composed `MSG_INSTALL_SNAPSHOT_TO` the export port had no room
+    /// for (`xfer_held_len` bytes): written before anything more is read.
+    xfer_held_len: u16,
+    xfer_frame: [u8; 1 + wire::INSTALL_SNAPSHOT_HDR + wire::XFER_CHUNK_BODY],
+
+    // ── Resumable hand-off to the app (follower install, boot) ───
+    //
+    // The body is handed over from the file a step at a time, resuming
+    // where the channel stopped taking it, so its size is bounded by the
+    // filesystem and not by one channel's room. A peer install is told to
+    // raft only once the app acknowledges it (`app_install_ack`) — before
+    // that, raft must not move past state the app does not hold.
+    pub in_app_ack: i32,
+    rs_phase: u8,
+    rs_install: bool,
+    rs_reset_sent: bool,
+    rs_last_done: bool,
+    rs_held_sealed: bool,
+    rs_term: Term,
+    rs_index: Index,
+    rs_total: u64,
+    rs_off: u64,
+    rs_fd: i32,
+    rs_ticks: u32,
+    rs_held: u16,
+    rs_reader: ChunkReader,
+    rs_buf: [u8; wire::APP_SNAPSHOT_HDR + MAX_CHUNK_BODY],
+    /// The peer install the restore will signal when it lands.
+    pi_term: Term,
+    pi_index: Index,
+    pi_last_term: Term,
+    pi_membership: wire::Membership,
+    pi_durable: bool,
+    pi_signal_owed: bool,
+    installs_awaiting_app: u32,
+
     // Scratch
     path_buf: [u8; SNAP_PATH_MAX],
     msg_buf: [u8; 8192],
 }
+
+const XFER_IDLE: u8 = 0;
+const XFER_ASKED: u8 = 1;
+const XFER_RELAYING: u8 = 2;
+/// Steps a transfer may go without the app producing or the link taking
+/// a frame before it is abandoned (the peer re-raises its request).
+const XFER_STALL_TICKS: u32 = 30_000;
+/// How long after a transfer's last frame the wal still keeps the log the
+/// peer replays from the copy's position.
+const XFER_HOLD_MS: u64 = 120_000;
+/// How long a peer that was sent a copy has to install it before its
+/// request is answered with another.
+const XFER_INSTALL_MS: u64 = 60_000;
+
+const RS_IDLE: u8 = 0;
+const RS_SENDING: u8 = 1;
+const RS_AWAIT_ACK: u8 = 2;
+const RS_DONE: u8 = 3;
+const RS_FAILED: u8 = 4;
+/// Steps a peer install waits for the app's acknowledgement.
+const RS_ACK_TICKS: u32 = 120_000;
 
 pub unsafe fn init(s: &mut Snapshot) {
     s.inbox_import = super::inbox::Inbox::new();
@@ -509,6 +594,41 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.seal_fault = false;
     s.seal_failures = 0;
     s.seal_buf = [0; SEAL_BUF];
+    s.xfer_phase = XFER_IDLE;
+    s.xfer_target = 0;
+    s.xfer_id = 0;
+    s.xfer_leader_term = 0;
+    s.xfer_ticks = 0;
+    s.xfer_expect_off = 0;
+    s.xfer_floor_index = 0;
+    s.xfer_floor_until_ms = 0;
+    s.xfer_sent_target = 0;
+    s.xfer_sent_until_ms = 0;
+    s.xfers_started = 0;
+    s.xfers_completed = 0;
+    s.xfers_abandoned = 0;
+    s.xfer_held_len = 0;
+    s.in_app_ack = -1;
+    s.rs_phase = RS_IDLE;
+    s.rs_install = false;
+    s.rs_fd = -1;
+    s.rs_held = 0;
+    s.rs_reader = ChunkReader::new(0, 0, wire::Membership::default());
+    s.pi_signal_owed = false;
+    s.installs_awaiting_app = 0;
+}
+
+/// The wal position a transfer in flight (or just finished) still needs
+/// kept: the peer replays the log from the copy's position.
+pub fn xfer_floor(s: &Snapshot, now_ms: u64) -> Option<u64> {
+    if s.xfer_floor_index == 0 {
+        return None;
+    }
+    if s.xfer_phase != XFER_IDLE || now_ms < s.xfer_floor_until_ms {
+        Some(s.xfer_floor_index)
+    } else {
+        None
+    }
 }
 
 /// Lowest key epoch a sealed snapshot on disk may still name (0 when
@@ -612,6 +732,7 @@ unsafe fn seal_chunk_out(s: &mut Snapshot, sys: &SyscallTable, flags: u8) -> boo
 
 /// A reader over a sealed body: the binding its first chunk fixes and
 /// the key it derived.
+#[derive(Clone, Copy)]
 struct ChunkReader {
     key: i32,
     binding: sealed::SnapBinding,
@@ -784,6 +905,13 @@ fn hb_field(buf: &mut [u8], at: usize, tag: &[u8], val: u32) -> usize {
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn on_trigger(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) -> bool {
     s.triggers_seen = s.triggers_seen.saturating_add(1);
+    // A body being handed to the app (an install, a boot restore) owns the
+    // control channel and the sealing buffer until it lands; the next
+    // rotation re-fires this trigger.
+    if s.rs_phase != RS_IDLE || s.pi_signal_owed {
+        s.triggers_deferred = s.triggers_deferred.saturating_add(1);
+        return false;
+    }
     // No retention gate here. A snapshot is the STATE at `index` and
     // is always safe to take; what a retention floor protects is the
     // ENTRIES below it, and those are retired by the wal's segment
@@ -909,11 +1037,21 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             if msg_type != wire::MSG_SNAPSHOT_INSTALL_REQUEST {
                 continue;
             }
-            let Some((_target, commit)) =
+            let Some((target, commit)) =
                 wire::decode_snapshot_install_request(&s.msg_buf[..plen as usize])
             else {
                 continue;
             };
+            // With an app state machine the install is its portable copy,
+            // asked for now; never this node's stored body (a disk store's
+            // is a marker only this node can adopt) nor a bare manifest
+            // (which a peer would adopt with no state behind it).
+            if s.out_app_ctl >= 0 && s.in_app_body >= 0 {
+                let leader_term =
+                    wire::decode_snapshot_install_request_term(&s.msg_buf[..plen as usize]);
+                xfer_ask(s, sys, target, commit, leader_term);
+                continue;
+            }
             if s.last_snapshot_index == 0 {
                 demand_trigger = true;
             } else if s.last_snapshot_index <= commit {
@@ -953,12 +1091,32 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     // 2c. App state-machine snapshot bodies. The body's
     //     own (term, index) is authoritative — the app may have
     //     applied past the trigger that prompted the capture.
-    if s.in_app_body >= 0 && s.app_capture_pending {
+    //     The same port carries a portable export's chunks, relayed to
+    //     the peer that asked; a frame the export port has not taken
+    //     holds everything behind it.
+    if s.in_app_body >= 0 && s.xfer_held_len > 0 {
+        xfer_flush(s, sys);
+    }
+    if s.in_app_body >= 0 && s.xfer_phase != XFER_IDLE {
+        s.xfer_ticks = s.xfer_ticks.saturating_add(1);
+        if s.xfer_ticks > XFER_STALL_TICKS {
+            xfer_abandon(s, sys);
+        }
+    }
+    if s.in_app_body >= 0
+        && (s.app_capture_pending || s.xfer_phase != XFER_IDLE)
+        && s.xfer_held_len == 0
+    {
         if wire_channels::readable(sys, s.in_app_body) {
             let (msg_type, plen) =
                 wire_channels::channel_read_msg(sys, s.in_app_body, &mut s.msg_buf);
             let pl = plen as usize;
-            let chunk = if msg_type == wire::MSG_APP_SNAPSHOT_CHUNK && pl >= wire::APP_SNAPSHOT_HDR
+            if msg_type == wire::MSG_APP_SNAPSHOT_EXPORT_CHUNK {
+                xfer_relay(s, sys, pl);
+            }
+            let chunk = if s.app_capture_pending
+                && msg_type == wire::MSG_APP_SNAPSHOT_CHUNK
+                && pl >= wire::APP_SNAPSHOT_HDR
             {
                 wire::decode_term_index(&s.msg_buf[..pl])
             } else {
@@ -1025,7 +1183,7 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                     }
                 }
             }
-        } else {
+        } else if s.app_capture_pending {
             // Bound the wait: a silent app (encode failed, or the
             // state outgrew its export budget) must not wedge
             // snapshotting for good.
@@ -1057,6 +1215,28 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                 _ => {}
             }
         }
+    }
+
+    // 3b. The app's acknowledgements of installs it holds, and the
+    //     hand-off of an installed body a step at a time.
+    drain_app_acks(s, sys);
+    if s.rs_phase != RS_IDLE && s.rs_install {
+        restore_step(s, sys);
+        match s.rs_phase {
+            RS_DONE => {
+                s.rs_phase = RS_IDLE;
+                s.pi_signal_owed = true;
+            }
+            RS_FAILED => {
+                s.rs_phase = RS_IDLE;
+                s.install_failures = s.install_failures.saturating_add(1);
+                dev_log(sys, 1, b"[snap] install not held by app".as_ptr(), 30);
+            }
+            _ => {}
+        }
+    }
+    if s.pi_signal_owed {
+        signal_peer_install(s, sys);
     }
 
     // 4. Periodic metrics.
@@ -1229,6 +1409,12 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         || s.in_progress_term != term
         || s.in_progress_last_idx != last_idx;
     if restart {
+        // A new install supersedes the one still being handed to the app.
+        if s.rs_install && s.rs_phase != RS_IDLE {
+            restore_close(s, sys);
+            s.rs_phase = RS_IDLE;
+        }
+        s.pi_signal_owed = false;
         s.in_progress_term = term;
         s.in_progress_last_idx = last_idx;
         s.in_progress_last_term = last_term;
@@ -1303,53 +1489,37 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         // durable artefact is possible, but the (term, index) is still a
         // valid install there. With an FS present, only signal on a
         // confirmed durable write.
-        // Hand the state-machine body to the app BEFORE signalling the
-        // install. The install signal is what lets raft compact its log
-        // to last_idx; if the app never received the state it could
-        // then never catch up. A refused hand-off (channel full)
-        // withholds the signal and the leader re-sends from offset 0.
-        let carries_state = s.out_app_ctl >= 0 && s.body_len > 0;
-        let mut app_restored = true;
-        if carries_state {
-            app_restored = restore_app(s, sys, s.in_progress_term, s.in_progress_last_idx);
-        }
-
-        if app_restored && (durable || !had_fs) && s.out_installed >= 0 {
-            if wire_channels::writable(sys, s.out_installed) {
-                let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
-                wire::encode_snapshot_installed(
-                    &mut buf,
+        //
+        // A body is handed to the app before raft hears of the install —
+        // the signal is what lets raft move its log past the snapshot, and
+        // past state the app never received it could never catch up. The
+        // hand-off is resumable (`restore_step`), and with the app's
+        // acknowledgement wired the signal waits for it.
+        if durable || !had_fs {
+            s.pi_term = s.in_progress_term;
+            s.pi_index = s.in_progress_last_idx;
+            s.pi_last_term = s.in_progress_last_term;
+            s.pi_membership = s.in_progress_membership;
+            s.pi_durable = durable;
+            let carries_state = s.out_app_ctl >= 0 && s.body_len > 0;
+            if s.out_app_ctl >= 0 && !carries_state {
+                // A bare manifest where an app holds the state: adopted,
+                // it would put raft past state the app never received.
+                // Refused; the leader's next answer carries the state.
+                s.install_failures = s.install_failures.saturating_add(1);
+                dev_log(sys, 1, b"[snap] stateless install refused".as_ptr(), 32);
+            } else if carries_state {
+                restore_begin(
+                    s,
                     s.in_progress_term,
                     s.in_progress_last_idx,
-                    s.in_progress_last_term,
-                    s.in_progress_membership,
-                    carries_state,
+                    u64::from(s.body_len),
+                    true,
                 );
-                write_installed(s, sys, wire::MSG_SNAPSHOT_INSTALLED, &buf);
-                let prev_index = s.last_snapshot_index;
-                s.last_snapshot_term = s.in_progress_term;
-                s.last_snapshot_index = s.in_progress_last_idx;
-                s.last_snapshot_membership = s.in_progress_membership;
-                // Seam latch → wal: the installed prefix will never
-                // arrive on `entries`, so the wal must fast-forward its
-                // append contract to `last_idx` or the very next
-                // post-install append (`last_idx + 1` against an
-                // expected `current_index + 1`) latches a continuity
-                // fault. Monotone latest-wins; drained by the dispatch
-                // table after this component's step.
-                s.wal_fast_forward = (
-                    s.in_progress_last_term,
-                    s.in_progress_last_idx,
-                    s.in_progress_membership,
-                );
-                s.wal_fast_forward_dirty = true;
-                dev_log(sys, 3, b"[snap] installed".as_ptr(), 16);
-                // Exactly-one-snapshot steady state (mirrors the local
-                // trigger path): retire the superseded snapshot file only
-                // when this install confirmed durable on a real FS.
-                if durable {
-                    unlink_prev_snapshot(s, sys, prev_index, s.last_snapshot_index);
-                }
+                s.installs_awaiting_app = s.installs_awaiting_app.saturating_add(1);
+            } else {
+                s.pi_signal_owed = true;
+                signal_peer_install(s, sys);
             }
         }
         // Fold the install duration into the transfer histogram.
@@ -1459,8 +1629,373 @@ unsafe fn finalize_local_snapshot(s: &mut Snapshot, sys: &SyscallTable, term: Te
     if durable {
         unlink_prev_snapshot(s, sys, prev_index, index);
     }
-    export_staged(s, sys, term, index);
+    // A manifest-only graph pushes its snapshot to peers as before. With
+    // an app state machine a peer is caught up by a portable transfer it
+    // asks for (`xfer_ask`): this node's body may certify only its own
+    // store (a disk store's marker), and broadcast it would rewind a peer.
+    if s.out_app_ctl < 0 {
+        export_staged(s, sys, term, index);
+    }
     s.snapshots_taken += 1;
+}
+
+/// Ask the app for a portable copy for `target` (one transfer at a time;
+/// a request for the transfer under way, or for another peer meanwhile,
+/// is answered by the hold re-raising it).
+unsafe fn xfer_ask(
+    s: &mut Snapshot,
+    sys: &SyscallTable,
+    target: u8,
+    commit: Index,
+    leader_term: Term,
+) {
+    if s.xfer_phase != XFER_IDLE {
+        return;
+    }
+    if target == s.xfer_sent_target && dev_millis(sys) < s.xfer_sent_until_ms {
+        return;
+    }
+    let id = s.xfer_id.wrapping_add(1) & 0x00FF_FFFF;
+    let mut buf = [0u8; 20];
+    buf[..8].copy_from_slice(&leader_term.to_le_bytes());
+    buf[8..16].copy_from_slice(&commit.to_le_bytes());
+    buf[16..20].copy_from_slice(&id.to_le_bytes());
+    if wire_channels::channel_write_msg(
+        sys,
+        s.out_app_ctl,
+        wire::MSG_APP_SNAPSHOT_EXPORT_REQUEST,
+        &buf,
+    ) <= 0
+    {
+        return;
+    }
+    s.xfer_id = id;
+    s.xfer_phase = XFER_ASKED;
+    s.xfer_target = target;
+    s.xfer_leader_term = leader_term;
+    s.xfer_ticks = 0;
+    s.xfer_expect_off = 0;
+    s.xfers_started = s.xfers_started.saturating_add(1);
+    dev_log(sys, 3, b"[snap] xfer asked".as_ptr(), 17);
+}
+
+/// Relay one export chunk (in `msg_buf`, `pl` bytes) to the transfer's
+/// peer as an install frame, under the leader's term.
+unsafe fn xfer_relay(s: &mut Snapshot, sys: &SyscallTable, pl: usize) {
+    if s.xfer_phase == XFER_IDLE || pl < wire::APP_SNAPSHOT_HDR {
+        return;
+    }
+    let Some((term, index)) = wire::decode_term_index(&s.msg_buf[..pl]) else {
+        return;
+    };
+    let mut o = [0u8; 8];
+    o.copy_from_slice(&s.msg_buf[16..24]);
+    let offset = u64::from_le_bytes(o);
+    let done = s.msg_buf[24] != 0;
+    let id = u32::from_le_bytes([s.msg_buf[25], s.msg_buf[26], s.msg_buf[27], 0]);
+    if id != s.xfer_id {
+        return; // a superseded export's tail
+    }
+    let body_len = pl - wire::APP_SNAPSHOT_HDR;
+    if offset != s.xfer_expect_off || body_len > wire::XFER_CHUNK_BODY {
+        xfer_abandon(s, sys);
+        return;
+    }
+    let leader_term = if s.xfer_leader_term != 0 {
+        s.xfer_leader_term
+    } else {
+        term
+    };
+    let membership = membership_of(s, index);
+    let mut hdr = [0u8; wire::INSTALL_SNAPSHOT_HDR];
+    if wire::encode_install_snapshot(
+        &mut hdr,
+        leader_term,
+        index,
+        term,
+        offset,
+        done,
+        membership,
+        &[],
+    ) == 0
+    {
+        xfer_abandon(s, sys);
+        return;
+    }
+    s.xfer_frame[0] = s.xfer_target;
+    s.xfer_frame[1..1 + wire::INSTALL_SNAPSHOT_HDR].copy_from_slice(&hdr);
+    let at = 1 + wire::INSTALL_SNAPSHOT_HDR;
+    let mut i = 0usize;
+    while i < body_len {
+        s.xfer_frame[at + i] = s.msg_buf[wire::APP_SNAPSHOT_HDR + i];
+        i += 1;
+    }
+    s.xfer_held_len = (at + body_len) as u16;
+    s.xfer_phase = XFER_RELAYING;
+    s.xfer_floor_index = index;
+    s.xfer_floor_until_ms = dev_millis(sys).saturating_add(XFER_HOLD_MS);
+    s.xfer_expect_off = offset + body_len as u64;
+    s.xfer_ticks = 0;
+    if done {
+        // The stream is whole once this frame goes; the floor holds on.
+        s.xfer_phase = XFER_IDLE;
+        s.xfers_completed = s.xfers_completed.saturating_add(1);
+        s.xfer_sent_target = s.xfer_target;
+        s.xfer_sent_until_ms = dev_millis(sys).saturating_add(XFER_INSTALL_MS);
+        dev_log(sys, 3, b"[snap] xfer sent".as_ptr(), 16);
+    }
+    xfer_flush(s, sys);
+}
+
+/// Write the held install frame, if the export port takes it now.
+unsafe fn xfer_flush(s: &mut Snapshot, sys: &SyscallTable) {
+    let n = s.xfer_held_len as usize;
+    if n == 0 || s.out_export < 0 {
+        s.xfer_held_len = 0;
+        return;
+    }
+    if wire_channels::channel_write_msg(
+        sys,
+        s.out_export,
+        wire::MSG_INSTALL_SNAPSHOT_TO,
+        &s.xfer_frame[..n],
+    ) > 0
+    {
+        s.xfer_held_len = 0;
+        s.xfer_ticks = 0;
+    }
+}
+
+/// Give the transfer up: its peer's hold re-raises the request and a new
+/// copy is asked for. The app's export, still running, is superseded by
+/// that next ask (or ends on its own idle bound).
+unsafe fn xfer_abandon(s: &mut Snapshot, sys: &SyscallTable) {
+    s.xfer_phase = XFER_IDLE;
+    s.xfer_sent_until_ms = 0;
+    s.xfer_held_len = 0;
+    s.xfers_abandoned = s.xfers_abandoned.saturating_add(1);
+    dev_log(sys, 2, b"[snap] xfer abandoned".as_ptr(), 21);
+}
+
+/// Begin handing the body of the snapshot at `index` to the app.
+unsafe fn restore_begin(s: &mut Snapshot, term: Term, index: Index, total: u64, install: bool) {
+    s.rs_phase = RS_SENDING;
+    s.rs_install = install;
+    s.rs_term = term;
+    s.rs_index = index;
+    s.rs_total = total;
+    s.rs_off = 0;
+    s.rs_reset_sent = false;
+    s.rs_last_done = false;
+    s.rs_held = 0;
+    s.rs_ticks = 0;
+    s.rs_fd = -1;
+    s.rs_reader = ChunkReader::new(term, index, membership_of(s, index));
+}
+
+/// Close the restore's file and key.
+unsafe fn restore_close(s: &mut Snapshot, sys: &SyscallTable) {
+    if s.rs_fd >= 0 {
+        (sys.provider_call)(s.rs_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.rs_fd = -1;
+    }
+    if s.rs_reader.key >= 0 {
+        sealed::destroy(sys, s.rs_reader.key);
+        s.rs_reader.key = -1;
+    }
+    s.rs_held = 0;
+}
+
+/// One step of the hand-off: the RESET, then the body a chunk at a time
+/// for as long as the control channel takes it, resuming where it
+/// stopped. Then, for a peer install with the acknowledgement wired, the
+/// wait for it. Leaves `rs_phase` at `RS_DONE` or `RS_FAILED` when over.
+unsafe fn restore_step(s: &mut Snapshot, sys: &SyscallTable) {
+    if s.rs_phase == RS_AWAIT_ACK {
+        s.rs_ticks = s.rs_ticks.saturating_add(1);
+        if s.rs_ticks > RS_ACK_TICKS {
+            s.rs_phase = RS_FAILED;
+        }
+        return;
+    }
+    if s.rs_phase != RS_SENDING || s.out_app_ctl < 0 {
+        return;
+    }
+    if !s.rs_reset_sent {
+        let mut hdr = [0u8; 16];
+        hdr[..8].copy_from_slice(&s.rs_term.to_le_bytes());
+        hdr[8..].copy_from_slice(&s.rs_index.to_le_bytes());
+        if wire_channels::channel_write_msg(sys, s.out_app_ctl, wire::MSG_APP_SNAPSHOT_RESET, &hdr)
+            <= 0
+        {
+            return;
+        }
+        s.rs_reset_sent = true;
+    }
+    if s.rs_fd < 0 && s.rs_total > 0 {
+        s.rs_fd = snap_open_body(s, sys, s.rs_index, 0);
+        if s.rs_fd < 0 {
+            s.rs_phase = RS_FAILED;
+            return;
+        }
+    }
+    let sealed_body = sealing(s) && s.rs_total > 0;
+    for _ in 0..8 {
+        if s.rs_held > 0 {
+            let n = s.rs_held as usize;
+            let w = if s.rs_held_sealed {
+                let start = sealed::SNAP_HDR_LEN - wire::APP_SNAPSHOT_HDR;
+                wire_channels::channel_write_msg(
+                    sys,
+                    s.out_app_ctl,
+                    wire::MSG_APP_SNAPSHOT_CHUNK,
+                    &s.seal_buf[start..start + n],
+                )
+            } else {
+                wire_channels::channel_write_msg(
+                    sys,
+                    s.out_app_ctl,
+                    wire::MSG_APP_SNAPSHOT_CHUNK,
+                    &s.rs_buf[..n],
+                )
+            };
+            if w <= 0 {
+                return; // the channel is full: the same chunk next step
+            }
+            s.rs_held = 0;
+            if s.rs_last_done {
+                restore_close(s, sys);
+                s.rs_phase = if s.rs_install && s.in_app_ack >= 0 {
+                    RS_AWAIT_ACK
+                } else {
+                    RS_DONE
+                };
+                s.rs_ticks = 0;
+                return;
+            }
+        }
+        // Compose the next chunk.
+        let c = if sealed_body {
+            let mut r = s.rs_reader;
+            let got = read_chunk(s, sys, s.rs_fd, &mut r);
+            s.rs_reader = r;
+            match got {
+                Ok(c) => c,
+                Err(_) => {
+                    s.seal_failures = s.seal_failures.saturating_add(1);
+                    restore_close(s, sys);
+                    s.rs_phase = RS_FAILED;
+                    return;
+                }
+            }
+        } else {
+            let c = (s.rs_total - s.rs_off).min(MAX_CHUNK_BODY as u64) as usize;
+            if c > 0 {
+                let dst = s.rs_buf.as_mut_ptr().add(wire::APP_SNAPSHOT_HDR);
+                if (sys.provider_call)(s.rs_fd, FS_READ, dst, c) != c as i32 {
+                    restore_close(s, sys);
+                    s.rs_phase = RS_FAILED;
+                    return;
+                }
+            }
+            c
+        };
+        if sealed_body && c == 0 {
+            if s.rs_reader.done && s.rs_off != s.rs_total {
+                restore_close(s, sys);
+                s.rs_phase = RS_FAILED;
+                return;
+            }
+            continue;
+        }
+        if s.rs_off + c as u64 > s.rs_total {
+            restore_close(s, sys);
+            s.rs_phase = RS_FAILED;
+            return;
+        }
+        let done = s.rs_off + c as u64 == s.rs_total;
+        let mut h = [0u8; wire::APP_SNAPSHOT_HDR];
+        h[..8].copy_from_slice(&s.rs_term.to_le_bytes());
+        h[8..16].copy_from_slice(&s.rs_index.to_le_bytes());
+        h[16..24].copy_from_slice(&s.rs_off.to_le_bytes());
+        h[24] = u8::from(done);
+        if sealed_body {
+            let start = sealed::SNAP_HDR_LEN - wire::APP_SNAPSHOT_HDR;
+            s.seal_buf[start..sealed::SNAP_HDR_LEN].copy_from_slice(&h);
+        } else {
+            s.rs_buf[..wire::APP_SNAPSHOT_HDR].copy_from_slice(&h);
+        }
+        s.rs_held_sealed = sealed_body;
+        s.rs_held = (wire::APP_SNAPSHOT_HDR + c) as u16;
+        s.rs_off += c as u64;
+        s.rs_last_done = done;
+    }
+}
+
+/// The app's install acknowledgements: the one naming the restore's index
+/// completes it.
+unsafe fn drain_app_acks(s: &mut Snapshot, sys: &SyscallTable) {
+    if s.in_app_ack < 0 {
+        return;
+    }
+    for _ in 0..4 {
+        if !wire_channels::readable(sys, s.in_app_ack) {
+            return;
+        }
+        let mut buf = [0u8; 32];
+        let (msg_type, plen) = wire_channels::channel_read_msg(sys, s.in_app_ack, &mut buf);
+        if msg_type != wire::MSG_APP_SNAPSHOT_INSTALLED || (plen as usize) < 10 {
+            continue;
+        }
+        if u16::from_le_bytes([buf[0], buf[1]]) != s.partition_id {
+            continue;
+        }
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&buf[2..10]);
+        let index = u64::from_le_bytes(b);
+        if s.rs_phase == RS_AWAIT_ACK && s.rs_install && index == s.rs_index {
+            s.rs_phase = RS_DONE;
+        }
+    }
+}
+
+/// Tell raft a peer install landed (owed until its port takes it): the
+/// state is the app's and the snapshot durable, so raft may base its log
+/// on it; the wal fast-forwards past the prefix it subsumes.
+unsafe fn signal_peer_install(s: &mut Snapshot, sys: &SyscallTable) {
+    if s.out_installed < 0 {
+        s.pi_signal_owed = false;
+        return;
+    }
+    let carries_state = s.out_app_ctl >= 0 && s.rs_total > 0 && s.rs_index == s.pi_index;
+    let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
+    wire::encode_snapshot_installed(
+        &mut buf,
+        s.pi_term,
+        s.pi_index,
+        s.pi_last_term,
+        s.pi_membership,
+        carries_state,
+    );
+    if write_installed(s, sys, wire::MSG_SNAPSHOT_INSTALLED, &buf) <= 0 {
+        return;
+    }
+    s.pi_signal_owed = false;
+    let prev_index = s.last_snapshot_index;
+    s.last_snapshot_term = s.pi_term;
+    s.last_snapshot_index = s.pi_index;
+    s.last_snapshot_membership = s.pi_membership;
+    // Seam latch → wal: the installed prefix will never arrive on
+    // `entries`, so the wal fast-forwards its append contract to the
+    // install's index (or the next append latches a continuity fault).
+    s.wal_fast_forward = (s.pi_last_term, s.pi_index, s.pi_membership);
+    s.wal_fast_forward_dirty = true;
+    dev_log(sys, 3, b"[snap] installed".as_ptr(), 16);
+    // Exactly-one-snapshot steady state: retire the superseded snapshot
+    // file only when this install confirmed durable on a real FS.
+    if s.pi_durable {
+        unlink_prev_snapshot(s, sys, prev_index, s.pi_index);
+    }
 }
 
 /// Ask the app state machine to capture its state now. `(term, index)`
@@ -1504,88 +2039,6 @@ unsafe fn request_app_capture(
 /// `emit_install_staged`.
 unsafe fn emit_install_chunk(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) {
     emit_install_body(s, sys, term, index, &[]);
-}
-
-/// Deliver an installed snapshot to the app state machine: a
-/// `MSG_APP_SNAPSHOT_RESET` (discard current state) followed by the body as
-/// a `MSG_APP_SNAPSHOT_CHUNK` stream.
-///
-/// Returns false if the hand-off could not be completed, in which case
-/// the caller MUST withhold the install signal — otherwise raft would
-/// compact past state the app never received.
-///
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Snapshot` and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel routines.
-#[inline(never)]
-unsafe fn emit_app_restore(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) -> bool {
-    if s.out_app_ctl < 0 {
-        return false;
-    }
-    let total = s.body_len as usize;
-    // The body lives in the snapshot FILE, not in module state, so it is
-    // read back a chunk at a time as it is handed over. Opened per
-    // attempt: a refused chunk aborts the whole restore and the caller
-    // retries from offset 0, so there is no partial stream to resume.
-    let fd = if total > 0 {
-        snap_open_body(s, sys, index, 0)
-    } else {
-        -1
-    };
-    if total > 0 && fd < 0 {
-        return false;
-    }
-    // RESET first: the app discards state up front, so a stream that
-    // dies mid-way leaves it empty (catch-up from leader) rather than
-    // half-old/half-new.
-    if !wire_channels::writable(sys, s.out_app_ctl) {
-        if fd >= 0 {
-            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        }
-        return false;
-    }
-    let mut hdr = [0u8; 16];
-    hdr[..8].copy_from_slice(&term.to_le_bytes());
-    hdr[8..].copy_from_slice(&index.to_le_bytes());
-    wire_channels::channel_write_msg(sys, s.out_app_ctl, wire::MSG_APP_SNAPSHOT_RESET, &hdr);
-
-    let mut sent = 0usize;
-    loop {
-        let chunk = (total - sent).min(MAX_CHUNK_BODY);
-        let done = sent + chunk == total;
-        if !wire_channels::writable(sys, s.out_app_ctl) {
-            if fd >= 0 {
-                (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-            }
-            return false;
-        }
-        let mut buf = [0u8; wire::APP_SNAPSHOT_HDR + MAX_CHUNK_BODY];
-        buf[..8].copy_from_slice(&term.to_le_bytes());
-        buf[8..16].copy_from_slice(&index.to_le_bytes());
-        buf[16..24].copy_from_slice(&(sent as u64).to_le_bytes());
-        buf[24] = u8::from(done);
-        if chunk > 0 {
-            let dst = buf.as_mut_ptr().add(wire::APP_SNAPSHOT_HDR);
-            if (sys.provider_call)(fd, FS_READ, dst, chunk) != chunk as i32 {
-                (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-                return false;
-            }
-        }
-        wire_channels::channel_write_msg(
-            sys,
-            s.out_app_ctl,
-            wire::MSG_APP_SNAPSHOT_CHUNK,
-            &buf[..wire::APP_SNAPSHOT_HDR + chunk],
-        );
-        sent += chunk;
-        if done {
-            if fd >= 0 {
-                (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-            }
-            return true;
-        }
-    }
 }
 
 /// Emit an InstallSnapshot RPC carrying the body staged in
@@ -1663,26 +2116,8 @@ unsafe fn emit_install_staged(s: &mut Snapshot, sys: &SyscallTable, term: Term, 
     (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
 }
 
-/// Hand the retained snapshot's body to the app state machine, by the
-/// path that matches how it is stored. Dispatched above either path's
-/// frame: the unsealed stream stages a page-sized buffer on the stack
-/// that the sealed one does not need.
-///
-/// # Safety
-/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
-unsafe fn restore_app(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) -> bool {
-    if s.out_app_ctl < 0 {
-        return false;
-    }
-    if sealing(s) {
-        emit_sealed_body(s, sys, term, index, s.out_app_ctl, true)
-    } else {
-        emit_app_restore(s, sys, term, index)
-    }
-}
-
 /// Ship the retained snapshot to peers, by the path that matches how it
-/// is stored (see `restore_app`).
+/// is stored.
 ///
 /// # Safety
 /// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
@@ -2363,11 +2798,32 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             false
         }
         BOOT_EMIT => {
-            if restore_app(s, sys, s.last_snapshot_term, s.last_snapshot_index) {
-                dev_log(sys, 3, b"[snap] boot restored".as_ptr(), 20);
-                s.boot_phase = BOOT_SIGNAL;
+            // The body is handed over resumably: one larger than the
+            // control channel's room (a portable install's) lands over
+            // several steps, and the app reads it once it is serving.
+            if s.rs_phase == RS_IDLE {
+                restore_begin(
+                    s,
+                    s.last_snapshot_term,
+                    s.last_snapshot_index,
+                    u64::from(s.body_len),
+                    false,
+                );
             }
-            false // channel not ready / partial — re-send next step
+            restore_step(s, sys);
+            match s.rs_phase {
+                RS_DONE => {
+                    s.rs_phase = RS_IDLE;
+                    dev_log(sys, 3, b"[snap] boot restored".as_ptr(), 20);
+                    s.boot_phase = BOOT_SIGNAL;
+                }
+                RS_FAILED => {
+                    // Started over from the RESET next step.
+                    s.rs_phase = RS_IDLE;
+                }
+                _ => {}
+            }
+            false
         }
         BOOT_SIGNAL => {
             // Consensus must learn the snapshot base BEFORE the wal

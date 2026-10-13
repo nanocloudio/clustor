@@ -272,9 +272,27 @@ pub struct Repl {
     catchup_sent: u32,
     last_metrics_ms: u64,
 
+    /// A routed install frame (`MSG_INSTALL_SNAPSHOT_TO`) the peer link had
+    /// no room for: sent before anything else is forwarded, so a transfer
+    /// is never cut by a dropped frame (the follower's offset gate would
+    /// discard the rest and the stream would start over).
+    fwd_held: bool,
+    fwd_target: u8,
+    fwd_len: u16,
+    fwd_buf: [u8; FWD_FRAME_MAX],
+    /// An install frame from the leader durability's import had no room
+    /// for: written before more is taken.
+    import_held: bool,
+    import_type: u8,
+    import_len: u16,
+    import_buf: [u8; FWD_FRAME_MAX],
+
     // Scratch
     msg_buf: [u8; 4096],
 }
+
+/// One install frame of a portable transfer, header and body.
+const FWD_FRAME_MAX: usize = wire::INSTALL_SNAPSHOT_HDR + wire::XFER_CHUNK_BODY;
 
 /// Initialise every field to its pre-param default. Channel handles
 /// and params are assigned by `mod.rs` afterwards; `arm` runs the
@@ -306,6 +324,8 @@ pub fn init(s: &mut Repl) {
     s.commit_hint = 0;
     s.term_hint_out = None;
     s.snapshot_target = None;
+    s.fwd_held = false;
+    s.import_held = false;
     s.last_emitted_prev_index = 0;
     s.last_emitted_prev_term = 0;
     s.current_voters = 0;
@@ -510,6 +530,22 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
         return;
     }
 
+    // An install frame still owed to durability goes first; nothing more
+    // is taken until it lands (on a follower only install frames arrive
+    // here, so nothing else waits behind it).
+    if s.import_held {
+        let n = wire_channels::channel_write_partitioned(
+            sys,
+            s.out_snapshot_import,
+            s.partition_id,
+            s.import_type,
+            &s.import_buf[..s.import_len as usize],
+        );
+        if n <= 0 {
+            return;
+        }
+        s.import_held = false;
+    }
     // Acks arrive pre-routed in this slot's inbox: the engine reads the
     // shared `peer_rx` channel once and matches the 5-byte partitioned
     // envelope's partition_id, so nothing here belongs to another group.
@@ -686,16 +722,23 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                 // snapshot side via out_snapshot_import so it can accumulate
                 // / install.
                 if s.out_snapshot_import >= 0 {
-                    if wire_channels::writable(sys, s.out_snapshot_import) {
-                        // Partitioned: one durability instance imports
-                        // for K groups, so the chunk names its group.
-                        wire_channels::channel_write_partitioned(
-                            sys,
-                            s.out_snapshot_import,
-                            s.partition_id,
-                            msg_type,
-                            &s.msg_buf[..plen as usize],
-                        );
+                    // Partitioned: one durability instance imports for K
+                    // groups, so the chunk names its group. A frame with
+                    // no room is held, not dropped: a gap in the stream
+                    // costs the whole transfer.
+                    let n = wire_channels::channel_write_partitioned(
+                        sys,
+                        s.out_snapshot_import,
+                        s.partition_id,
+                        msg_type,
+                        &s.msg_buf[..plen as usize],
+                    );
+                    if n <= 0 && (plen as usize) <= FWD_FRAME_MAX {
+                        s.import_buf[..plen as usize].copy_from_slice(&s.msg_buf[..plen as usize]);
+                        s.import_len = plen;
+                        s.import_type = msg_type;
+                        s.import_held = true;
+                        return;
                     }
                 }
             }
@@ -1033,8 +1076,8 @@ unsafe fn request_snapshot_install(s: &mut Repl, sys: &SyscallTable, target: u8)
     // The commit index rides along: the follower adopts whatever index
     // it installs as committed, so durability ships a manifest no higher
     // than this.
-    let mut buf = [0u8; wire::SNAPSHOT_INSTALL_REQUEST_LEN];
-    wire::encode_snapshot_install_request(&mut buf, target, s.commit_hint);
+    let mut buf = [0u8; wire::SNAPSHOT_INSTALL_REQUEST_TERM_LEN];
+    wire::encode_snapshot_install_request_term(&mut buf, target, s.commit_hint, s.current_term);
     wire_channels::channel_write_partitioned(
         sys,
         s.out_snapshot_request,
@@ -1181,12 +1224,54 @@ unsafe fn forward_snapshots(s: &mut Repl, sys: &SyscallTable) {
         return;
     }
 
+    // A routed frame the link refused goes first; nothing more is taken
+    // from durability until it lands.
+    if s.fwd_held {
+        let n = wire_channels::channel_write_routed_partitioned(
+            sys,
+            s.out_net,
+            s.fwd_target,
+            s.partition_id,
+            wire::MSG_INSTALL_SNAPSHOT,
+            &s.fwd_buf[..s.fwd_len as usize],
+        );
+        if n <= 0 {
+            return;
+        }
+        s.fwd_held = false;
+    }
     for _ in 0..4 {
         let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_snapshot_rx, &mut s.msg_buf)
         else {
             break;
         };
         if plen == 0 {
+            continue;
+        }
+        if msg_type == wire::MSG_INSTALL_SNAPSHOT_TO {
+            // A portable transfer to one peer: routed to it alone, and
+            // only while this replica leads (a deposed leader's
+            // stream answers no one's request).
+            let pl = plen as usize;
+            if pl < 1 + wire::INSTALL_SNAPSHOT_HDR || pl - 1 > FWD_FRAME_MAX || !s.is_leader {
+                continue;
+            }
+            let target = s.msg_buf[0];
+            let n = wire_channels::channel_write_routed_partitioned(
+                sys,
+                s.out_net,
+                target,
+                s.partition_id,
+                wire::MSG_INSTALL_SNAPSHOT,
+                &s.msg_buf[1..pl],
+            );
+            if n <= 0 {
+                s.fwd_buf[..pl - 1].copy_from_slice(&s.msg_buf[1..pl]);
+                s.fwd_len = (pl - 1) as u16;
+                s.fwd_target = target;
+                s.fwd_held = true;
+                return;
+            }
             continue;
         }
 

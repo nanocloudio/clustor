@@ -209,7 +209,10 @@ define_params! {
     // connection, or a claim of an id with no pin, never does (fail
     // closed). `open`: a claim binds without one, as a cleartext graph
     // needs; a configured pin is still enforced when an identity arrives.
-    24, require_identity, u8, 0, enum { open=0, pinned=1 }
+    // `principal`: only a verified chain whose principal names the
+    // claimed replica (`principal_prefix` + id, optionally `.role`) binds
+    // it — the authority that certified the key decides, not a pin.
+    24, require_identity, u8, 0, enum { open=0, pinned=1, principal=2 }
         => |s, d, len| { s.require_identity = p_u8(d, len, 0, 0); };
 
     // Partitions a peer frame may name (0: any). A frame naming another
@@ -224,6 +227,25 @@ define_params! {
     // 0: no bound.
     26, max_link_s, u32, 86400
         => |s, d, len| { s.max_link_s = p_u32(d, len, 0, 86_400); };
+
+    // Under `require_identity: principal`: replica ids below `voters` are
+    // the group's voters; one at or above it is a learner slot, and when
+    // its principal binds this router asks `operations` (learner_admin →
+    // admin_requests) to add it as a learner. The authority certified that
+    // principal through a join only the slot's own credential could make,
+    // so binding is the admission. 0: no slot is admitted here.
+    28, voters, u8, 0
+        => |s, d, len| { s.voters = p_u8(d, len, 0, 0); };
+
+    // The principal prefix `require_identity: principal` completes with a
+    // replica's id. One that does not fit is not taken (names nothing).
+    27, principal_prefix, str, 0
+        => |s, d, len| {
+            if len <= peer_policy::PRINCIPAL_MAX && !d.is_null() {
+                core::ptr::copy_nonoverlapping(d, s.principal_prefix.as_mut_ptr(), len);
+                s.principal_prefix_len = len as u8;
+            }
+        };
 }
 
 /// Adopt peer `idx`'s pinned key fingerprint, 64 hex characters. One that
@@ -324,6 +346,10 @@ struct Conn {
     /// while `tls_verified`.
     peer_fp: [u8; PEER_FP_MAX],
     peer_fp_len: u8,
+    /// The verified principal from `MSG_PEER_IDENTITY` (empty: none),
+    /// valid only while `tls_verified`.
+    principal: [u8; peer_policy::PRINCIPAL_MAX],
+    principal_len: u8,
     /// Pre-identify fragment: bytes of a connection's opening data
     /// that arrived in a chunk shorter than the 3-byte handshake
     /// magic. Buffered here (never dropped) until enough bytes exist
@@ -358,6 +384,8 @@ impl Conn {
             identity_forwarded: false,
             peer_fp: [0; PEER_FP_MAX],
             peer_fp_len: 0,
+            principal: [0; peer_policy::PRINCIPAL_MAX],
+            principal_len: 0,
             not_after: 0,
             bound_ms: 0,
             frag_len: 0,
@@ -418,6 +446,22 @@ struct ModuleState {
     pins: [[u8; PEER_FP_MAX]; MAX_NODES],
     pinned: u8,
     require_identity: u8,
+    /// `require_identity: principal`: the principal prefix a replica's id
+    /// completes (`spiffe://<domain>/tenant/<t>/device/replica-`).
+    principal_prefix: [u8; peer_policy::PRINCIPAL_MAX],
+    principal_prefix_len: u8,
+    /// `voters`: replica ids below it are the group's voters; a replica at
+    /// or above it is a learner slot, admitted to the group when its
+    /// principal binds (0: none admitted here).
+    voters: u8,
+    /// Per learner slot: when its ADD_LEARNER is next asked (while its
+    /// principal stays bound), and whether this binding's first ask is
+    /// still to be logged. Asked again and again — at bind the group may
+    /// have no leader to commit it (a follower answers NOT_LEADER and does
+    /// nothing), and the leader answers an admitted learner without a log
+    /// entry, so a repeat costs nothing.
+    learner_ask_at: [u64; 8],
+    learners_fresh: u8,
     partitions: u16,
     max_link_s: u32,
     /// Replica claims refused for want of a pinned identity, connections
@@ -449,10 +493,14 @@ struct ModuleState {
     net_out: i32,         // out[0]: net_proto commands to tls/ip
     dial_out: i32,        // out[5]: commands for dialled conns (see `dial_in`)
     client_identity: i32, // out[6]: identities re-keyed to `wire::ConnId`
-    cleartext: i32,       // out[1]: non-Raft client data → gateway
-    peer_rx: i32,         // out[2]: AppendEntries acks → replicator_pN
-    raft_rpc: i32,        // out[3]: votes/AE/heartbeats → consensus_pN
-    out_metrics: i32,     // out[4]: MSG_METRIC_SAMPLE to operations
+    /// out[7]: local membership commands for `operations.admin_requests`
+    /// (MSG_ADMIN_COMMAND) — `ADD_LEARNER` for a learner slot a principal
+    /// bound. -1 when unwired.
+    learner_admin: i32,
+    cleartext: i32,   // out[1]: non-Raft client data → gateway
+    peer_rx: i32,     // out[2]: AppendEntries acks → replicator_pN
+    raft_rpc: i32,    // out[3]: votes/AE/heartbeats → consensus_pN
+    out_metrics: i32, // out[4]: MSG_METRIC_SAMPLE to operations
 
     // Config
     self_id: ReplicaId,
@@ -630,6 +678,7 @@ pub extern "C" fn module_new(
         s.dial_in = dev_channel_port(sys, 0, 5);
         s.dial_out = dev_channel_port(sys, 1, 5);
         s.client_identity = dev_channel_port(sys, 1, 6);
+        s.learner_admin = dev_channel_port(sys, 1, 7);
 
         // Defaults + TLV param parsing
         s.pins = [[0; PEER_FP_MAX]; MAX_NODES];
@@ -718,6 +767,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             flush_revokes(s, sys);
         }
         drain_tls_identity(s, sys, now);
+        send_owed_learners(s, sys);
         process_net_events(s, sys, now);
         // Second flush, after inbound processing: an identity owed by
         // a handshake that completed THIS step would otherwise stay
@@ -868,8 +918,15 @@ unsafe fn drain_tls_identity(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
             fp_len: fp_len as u8,
             not_after: id.not_after,
             at_ms: now,
+            principal: [0u8; peer_policy::PRINCIPAL_MAX],
+            principal_len: 0,
         };
         report.fp[..fp_len].copy_from_slice(&s.buf[id.fingerprint_at..id.fingerprint_at + fp_len]);
+        if id.principal_len <= peer_policy::PRINCIPAL_MAX {
+            let at = id.principal_at;
+            report.principal[..id.principal_len].copy_from_slice(&s.buf[at..at + id.principal_len]);
+            report.principal_len = id.principal_len as u8;
+        }
         let i = find_conn(s, report.conn_id);
         if i < MAX_CONNS && peer_policy::report_belongs(s.conns[i].generation, report.generation) {
             apply_identity(s, sys, i, &report, now);
@@ -880,6 +937,47 @@ unsafe fn drain_tls_identity(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
         }
     }
 }
+
+/// Ask `operations` to add every owed learner slot (ADD_LEARNER, local
+/// path: `[conn_id:u16 = 0xFFFF][op][replica]`). A command the channel cannot
+/// take stays owed for the next step; one sent is not sent again.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn send_owed_learners(s: &mut ModuleState, sys: &SyscallTable) {
+    if s.learner_admin < 0 || s.require_identity != REQUIRE_PRINCIPAL || s.voters == 0 {
+        return;
+    }
+    let now = dev_millis(sys);
+    for id in s.voters..8u8 {
+        // Only while the slot's principal is bound to a live link.
+        if slot_of_replica(s, id) == MAX_CONNS {
+            continue;
+        }
+        if now < s.learner_ask_at[id as usize] {
+            continue;
+        }
+        // conn 0xFFFF: no slot is ever numbered so, so the answer reaches no one.
+        let cmd = [0xFF, 0xFF, wire::ADMIN_OP_ADD_LEARNER, id];
+        if wire_channels::channel_write_msg(sys, s.learner_admin, wire::MSG_ADMIN_COMMAND, &cmd) > 0
+        {
+            s.learner_ask_at[id as usize] = now.saturating_add(LEARNER_REASK_MS);
+            if s.learners_fresh & (1 << id) != 0 {
+                s.learners_fresh &= !(1 << id);
+                let mut m = *b"[pr] add learner p=? asked";
+                m[19] = b'0' + id;
+                dev_log(sys, 2, m.as_ptr(), m.len());
+            }
+        } else {
+            return;
+        }
+    }
+}
+
+/// Between asks of a bound learner slot's admission.
+const LEARNER_REASK_MS: u64 = 5000;
 
 /// Apply the identity report waiting for the connection just opened in
 /// `slot`, if any. Whether the connection is still open.
@@ -980,6 +1078,7 @@ unsafe fn adopt_report(
         c.identified = false;
         c.tls_verified = false;
         c.peer_fp_len = 0;
+        c.principal_len = 0;
         dev_log(sys, 2, b"[pr] tls unverified".as_ptr(), 19);
         return;
     }
@@ -987,6 +1086,8 @@ unsafe fn adopt_report(
     c.tls_verified = true;
     c.peer_fp = report.fp;
     c.peer_fp_len = report.fp_len;
+    c.principal = report.principal;
+    c.principal_len = report.principal_len;
     c.not_after = report.not_after;
     dev_log(sys, 3, b"[pr] tls keyed".as_ptr(), 14);
     // A replica bound before its identity arrived (an open graph) keeps
@@ -1109,9 +1210,28 @@ fn pin_of(s: &ModuleState, peer_id: u8) -> Option<&[u8; PEER_FP_MAX]> {
     (i < MAX_NODES && s.pinned & (1 << i) != 0).then(|| &s.pins[i])
 }
 
+/// `require_identity: principal` — a replica binds from a verified chain
+/// whose principal names it (`principal_prefix` + id), not from a pinned
+/// key: the cluster's authority, not the graph, says which key is whose.
+const REQUIRE_PRINCIPAL: u8 = 2;
+
+/// Does the connection in `slot` hold a verified principal naming `peer_id`?
+fn principal_admitted(s: &ModuleState, slot: usize, peer_id: u8) -> bool {
+    let c = &s.conns[slot];
+    c.tls_verified
+        && peer_policy::principal_names(
+            &s.principal_prefix[..s.principal_prefix_len as usize],
+            peer_id,
+            &c.principal[..c.principal_len as usize],
+        )
+}
+
 /// May the connection in `slot` bind replica `peer_id`
 /// ([`peer_policy::claim_admitted`])?
 fn claim_admitted(s: &ModuleState, slot: usize, peer_id: u8) -> bool {
+    if s.require_identity == REQUIRE_PRINCIPAL {
+        return principal_admitted(s, slot, peer_id);
+    }
     peer_policy::claim_admitted(
         s.require_identity != 0,
         pin_of(s, peer_id),
@@ -1125,6 +1245,14 @@ fn claim_admitted(s: &ModuleState, slot: usize, peer_id: u8) -> bool {
 fn judge_claim(s: &ModuleState, slot: usize, peer_id: u8) -> peer_policy::Claim {
     let c = &s.conns[slot];
     let reported = (s.tls_identity < 0 || c.identity_seen).then(|| held_identity(c));
+    if s.require_identity == REQUIRE_PRINCIPAL {
+        // Judged on the report, which a claim may outrun: it waits.
+        return match reported {
+            None => peer_policy::Claim::Wait,
+            Some(_) if principal_admitted(s, slot, peer_id) => peer_policy::Claim::Bind,
+            Some(_) => peer_policy::Claim::Refuse,
+        };
+    }
     peer_policy::judge_claim(s.require_identity != 0, pin_of(s, peer_id), reported)
 }
 
@@ -1501,26 +1629,22 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                     // Outbound connection established — send identity. Claimed by
                     // requester tag, so a fanned `net_out` hands this module only
                     // the connections it dialled.
-                    let tag = if payload_len > net_proto::CONN_ID_LEN {
-                        s.buf[NET_FRAME_HDR + net_proto::CONN_ID_LEN]
+                    // `[conn_id u16][tag u16][generation u16]`, read through
+                    // the contract's accessors rather than at fixed offsets.
+                    let payload = &s.buf[NET_FRAME_HDR..NET_FRAME_HDR + payload_len];
+                    let (_, tag) = if payload_len >= net_proto::CONN_ID_LEN {
+                        net_proto::connected_parts(payload)
                     } else {
-                        net_proto::REQUESTER_TAG_NONE
+                        (0, net_proto::REQUESTER_TAG_NONE)
                     };
+                    let generation =
+                        net_proto::session_generation(payload, net_proto::CONNECTED_FIXED);
                     let mine =
                         tag == dev_requester_tag(sys) || tag == net_proto::REQUESTER_TAG_NONE;
                     dev_log(sys, 2, b"[pr] dial-ok".as_ptr(), 11);
                     if payload_len >= 2 && mine {
                         reap_conn_id(s, sys, conn_id);
                         if let Some(slot) = alloc_conn(s) {
-                            // `[conn_id][tag][generation]`
-                            let generation = if payload_len >= 5 {
-                                u16::from_le_bytes([
-                                    s.buf[NET_FRAME_HDR + 3],
-                                    s.buf[NET_FRAME_HDR + 4],
-                                ])
-                            } else {
-                                0
-                            };
                             register_conn(s, slot, conn_id, generation, true);
                             if adopt_awaiting_identity(s, sys, slot, now) {
                                 send_identity(s, sys, slot);
@@ -1903,6 +2027,15 @@ unsafe fn handle_identity(
         let mut m = *b"[pr] conn up p=?";
         m[15] = b'0' + (peer_id % 10);
         dev_log(sys, 2, m.as_ptr(), m.len());
+    }
+    if s.require_identity == REQUIRE_PRINCIPAL
+        && s.voters != 0
+        && peer_id >= s.voters
+        && (peer_id as usize) < 8
+    {
+        // A fresh binding is asked for now (and logged once).
+        s.learner_ask_at[peer_id as usize] = 0;
+        s.learners_fresh |= 1 << peer_id;
     }
     // Fresh link — start the liveness window now so a just-established peer
     // isn't immediately judged stale before its first data frame.

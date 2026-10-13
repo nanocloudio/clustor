@@ -1267,6 +1267,47 @@ pub fn decode_snapshot_install_request(buf: &[u8]) -> Option<(u8, u64)> {
     Some((buf[0], commit))
 }
 
+/// The request with the asking leader's current term appended
+/// (`[target][commit][leader_term:u64]`): a portable install is shipped
+/// under it, because a follower ignores an install from a term older
+/// than its own and the copy's own term can be any earlier one.
+pub const SNAPSHOT_INSTALL_REQUEST_TERM_LEN: usize = SNAPSHOT_INSTALL_REQUEST_LEN + 8;
+
+#[inline]
+pub fn encode_snapshot_install_request_term(
+    buf: &mut [u8; SNAPSHOT_INSTALL_REQUEST_TERM_LEN],
+    target: u8,
+    commit_index: u64,
+    leader_term: u64,
+) {
+    buf[0] = target;
+    buf[1..9].copy_from_slice(&commit_index.to_le_bytes());
+    buf[9..17].copy_from_slice(&leader_term.to_le_bytes());
+}
+
+/// The asking leader's term, or 0 for a request that carries none.
+#[inline]
+pub fn decode_snapshot_install_request_term(buf: &[u8]) -> u64 {
+    if buf.len() < SNAPSHOT_INSTALL_REQUEST_TERM_LEN {
+        return 0;
+    }
+    u64::from_le_bytes([
+        buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15], buf[16],
+    ])
+}
+
+/// durability → replicator: one install frame for ONE peer — `[target:u8]`
+/// then a `MSG_INSTALL_SNAPSHOT` payload. The replicator sends it to that
+/// peer alone as `MSG_INSTALL_SNAPSHOT`: the route travels with the frame,
+/// so a transfer to one peer is never broadcast to all, nor misrouted by
+/// another request raised meanwhile.
+pub const MSG_INSTALL_SNAPSHOT_TO: u8 = 0x5F;
+
+/// The most body one install frame of a portable transfer carries: a
+/// frame must arrive whole through every hop's carry bound
+/// (`MAX_ENTRY_BODY` + 64), header included.
+pub const XFER_CHUNK_BODY: usize = 2048;
+
 /// TLS peer identity from the foundation `tls` module to
 /// `peer_router` and `operations`' RBAC. Fired once per accepted or
 /// established TLS session. A consumer keys the connection's
@@ -1480,6 +1521,26 @@ pub const MSG_APP_SNAPSHOT_RESET: u8 = 0x59;
 /// compacted-away. The signal is leader-local (the durable snapshot is a
 /// per-node fact); a follower learns durability through install, not this.
 pub const MSG_APP_SNAPSHOT_DURABLE: u8 = 0x5B;
+
+/// app → durability: an install of a PORTABLE body completed and the state
+/// is resident (lattice-defined; mirrored, not renumbered). Payload:
+/// `[partition_id:u16 LE][applied_index:u64 LE]`. A follower's durability
+/// tells raft a peer install landed only once this names its index.
+pub const MSG_APP_SNAPSHOT_INSTALLED: u8 = 0x5C;
+
+/// durability → app: export a PORTABLE copy of the state for a peer's
+/// install. Payload `[term:u64 LE][index:u64 LE][xfer_id:u32 LE]`; the app
+/// answers on its snapshot body port with `MSG_APP_SNAPSHOT_EXPORT_CHUNK`s.
+/// The local capture (`MSG_APP_SNAPSHOT_REQUEST`) may answer with a body
+/// only its own store can adopt; this one carries the state.
+pub const MSG_APP_SNAPSHOT_EXPORT_REQUEST: u8 = 0x5D;
+
+/// app → durability: one chunk of a portable export — the
+/// `APP_SNAPSHOT_HDR` header (`[term][index][offset][done]`, the reserved
+/// bytes carrying the request's `xfer_id`, low 24 bits) then at most
+/// `XFER_CHUNK_BODY` bytes. `(term, index)` labels the copy: the position
+/// the app had applied when it began, committed by construction.
+pub const MSG_APP_SNAPSHOT_EXPORT_CHUNK: u8 = 0x5E;
 
 /// `MSG_APP_SNAPSHOT_CHUNK` fixed header size (28 bytes); body follows.
 pub const APP_SNAPSHOT_HDR: usize = 28;

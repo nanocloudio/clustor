@@ -449,6 +449,10 @@ pub struct Wal {
     /// would strand a follower that still needs those entries. Latest
     /// wins; `None` until the first one arrives.
     match_floor: Option<u64>,
+    /// The snapshot component's transfer floor (seam, set each step): a
+    /// peer being caught up by a portable copy replays the log from the
+    /// copy's position, which must outlive the transfer.
+    pub xfer_floor: Option<u64>,
     /// Compactions whose trim point a floor pulled down. Rising means
     /// retention (or a lagging voter) is what bounds disk, not the
     /// snapshot cadence.
@@ -957,6 +961,7 @@ pub unsafe fn init(s: &mut Wal) {
     s.retention_floors = [RetentionFloorSlot::empty(); RETENTION_FLOOR_SLOTS];
     s.retention_floor_overflow = false;
     s.match_floor = None;
+    s.xfer_floor = None;
     s.compact_floored = 0;
     s.in_entries = -1;
     s.in_entry_request = -1;
@@ -3819,7 +3824,10 @@ fn retention_floor_index(s: &Wal) -> Option<u64> {
     if s.retention_floor_overflow {
         return Some(0);
     }
-    let mut lowest = s.match_floor;
+    let mut lowest = match (s.match_floor, s.xfer_floor) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
     for slot in &s.retention_floors {
         if slot.kpg_id == FLOOR_SLOT_EMPTY {
             continue;

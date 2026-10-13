@@ -38,7 +38,8 @@ absent so that "absent here is a bug" stays a checkable claim:
   than a second literal), `RESP_BODY_MAX` from the exchange contract
   record's own bounds, `SEND_STAGE_MAX` from
   `ROUTE_FRAME_MAX`, `SR_MAX_CMD` from `SR_MAX_WRAPPED_KEY`,
-  `SNAP_PTR_CANDIDATES` from `SNAP_PTR_SLOTS`, and `EXPORT_TAIL_RECORDS`
+  `SNAP_PTR_CANDIDATES` from `SNAP_PTR_SLOTS`, `FWD_FRAME_MAX` (one
+  routed install frame the replicator holds) from `XFER_CHUNK_BODY`, and `EXPORT_TAIL_RECORDS`
   and `COMP_STEP_BUCKETS` from histogram bucket counts.
 - **Striping and resolution factors.** `DEDUP_SHARDS` picks which of 16
   high-water slots an index consults. Nothing is exhausted at 16; a
@@ -127,6 +128,7 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Identity reports awaiting their connection | `AWAITING_IDENTITIES` | modules/app/peer_router/mod.rs | 16 | Lossy capacity: a full table drops its oldest report, counted, and that connection opens with no identity — refused wherever one is required. Reports wait at most `peer_policy::AWAIT_MS`. |
 | Queued identity revokes | `REVOKES_MAX` | modules/app/peer_router/mod.rs | 64 | Lossy capacity, safe by construction: a slot's next connection delivers its own identity before any of its frames, so a dropped revoke costs rbac a table entry, never a grant. |
 | Re-keyed identity fingerprint | `PEER_IDENTITY_FP_MAX` | modules/common/wire.rs | 32 | Shape: one SHA-256, the only fingerprint the transport reports. |
+| Portable install frame body | `XFER_CHUNK_BODY` | modules/common/wire.rs | 2048 | Shape: the most state one frame of a peer's portable snapshot transfer carries. An install frame must arrive whole through every hop's carry bound (`MAX_ENTRY_BODY` + 64), header included; the app's export chunks are sized to it, so durability relays chunk for frame. |
 | Per-partition output ports per router | `MAX_LOCAL_PARTITIONS` | modules/app/partition_router/mod.rs | 4 | Capacity: one untagged + one tagged port per partition, so 2N channels against fluxor's port budget. It bounds PORTS, not partitions — `pick_chan` falls back to port 0 for a partition without its own port, and the envelope's partition id is what the multi-slot engine demuxes on. |
 | Partitions a router will route to | `MAX_ROUTED_PARTITIONS` | modules/app/partition_router/mod.rs | 64 | Capacity: tracks the engine's `K_MAX`, and `num_partitions` is clamped to it at init. Deliberately not clamped to the port count — that would silently give a graph asking for 64 partitions four groups and leave sixty idle. |
 | Node-set identifier width | `NODE_SET_CAPACITY` | modules/common/types.rs | — | Typed value 8. This is the bitset envelope; active voters remain capped at `MAX_NODES` (7). |
@@ -254,6 +256,7 @@ RETENTION_FLOOR_SLOTS | modules/app/durability/wal.rs | 32
 MAX_COMMAND_BYTES | modules/common/replica_facade.rs | 4096
 MAX_ENTRY_BODY | modules/common/wal_frame.rs | 2048
 MAX_PAYLOAD | modules/common/wire.rs | 0xFFFF
+XFER_CHUNK_BODY | modules/common/wire.rs | 2048
 MAX_PAYLOAD | modules/common/replica_facade.rs | 0xFFFF
 MAX_NODES | modules/common/types.rs | 7
 MAX_NODES | modules/common/replica_facade.rs | 7
@@ -372,6 +375,7 @@ EXPORT_BUDGET | modules/app/operations/telemetry.rs | -
 CLIENT_FRAME_MAX | modules/app/peer_router/mod.rs | -
 INB_STASH_MAX | modules/app/peer_router/mod.rs | -
 SEND_STAGE_MAX | modules/app/peer_router/mod.rs | -
+FWD_FRAME_MAX | modules/app/consensus/replicator.rs | -
 
 # Status codes. The convention keys on the NAME, and a reply status that
 # reports exhaustion reads as a capacity — these are values on the wire,
