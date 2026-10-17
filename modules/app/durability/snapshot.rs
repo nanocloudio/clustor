@@ -19,8 +19,11 @@ use super::types::{Index, Term};
 use super::{dev_log, dev_millis, fmt_u32_raw, wire, wire_channels};
 use crate::abi::contracts::key_vault as kv;
 
+#[path = "../../common/fs_step.rs"]
+mod fs_step;
 #[path = "../../common/sealed_record.rs"]
 mod sealed;
+use fs_step::{later, Io};
 
 const FS_OPEN: u32 = 0x0900;
 const FS_READ: u32 = 0x0901;
@@ -55,12 +58,73 @@ const NAME_FENCE_STRICT: u8 = 1;
 const NAME_FENCE_UNPROBED: u8 = 0;
 const NAME_FENCE_PRESENT: u8 = 1;
 const NAME_FENCE_ABSENT: u8 = 2;
-/// FS E_AGAIN: the provider exists but is still initialising (fat32
-/// reading the BPB/GPT/root on a cold boot). Distinct from ENODEV/ENOSYS
-/// ("no provider"): an E_AGAIN persist failure must NOT be treated as the
-/// in-memory-graph case, or we'd signal an install (and let raft compact
-/// the WAL) against a manifest that never landed.
-const FS_E_AGAIN: i32 = -11;
+/// Non-blocking fs (`fs_step`): `EAGAIN` (nothing moved, ask again) and
+/// `EINPROGRESS` (taken, re-ask the same request) are never failures —
+/// in particular never the in-memory-graph case, or we'd signal an install
+/// (and let raft compact the WAL) against a manifest that never landed.
+/// Every sequence below keeps its request in `Snapshot` and resumes it.
+const FS_E_INPROGRESS: i32 = fs_step::E_INPROGRESS;
+const FS_E_NOENT: i32 = fs_step::E_NOENT;
+
+/// How a resumable fs sequence stands after one step's asks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Step {
+    Done,
+    Later,
+    Fail,
+}
+
+// Snapshot-writer phases (`w_phase`).
+const W_IDLE: u8 = 0;
+const W_OPEN: u8 = 1;
+const W_HDR: u8 = 2;
+const W_STREAM: u8 = 3;
+const W_FIN_SEAL: u8 = 4;
+const W_FIN_FLUSH: u8 = 5;
+const W_FIN_HDR: u8 = 6;
+const W_FIN_CRC: u8 = 7;
+const W_FIN_TRAILER: u8 = 8;
+const W_FIN_FSYNC: u8 = 9;
+const W_FIN_NAME: u8 = 10;
+const W_PTR: u8 = 11;
+const W_DONE: u8 = 12;
+
+// Whose finish the writer is running (`w_owner`).
+const OWNER_NONE: u8 = 0;
+const OWNER_CAPTURE: u8 = 1;
+const OWNER_INSTALL: u8 = 2;
+
+// Pointer-persist phases (`p_phase`).
+const P_IDLE: u8 = 0;
+const P_START: u8 = 1;
+const P_MAT_OPEN: u8 = 2;
+const P_MAT_PROBE: u8 = 3;
+const P_MAT_NEUTRAL: u8 = 4;
+const P_MAT_FSYNC: u8 = 5;
+const P_MAT_NAME: u8 = 6;
+const P_WRITE_OPEN: u8 = 7;
+const P_WRITE: u8 = 8;
+const P_FSYNC: u8 = 9;
+const P_CHECK: u8 = 10;
+
+// Previous-snapshot retirement phases (`ul_phase`).
+const UL_IDLE: u8 = 0;
+const UL_CAPS: u8 = 1;
+const UL_UNLINK: u8 = 2;
+const UL_NAME: u8 = 3;
+
+// Export phases (`ex_phase`).
+const EX_IDLE: u8 = 0;
+const EX_OPEN: u8 = 1;
+const EX_SEND: u8 = 2;
+
+// Boot-load phases (`bl_phase`).
+const BL_OPEN: u8 = 0;
+const BL_HDR: u8 = 1;
+const BL_BODY: u8 = 2;
+const BL_TRAILER: u8 = 3;
+const BL_SEALED: u8 = 4;
+const BL_ADOPT: u8 = 5;
 
 // ── Boot-restore phases ───────────────────────────────────────────────
 /// Read the pointer sidecar naming the durable local snapshot.
@@ -484,6 +548,108 @@ pub struct Snapshot {
     pi_signal_owed: bool,
     installs_awaiting_app: u32,
 
+    // ── Non-blocking fs: requests in flight ───────────────────
+    //
+    // No fs call waits on the device, so the writer, the pointer persist,
+    // the retirement, the export, the restore and the boot load are step
+    // machines that keep their request here and resume it.
+    /// The writer's phase (`W_*`), whose finish it runs (`OWNER_*`),
+    /// whether a finish was asked for, whether the stream failed, and the
+    /// finish's outcome.
+    w_phase: u8,
+    w_owner: u8,
+    /// Which producer's stream is open (`OWNER_*`): a capture and an
+    /// install never write through each other's stream.
+    w_for: u8,
+    w_finish: bool,
+    w_failed: bool,
+    w_durable: bool,
+    w_ptr_ok: bool,
+    /// Bytes of the current write moved, and whether this phase's seek
+    /// has answered.
+    w_moved: u32,
+    w_seeked: bool,
+    /// The header (placeholder, then true) and trailer being written.
+    w_hdr: [u8; SNAP_HDR_LEN],
+    w_trailer: [u8; SNAP_TRAILER_LEN],
+    /// The finish's read-back CRC: stored body length, bytes read, bytes
+    /// of the current chunk read, and the chunk.
+    w_crc: Crc32c,
+    w_body_len: u32,
+    w_read: u32,
+    w_vgot: u32,
+    w_vbuf: [u8; SNAP_VERIFY_CHUNK],
+    /// Body bytes `msg_buf[ap_from..ap_to]` queued but not yet written
+    /// (or staged for sealing), and a whole sealed chunk
+    /// `seal_buf[wq_moved..wq_len]` not yet written.
+    ap_from: u32,
+    ap_to: u32,
+    wq_len: u32,
+    wq_moved: u32,
+    /// The capture a finish completes: its `(term, index)`, the snapshot
+    /// it supersedes, and its body length.
+    fin_term: Term,
+    fin_index: Index,
+    fin_prev: Index,
+    fin_blen: u32,
+    /// Pointer persist (`P_*`): the snapshot it names, the slot being
+    /// materialised and the one written, the record and its read-back.
+    p_phase: u8,
+    p_index: Index,
+    p_mslot: u8,
+    p_slot: u8,
+    p_fd: i32,
+    p_seeked: bool,
+    p_moved: u8,
+    p_got: u8,
+    p_gen: u64,
+    p_buf: [u8; SNAP_PTR_SIZE],
+    p_check: [u8; SNAP_PTR_SIZE],
+    /// Previous-snapshot retirement (`UL_*`): its index, whether its
+    /// unlink was taken, and the next one asked for meanwhile.
+    ul_phase: u8,
+    ul_index: Index,
+    ul_taken: bool,
+    ul_queued: Index,
+    /// Export of the stored body to peers (`EX_*`).
+    ex_phase: u8,
+    ex_fd: i32,
+    ex_seeked: bool,
+    ex_sealed: bool,
+    ex_term: Term,
+    ex_index: Index,
+    ex_total: u32,
+    ex_sent: u32,
+    ex_got: u32,
+    ex_reader: ChunkReader,
+    ex_buf: [u8; wire::INSTALL_SNAPSHOT_HDR + MAX_CHUNK_BODY],
+    /// The restore's descriptor is positioned, and bytes of its current
+    /// chunk read.
+    rs_seeked: bool,
+    rs_got: u32,
+    /// Boot pointer collection: next slot (2 = the flat record), its
+    /// descriptor, bytes, buffer, and what was found.
+    bp_slot: u8,
+    bp_fd: i32,
+    bp_got: u8,
+    bp_buf: [u8; SNAP_PTR_SIZE],
+    bp_found: [(u64, Index); SNAP_PTR_SLOTS],
+    bp_count: u8,
+    bp_flat: Option<Index>,
+    /// Boot load of the candidate snapshot (`BL_*`).
+    bl_phase: u8,
+    bl_fd: i32,
+    bl_got: u32,
+    bl_seeked: bool,
+    bl_hdr: [u8; SNAP_HDR_LEN],
+    bl_trailer: [u8; SNAP_TRAILER_LEN],
+    bl_crc: Crc32c,
+    bl_body_len: u32,
+    bl_read: u32,
+    bl_consumed: u32,
+    bl_logical: u32,
+    bl_reader: ChunkReader,
+
     // Scratch
     path_buf: [u8; SNAP_PATH_MAX],
     msg_buf: [u8; 8192],
@@ -616,6 +782,77 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.rs_reader = ChunkReader::new(0, 0, wire::Membership::default());
     s.pi_signal_owed = false;
     s.installs_awaiting_app = 0;
+    s.w_phase = W_IDLE;
+    s.w_owner = OWNER_NONE;
+    s.w_for = OWNER_NONE;
+    s.w_finish = false;
+    s.w_failed = false;
+    s.w_durable = false;
+    s.w_ptr_ok = false;
+    s.w_moved = 0;
+    s.w_seeked = false;
+    s.w_hdr = [0; SNAP_HDR_LEN];
+    s.w_trailer = [0; SNAP_TRAILER_LEN];
+    s.w_crc = Crc32c::new();
+    s.w_body_len = 0;
+    s.w_read = 0;
+    s.w_vgot = 0;
+    s.w_vbuf = [0; SNAP_VERIFY_CHUNK];
+    s.ap_from = 0;
+    s.ap_to = 0;
+    s.wq_len = 0;
+    s.wq_moved = 0;
+    s.fin_term = 0;
+    s.fin_index = 0;
+    s.fin_prev = 0;
+    s.fin_blen = 0;
+    s.p_phase = P_IDLE;
+    s.p_index = 0;
+    s.p_mslot = 0;
+    s.p_slot = 0;
+    s.p_fd = -1;
+    s.p_seeked = false;
+    s.p_moved = 0;
+    s.p_got = 0;
+    s.p_gen = 0;
+    s.p_buf = [0; SNAP_PTR_SIZE];
+    s.p_check = [0; SNAP_PTR_SIZE];
+    s.ul_phase = UL_IDLE;
+    s.ul_index = 0;
+    s.ul_taken = false;
+    s.ul_queued = 0;
+    s.ex_phase = EX_IDLE;
+    s.ex_fd = -1;
+    s.ex_seeked = false;
+    s.ex_sealed = false;
+    s.ex_term = 0;
+    s.ex_index = 0;
+    s.ex_total = 0;
+    s.ex_sent = 0;
+    s.ex_got = 0;
+    s.ex_reader = ChunkReader::new(0, 0, wire::Membership::default());
+    s.ex_buf = [0; wire::INSTALL_SNAPSHOT_HDR + MAX_CHUNK_BODY];
+    s.rs_seeked = false;
+    s.rs_got = 0;
+    s.bp_slot = 0;
+    s.bp_fd = -1;
+    s.bp_got = 0;
+    s.bp_buf = [0; SNAP_PTR_SIZE];
+    s.bp_found = [(0, 0); SNAP_PTR_SLOTS];
+    s.bp_count = 0;
+    s.bp_flat = None;
+    s.bl_phase = BL_OPEN;
+    s.bl_fd = -1;
+    s.bl_got = 0;
+    s.bl_seeked = false;
+    s.bl_hdr = [0; SNAP_HDR_LEN];
+    s.bl_trailer = [0; SNAP_TRAILER_LEN];
+    s.bl_crc = Crc32c::new();
+    s.bl_body_len = 0;
+    s.bl_read = 0;
+    s.bl_consumed = 0;
+    s.bl_logical = 0;
+    s.bl_reader = ChunkReader::new(0, 0, wire::Membership::default());
 }
 
 /// The wal position a transfer in flight (or just finished) still needs
@@ -682,7 +919,8 @@ unsafe fn snap_key(
     )
 }
 
-/// Seal the staged plaintext as the stream's next chunk and write it.
+/// Seal the staged plaintext as the stream's next chunk and queue it for
+/// writing.
 ///
 /// # Safety
 /// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
@@ -721,9 +959,12 @@ unsafe fn seal_chunk_out(s: &mut Snapshot, sys: &SyscallTable, flags: u8) -> boo
         return false;
     }
     let total = sealed::SNAP_OVERHEAD + c;
-    if (sys.provider_call)(s.wfd, FS_WRITE, base, total) != total as i32 {
-        return false;
-    }
+    // Queued, not written here: the chunk is sealed exactly once, and its
+    // ciphertext is written from `seal_buf` as the provider takes it
+    // (`drain_append`), resuming after any short write. Nothing is staged
+    // into `seal_buf` until it is all written.
+    s.wq_len = total as u32;
+    s.wq_moved = 0;
     s.wchunk += 1;
     s.wfill = 0;
     s.wstored = s.wstored.saturating_add(total as u32);
@@ -768,8 +1009,10 @@ impl ChunkReader {
     }
 }
 
-/// Read and open the next chunk from `fd` into `seal_buf`. Returns the
-/// plaintext length (at `seal_buf[40..]`).
+/// Read and open the next chunk from `fd` into `seal_buf`, resumably:
+/// `*got` is how much of the chunk has been read, and `Ok(None)` means
+/// the rest moves on a later step (call again with the same `got`).
+/// `Ok(Some(c))` is the plaintext length (at `seal_buf[40..]`).
 ///
 /// # Safety
 /// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
@@ -778,19 +1021,45 @@ unsafe fn read_chunk(
     sys: &SyscallTable,
     fd: i32,
     r: &mut ChunkReader,
-) -> Result<usize, ChunkErr> {
+    got: &mut u32,
+) -> Result<Option<usize>, ChunkErr> {
     let hl = sealed::SNAP_HDR_LEN;
-    if (sys.provider_call)(fd, FS_READ, s.seal_buf.as_mut_ptr(), hl) != hl as i32 {
-        return Err(ChunkErr::Io);
+    let mut n = *got as usize;
+    if n < hl {
+        let io = fs_step::read_into(sys.provider_call, fd, s.seal_buf.as_mut_ptr(), hl, &mut n);
+        *got = n as u32;
+        match io {
+            Io::Later => return Ok(None),
+            Io::Done => {}
+            Io::End | Io::Fail(_) => {
+                *got = 0;
+                return Err(ChunkErr::Io);
+            }
+        }
     }
     let Some(h) = sealed::snap_parse_header(&s.seal_buf[..hl], SEAL_CHUNK_PLAIN) else {
+        *got = 0;
         return Err(ChunkErr::Io);
     };
     let c = h.ct_len as usize;
-    let rest = c + sealed::TAG_LEN;
-    if (sys.provider_call)(fd, FS_READ, s.seal_buf.as_mut_ptr().add(hl), rest) != rest as i32 {
-        return Err(ChunkErr::Io);
+    let total = hl + c + sealed::TAG_LEN;
+    let io = fs_step::read_into(
+        sys.provider_call,
+        fd,
+        s.seal_buf.as_mut_ptr(),
+        total,
+        &mut n,
+    );
+    *got = n as u32;
+    match io {
+        Io::Later => return Ok(None),
+        Io::Done => {}
+        Io::End | Io::Fail(_) => {
+            *got = 0;
+            return Err(ChunkErr::Io);
+        }
     }
+    *got = 0;
     if r.next == 0 {
         r.binding.generation = h.generation;
         r.binding.epoch = h.epoch;
@@ -828,48 +1097,7 @@ unsafe fn read_chunk(
     }
     r.next += 1;
     r.done = h.flags & sealed::SNAP_FLAG_FINAL != 0;
-    Ok(c)
-}
-
-/// Authenticate a whole sealed body of `stored` bytes starting at the
-/// file's current position: every chunk in order, the last one final,
-/// nothing after it. Returns the plaintext length.
-///
-/// # Safety
-/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
-unsafe fn verify_sealed_body(
-    s: &mut Snapshot,
-    sys: &SyscallTable,
-    fd: i32,
-    stored: usize,
-    term: Term,
-    index: Index,
-    membership: wire::Membership,
-) -> Result<u32, ChunkErr> {
-    let mut r = ChunkReader::new(term, index, membership);
-    let mut consumed = 0usize;
-    let mut logical = 0u32;
-    while !r.done {
-        if consumed >= stored {
-            sealed::destroy(sys, r.key);
-            return Err(ChunkErr::Auth);
-        }
-        let got = read_chunk(s, sys, fd, &mut r);
-        let c = match got {
-            Ok(c) => c,
-            Err(e) => {
-                sealed::destroy(sys, r.key);
-                return Err(e);
-            }
-        };
-        consumed += sealed::SNAP_OVERHEAD + c;
-        logical = logical.saturating_add(c as u32);
-    }
-    sealed::destroy(sys, r.key);
-    if consumed != stored {
-        return Err(ChunkErr::Auth);
-    }
-    Ok(logical)
+    Ok(Some(c))
 }
 
 /// Deliver the wal component's current `(term, index)` high-water.
@@ -909,6 +1137,13 @@ pub unsafe fn on_trigger(s: &mut Snapshot, sys: &SyscallTable, term: Term, index
     // control channel and the sealing buffer until it lands; the next
     // rotation re-fires this trigger.
     if s.rs_phase != RS_IDLE || s.pi_signal_owed {
+        s.triggers_deferred = s.triggers_deferred.saturating_add(1);
+        return false;
+    }
+    // The single write stream is another snapshot's (an install landing,
+    // or a finish still being decided): the next rotation re-fires this
+    // trigger rather than finishing — or interleaving with — that stream.
+    if s.w_phase != W_IDLE && !(s.app_capture_pending && s.w_for == OWNER_CAPTURE) {
         s.triggers_deferred = s.triggers_deferred.saturating_add(1);
         return false;
     }
@@ -994,6 +1229,24 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
         p = hb_field(&mut hb, p, b" hw=", hw_index as u32);
         p = hb_field(&mut hb, p, b" unres=", s.installs_unresolved);
         dev_log(sys, 3, hb.as_ptr(), p);
+    }
+
+    // 0. Non-blocking fs: resume the writer (and hand a finished stream
+    //    to its owner), the previous-snapshot retirement and the export.
+    //    While the writer holds queued bytes in `msg_buf`, or runs a
+    //    finish, or a boot load is mid-verify, the inputs wait: nothing is
+    //    read into `msg_buf` and no second stream starts.
+    drive_writer(s, sys);
+    complete_writer(s, sys);
+    unlink_step(s, sys);
+    export_step(s, sys);
+    if writer_holds_input(s)
+        || s.ex_phase != EX_IDLE
+        || s.boot_phase == BOOT_LOAD
+        || s.boot_phase == BOOT_EMIT
+    {
+        emit_metrics(s, sys);
+        return cold_fs;
     }
 
     // 1. External snapshot triggers.
@@ -1148,10 +1401,15 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                         let m = s.cfg.at(index);
                         let (started, had_fs) = snap_begin(s, sys, term, index, term, m);
                         s.capture_had_fs = had_fs;
+                        if started {
+                            s.w_for = OWNER_CAPTURE;
+                        }
                         started || !had_fs
                     }
                 } else {
-                    s.wfd >= 0 || !s.capture_had_fs
+                    // The stream must still be this capture's: an install
+                    // restarted meanwhile owns the write stream now.
+                    (s.w_phase != W_IDLE && s.w_for == OWNER_CAPTURE) || !s.capture_had_fs
                 };
                 if offset != expected || !start_ok {
                     snap_abort(s, sys);
@@ -1162,8 +1420,14 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                 } else {
                     let mut ok = true;
                     if body_len > 0 && s.capture_had_fs {
-                        let src = s.msg_buf.as_mut_ptr().add(wire::APP_SNAPSHOT_HDR);
-                        ok = snap_append(s, sys, src, body_len);
+                        ok = snap_append(s, sys, wire::APP_SNAPSHOT_HDR, body_len);
+                    }
+                    // A stream that failed after its last append was taken
+                    // has nothing to finish: never publish it as a fresh
+                    // (empty) snapshot.
+                    if ok && done && s.capture_had_fs && s.w_phase == W_IDLE {
+                        snap_abort(s, sys);
+                        ok = false;
                     }
                     if !ok {
                         s.app_body_len = 0;
@@ -1434,6 +1698,9 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         // never shadows the artefact the boot restore reads.
         let (started, had_fs) = snap_begin(s, sys, term, last_idx, last_term, membership);
         s.install_had_fs = had_fs;
+        if started {
+            s.w_for = OWNER_INSTALL;
+        }
         if !started && had_fs {
             // FS present but the open failed (provider still
             // initialising, ENOSPC, …). Leave the install inactive; the
@@ -1452,12 +1719,13 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
         return;
     }
 
-    // Stream the chunk straight to the file. A short write aborts the
-    // install (snap_append closes the fd); the leader re-sends from
-    // offset 0 and `restart` opens a fresh file.
+    // Stream the chunk straight to the file. The bytes are queued and
+    // written as the provider takes them (a short write resumes after what
+    // moved; the snapshot's inputs are held until it has). A refused write
+    // aborts the install (snap_append closes the fd); the leader re-sends
+    // from offset 0 and `restart` opens a fresh file.
     if body_len > 0 && s.install_had_fs {
-        let src = s.msg_buf.as_mut_ptr().add(hdr_len);
-        if !snap_append(s, sys, src, body_len) {
+        if s.w_for != OWNER_INSTALL || !snap_append(s, sys, hdr_len, body_len) {
             dev_log(sys, 3, b"[snap] append fail".as_ptr(), 18);
             s.in_progress_active = false;
             return;
@@ -1473,68 +1741,84 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
 
     if done {
         // Finalise: durably write the accumulated body to disk
-        // (crash-atomically — see write_snapshot_durable) BEFORE telling
-        // raft the snapshot is installed. The install signal is what lets a
+        // (crash-atomically — see snap_finish) BEFORE telling raft the
+        // snapshot is installed. The install signal is what lets a
         // follower advance its state to last_idx and compact its log, so it
         // must not be emitted until the body survives a crash. A torn/failed
         // write withholds the signal; the leader re-sends from offset 0.
-        let had_fs = s.install_had_fs;
-        let durable = had_fs && snap_finish(s, sys);
-        // Boot pointer: an installed snapshot that boot can't find is
-        // as good as lost once raft compacts behind it (same gate as
-        // the local-rotation publish).
-        let durable = durable && (!had_fs || persist_snap_pointer(s, sys, s.in_progress_last_idx));
-
-        // `had_fs == false` means no FS provider (in-memory graph): no
-        // durable artefact is possible, but the (term, index) is still a
-        // valid install there. With an FS present, only signal on a
-        // confirmed durable write.
-        //
-        // A body is handed to the app before raft hears of the install —
-        // the signal is what lets raft move its log past the snapshot, and
-        // past state the app never received it could never catch up. The
-        // hand-off is resumable (`restore_step`), and with the app's
-        // acknowledgement wired the signal waits for it.
-        if durable || !had_fs {
-            s.pi_term = s.in_progress_term;
-            s.pi_index = s.in_progress_last_idx;
-            s.pi_last_term = s.in_progress_last_term;
-            s.pi_membership = s.in_progress_membership;
-            s.pi_durable = durable;
-            let carries_state = s.out_app_ctl >= 0 && s.body_len > 0;
-            if s.out_app_ctl >= 0 && !carries_state {
-                // A bare manifest where an app holds the state: adopted,
-                // it would put raft past state the app never received.
-                // Refused; the leader's next answer carries the state.
-                s.install_failures = s.install_failures.saturating_add(1);
-                dev_log(sys, 1, b"[snap] stateless install refused".as_ptr(), 32);
-            } else if carries_state {
-                restore_begin(
-                    s,
-                    s.in_progress_term,
-                    s.in_progress_last_idx,
-                    u64::from(s.body_len),
-                    true,
-                );
-                s.installs_awaiting_app = s.installs_awaiting_app.saturating_add(1);
-            } else {
-                s.pi_signal_owed = true;
-                signal_peer_install(s, sys);
+        // The finish — and the boot pointer after it — may be decided on a
+        // later step; `install_done` runs once they are.
+        if s.install_had_fs {
+            if s.w_for != OWNER_INSTALL {
+                snap_abort(s, sys);
+                s.w_failed = true;
             }
+            snap_finish(s, sys, OWNER_INSTALL);
+            complete_writer(s, sys);
+        } else {
+            install_done(s, sys, false);
         }
-        // Fold the install duration into the transfer histogram.
-        let elapsed_ms = dev_millis(sys).wrapping_sub(s.install_start_ms);
-        let b = wire::hist::bucket(&wire::hist::SNAPSHOT_MS, elapsed_ms);
-        s.transfer_buckets[b] = s.transfer_buckets[b].saturating_add(1);
-        let rb = wire::hist::bucket(
-            &wire::hist::SNAPSHOT_RING_US,
-            elapsed_ms.saturating_mul(1_000),
-        );
-        s.ring_transfer_buckets[rb] = s.ring_transfer_buckets[rb].wrapping_add(1);
-        s.in_progress_active = false;
-        s.body_len = 0;
-        s.in_progress_offset = 0;
     }
+}
+
+/// The install being received has finished landing: `durable` when its
+/// body and its boot pointer are both durable (an install that boot
+/// can't find is as good as lost once raft compacts behind it — the same
+/// gate as the local-rotation publish).
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn install_done(s: &mut Snapshot, sys: &SyscallTable, durable: bool) {
+    let had_fs = s.install_had_fs;
+    // `had_fs == false` means no FS provider (in-memory graph): no
+    // durable artefact is possible, but the (term, index) is still a
+    // valid install there. With an FS present, only signal on a
+    // confirmed durable write.
+    //
+    // A body is handed to the app before raft hears of the install —
+    // the signal is what lets raft move its log past the snapshot, and
+    // past state the app never received it could never catch up. The
+    // hand-off is resumable (`restore_step`), and with the app's
+    // acknowledgement wired the signal waits for it.
+    if durable || !had_fs {
+        s.pi_term = s.in_progress_term;
+        s.pi_index = s.in_progress_last_idx;
+        s.pi_last_term = s.in_progress_last_term;
+        s.pi_membership = s.in_progress_membership;
+        s.pi_durable = durable;
+        let carries_state = s.out_app_ctl >= 0 && s.body_len > 0;
+        if s.out_app_ctl >= 0 && !carries_state {
+            // A bare manifest where an app holds the state: adopted,
+            // it would put raft past state the app never received.
+            // Refused; the leader's next answer carries the state.
+            s.install_failures = s.install_failures.saturating_add(1);
+            dev_log(sys, 1, b"[snap] stateless install refused".as_ptr(), 32);
+        } else if carries_state {
+            restore_begin(
+                s,
+                s.in_progress_term,
+                s.in_progress_last_idx,
+                u64::from(s.body_len),
+                true,
+            );
+            s.installs_awaiting_app = s.installs_awaiting_app.saturating_add(1);
+        } else {
+            s.pi_signal_owed = true;
+            signal_peer_install(s, sys);
+        }
+    }
+    // Fold the install duration into the transfer histogram.
+    let elapsed_ms = dev_millis(sys).wrapping_sub(s.install_start_ms);
+    let b = wire::hist::bucket(&wire::hist::SNAPSHOT_MS, elapsed_ms);
+    s.transfer_buckets[b] = s.transfer_buckets[b].saturating_add(1);
+    let rb = wire::hist::bucket(
+        &wire::hist::SNAPSHOT_RING_US,
+        elapsed_ms.saturating_mul(1_000),
+    );
+    s.ring_transfer_buckets[rb] = s.ring_transfer_buckets[rb].wrapping_add(1);
+    s.in_progress_active = false;
+    s.body_len = 0;
+    s.in_progress_offset = 0;
 }
 
 /// Finalise a locally-taken snapshot at `(term, index)`, shipping
@@ -1551,7 +1835,6 @@ unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines.
 unsafe fn finalize_local_snapshot(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) {
-    let prev_index = s.last_snapshot_index;
     // Persist the app BODY with the snapshot, not a bare manifest: the
     // boot restore replays exactly this body to the state machine
     // before the (compacted) wal tail — a body-less manifest would let
@@ -1561,7 +1844,7 @@ unsafe fn finalize_local_snapshot(s: &mut Snapshot, sys: &SyscallTable, term: Te
     // manifest-only path (no app state machine on this graph) has no
     // stream in flight, so open one now for an empty body. Both end at
     // the same writer, so both emit byte-identical artefacts.
-    if s.wfd < 0 {
+    if s.w_phase == W_IDLE {
         let m = s.cfg.at(index);
         let (started, had_fs) = snap_begin(s, sys, term, index, term, m);
         s.capture_had_fs = had_fs;
@@ -1569,23 +1852,50 @@ unsafe fn finalize_local_snapshot(s: &mut Snapshot, sys: &SyscallTable, term: Te
             dev_log(sys, 3, b"[snap] open fail".as_ptr(), 16);
             return;
         }
+        if started {
+            s.w_for = OWNER_CAPTURE;
+        }
     }
-    let had_fs = s.capture_had_fs;
-    let blen = s.app_body_len;
-    let durable = had_fs && snap_finish(s, sys);
-    if !had_fs {
-        // No FS provider: nothing durable is possible, and the caller's
+    s.fin_term = term;
+    s.fin_index = index;
+    s.fin_prev = s.last_snapshot_index;
+    s.fin_blen = s.app_body_len;
+    if !s.capture_had_fs {
+        // No FS provider: nothing durable is possible, and the
         // `!had_fs` path applies.
+        capture_done(s, sys, false, false);
+        return;
+    }
+    // The finish — and the boot pointer after it — may be decided on a
+    // later step; `capture_done` runs once they are.
+    snap_finish(s, sys, OWNER_CAPTURE);
+    complete_writer(s, sys);
+}
+
+/// A local snapshot's finish has answered: publish it (`durable` body
+/// and `ptr_ok` boot pointer), or drop it. Order of operations: persist,
+/// signal raft, retire the superseded manifest, then ship to peers.
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn capture_done(s: &mut Snapshot, sys: &SyscallTable, durable: bool, ptr_ok: bool) {
+    let term = s.fin_term;
+    let index = s.fin_index;
+    let prev_index = s.fin_prev;
+    let blen = s.fin_blen;
+    let had_fs = s.capture_had_fs;
+    if !had_fs {
+        // No FS provider: nothing durable is possible.
         s.body_len = blen;
     }
     if !durable && had_fs {
-        // FS present but the snapshot didn't land (provider
-        // initialising, ENOSPC, short write…). Drop it — the next
-        // rotation re-fires. Signalling an install here would let raft
-        // compact WAL segments against a snapshot that isn't on disk.
+        // FS present but the snapshot didn't land (ENOSPC, a refused
+        // write…). Drop it — the next rotation re-fires. Signalling an
+        // install here would let raft compact WAL segments against a
+        // snapshot that isn't on disk.
         return;
     }
-    if had_fs && !persist_snap_pointer(s, sys, index) {
+    if had_fs && !ptr_ok {
         // Snapshot durable but the boot pointer isn't: unfindable at
         // boot. Withhold the install signal; the next rotation retries
         // the whole publish.
@@ -1790,6 +2100,8 @@ unsafe fn restore_begin(s: &mut Snapshot, term: Term, index: Index, total: u64, 
     s.rs_held = 0;
     s.rs_ticks = 0;
     s.rs_fd = -1;
+    s.rs_seeked = false;
+    s.rs_got = 0;
     s.rs_reader = ChunkReader::new(term, index, membership_of(s, index));
 }
 
@@ -1799,6 +2111,8 @@ unsafe fn restore_close(s: &mut Snapshot, sys: &SyscallTable) {
         (sys.provider_call)(s.rs_fd, FS_CLOSE, core::ptr::null_mut(), 0);
         s.rs_fd = -1;
     }
+    s.rs_seeked = false;
+    s.rs_got = 0;
     if s.rs_reader.key >= 0 {
         sealed::destroy(sys, s.rs_reader.key);
         s.rs_reader.key = -1;
@@ -1832,11 +2146,19 @@ unsafe fn restore_step(s: &mut Snapshot, sys: &SyscallTable) {
         }
         s.rs_reset_sent = true;
     }
-    if s.rs_fd < 0 && s.rs_total > 0 {
-        s.rs_fd = snap_open_body(s, sys, s.rs_index, 0);
-        if s.rs_fd < 0 {
-            s.rs_phase = RS_FAILED;
-            return;
+    if s.rs_total > 0 && (s.rs_fd < 0 || !s.rs_seeked) {
+        let mut fd = s.rs_fd;
+        let mut seeked = s.rs_seeked;
+        let io = snap_open_body(s, sys, s.rs_index, &mut fd, &mut seeked);
+        s.rs_fd = fd;
+        s.rs_seeked = seeked;
+        match io {
+            Io::Later => return, // the open or seek is asked again next step
+            Io::Done => {}
+            Io::End | Io::Fail(_) => {
+                s.rs_phase = RS_FAILED;
+                return;
+            }
         }
     }
     let sealed_body = sealing(s) && s.rs_total > 0;
@@ -1874,13 +2196,18 @@ unsafe fn restore_step(s: &mut Snapshot, sys: &SyscallTable) {
                 return;
             }
         }
-        // Compose the next chunk.
+        // Compose the next chunk. Its read is resumed (`rs_got`) until the
+        // provider has delivered all of it; a chunk not cached yet is
+        // waited for, never taken for a torn body.
         let c = if sealed_body {
             let mut r = s.rs_reader;
-            let got = read_chunk(s, sys, s.rs_fd, &mut r);
+            let mut got = s.rs_got;
+            let res = read_chunk(s, sys, s.rs_fd, &mut r, &mut got);
             s.rs_reader = r;
-            match got {
-                Ok(c) => c,
+            s.rs_got = got;
+            match res {
+                Ok(None) => return,
+                Ok(Some(c)) => c,
                 Err(_) => {
                     s.seal_failures = s.seal_failures.saturating_add(1);
                     restore_close(s, sys);
@@ -1892,10 +2219,17 @@ unsafe fn restore_step(s: &mut Snapshot, sys: &SyscallTable) {
             let c = (s.rs_total - s.rs_off).min(MAX_CHUNK_BODY as u64) as usize;
             if c > 0 {
                 let dst = s.rs_buf.as_mut_ptr().add(wire::APP_SNAPSHOT_HDR);
-                if (sys.provider_call)(s.rs_fd, FS_READ, dst, c) != c as i32 {
-                    restore_close(s, sys);
-                    s.rs_phase = RS_FAILED;
-                    return;
+                let mut got = s.rs_got as usize;
+                let io = fs_step::read_into(sys.provider_call, s.rs_fd, dst, c, &mut got);
+                s.rs_got = got as u32;
+                match io {
+                    Io::Later => return,
+                    Io::Done => s.rs_got = 0,
+                    Io::End | Io::Fail(_) => {
+                        restore_close(s, sys);
+                        s.rs_phase = RS_FAILED;
+                        return;
+                    }
                 }
             }
             c
@@ -2036,167 +2370,126 @@ unsafe fn request_app_capture(
 /// Re-broadcast the most recent snapshot as a manifest-only
 /// InstallSnapshot: peers learn the `(term, index)` and trust their own
 /// log/WAL for the rest. Body-carrying installs go out through
-/// `emit_install_staged`.
+/// `export_staged`.
 unsafe fn emit_install_chunk(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) {
     emit_install_body(s, sys, term, index, &[]);
 }
 
-/// Emit an InstallSnapshot RPC carrying the body staged in
-/// the snapshot file's body, chunked to `MAX_CHUNK_BODY`.
-///
-/// Separate from `emit_install_body` because the body lives in state:
-/// passing it as a slice would alias the `&mut Snapshot` the
-/// chunking loop needs.
+/// Ship the retained snapshot to peers, chunked to `MAX_CHUNK_BODY`, by
+/// the path that matches how it is stored. The body is read back from the
+/// snapshot file rather than from a resident buffer, so what a leader can
+/// send a follower is bounded by the filesystem and not by module state.
+/// The read is resumed across steps (`export_step`) until each chunk is
+/// whole; a saturated export channel ends the export — the trigger path
+/// retries on the next rotation or an explicit ADMIN_OP_SNAPSHOT.
 ///
 /// # Safety
-///
-/// Caller must hold an exclusive `&mut Snapshot` and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel routines.
-#[inline(never)]
-unsafe fn emit_install_staged(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) {
-    let total = s.body_len as usize;
-    if total == 0 {
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn export_staged(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) {
+    if s.body_len == 0 {
         emit_install_body(s, sys, term, index, &[]);
         return;
     }
     if s.out_export < 0 {
         return;
     }
-    // Read the body back from the snapshot file rather than from a
-    // resident buffer, so what a leader can send a follower is bounded
-    // by the filesystem and not by module state.
-    let fd = snap_open_body(s, sys, index, 0);
-    if fd < 0 {
-        return;
-    }
-    let mut offset: u64 = 0;
-    let mut sent = 0usize;
-    while sent < total {
-        let chunk = (total - sent).min(MAX_CHUNK_BODY);
-        let done = sent + chunk == total;
-        if !wire_channels::writable(sys, s.out_export) {
-            // Channel saturated — the trigger path retries on the next
-            // rotation or an explicit ADMIN_OP_SNAPSHOT.
-            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-            return;
-        }
-        let mut buf = [0u8; wire::INSTALL_SNAPSHOT_HDR + MAX_CHUNK_BODY];
-        let dst = buf.as_mut_ptr().add(wire::INSTALL_SNAPSHOT_HDR);
-        if (sys.provider_call)(fd, FS_READ, dst, chunk) != chunk as i32 {
-            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-            return;
-        }
-        // Header is written in place ahead of the body already staged at
-        // INSTALL_SNAPSHOT_HDR, so the frame is composed with one copy.
-        let mut hdr = [0u8; wire::INSTALL_SNAPSHOT_HDR];
-        let n = wire::encode_install_snapshot(
-            &mut hdr,
-            term,
-            index,
-            term,
-            offset,
-            done,
-            membership_of(s, index),
-            &[],
-        );
-        if n == 0 {
-            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-            return;
-        }
-        buf[..wire::INSTALL_SNAPSHOT_HDR].copy_from_slice(&hdr);
-        wire_channels::channel_write_msg(
-            sys,
-            s.out_export,
-            wire::MSG_INSTALL_SNAPSHOT,
-            &buf[..wire::INSTALL_SNAPSHOT_HDR + chunk],
-        );
-        offset += chunk as u64;
-        sent += chunk;
-    }
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    export_end(s, sys);
+    s.ex_phase = EX_OPEN;
+    s.ex_seeked = false;
+    s.ex_term = term;
+    s.ex_index = index;
+    s.ex_total = s.body_len;
+    s.ex_sent = 0;
+    s.ex_got = 0;
+    s.ex_sealed = sealing(s);
+    s.ex_reader = ChunkReader::new(term, index, membership_of(s, index));
+    export_step(s, sys);
 }
 
-/// Ship the retained snapshot to peers, by the path that matches how it
-/// is stored.
+/// End the export: close its descriptor and key.
 ///
 /// # Safety
-/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
-unsafe fn export_staged(s: &mut Snapshot, sys: &SyscallTable, term: Term, index: Index) {
-    if sealing(s) && s.body_len > 0 {
-        if s.out_export >= 0 {
-            emit_sealed_body(s, sys, term, index, s.out_export, false);
-        }
-    } else {
-        emit_install_staged(s, sys, term, index);
+/// `sys` must reach live kernel routines per the module ABI.
+unsafe fn export_end(s: &mut Snapshot, sys: &SyscallTable) {
+    if s.ex_fd >= 0 {
+        (sys.provider_call)(s.ex_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.ex_fd = -1;
     }
+    if s.ex_reader.key >= 0 {
+        sealed::destroy(sys, s.ex_reader.key);
+        s.ex_reader.key = -1;
+    }
+    s.ex_phase = EX_IDLE;
 }
 
-/// Stream a sealed body as logical chunks: to the app (`restore`: a
-/// RESET, then `MSG_APP_SNAPSHOT_CHUNK`s) or to peers (InstallSnapshot).
-/// Each chunk is opened and authenticated before its plaintext leaves:
-/// the receiver seals what it keeps under its own key. The pieces,
-/// offsets and final flags are exactly the unsealed stream's. Each
-/// message is composed in place in `seal_buf`, its header written over
-/// the chunk header just ahead of the plaintext. Returns whether the
-/// whole body went out.
+/// Resume the export: one chunk at a time, each read whole (across
+/// steps) before it is sent. A sealed body is opened and authenticated
+/// chunk by chunk before its plaintext leaves: the receiver seals what it
+/// keeps under its own key. The pieces, offsets and final flags are
+/// exactly the unsealed stream's.
 ///
 /// # Safety
 /// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
 #[inline(never)]
-unsafe fn emit_sealed_body(
-    s: &mut Snapshot,
-    sys: &SyscallTable,
-    term: Term,
-    index: Index,
-    chan: i32,
-    restore: bool,
-) -> bool {
-    let total = s.body_len as usize;
-    let fd = snap_open_body(s, sys, index, 0);
-    if fd < 0 {
-        return false;
+unsafe fn export_step(s: &mut Snapshot, sys: &SyscallTable) {
+    if s.ex_phase == EX_IDLE {
+        return;
     }
-    if restore {
-        if !wire_channels::writable(sys, chan) {
-            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-            return false;
-        }
-        let mut hdr = [0u8; 16];
-        hdr[..8].copy_from_slice(&term.to_le_bytes());
-        hdr[8..].copy_from_slice(&index.to_le_bytes());
-        wire_channels::channel_write_msg(sys, chan, wire::MSG_APP_SNAPSHOT_RESET, &hdr);
-    }
-    let body = sealed::SNAP_HDR_LEN;
-    let mut r = ChunkReader::new(term, index, membership_of(s, index));
-    let mut sent = 0usize;
-    let mut whole = false;
-    while !r.done {
-        let c = match read_chunk(s, sys, fd, &mut r) {
-            Ok(c) => c,
-            Err(_) => {
-                s.seal_failures = s.seal_failures.saturating_add(1);
-                dev_log(sys, 1, b"[snap] seal read FAIL".as_ptr(), 21);
-                break;
+    if s.ex_phase == EX_OPEN {
+        let mut fd = s.ex_fd;
+        let mut seeked = s.ex_seeked;
+        let io = snap_open_body(s, sys, s.ex_index, &mut fd, &mut seeked);
+        s.ex_fd = fd;
+        s.ex_seeked = seeked;
+        match io {
+            Io::Later => return,
+            Io::Done => s.ex_phase = EX_SEND,
+            Io::End | Io::Fail(_) => {
+                export_end(s, sys);
+                return;
             }
-        };
-        if c == 0 {
-            whole = r.done && sent == total;
-            continue;
         }
-        if sent + c > total || !wire_channels::writable(sys, chan) {
-            break;
+    }
+    let term = s.ex_term;
+    let index = s.ex_index;
+    let total = s.ex_total as usize;
+    loop {
+        let sent = s.ex_sent as usize;
+        if sent >= total || (s.ex_sealed && s.ex_reader.done) {
+            export_end(s, sys);
+            return;
         }
-        let done = sent + c == total;
-        let (msg, start) = if restore {
-            let start = body - wire::APP_SNAPSHOT_HDR;
-            let h = &mut s.seal_buf[start..body];
-            h[..8].copy_from_slice(&term.to_le_bytes());
-            h[8..16].copy_from_slice(&index.to_le_bytes());
-            h[16..24].copy_from_slice(&(sent as u64).to_le_bytes());
-            h[24] = u8::from(done);
-            h[25..].fill(0);
-            (wire::MSG_APP_SNAPSHOT_CHUNK, start)
-        } else {
+        if s.ex_got == 0 && !wire_channels::writable(sys, s.out_export) {
+            // Channel saturated — the trigger path retries on the next
+            // rotation or an explicit ADMIN_OP_SNAPSHOT.
+            export_end(s, sys);
+            return;
+        }
+        if s.ex_sealed {
+            let mut r = s.ex_reader;
+            let mut got = s.ex_got;
+            let res = read_chunk(s, sys, s.ex_fd, &mut r, &mut got);
+            s.ex_reader = r;
+            s.ex_got = got;
+            let c = match res {
+                Ok(None) => return,
+                Ok(Some(c)) => c,
+                Err(_) => {
+                    s.seal_failures = s.seal_failures.saturating_add(1);
+                    dev_log(sys, 1, b"[snap] seal read FAIL".as_ptr(), 21);
+                    export_end(s, sys);
+                    return;
+                }
+            };
+            if c == 0 {
+                continue;
+            }
+            if sent + c > total || !wire_channels::writable(sys, s.out_export) {
+                export_end(s, sys);
+                return;
+            }
+            let done = sent + c == total;
+            let body = sealed::SNAP_HDR_LEN;
             let start = body - wire::INSTALL_SNAPSHOT_HDR;
             let mut hdr = [0u8; wire::INSTALL_SNAPSHOT_HDR];
             if wire::encode_install_snapshot(
@@ -2210,18 +2503,64 @@ unsafe fn emit_sealed_body(
                 &[],
             ) == 0
             {
-                break;
+                export_end(s, sys);
+                return;
             }
             s.seal_buf[start..body].copy_from_slice(&hdr);
-            (wire::MSG_INSTALL_SNAPSHOT, start)
-        };
-        wire_channels::channel_write_msg(sys, chan, msg, &s.seal_buf[start..body + c]);
-        sent += c;
-        whole = r.done && sent == total;
+            if let Some(frame) = s.seal_buf.get(start..body + c) {
+                wire_channels::channel_write_msg(
+                    sys,
+                    s.out_export,
+                    wire::MSG_INSTALL_SNAPSHOT,
+                    frame,
+                );
+            }
+            s.ex_sent = (sent + c) as u32;
+        } else {
+            let chunk = (total - sent).min(MAX_CHUNK_BODY);
+            let done = sent + chunk == total;
+            let dst = s.ex_buf.as_mut_ptr().add(wire::INSTALL_SNAPSHOT_HDR);
+            let mut got = s.ex_got as usize;
+            let io = fs_step::read_into(sys.provider_call, s.ex_fd, dst, chunk, &mut got);
+            s.ex_got = got as u32;
+            match io {
+                Io::Later => return,
+                Io::Done => s.ex_got = 0,
+                Io::End | Io::Fail(_) => {
+                    export_end(s, sys);
+                    return;
+                }
+            }
+            // Header is written in place ahead of the body already staged
+            // at INSTALL_SNAPSHOT_HDR, so the frame is composed with one
+            // copy.
+            let mut hdr = [0u8; wire::INSTALL_SNAPSHOT_HDR];
+            let n = wire::encode_install_snapshot(
+                &mut hdr,
+                term,
+                index,
+                term,
+                sent as u64,
+                done,
+                membership_of(s, index),
+                &[],
+            );
+            if n == 0 || !wire_channels::writable(sys, s.out_export) {
+                export_end(s, sys);
+                return;
+            }
+            s.ex_buf[..wire::INSTALL_SNAPSHOT_HDR].copy_from_slice(&hdr);
+            if let Some(frame) = s.ex_buf.get(..wire::INSTALL_SNAPSHOT_HDR + chunk) {
+                wire_channels::channel_write_msg(
+                    sys,
+                    s.out_export,
+                    wire::MSG_INSTALL_SNAPSHOT,
+                    frame,
+                );
+            }
+            s.ex_sent = (sent + chunk) as u32;
+        }
     }
-    sealed::destroy(sys, r.key);
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    whole
 }
 
 /// # Safety
@@ -2427,160 +2766,379 @@ unsafe fn build_snap_pointer_path(s: &mut Snapshot) -> usize {
     i
 }
 
-/// Bring BOTH pointer slot files into existence, at full size, with
-/// both names fenced — before any non-neutral generation is adopted.
+/// Close the pointer persist's descriptor.
 ///
-/// Two files make the RECORDS independent; they do not make the NAMES
-/// independent. On FAT32 a directory entry is 32 bytes inside a
-/// 512-byte directory sector, and two entries in one directory
-/// routinely share one, so minting the second name mutates a sector the
-/// first name already occupies. Creating each slot at its first publish
-/// puts that mutation after generation 1 is adopted and is the only
-/// pointer the node has — the worst possible moment. Doing it here puts
-/// it where nothing has been adopted yet, and from the first adopted
-/// generation onward every publish overwrites `SNAP_PTR_SIZE` bytes in
-/// a file that already has its size and its cluster chain, leaving the
-/// directory untouched.
+/// # Safety
+/// `sys` must reach live kernel routines per the module ABI.
+unsafe fn p_close(s: &mut Snapshot, sys: &SyscallTable) {
+    if s.p_fd >= 0 {
+        (sys.provider_call)(s.p_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.p_fd = -1;
+    }
+}
+
+/// The pointer persist failed: close, idle, and report it.
 ///
-/// An existing slot is read first and left alone if it is already full
-/// size: a node upgrading into this scheme must not have its recovered
-/// pointer zeroed. A fresh slot gets all zeroes, which `decode_snap_ptr`
-/// rejects, so it is "nothing yet" rather than a competing record.
+/// # Safety
+/// `sys` must reach live kernel routines per the module ABI.
+unsafe fn p_fail(s: &mut Snapshot, sys: &SyscallTable) -> Step {
+    p_close(s, sys);
+    s.p_phase = P_IDLE;
+    Step::Fail
+}
+
+/// Persist the pointer naming the snapshot at `p_index`, as a step
+/// machine over `p_*` (every request re-asked unchanged until decided).
+/// `Done` once durable-or-no-fs like the other persists; the caller gates
+/// the install signal on it — a snapshot whose pointer never landed is
+/// unfindable at boot, and letting raft compact against it would strand
+/// the state below it.
 ///
-/// Returns false only on a real FS failure; a device with no FS at all
-/// is handled by the caller's `FS_E_NODEV` / `FS_E_NOSYS` path.
+/// First, BOTH pointer slot files are brought into existence, at full
+/// size, with both names fenced — before any non-neutral generation is
+/// adopted. Two files make the RECORDS independent; they do not make the
+/// NAMES independent. On FAT32 a directory entry is 32 bytes inside a
+/// 512-byte directory sector, and two entries in one directory routinely
+/// share one, so minting the second name mutates a sector the first name
+/// already occupies. Creating each slot at its first publish puts that
+/// mutation after generation 1 is adopted and is the only pointer the
+/// node has — the worst possible moment. Doing it first puts it where
+/// nothing has been adopted yet, and from the first adopted generation
+/// onward every publish overwrites `SNAP_PTR_SIZE` bytes in a file that
+/// already has its size and its cluster chain, leaving the directory
+/// untouched. An existing slot is read first and left alone if it is
+/// already full size: a node upgrading into this scheme must not have its
+/// recovered pointer zeroed. A fresh slot gets all zeroes, which
+/// `decode_snap_ptr` rejects, so it is "nothing yet" rather than a
+/// competing record.
+///
+/// Then the INACTIVE slot is written: the record boot would follow today
+/// is never the one being overwritten, so no failure between here and
+/// the fsync can leave the node without a usable pointer. The slot is
+/// read back and re-validated before the new generation is adopted.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn materialize_snap_ptr_slots(s: &mut Snapshot, sys: &SyscallTable) -> bool {
-    if s.snap_ptr_slots_materialized {
-        return true;
-    }
-    for slot in 0..SNAP_PTR_SLOTS as u8 {
-        let plen = build_snap_ptr_slot_path(s, slot);
-        let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
-        if fd < 0 {
-            return fd == FS_E_NODEV || fd == FS_E_NOSYS;
-        }
-        // A short read is the test for "not yet sized": a file created
-        // a moment ago reads 0, one written by a previous boot reads
-        // SNAP_PTR_SIZE and keeps whatever record it holds.
-        let seek = 0i32.to_le_bytes();
-        let mut probe = [0u8; SNAP_PTR_SIZE];
-        let sized = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) >= 0
-            && (sys.provider_call)(fd, FS_READ, probe.as_mut_ptr(), SNAP_PTR_SIZE)
-                == SNAP_PTR_SIZE as i32;
-        if !sized {
-            let mut neutral = [0u8; SNAP_PTR_SIZE];
-            let ok = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) >= 0
-                && (sys.provider_call)(fd, FS_WRITE, neutral.as_mut_ptr(), SNAP_PTR_SIZE)
-                    == SNAP_PTR_SIZE as i32
-                && (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) == 0;
-            if !ok {
-                (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-                return false;
+#[inline(never)]
+unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable) -> Step {
+    loop {
+        match s.p_phase {
+            P_START => {
+                s.p_mslot = 0;
+                s.p_phase = if s.snap_ptr_slots_materialized {
+                    P_WRITE_OPEN
+                } else {
+                    P_MAT_OPEN
+                };
+            }
+            P_MAT_OPEN => {
+                if s.p_mslot as usize >= SNAP_PTR_SLOTS {
+                    s.snap_ptr_slots_materialized = true;
+                    s.p_phase = P_WRITE_OPEN;
+                    continue;
+                }
+                let plen = build_snap_ptr_slot_path(s, s.p_mslot);
+                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
+                if later(fd) {
+                    return Step::Later;
+                }
+                if fd < 0 {
+                    s.p_phase = P_IDLE;
+                    // A device with no FS at all has no pointer to keep.
+                    return if fd == FS_E_NODEV || fd == FS_E_NOSYS {
+                        Step::Done
+                    } else {
+                        Step::Fail
+                    };
+                }
+                s.p_fd = fd;
+                s.p_seeked = false;
+                s.p_got = 0;
+                s.p_phase = P_MAT_PROBE;
+            }
+            P_MAT_PROBE => {
+                // A short read is the test for "not yet sized": a file
+                // created a moment ago reads 0, one written by a previous
+                // boot reads SNAP_PTR_SIZE and keeps whatever record it holds.
+                if !s.p_seeked {
+                    let seek = 0i32.to_le_bytes();
+                    let rc = (sys.provider_call)(s.p_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                    if later(rc) {
+                        return Step::Later;
+                    }
+                    if rc < 0 {
+                        s.p_phase = P_MAT_NEUTRAL;
+                        s.p_seeked = false;
+                        s.p_moved = 0;
+                        continue;
+                    }
+                    s.p_seeked = true;
+                }
+                let mut got = s.p_got as usize;
+                let io = fs_step::read_into(
+                    sys.provider_call,
+                    s.p_fd,
+                    s.p_check.as_mut_ptr(),
+                    SNAP_PTR_SIZE,
+                    &mut got,
+                );
+                s.p_got = got as u8;
+                match io {
+                    Io::Later => return Step::Later,
+                    Io::Done => {
+                        p_close(s, sys);
+                        s.p_phase = P_MAT_NAME;
+                    }
+                    Io::End | Io::Fail(_) => {
+                        s.p_seeked = false;
+                        s.p_moved = 0;
+                        s.p_phase = P_MAT_NEUTRAL;
+                    }
+                }
+            }
+            P_MAT_NEUTRAL => {
+                if !s.p_seeked {
+                    let seek = 0i32.to_le_bytes();
+                    let rc = (sys.provider_call)(s.p_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                    if later(rc) {
+                        return Step::Later;
+                    }
+                    if rc < 0 {
+                        return p_fail(s, sys);
+                    }
+                    s.p_seeked = true;
+                }
+                let neutral = [0u8; SNAP_PTR_SIZE];
+                let mut moved = s.p_moved as usize;
+                let io = fs_step::write_from(
+                    sys.provider_call,
+                    FS_WRITE,
+                    s.p_fd,
+                    neutral.as_ptr(),
+                    SNAP_PTR_SIZE,
+                    &mut moved,
+                );
+                s.p_moved = moved as u8;
+                match io {
+                    Io::Later => return Step::Later,
+                    Io::Done => s.p_phase = P_MAT_FSYNC,
+                    Io::End | Io::Fail(_) => return p_fail(s, sys),
+                }
+            }
+            P_MAT_FSYNC => {
+                let rc = (sys.provider_call)(s.p_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                if later(rc) {
+                    return Step::Later;
+                }
+                if rc != 0 {
+                    return p_fail(s, sys);
+                }
+                p_close(s, sys);
+                s.p_phase = P_MAT_NAME;
+            }
+            P_MAT_NAME => {
+                let plen = build_snap_ptr_slot_path(s, s.p_mslot);
+                match publish_name(s, sys, plen) {
+                    Step::Later => return Step::Later,
+                    Step::Fail => return p_fail(s, sys),
+                    Step::Done => {
+                        s.p_mslot += 1;
+                        s.p_phase = P_MAT_OPEN;
+                    }
+                }
+            }
+            P_WRITE_OPEN => {
+                // Both names and both sizes are settled before anything is
+                // adopted, so no publish below ever mutates the directory.
+                let slot = 1 - (s.snap_ptr_slot & 1);
+                let plen = build_snap_ptr_slot_path(s, slot);
+                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
+                if later(fd) {
+                    return Step::Later;
+                }
+                if fd < 0 {
+                    s.p_phase = P_IDLE;
+                    return if fd == FS_E_NODEV || fd == FS_E_NOSYS {
+                        Step::Done
+                    } else {
+                        Step::Fail
+                    };
+                }
+                s.p_fd = fd;
+                s.p_slot = slot;
+                s.p_gen = s.snap_ptr_generation.wrapping_add(1);
+                let mut buf = [0u8; SNAP_PTR_SIZE];
+                encode_snap_ptr(&mut buf, s.p_gen, s.p_index);
+                s.p_buf = buf;
+                s.p_moved = 0;
+                s.p_phase = P_WRITE;
+            }
+            P_WRITE => {
+                let mut moved = s.p_moved as usize;
+                let io = fs_step::write_from(
+                    sys.provider_call,
+                    FS_WRITE,
+                    s.p_fd,
+                    s.p_buf.as_ptr(),
+                    SNAP_PTR_SIZE,
+                    &mut moved,
+                );
+                s.p_moved = moved as u8;
+                match io {
+                    Io::Later => return Step::Later,
+                    Io::Done => s.p_phase = P_FSYNC,
+                    Io::End | Io::Fail(_) => return p_fail(s, sys),
+                }
+            }
+            P_FSYNC => {
+                let rc = (sys.provider_call)(s.p_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                if later(rc) {
+                    return Step::Later;
+                }
+                if rc != 0 {
+                    return p_fail(s, sys);
+                }
+                s.p_seeked = false;
+                s.p_got = 0;
+                s.p_phase = P_CHECK;
+            }
+            P_CHECK => {
+                // Read the slot back and re-validate before adopting the new
+                // generation. The read is served through the descriptor that
+                // just wrote, so it proves the provider holds the bytes it
+                // accepted — a short or mis-encoded write is caught here; the
+                // fsync above is what carries them to media.
+                if !s.p_seeked {
+                    let seek = 0i32.to_le_bytes();
+                    let rc = (sys.provider_call)(s.p_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                    if later(rc) {
+                        return Step::Later;
+                    }
+                    if rc < 0 {
+                        return p_fail(s, sys);
+                    }
+                    s.p_seeked = true;
+                }
+                let mut got = s.p_got as usize;
+                let io = fs_step::read_into(
+                    sys.provider_call,
+                    s.p_fd,
+                    s.p_check.as_mut_ptr(),
+                    SNAP_PTR_SIZE,
+                    &mut got,
+                );
+                s.p_got = got as u8;
+                match io {
+                    Io::Later => return Step::Later,
+                    Io::Done => {}
+                    Io::End | Io::Fail(_) => return p_fail(s, sys),
+                }
+                p_close(s, sys);
+                if decode_snap_ptr(&s.p_check) != Some((s.p_gen, s.p_index)) {
+                    s.p_phase = P_IDLE;
+                    return Step::Fail;
+                }
+                // The name was fenced at materialisation, before anything
+                // was adopted, and this publish changed neither the size nor
+                // the cluster chain — so the directory entry is exactly as
+                // it was and needs no second fence.
+                s.snap_ptr_slot = s.p_slot;
+                s.snap_ptr_generation = s.p_gen;
+                s.p_phase = P_IDLE;
+                return Step::Done;
+            }
+            _ => {
+                s.p_phase = P_IDLE;
+                return Step::Fail;
             }
         }
-        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        // `path_buf` still holds this slot's path.
-        if !publish_name(s, sys, plen) {
-            return false;
-        }
     }
-    s.snap_ptr_slots_materialized = true;
-    true
 }
 
-/// Persist the pointer sidecar for `index`. Returns durable-or-no-fs
-/// like the other persists; the caller gates the install signal on it —
-/// a snapshot whose pointer never landed is unfindable at boot, and
-/// letting raft compact against it would strand the state below it.
-unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable, index: Index) -> bool {
-    // Both names and both sizes are settled before anything is adopted,
-    // so no publish below ever mutates the directory.
-    if !materialize_snap_ptr_slots(s, sys) {
-        return false;
-    }
-    // Target the INACTIVE slot: the record boot would follow today is
-    // never the one being overwritten, so no failure between here and
-    // the fsync can leave the node without a usable pointer.
-    let slot = 1 - (s.snap_ptr_slot & 1);
-    let generation = s.snap_ptr_generation.wrapping_add(1);
-    let plen = build_snap_ptr_slot_path(s, slot);
-    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
-    if fd < 0 {
-        return fd == FS_E_NODEV || fd == FS_E_NOSYS;
-    }
-    let mut buf = [0u8; SNAP_PTR_SIZE];
-    encode_snap_ptr(&mut buf, generation, index);
-    let w = (sys.provider_call)(fd, FS_WRITE, buf.as_mut_ptr(), SNAP_PTR_SIZE);
-    let f = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
-    if w != SNAP_PTR_SIZE as i32 || f != 0 {
-        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        return false;
-    }
-    // Read the slot back and re-validate before adopting the new
-    // generation. The read is served through the descriptor that just
-    // wrote, so it proves the provider holds the bytes it accepted —
-    // a short or mis-encoded write is caught here; the fsync above is
-    // what carries them to media.
-    let seek = 0i32.to_le_bytes();
-    let mut check = [0u8; SNAP_PTR_SIZE];
-    let ok = (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) >= 0
-        && (sys.provider_call)(fd, FS_READ, check.as_mut_ptr(), SNAP_PTR_SIZE)
-            == SNAP_PTR_SIZE as i32
-        && decode_snap_ptr(&check) == Some((generation, index));
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    if !ok {
-        return false;
-    }
-    // The name was fenced at materialisation, before anything was
-    // adopted, and this publish changed neither the size nor the
-    // cluster chain — so the directory entry is exactly as it was and
-    // needs no second fence.
-    s.snap_ptr_slot = slot;
-    s.snap_ptr_generation = generation;
-    true
-}
-
-/// Collect the pointer candidates at boot: both slots ordered by
-/// generation (newest first), then the flat record. Returns `true`
-/// when the FS provider is still initialising and the caller must
-/// retry on a later step.
+/// Collect the pointer candidates at boot, resumably: both slots, then
+/// the flat record, each opened and read until answered. Returns `true`
+/// while the collection has not resolved and the caller must retry on a
+/// later step; once it resolves, the slots are ordered by generation
+/// (newest first) and the flat record follows.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn collect_snap_ptr_candidates(s: &mut Snapshot, sys: &SyscallTable) -> bool {
-    let mut found: [(u64, Index); SNAP_PTR_SLOTS] = [(0, 0); SNAP_PTR_SLOTS];
-    let mut count = 0usize;
-    for slot in 0..SNAP_PTR_SLOTS as u8 {
-        let plen = build_snap_ptr_slot_path(s, slot);
-        let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
-        if fd == FS_E_AGAIN {
+    // Slots 0 and 1, then the single unchecksummed record (2) as the
+    // last resort.
+    while (s.bp_slot as usize) <= SNAP_PTR_SLOTS {
+        let flat = s.bp_slot as usize == SNAP_PTR_SLOTS;
+        let want = if flat {
+            SNAP_PTR_FLAT_SIZE
+        } else {
+            SNAP_PTR_SIZE
+        };
+        if s.bp_fd < 0 {
+            let plen = if flat {
+                build_snap_pointer_path(s)
+            } else {
+                build_snap_ptr_slot_path(s, s.bp_slot)
+            };
+            let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+            if later(fd) {
+                return true;
+            }
+            if fd < 0 {
+                s.bp_slot += 1;
+                continue;
+            }
+            s.bp_fd = fd;
+            s.bp_got = 0;
+        }
+        let mut got = s.bp_got as usize;
+        let io = fs_step::read_into(
+            sys.provider_call,
+            s.bp_fd,
+            s.bp_buf.as_mut_ptr(),
+            want,
+            &mut got,
+        );
+        s.bp_got = got as u8;
+        if io == Io::Later {
             return true;
         }
-        if fd < 0 {
+        (sys.provider_call)(s.bp_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.bp_fd = -1;
+        let slot = s.bp_slot;
+        s.bp_slot += 1;
+        if io != Io::Done {
+            if flat {
+                dev_log(sys, 3, b"[snap] boot ptr torn".as_ptr(), 20);
+            }
             continue;
         }
-        let mut buf = [0u8; SNAP_PTR_SIZE];
-        let n = (sys.provider_call)(fd, FS_READ, buf.as_mut_ptr(), SNAP_PTR_SIZE);
-        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        if n != SNAP_PTR_SIZE as i32 {
-            continue;
-        }
-        if let Some((generation, index)) = decode_snap_ptr(&buf) {
-            found[count] = (generation, index);
-            count += 1;
+        if flat {
+            let mut val = [0u8; SNAP_PTR_FLAT_SIZE];
+            val.copy_from_slice(&s.bp_buf[..SNAP_PTR_FLAT_SIZE]);
+            let index = u64::from_le_bytes(val);
+            let n = s.bp_count as usize;
+            let dup = s.bp_found.iter().take(n).any(|c| c.1 == index);
+            if !dup {
+                s.bp_flat = Some(index);
+            }
+        } else if let Some((generation, index)) = decode_snap_ptr(&s.bp_buf) {
+            let n = s.bp_count as usize;
+            if n < SNAP_PTR_SLOTS {
+                s.bp_found[n] = (generation, index);
+                s.bp_count += 1;
+            }
             if generation > s.snap_ptr_generation {
                 s.snap_ptr_generation = generation;
                 s.snap_ptr_slot = slot;
             }
         }
     }
+    let mut found = s.bp_found;
+    let count = s.bp_count as usize;
     // Newest generation first (at most two entries).
     if count == SNAP_PTR_SLOTS && found[1].0 > found[0].0 {
         found.swap(0, 1);
@@ -2591,31 +3149,9 @@ unsafe fn collect_snap_ptr_candidates(s: &mut Snapshot, sys: &SyscallTable) -> b
         s.boot_ptr_candidates[s.boot_ptr_count as usize] = entry.1;
         s.boot_ptr_count += 1;
     }
-
-    // The single unchecksummed record, as the last resort.
-    let plen = build_snap_pointer_path(s);
-    let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
-    if fd == FS_E_AGAIN {
-        return s.boot_ptr_count == 0;
-    }
-    if fd >= 0 {
-        let mut val = [0u8; SNAP_PTR_FLAT_SIZE];
-        let n = (sys.provider_call)(fd, FS_READ, val.as_mut_ptr(), SNAP_PTR_FLAT_SIZE);
-        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        if n == SNAP_PTR_FLAT_SIZE as i32 {
-            let index = u64::from_le_bytes(val);
-            let dup = s
-                .boot_ptr_candidates
-                .iter()
-                .take(s.boot_ptr_count as usize)
-                .any(|c| *c == index);
-            if !dup {
-                s.boot_ptr_candidates[s.boot_ptr_count as usize] = index;
-                s.boot_ptr_count += 1;
-            }
-        } else {
-            dev_log(sys, 3, b"[snap] boot ptr torn".as_ptr(), 20);
-        }
+    if let Some(index) = s.bp_flat {
+        s.boot_ptr_candidates[s.boot_ptr_count as usize] = index;
+        s.boot_ptr_count += 1;
     }
     false
 }
@@ -2672,129 +3208,7 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             false
         }
         BOOT_LOAD => {
-            let plen = build_snapshot_path(s, s.boot_ptr_index);
-            let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
-            if fd == FS_E_AGAIN {
-                return false;
-            }
-            if fd < 0 {
-                // Pointer names a file that is gone. Fall through to the
-                // next candidate: an older pointer whose snapshot IS
-                // present is a valid recovery root, and only when every
-                // candidate fails is there nothing to restore. The wal
-                // then replays whatever it still holds; state below the
-                // vanished snapshot is LOST and the log says so rather
-                // than guessing.
-                dev_log(sys, 3, b"[snap] boot missing".as_ptr(), 19);
-                next_boot_candidate(s);
-                return false;
-            }
-            let mut hdr = [0u8; SNAP_HDR_LEN];
-            let mut ok = (sys.provider_call)(fd, FS_READ, hdr.as_mut_ptr(), SNAP_HDR_LEN)
-                == SNAP_HDR_LEN as i32
-                && u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) == MAGIC_SNAP
-                && u16::from_le_bytes([hdr[4], hdr[5]]) == s.partition_id;
-            let body_len = if ok {
-                u32::from_le_bytes([hdr[36], hdr[37], hdr[38], hdr[39]]) as usize
-            } else {
-                0
-            };
-            // Verify the body by streaming it, so boot is not bounded
-            // by a buffer either: the body is replayed to the app from
-            // the file later (BOOT_EMIT), and nothing needs it resident.
-            let mut c = Crc32c::new();
-            c.update(&hdr);
-            if ok && body_len > 0 {
-                let mut read = 0usize;
-                let mut vbuf = [0u8; SNAP_VERIFY_CHUNK];
-                while ok && read < body_len {
-                    let want = (body_len - read).min(SNAP_VERIFY_CHUNK);
-                    ok = (sys.provider_call)(fd, FS_READ, vbuf.as_mut_ptr(), want) == want as i32;
-                    if ok {
-                        c.update(&vbuf[..want]);
-                        read += want;
-                    }
-                }
-            }
-            if ok {
-                let mut trailer = [0u8; SNAP_TRAILER_LEN];
-                ok = (sys.provider_call)(fd, FS_READ, trailer.as_mut_ptr(), SNAP_TRAILER_LEN)
-                    == SNAP_TRAILER_LEN as i32
-                    && u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]])
-                        == END_MAGIC_SNAP
-                    && c.finalize()
-                        == u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-            }
-            // Sealed, a body whose CRC holds must also authenticate, chunk
-            // by chunk, before anything in it — or its header's term and
-            // index — reaches the state machine or consensus. The CRC is
-            // judged first: a torn file is a crash's leftovers, while a
-            // whole one that does not authenticate is tampering or the
-            // wrong key, and fails the replica closed.
-            let mut logical = body_len as u32;
-            if ok && sealing(s) {
-                let term = u64::from_le_bytes([
-                    hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
-                ]);
-                let index = u64::from_le_bytes([
-                    hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
-                ]);
-                let start = (SNAP_HDR_LEN as i32).to_le_bytes();
-                let verdict = if (sys.provider_call)(fd, FS_SEEK, start.as_ptr() as *mut u8, 4) < 0
-                {
-                    Err(ChunkErr::Io)
-                } else {
-                    let m = wire::Membership::decode(&hdr[40..43]).unwrap_or_default();
-                    verify_sealed_body(s, sys, fd, body_len, term, index, m)
-                };
-                match verdict {
-                    Ok(n) => {
-                        logical = n;
-                        let epoch = u32::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35]]);
-                        s.sealed_epoch = epoch;
-                        s.done_epoch = epoch;
-                    }
-                    Err(e) => {
-                        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-                        s.seal_failures = s.seal_failures.saturating_add(1);
-                        if !s.seal_fault {
-                            s.seal_fault = true;
-                            if e == ChunkErr::Key {
-                                dev_log(sys, 1, b"[snap] seal: key epoch unavailable".as_ptr(), 34);
-                            } else {
-                                dev_log(sys, 1, b"[snap] seal tag FAIL".as_ptr(), 20);
-                            }
-                        }
-                        return false;
-                    }
-                }
-            }
-            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-            if !ok {
-                // Fail CLOSED on a torn/corrupt snapshot: never replay a
-                // bad body, and never let a pointer to one become the
-                // recovery root. Try the next candidate instead.
-                dev_log(sys, 3, b"[snap] boot corrupt".as_ptr(), 19);
-                s.body_len = 0;
-                next_boot_candidate(s);
-                return false;
-            }
-            s.last_snapshot_term = u64::from_le_bytes([
-                hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
-            ]);
-            s.last_snapshot_index = u64::from_le_bytes([
-                hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
-            ]);
-            s.last_snapshot_membership = wire::Membership::decode(&hdr[40..43]).unwrap_or_default();
-            // The log below the snapshot may be gone: the configuration
-            // the wal replays on top of is the snapshot's.
-            s.wal_membership = Some((s.last_snapshot_index, s.last_snapshot_membership));
-            s.body_len = logical;
-            s.boot_phase = if s.out_app_ctl >= 0 && logical > 0 {
-                BOOT_EMIT
-            } else {
-                BOOT_SIGNAL
-            };
+            boot_load_step(s, sys);
             false
         }
         BOOT_EMIT => {
@@ -2855,6 +3269,285 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
             true
         }
         _ => true,
+    }
+}
+
+/// Close the boot load's descriptor and its key.
+///
+/// # Safety
+/// `sys` must reach live kernel routines per the module ABI.
+unsafe fn bl_close(s: &mut Snapshot, sys: &SyscallTable) {
+    if s.bl_fd >= 0 {
+        (sys.provider_call)(s.bl_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.bl_fd = -1;
+    }
+    if s.bl_reader.key >= 0 {
+        sealed::destroy(sys, s.bl_reader.key);
+        s.bl_reader.key = -1;
+    }
+    s.bl_phase = BL_OPEN;
+}
+
+/// The candidate failed its check: fail CLOSED on a torn/corrupt
+/// snapshot — never replay a bad body, and never let a pointer to one
+/// become the recovery root. Try the next candidate instead.
+///
+/// # Safety
+/// `sys` must reach live kernel routines per the module ABI.
+unsafe fn bl_corrupt(s: &mut Snapshot, sys: &SyscallTable) {
+    bl_close(s, sys);
+    dev_log(sys, 3, b"[snap] boot corrupt".as_ptr(), 19);
+    s.body_len = 0;
+    next_boot_candidate(s);
+}
+
+/// Load and validate the snapshot the current pointer candidate names:
+/// header, the body streamed through the CRC, the trailer, and — sealed —
+/// every chunk authenticated in order. Every open, seek and read is
+/// resumed across steps until answered (`bl_*`): a body the provider has
+/// not cached yet is waited for, never judged torn.
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+#[inline(never)]
+unsafe fn boot_load_step(s: &mut Snapshot, sys: &SyscallTable) {
+    loop {
+        match s.bl_phase {
+            BL_OPEN => {
+                let plen = build_snapshot_path(s, s.boot_ptr_index);
+                let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+                if later(fd) {
+                    return;
+                }
+                if fd < 0 {
+                    // Pointer names a file that is gone. Fall through to the
+                    // next candidate: an older pointer whose snapshot IS
+                    // present is a valid recovery root, and only when every
+                    // candidate fails is there nothing to restore. The wal
+                    // then replays whatever it still holds; state below the
+                    // vanished snapshot is LOST and the log says so rather
+                    // than guessing.
+                    dev_log(sys, 3, b"[snap] boot missing".as_ptr(), 19);
+                    next_boot_candidate(s);
+                    return;
+                }
+                s.bl_fd = fd;
+                s.bl_got = 0;
+                s.bl_phase = BL_HDR;
+            }
+            BL_HDR => {
+                let mut got = s.bl_got as usize;
+                let io = fs_step::read_into(
+                    sys.provider_call,
+                    s.bl_fd,
+                    s.bl_hdr.as_mut_ptr(),
+                    SNAP_HDR_LEN,
+                    &mut got,
+                );
+                s.bl_got = got as u32;
+                match io {
+                    Io::Later => return,
+                    Io::Done => {}
+                    Io::End | Io::Fail(_) => {
+                        bl_corrupt(s, sys);
+                        return;
+                    }
+                }
+                let hdr = s.bl_hdr;
+                if u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) != MAGIC_SNAP
+                    || u16::from_le_bytes([hdr[4], hdr[5]]) != s.partition_id
+                {
+                    bl_corrupt(s, sys);
+                    return;
+                }
+                s.bl_body_len = u32::from_le_bytes([hdr[36], hdr[37], hdr[38], hdr[39]]);
+                // Verify the body by streaming it, so boot is not bounded
+                // by a buffer either: the body is replayed to the app from
+                // the file later (BOOT_EMIT), and nothing needs it resident.
+                s.bl_crc.reset();
+                s.bl_crc.update(&hdr);
+                s.bl_read = 0;
+                s.bl_got = 0;
+                s.bl_phase = BL_BODY;
+            }
+            BL_BODY => {
+                if s.bl_read < s.bl_body_len {
+                    let want = ((s.bl_body_len - s.bl_read) as usize).min(SNAP_VERIFY_CHUNK);
+                    let mut got = s.bl_got as usize;
+                    let io = fs_step::read_into(
+                        sys.provider_call,
+                        s.bl_fd,
+                        s.w_vbuf.as_mut_ptr(),
+                        want,
+                        &mut got,
+                    );
+                    s.bl_got = got as u32;
+                    match io {
+                        Io::Later => return,
+                        Io::Done => {
+                            let v = s.w_vbuf;
+                            s.bl_crc.update(&v[..want]);
+                            s.bl_read += want as u32;
+                            s.bl_got = 0;
+                        }
+                        Io::End | Io::Fail(_) => {
+                            bl_corrupt(s, sys);
+                            return;
+                        }
+                    }
+                } else {
+                    s.bl_got = 0;
+                    s.bl_phase = BL_TRAILER;
+                }
+            }
+            BL_TRAILER => {
+                let mut got = s.bl_got as usize;
+                let io = fs_step::read_into(
+                    sys.provider_call,
+                    s.bl_fd,
+                    s.bl_trailer.as_mut_ptr(),
+                    SNAP_TRAILER_LEN,
+                    &mut got,
+                );
+                s.bl_got = got as u32;
+                match io {
+                    Io::Later => return,
+                    Io::Done => {}
+                    Io::End | Io::Fail(_) => {
+                        bl_corrupt(s, sys);
+                        return;
+                    }
+                }
+                let t = s.bl_trailer;
+                if u32::from_le_bytes([t[4], t[5], t[6], t[7]]) != END_MAGIC_SNAP
+                    || s.bl_crc.finalize() != u32::from_le_bytes([t[0], t[1], t[2], t[3]])
+                {
+                    bl_corrupt(s, sys);
+                    return;
+                }
+                // Sealed, a body whose CRC holds must also authenticate,
+                // chunk by chunk, before anything in it — or its header's
+                // term and index — reaches the state machine or consensus.
+                // The CRC is judged first: a torn file is a crash's
+                // leftovers, while a whole one that does not authenticate is
+                // tampering or the wrong key, and fails the replica closed.
+                s.bl_logical = s.bl_body_len;
+                if sealing(s) {
+                    let hdr = s.bl_hdr;
+                    let term = u64::from_le_bytes([
+                        hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+                    ]);
+                    let index = u64::from_le_bytes([
+                        hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
+                    ]);
+                    let m = wire::Membership::decode(&hdr[40..43]).unwrap_or_default();
+                    s.bl_reader = ChunkReader::new(term, index, m);
+                    s.bl_consumed = 0;
+                    s.bl_logical = 0;
+                    s.bl_got = 0;
+                    s.bl_seeked = false;
+                    s.bl_phase = BL_SEALED;
+                } else {
+                    s.bl_phase = BL_ADOPT;
+                }
+            }
+            BL_SEALED => {
+                if !s.bl_seeked {
+                    let start = (SNAP_HDR_LEN as i32).to_le_bytes();
+                    let rc = (sys.provider_call)(s.bl_fd, FS_SEEK, start.as_ptr() as *mut u8, 4);
+                    if later(rc) {
+                        return;
+                    }
+                    if rc < 0 {
+                        boot_seal_fault(s, sys, ChunkErr::Io);
+                        return;
+                    }
+                    s.bl_seeked = true;
+                }
+                // Authenticate the whole sealed body: every chunk in order,
+                // the last one final, nothing after it.
+                if s.bl_reader.done {
+                    if s.bl_consumed != s.bl_body_len {
+                        boot_seal_fault(s, sys, ChunkErr::Auth);
+                        return;
+                    }
+                    let hdr = s.bl_hdr;
+                    let epoch = u32::from_le_bytes([hdr[32], hdr[33], hdr[34], hdr[35]]);
+                    s.sealed_epoch = epoch;
+                    s.done_epoch = epoch;
+                    s.bl_phase = BL_ADOPT;
+                    continue;
+                }
+                if s.bl_consumed >= s.bl_body_len {
+                    boot_seal_fault(s, sys, ChunkErr::Auth);
+                    return;
+                }
+                let mut r = s.bl_reader;
+                let mut got = s.bl_got;
+                let res = read_chunk(s, sys, s.bl_fd, &mut r, &mut got);
+                s.bl_reader = r;
+                s.bl_got = got;
+                match res {
+                    Ok(None) => return,
+                    Ok(Some(c)) => {
+                        s.bl_consumed = s
+                            .bl_consumed
+                            .saturating_add((sealed::SNAP_OVERHEAD + c) as u32);
+                        s.bl_logical = s.bl_logical.saturating_add(c as u32);
+                    }
+                    Err(e) => {
+                        boot_seal_fault(s, sys, e);
+                        return;
+                    }
+                }
+            }
+            BL_ADOPT => {
+                bl_close(s, sys);
+                let hdr = s.bl_hdr;
+                s.last_snapshot_term = u64::from_le_bytes([
+                    hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+                ]);
+                s.last_snapshot_index = u64::from_le_bytes([
+                    hdr[16], hdr[17], hdr[18], hdr[19], hdr[20], hdr[21], hdr[22], hdr[23],
+                ]);
+                s.last_snapshot_membership =
+                    wire::Membership::decode(&hdr[40..43]).unwrap_or_default();
+                // The log below the snapshot may be gone: the configuration
+                // the wal replays on top of is the snapshot's.
+                s.wal_membership = Some((s.last_snapshot_index, s.last_snapshot_membership));
+                let logical = s.bl_logical;
+                s.body_len = logical;
+                s.boot_phase = if s.out_app_ctl >= 0 && logical > 0 {
+                    BOOT_EMIT
+                } else {
+                    BOOT_SIGNAL
+                };
+                return;
+            }
+            _ => {
+                s.bl_phase = BL_OPEN;
+                return;
+            }
+        }
+    }
+}
+
+/// A sealed snapshot whose CRC held did not authenticate (or its key is
+/// gone): the replica fails closed — nothing below it may be rebuilt from
+/// this replica's media.
+///
+/// # Safety
+/// `sys` must reach live kernel routines per the module ABI.
+unsafe fn boot_seal_fault(s: &mut Snapshot, sys: &SyscallTable, e: ChunkErr) {
+    bl_close(s, sys);
+    s.seal_failures = s.seal_failures.saturating_add(1);
+    if !s.seal_fault {
+        s.seal_fault = true;
+        if e == ChunkErr::Key {
+            dev_log(sys, 1, b"[snap] seal: key epoch unavailable".as_ptr(), 34);
+        } else {
+            dev_log(sys, 1, b"[snap] seal tag FAIL".as_ptr(), 20);
+        }
     }
 }
 
@@ -2948,59 +3641,70 @@ unsafe fn build_snapshot_path(s: &mut Snapshot, index: Index) -> usize {
 }
 
 /// Lazily probe the FS provider's capability bitmap for `UNLINK` support
-/// (same shape as `wal::fs_unlink_supported`). A failed CAPS call stays
-/// unprobed and retries later rather than caching a transient error.
+/// (same shape as `wal::fs_unlink_supported`). A CAPS call the provider
+/// cannot answer yet stays unprobed and retries later rather than caching
+/// a transient answer.
 unsafe fn fs_unlink_supported(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     ensure_fs_caps(s, sys);
     s.fs_unlink_probe == 1
 }
 
 /// One-shot FS capability probe, caching the `UNLINK` and `FSYNC_NAME`
-/// dispositions together. A failed CAPS call leaves both unprobed and
-/// retries later rather than caching a transient error as "unsupported".
-unsafe fn ensure_fs_caps(s: &mut Snapshot, sys: &SyscallTable) {
+/// dispositions together. Returns whether the bitmap is known. `EAGAIN`
+/// (the provider is still attaching its volume) leaves both unprobed and
+/// is asked again later, never latched as "absent"; any other failure is
+/// latched as offering nothing optional.
+unsafe fn ensure_fs_caps(s: &mut Snapshot, sys: &SyscallTable) -> bool {
     if s.fs_unlink_probe != 0 {
-        return;
+        return true;
     }
     let mut caps = [0u8; 4];
     let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
-    if rc == 4 {
-        let bits = u32::from_le_bytes(caps);
-        s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
-        s.name_fence_probe = if bits & FS_CAP_FSYNC_NAME != 0 {
-            NAME_FENCE_PRESENT
-        } else {
-            NAME_FENCE_ABSENT
-        };
+    if later(rc) {
+        return false;
     }
+    let bits = if rc == 4 { u32::from_le_bytes(caps) } else { 0 };
+    s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
+    s.name_fence_probe = if bits & FS_CAP_FSYNC_NAME != 0 {
+        NAME_FENCE_PRESENT
+    } else {
+        NAME_FENCE_ABSENT
+    };
+    true
 }
 
 /// Publish the parent-directory entry for the path currently staged in
 /// `path_buf` — the fence that makes a snapshot artefact, a pointer
 /// slot, or a retirement survive a power cut. Same posture rules as the
 /// WAL's `publish_name`: strict refuses what the provider cannot fence,
-/// auto meters it.
+/// auto meters it. `Later` while the fence (or the capability probe) is
+/// undecided: the caller re-stages the same path and asks again.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn publish_name(s: &mut Snapshot, sys: &SyscallTable, plen: usize) -> bool {
-    ensure_fs_caps(s, sys);
+unsafe fn publish_name(s: &mut Snapshot, sys: &SyscallTable, plen: usize) -> Step {
+    if !ensure_fs_caps(s, sys) {
+        return Step::Later;
+    }
     if s.name_fence_probe != NAME_FENCE_PRESENT {
         if s.name_fence == NAME_FENCE_STRICT {
             dev_log(sys, 1, b"[snap] no name fence".as_ptr(), 20);
-            return false;
+            return Step::Fail;
         }
         s.name_unfenced = s.name_unfenced.saturating_add(1);
-        return true;
+        return Step::Done;
     }
     let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, s.path_buf.as_mut_ptr(), plen);
+    if later(rc) {
+        return Step::Later;
+    }
     if rc == 0 {
-        return true;
+        return Step::Done;
     }
     dev_log(sys, 1, b"[snap] name fence FAIL".as_ptr(), 22);
-    false
+    Step::Fail
 }
 
 /// Retire the previous snapshot file after a NEWER one is durable, so the
@@ -3008,7 +3712,10 @@ unsafe fn publish_name(s: &mut Snapshot, sys: &SyscallTable, plen: usize) -> boo
 /// instead of accumulating one per WAL rotation. Best-effort: a missing
 /// file (operator GC, skip_replay renumbering) or a provider without
 /// `caps::UNLINK` leaves the old file orphaned — never an error, the new
-/// snapshot's durability is already established by the caller.
+/// snapshot's durability is already established by the caller. The unlink
+/// and its name fence are resumed across steps (`unlink_step`); one
+/// retirement is in flight at a time, and the latest one asked for while
+/// it runs follows it.
 unsafe fn unlink_prev_snapshot(
     s: &mut Snapshot,
     sys: &SyscallTable,
@@ -3018,28 +3725,91 @@ unsafe fn unlink_prev_snapshot(
     if prev_index == 0 || prev_index == new_index {
         return;
     }
-    if !fs_unlink_supported(s, sys) {
+    if s.ul_phase != UL_IDLE {
+        s.ul_queued = prev_index;
         return;
     }
-    let plen = build_snapshot_path(s, prev_index);
-    if plen == 0 {
-        return;
-    }
-    if (sys.provider_call)(-1, FS_UNLINK, s.path_buf.as_mut_ptr(), plen) == 0
-        && publish_name(s, sys, plen)
-    {
-        // Retirement is complete only once the REMOVAL of the name is
-        // durable: an unlink left in a volatile directory cache
-        // resurrects the retired snapshot after a power cut.
-        dev_log(sys, 3, b"[snap] retired".as_ptr(), 14);
-        if sealing(s) && s.done_epoch != 0 {
-            s.sealed_epoch = s.done_epoch;
+    s.ul_index = prev_index;
+    s.ul_taken = false;
+    s.ul_phase = UL_CAPS;
+    unlink_step(s, sys);
+}
+
+/// Resume the previous-snapshot retirement.
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn unlink_step(s: &mut Snapshot, sys: &SyscallTable) {
+    loop {
+        match s.ul_phase {
+            UL_IDLE => {
+                if s.ul_queued == 0 {
+                    return;
+                }
+                s.ul_index = s.ul_queued;
+                s.ul_queued = 0;
+                s.ul_taken = false;
+                s.ul_phase = UL_CAPS;
+            }
+            UL_CAPS => {
+                if !ensure_fs_caps(s, sys) {
+                    return;
+                }
+                s.ul_phase = if fs_unlink_supported(s, sys) {
+                    UL_UNLINK
+                } else {
+                    UL_IDLE
+                };
+            }
+            UL_UNLINK => {
+                let plen = build_snapshot_path(s, s.ul_index);
+                if plen == 0 {
+                    s.ul_phase = UL_IDLE;
+                    continue;
+                }
+                let rc = (sys.provider_call)(-1, FS_UNLINK, s.path_buf.as_mut_ptr(), plen);
+                if rc == FS_E_INPROGRESS {
+                    s.ul_taken = true;
+                }
+                if later(rc) {
+                    return;
+                }
+                // A taken unlink whose decision the provider dropped answers
+                // ENOENT when re-asked: the removal it started happened.
+                s.ul_phase = if rc == 0 || (rc == FS_E_NOENT && s.ul_taken) {
+                    UL_NAME
+                } else {
+                    UL_IDLE
+                };
+            }
+            UL_NAME => {
+                let plen = build_snapshot_path(s, s.ul_index);
+                match publish_name(s, sys, plen) {
+                    Step::Later => return,
+                    Step::Fail => s.ul_phase = UL_IDLE,
+                    Step::Done => {
+                        // Retirement is complete only once the REMOVAL of
+                        // the name is durable: an unlink left in a volatile
+                        // directory cache resurrects the retired snapshot
+                        // after a power cut.
+                        dev_log(sys, 3, b"[snap] retired".as_ptr(), 14);
+                        if sealing(s) && s.done_epoch != 0 {
+                            s.sealed_epoch = s.done_epoch;
+                        }
+                        s.ul_phase = UL_IDLE;
+                    }
+                }
+            }
+            _ => s.ul_phase = UL_IDLE,
         }
     }
 }
 
-/// Open the snapshot file for `index` positioned `at` bytes into its
-/// body. Returns a read fd, or -1.
+/// Open the snapshot file for `index` positioned at the start of its
+/// body, resumably: `*fd` holds the descriptor once opened, `*seeked`
+/// once positioned. `Io::Done` when ready to read the body; `Io::Later`
+/// while the open or the seek is unanswered; `Io::Fail` when the file
+/// cannot be had (the descriptor is closed).
 ///
 /// Snapshot bodies are never resident, so every consumer — the app
 /// restore, the export to a follower, the boot-time verify — reads them
@@ -3049,21 +3819,42 @@ unsafe fn unlink_prev_snapshot(
 ///
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn snap_open_body(s: &mut Snapshot, sys: &SyscallTable, index: Index, at: usize) -> i32 {
-    let plen = build_snapshot_path(s, index);
-    if plen == 0 {
-        return -1;
+unsafe fn snap_open_body(
+    s: &mut Snapshot,
+    sys: &SyscallTable,
+    index: Index,
+    fd: &mut i32,
+    seeked: &mut bool,
+) -> Io {
+    if *fd < 0 {
+        let plen = build_snapshot_path(s, index);
+        if plen == 0 {
+            return Io::Fail(-1);
+        }
+        let opened = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+        if later(opened) {
+            return Io::Later;
+        }
+        if opened < 0 {
+            return Io::Fail(opened);
+        }
+        *fd = opened;
+        *seeked = false;
     }
-    let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
-    if fd < 0 {
-        return -1;
+    if !*seeked {
+        let off = (SNAP_HDR_LEN as i32).to_le_bytes();
+        let rc = (sys.provider_call)(*fd, FS_SEEK, off.as_ptr() as *mut u8, 4);
+        if later(rc) {
+            return Io::Later;
+        }
+        if rc < 0 {
+            (sys.provider_call)(*fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            *fd = -1;
+            return Io::Fail(rc);
+        }
+        *seeked = true;
     }
-    let off = ((SNAP_HDR_LEN + at) as i32).to_le_bytes();
-    if (sys.provider_call)(fd, FS_SEEK, off.as_ptr() as *mut u8, 4) < 0 {
-        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        return -1;
-    }
-    fd
+    Io::Done
 }
 
 /// Write to the consensus-facing install channel in the 5-byte partitioned
@@ -3126,6 +3917,12 @@ fn snap_header(
 /// had_fs contract as the old `write_snapshot_durable`: false means no
 /// FS provider at all (an in-memory graph), which is not a failure.
 ///
+/// The open and the header write are non-blocking: an open the provider
+/// has not answered yet leaves the stream started (an FS that answers
+/// `EAGAIN` exists), and the writer resumes it (`drive_writer`) while the
+/// snapshot's inputs are held. A later refusal fails the stream, which
+/// the next append or the finish reports.
+///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
@@ -3145,11 +3942,11 @@ unsafe fn snap_begin(
         return (false, false);
     }
     let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
-    if fd < 0 {
+    if !later(fd) && fd < 0 {
         // Genuinely no FS provider (in-memory graph): nothing to durably
-        // install. ANY other error (E_AGAIN during a fat32 cold boot,
-        // EIO, ENOSPC, missing parent dir) reports had_fs=true so the
-        // caller withholds its install signal and the source retries.
+        // install. ANY other error (EIO, ENOSPC, missing parent dir)
+        // reports had_fs=true so the caller withholds its install signal
+        // and the source retries.
         return (false, fd != FS_E_NODEV && fd != FS_E_NOSYS);
     }
     if sealing(s) {
@@ -3166,7 +3963,9 @@ unsafe fn snap_begin(
             -1
         };
         if s.wkey < 0 {
-            (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            if fd >= 0 {
+                (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            }
             s.seal_failures = s.seal_failures.saturating_add(1);
             dev_log(sys, 2, b"[snap] seal key unavailable".as_ptr(), 27);
             return (false, true);
@@ -3175,68 +3974,149 @@ unsafe fn snap_begin(
         s.wfill = 0;
         s.wstored = 0;
     }
-    // Placeholder header: body_len is not known until the last chunk.
-    // `snap_finish` seeks back and rewrites it.
-    let mut hdr = snap_header(s, term, last_idx, last_term, 0);
-    let ok =
-        (sys.provider_call)(fd, FS_WRITE, hdr.as_mut_ptr(), SNAP_HDR_LEN) == SNAP_HDR_LEN as i32;
-    if !ok {
-        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        sealed::destroy(sys, s.wkey);
-        s.wkey = -1;
-        return (false, true);
-    }
-    s.wfd = fd;
     s.wbody = 0;
     s.wterm = term;
     s.windex = last_idx;
     s.wlast_term = last_term;
+    // Placeholder header: body_len is not known until the last chunk.
+    // `snap_finish` seeks back and rewrites it.
+    s.w_hdr = snap_header(s, term, last_idx, last_term, 0);
+    s.w_failed = false;
+    s.w_finish = false;
+    s.w_owner = OWNER_NONE;
+    s.w_moved = 0;
+    s.w_seeked = false;
+    s.ap_from = 0;
+    s.ap_to = 0;
+    s.wq_len = 0;
+    s.wq_moved = 0;
+    if fd >= 0 {
+        s.wfd = fd;
+        s.w_phase = W_HDR;
+    } else {
+        // Not answered yet: the same open is asked again by the writer.
+        s.w_phase = W_OPEN;
+    }
+    drive_writer(s, sys);
+    if s.w_failed {
+        snap_abort(s, sys);
+        return (false, true);
+    }
     (true, true)
 }
 
-/// Append body bytes to the snapshot being streamed.
+/// Append `len` body bytes, `msg_buf[from..from + len]`, to the snapshot
+/// being streamed. The bytes are queued and written as the provider takes
+/// them (a short write resumes after what moved); `msg_buf` is not reused
+/// until they are, because the snapshot's inputs are held meanwhile
+/// (`writer_holds_input`). False once the stream has failed.
 ///
 /// # Safety
 ///
-/// Caller must hold an exclusive `&mut Snapshot`, supply a valid
-/// `&SyscallTable`, and `src` must be readable for `len` bytes.
-unsafe fn snap_append(s: &mut Snapshot, sys: &SyscallTable, src: *mut u8, len: usize) -> bool {
-    if s.wfd < 0 {
+/// Caller must hold an exclusive `&mut Snapshot` and supply a valid
+/// `&SyscallTable`; `from + len` must lie within `msg_buf`.
+unsafe fn snap_append(s: &mut Snapshot, sys: &SyscallTable, from: usize, len: usize) -> bool {
+    if s.w_failed || s.w_phase == W_IDLE || s.w_phase >= W_FIN_SEAL {
+        snap_abort(s, sys);
         return false;
     }
     if len == 0 {
         return true;
     }
-    if sealing(s) {
-        // Stage toward whole `SEAL_CHUNK_PLAIN` chunks; the remainder is
-        // sealed as the final chunk by `snap_finish`.
-        let mut done = 0usize;
-        while done < len {
+    if from + len > s.msg_buf.len() || s.ap_from < s.ap_to {
+        snap_abort(s, sys);
+        return false;
+    }
+    s.ap_from = from as u32;
+    s.ap_to = (from + len) as u32;
+    s.wbody = s.wbody.saturating_add(len as u32);
+    drive_writer(s, sys);
+    if s.w_failed {
+        snap_abort(s, sys);
+        return false;
+    }
+    true
+}
+
+/// The writer holds the snapshot's inputs: bytes queued from `msg_buf`
+/// not yet written, a sealed chunk not yet written, an open or header not
+/// yet answered, or a finish under way. Nothing reads into `msg_buf`,
+/// and no other stream starts, until it does not.
+fn writer_holds_input(s: &Snapshot) -> bool {
+    s.ap_from < s.ap_to
+        || s.wq_moved < s.wq_len
+        || s.w_phase == W_OPEN
+        || s.w_phase == W_HDR
+        || (s.w_finish && s.w_phase != W_IDLE)
+}
+
+/// Write the queued bytes: a sealed chunk in `seal_buf[..wq_len]`, then
+/// whatever of `msg_buf[ap_from..ap_to]` is left — staged toward whole
+/// sealed chunks when sealing, written straight through otherwise.
+/// `Done` once nothing is queued.
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn drain_append(s: &mut Snapshot, sys: &SyscallTable) -> Step {
+    loop {
+        if s.wq_moved < s.wq_len {
+            let mut moved = s.wq_moved as usize;
+            let io = fs_step::write_from(
+                sys.provider_call,
+                FS_WRITE,
+                s.wfd,
+                s.seal_buf.as_ptr(),
+                s.wq_len as usize,
+                &mut moved,
+            );
+            s.wq_moved = moved as u32;
+            match io {
+                Io::Later => return Step::Later,
+                Io::Done => {
+                    s.wq_len = 0;
+                    s.wq_moved = 0;
+                }
+                Io::End | Io::Fail(_) => return Step::Fail,
+            }
+        }
+        if s.ap_from >= s.ap_to {
+            return Step::Done;
+        }
+        if sealing(s) {
+            // Stage toward whole `SEAL_CHUNK_PLAIN` chunks; the remainder
+            // is sealed as the final chunk by the finish.
             let room = SEAL_CHUNK_PLAIN - s.wfill as usize;
-            let take = (len - done).min(room);
+            let take = ((s.ap_to - s.ap_from) as usize).min(room);
             core::ptr::copy_nonoverlapping(
-                src.add(done),
+                s.msg_buf.as_ptr().add(s.ap_from as usize),
                 s.seal_buf
                     .as_mut_ptr()
                     .add(sealed::SNAP_HDR_LEN + s.wfill as usize),
                 take,
             );
             s.wfill += take as u32;
-            done += take;
+            s.ap_from += take as u32;
             if s.wfill as usize == SEAL_CHUNK_PLAIN && !seal_chunk_out(s, sys, 0) {
-                snap_abort(s, sys);
-                return false;
+                return Step::Fail;
+            }
+        } else {
+            let mut moved = s.ap_from as usize;
+            let io = fs_step::write_from(
+                sys.provider_call,
+                FS_WRITE,
+                s.wfd,
+                s.msg_buf.as_ptr(),
+                s.ap_to as usize,
+                &mut moved,
+            );
+            s.ap_from = moved as u32;
+            match io {
+                Io::Later => return Step::Later,
+                Io::Done => {}
+                Io::End | Io::Fail(_) => return Step::Fail,
             }
         }
-        s.wbody = s.wbody.saturating_add(len as u32);
-        return true;
     }
-    if (sys.provider_call)(s.wfd, FS_WRITE, src, len) != len as i32 {
-        snap_abort(s, sys);
-        return false;
-    }
-    s.wbody = s.wbody.saturating_add(len as u32);
-    true
 }
 
 /// Close and discard a snapshot being streamed. Idempotent.
@@ -3256,11 +4136,47 @@ unsafe fn snap_abort(s: &mut Snapshot, sys: &SyscallTable) {
         s.wkey = -1;
     }
     s.wfill = 0;
+    s.w_phase = W_IDLE;
+    s.w_finish = false;
+    s.w_owner = OWNER_NONE;
+    s.w_for = OWNER_NONE;
+    s.ap_from = 0;
+    s.ap_to = 0;
+    s.wq_len = 0;
+    s.wq_moved = 0;
+    s.p_phase = P_IDLE;
+    if s.p_fd >= 0 {
+        (sys.provider_call)(s.p_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.p_fd = -1;
+    }
 }
 
-/// Finalise a streamed snapshot: rewrite the header with the true body
-/// length, compute the `header || body` CRC by reading the body back,
-/// append the trailer, fsync, close, and publish the name.
+/// The stream failed: close it. A finish under way reports not durable
+/// to its owner; a stream still accepting appends refuses the next one.
+///
+/// # Safety
+/// `sys` must reach live kernel routines per the module ABI.
+unsafe fn fail_writer(s: &mut Snapshot, sys: &SyscallTable) {
+    let finishing = s.w_finish;
+    let owner = s.w_owner;
+    snap_abort(s, sys);
+    s.w_failed = true;
+    if finishing {
+        s.install_failures = s.install_failures.saturating_add(1);
+        dev_log(sys, 3, b"[snap] durable FAIL".as_ptr(), 19);
+        s.w_owner = owner;
+        s.w_durable = false;
+        s.w_ptr_ok = false;
+        s.w_phase = W_DONE;
+    }
+}
+
+/// Finalise the streamed snapshot for `owner`: rewrite the header with
+/// the true body length, compute the `header || body` CRC by reading the
+/// body back, append the trailer, fsync, close, publish the name, then
+/// persist the boot pointer naming it. The owner's completion
+/// (`complete_writer`) runs once all of that has answered — this step or a
+/// later one; the snapshot's inputs are held meanwhile.
 ///
 /// The read-back is what lets the body stream without being buffered:
 /// the CRC's first input is a header field that only the last chunk
@@ -3271,90 +4187,325 @@ unsafe fn snap_abort(s: &mut Snapshot, sys: &SyscallTable) {
 ///
 /// Caller must hold an exclusive `&mut Snapshot` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn snap_finish(s: &mut Snapshot, sys: &SyscallTable) -> bool {
-    if s.wfd < 0 {
-        return false;
+unsafe fn snap_finish(s: &mut Snapshot, sys: &SyscallTable, owner: u8) {
+    s.w_owner = owner;
+    s.w_finish = true;
+    s.w_durable = false;
+    s.w_ptr_ok = false;
+    if s.w_failed || s.w_phase == W_IDLE {
+        fail_writer(s, sys);
+        return;
     }
-    let fd = s.wfd;
-    let logical = s.wbody;
-    // Sealed, the body ends with the chunk carrying the final flag: the
-    // staged remainder, possibly empty, so every sealed body has an
-    // authenticated end.
-    let mut ok = !sealing(s) || seal_chunk_out(s, sys, sealed::SNAP_FLAG_FINAL);
-    if s.wkey >= 0 {
-        sealed::destroy(sys, s.wkey);
-        s.wkey = -1;
+    drive_writer(s, sys);
+}
+
+/// Seek the stream's descriptor once per phase (`w_seeked`).
+///
+/// # Safety
+/// `sys` must reach live kernel routines per the module ABI.
+unsafe fn w_seek(s: &mut Snapshot, sys: &SyscallTable, at: u32) -> Step {
+    if s.w_seeked {
+        return Step::Done;
     }
-    let body_len = if sealing(s) { s.wstored } else { logical };
-    let mut hdr = snap_header(s, s.wterm, s.windex, s.wlast_term, body_len);
+    let arg = (at as i32).to_le_bytes();
+    let rc = (sys.provider_call)(s.wfd, FS_SEEK, arg.as_ptr() as *mut u8, 4);
+    if later(rc) {
+        return Step::Later;
+    }
+    if rc < 0 {
+        return Step::Fail;
+    }
+    s.w_seeked = true;
+    Step::Done
+}
 
-    // 1. True header at offset 0.
-    let zero = 0i32.to_le_bytes();
-    ok = ok
-        && (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4) >= 0
-        && (sys.provider_call)(fd, FS_WRITE, hdr.as_mut_ptr(), SNAP_HDR_LEN) == SNAP_HDR_LEN as i32;
-
-    // 2. CRC over header || body, reading the body back in chunks.
-    let mut crc = Crc32c::new();
-    crc.update(&hdr);
-    if ok && body_len > 0 {
-        let start = (SNAP_HDR_LEN as i32).to_le_bytes();
-        ok = (sys.provider_call)(fd, FS_SEEK, start.as_ptr() as *mut u8, 4) >= 0;
-        let mut read = 0u32;
-        let mut buf = [0u8; SNAP_VERIFY_CHUNK];
-        while ok && read < body_len {
-            let want = ((body_len - read) as usize).min(SNAP_VERIFY_CHUNK);
-            ok = (sys.provider_call)(fd, FS_READ, buf.as_mut_ptr(), want) == want as i32;
-            if ok {
-                crc.update(&buf[..want]);
-                read += want as u32;
+/// Resume the snapshot writer through its phases (`W_*`). Each request is
+/// re-asked unchanged until the provider decides it; the loop continues
+/// while phases complete and stops at the first that has to wait.
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+#[inline(never)]
+unsafe fn drive_writer(s: &mut Snapshot, sys: &SyscallTable) {
+    loop {
+        match s.w_phase {
+            W_OPEN => {
+                let plen = build_snapshot_path(s, s.windex);
+                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
+                if later(fd) {
+                    return;
+                }
+                if fd < 0 {
+                    fail_writer(s, sys);
+                    return;
+                }
+                s.wfd = fd;
+                s.w_moved = 0;
+                s.w_phase = W_HDR;
             }
+            W_HDR => {
+                let mut moved = s.w_moved as usize;
+                let io = fs_step::write_from(
+                    sys.provider_call,
+                    FS_WRITE,
+                    s.wfd,
+                    s.w_hdr.as_ptr(),
+                    SNAP_HDR_LEN,
+                    &mut moved,
+                );
+                s.w_moved = moved as u32;
+                match io {
+                    Io::Later => return,
+                    Io::Done => s.w_phase = W_STREAM,
+                    Io::End | Io::Fail(_) => {
+                        fail_writer(s, sys);
+                        return;
+                    }
+                }
+            }
+            W_STREAM => match drain_append(s, sys) {
+                Step::Later => return,
+                Step::Fail => {
+                    fail_writer(s, sys);
+                    return;
+                }
+                Step::Done => {
+                    if !s.w_finish {
+                        return;
+                    }
+                    s.w_phase = W_FIN_SEAL;
+                }
+            },
+            W_FIN_SEAL => {
+                // Sealed, the body ends with the chunk carrying the final
+                // flag: the staged remainder, possibly empty, so every
+                // sealed body has an authenticated end.
+                if sealing(s) {
+                    if !seal_chunk_out(s, sys, sealed::SNAP_FLAG_FINAL) {
+                        fail_writer(s, sys);
+                        return;
+                    }
+                    if s.wkey >= 0 {
+                        sealed::destroy(sys, s.wkey);
+                        s.wkey = -1;
+                    }
+                }
+                s.w_phase = W_FIN_FLUSH;
+            }
+            W_FIN_FLUSH => match drain_append(s, sys) {
+                Step::Later => return,
+                Step::Fail => {
+                    fail_writer(s, sys);
+                    return;
+                }
+                Step::Done => {
+                    let body_len = if sealing(s) { s.wstored } else { s.wbody };
+                    s.w_body_len = body_len;
+                    s.w_hdr = snap_header(s, s.wterm, s.windex, s.wlast_term, body_len);
+                    s.w_seeked = false;
+                    s.w_moved = 0;
+                    s.w_phase = W_FIN_HDR;
+                }
+            },
+            W_FIN_HDR => {
+                // 1. True header at offset 0.
+                match w_seek(s, sys, 0) {
+                    Step::Later => return,
+                    Step::Fail => {
+                        fail_writer(s, sys);
+                        return;
+                    }
+                    Step::Done => {}
+                }
+                let mut moved = s.w_moved as usize;
+                let io = fs_step::write_from(
+                    sys.provider_call,
+                    FS_WRITE,
+                    s.wfd,
+                    s.w_hdr.as_ptr(),
+                    SNAP_HDR_LEN,
+                    &mut moved,
+                );
+                s.w_moved = moved as u32;
+                match io {
+                    Io::Later => return,
+                    Io::Done => {
+                        // 2. CRC over header || body, reading the body back
+                        //    in chunks.
+                        s.w_crc.reset();
+                        let hdr = s.w_hdr;
+                        s.w_crc.update(&hdr);
+                        s.w_read = 0;
+                        s.w_vgot = 0;
+                        s.w_seeked = false;
+                        s.w_phase = W_FIN_CRC;
+                    }
+                    Io::End | Io::Fail(_) => {
+                        fail_writer(s, sys);
+                        return;
+                    }
+                }
+            }
+            W_FIN_CRC => {
+                if s.w_read < s.w_body_len {
+                    match w_seek(s, sys, SNAP_HDR_LEN as u32) {
+                        Step::Later => return,
+                        Step::Fail => {
+                            fail_writer(s, sys);
+                            return;
+                        }
+                        Step::Done => {}
+                    }
+                    let want = ((s.w_body_len - s.w_read) as usize).min(SNAP_VERIFY_CHUNK);
+                    let mut got = s.w_vgot as usize;
+                    let io = fs_step::read_into(
+                        sys.provider_call,
+                        s.wfd,
+                        s.w_vbuf.as_mut_ptr(),
+                        want,
+                        &mut got,
+                    );
+                    s.w_vgot = got as u32;
+                    match io {
+                        Io::Later => return,
+                        Io::Done => {
+                            let v = s.w_vbuf;
+                            s.w_crc.update(&v[..want]);
+                            s.w_read += want as u32;
+                            s.w_vgot = 0;
+                        }
+                        Io::End | Io::Fail(_) => {
+                            fail_writer(s, sys);
+                            return;
+                        }
+                    }
+                } else {
+                    // 3. Trailer at the end, then one trailing fsync makes
+                    //    the whole file durable atomically.
+                    s.w_trailer[0..4].copy_from_slice(&s.w_crc.finalize().to_le_bytes());
+                    s.w_trailer[4..8].copy_from_slice(&END_MAGIC_SNAP.to_le_bytes());
+                    s.w_seeked = false;
+                    s.w_moved = 0;
+                    s.w_phase = W_FIN_TRAILER;
+                }
+            }
+            W_FIN_TRAILER => {
+                match w_seek(s, sys, SNAP_HDR_LEN as u32 + s.w_body_len) {
+                    Step::Later => return,
+                    Step::Fail => {
+                        fail_writer(s, sys);
+                        return;
+                    }
+                    Step::Done => {}
+                }
+                let mut moved = s.w_moved as usize;
+                let io = fs_step::write_from(
+                    sys.provider_call,
+                    FS_WRITE,
+                    s.wfd,
+                    s.w_trailer.as_ptr(),
+                    SNAP_TRAILER_LEN,
+                    &mut moved,
+                );
+                s.w_moved = moved as u32;
+                match io {
+                    Io::Later => return,
+                    Io::Done => s.w_phase = W_FIN_FSYNC,
+                    Io::End | Io::Fail(_) => {
+                        fail_writer(s, sys);
+                        return;
+                    }
+                }
+            }
+            W_FIN_FSYNC => {
+                // Durability is fenced BEFORE the close: CLOSE never waits
+                // and reports no write-back failure.
+                let rc = (sys.provider_call)(s.wfd, FS_FSYNC, core::ptr::null_mut(), 0);
+                if later(rc) {
+                    return;
+                }
+                if rc != 0 {
+                    fail_writer(s, sys);
+                    return;
+                }
+                (sys.provider_call)(s.wfd, FS_CLOSE, core::ptr::null_mut(), 0);
+                s.wfd = -1;
+                s.w_phase = W_FIN_NAME;
+            }
+            W_FIN_NAME => {
+                // The artefact is self-describing (magic + CRC + END_MAGIC),
+                // so it is published under its final name rather than
+                // renamed into place. That name is only durable once its
+                // parent-directory entry is fenced.
+                let plen = build_snapshot_path(s, s.windex);
+                let st = if plen > 0 {
+                    publish_name(s, sys, plen)
+                } else {
+                    Step::Fail
+                };
+                match st {
+                    Step::Later => return,
+                    Step::Fail => {
+                        fail_writer(s, sys);
+                        return;
+                    }
+                    Step::Done => {
+                        let logical = s.wbody;
+                        s.body_len = logical;
+                        s.snap_bytes_written = s.snap_bytes_written.saturating_add(logical as u64);
+                        if sealing(s) {
+                            // The previous file may survive until it is
+                            // retired: keep the lower of the two epochs live
+                            // until then.
+                            s.done_epoch = s.wepoch;
+                            if s.sealed_epoch == 0 || s.wepoch < s.sealed_epoch {
+                                s.sealed_epoch = s.wepoch;
+                            }
+                        }
+                        dev_log(sys, 3, b"[snap] durable".as_ptr(), 14);
+                        s.wbody = 0;
+                        s.w_durable = true;
+                        s.p_index = s.windex;
+                        s.p_phase = P_START;
+                        s.w_phase = W_PTR;
+                    }
+                }
+            }
+            W_PTR => match persist_snap_pointer(s, sys) {
+                Step::Later => return,
+                Step::Fail => {
+                    s.w_ptr_ok = false;
+                    s.w_phase = W_DONE;
+                }
+                Step::Done => {
+                    s.w_ptr_ok = true;
+                    s.w_phase = W_DONE;
+                }
+            },
+            _ => return,
         }
     }
+}
 
-    // 3. Trailer at the end, then one trailing fsync makes the whole
-    //    file durable atomically.
-    if ok {
-        let end = ((SNAP_HDR_LEN as u32 + body_len) as i32).to_le_bytes();
-        ok = (sys.provider_call)(fd, FS_SEEK, end.as_ptr() as *mut u8, 4) >= 0;
+/// Hand a finished stream's outcome to whichever owner asked for the
+/// finish, once (`W_DONE`).
+///
+/// # Safety
+/// Exclusive `&mut Snapshot`; `sys` must reach live kernel routines.
+unsafe fn complete_writer(s: &mut Snapshot, sys: &SyscallTable) {
+    if s.w_phase != W_DONE {
+        return;
     }
-    if ok {
-        let mut trailer = [0u8; SNAP_TRAILER_LEN];
-        trailer[0..4].copy_from_slice(&crc.finalize().to_le_bytes());
-        trailer[4..8].copy_from_slice(&END_MAGIC_SNAP.to_le_bytes());
-        ok = (sys.provider_call)(fd, FS_WRITE, trailer.as_mut_ptr(), SNAP_TRAILER_LEN)
-            == SNAP_TRAILER_LEN as i32;
+    let owner = s.w_owner;
+    let durable = s.w_durable;
+    let ptr_ok = s.w_ptr_ok;
+    s.w_phase = W_IDLE;
+    s.w_finish = false;
+    s.w_owner = OWNER_NONE;
+    s.w_failed = false;
+    match owner {
+        OWNER_CAPTURE => capture_done(s, sys, durable, ptr_ok),
+        OWNER_INSTALL => install_done(s, sys, durable && ptr_ok),
+        _ => {}
     }
-    if ok {
-        ok = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) == 0;
-    }
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    s.wfd = -1;
-
-    if ok {
-        // The artefact is self-describing (magic + CRC + END_MAGIC), so
-        // it is published under its final name rather than renamed into
-        // place. That name is only durable once its parent-directory
-        // entry is fenced.
-        let plen = build_snapshot_path(s, s.windex);
-        ok = plen > 0 && publish_name(s, sys, plen);
-    }
-    if ok {
-        s.body_len = logical;
-        s.snap_bytes_written = s.snap_bytes_written.saturating_add(logical as u64);
-        if sealing(s) {
-            // The previous file may survive until it is retired: keep the
-            // lower of the two epochs live until then.
-            s.done_epoch = s.wepoch;
-            if s.sealed_epoch == 0 || s.wepoch < s.sealed_epoch {
-                s.sealed_epoch = s.wepoch;
-            }
-        }
-        dev_log(sys, 3, b"[snap] durable".as_ptr(), 14);
-    } else {
-        s.install_failures = s.install_failures.saturating_add(1);
-        dev_log(sys, 3, b"[snap] durable FAIL".as_ptr(), 19);
-    }
-    s.wbody = 0;
-    ok
 }

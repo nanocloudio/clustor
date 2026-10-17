@@ -30,12 +30,15 @@
 use super::abi::SyscallTable;
 use super::collections::Crc32c;
 use super::inbox;
+#[path = "../../common/fs_step.rs"]
+mod fs_step;
 use super::seam::{HorizonLatch, SeamRing, PROBE_QUEUE_SLOTS};
 use super::types::*;
 use super::{
     dev_log, dev_micros, dev_millis, dev_report_step_effect, step_effect, wal_frame, wire,
     wire_channels,
 };
+use fs_step::{later, Io};
 
 /// One coalesced batch = one WAL entry body. Derived from the shared
 /// frame contract so the write path can never exceed what replay
@@ -180,7 +183,6 @@ const FS_OPEN_CREATE: u32 = 0x0909;
 /// FS E_AGAIN: provider present but still initialising (fat32 reading the BPB
 /// on a pi5 cold boot). `load_metadata` must retry rather than treat this as
 /// "no metadata" — otherwise a recovering node restarts fresh.
-const FS_E_AGAIN: i32 = -11;
 const FS_READ: u32 = 0x0901;
 const FS_WRITE: u32 = 0x0906;
 const FS_FSYNC: u32 = 0x0905;
@@ -702,6 +704,55 @@ pub struct Raft {
     /// (0 = none / fresh). Exposes whether the persisted hint is present.
     meta_hint_loaded: Index,
 
+    // ── Non-blocking fs: metadata I/O in flight ─────────────
+    //
+    // No fs call waits on the device, so the load, the slot
+    // materialisation and every persist are step machines that keep
+    // their request here and resume it on a later step.
+    /// Boot load: phase (`ML_*`), next slot, descriptor, bytes read, the
+    /// buffer, and the best record seen so far.
+    ml_phase: u8,
+    ml_slot: u8,
+    ml_fd: i32,
+    ml_got: u8,
+    ml_buf: [u8; META_SLOT_SIZE],
+    ml_best: Option<(u8, MetaRecord)>,
+    /// Slot materialisation: phase (`MZ_*`), slot, bytes read/written.
+    mz_phase: u8,
+    mz_slot: u8,
+    mz_got: u8,
+    mz_moved: u8,
+    /// Directories this boot minted (`META_DIR_*`) whose names are not
+    /// fenced yet.
+    meta_dirs_unfenced: u8,
+    /// The persist in flight (`MJ_*`): its slot, the record it adopts,
+    /// bytes written and read back, and the encoded and read-back bytes.
+    mj_phase: u8,
+    mj_slot: u8,
+    mj_moved: u8,
+    mj_got: u8,
+    mj_gen: u64,
+    mj_durable: Index,
+    mj_buf: [u8; META_SLOT_SIZE],
+    mj_check: [u8; META_SLOT_SIZE],
+    /// The record the persist in flight adopts, and the record last
+    /// adopted (generation aside): a persist of exactly what is already
+    /// durable has nothing to write.
+    mj_rec: MetaRecord,
+    meta_last: Option<MetaRecord>,
+    /// A save was asked for while another record's persist was in
+    /// flight: the current record is persisted once that one lands.
+    meta_dirty: bool,
+    /// A vote grant waiting on its durable record: the grant is answered
+    /// only once `(vote_wait_term, candidate)` is persisted.
+    vote_wait: bool,
+    vote_wait_cand: u8,
+    vote_wait_term: Term,
+    /// A candidacy waiting on its durable self-vote at this term (0 =
+    /// none): the term is adopted and the election begun only once it is
+    /// persisted.
+    cand_wait_term: Term,
+
     // ── Proposal batching ───────────────────────────────────
     proposal_batch: [u8; PROPOSAL_BATCH_CAP],
     proposal_batch_len: u16,
@@ -961,6 +1012,41 @@ pub fn init(s: &mut Raft) {
     s.voted_for = REPLICA_NONE as i8;
     s.frozen = false;
     s.meta_fs_step = false;
+    s.ml_phase = ML_SLOTS;
+    s.ml_slot = 0;
+    s.ml_fd = -1;
+    s.ml_got = 0;
+    s.ml_buf = [0; META_SLOT_SIZE];
+    s.ml_best = None;
+    s.mz_phase = MZ_START;
+    s.mz_slot = 0;
+    s.mz_got = 0;
+    s.mz_moved = 0;
+    s.meta_dirs_unfenced = 0;
+    s.mj_phase = MJ_IDLE;
+    s.mj_slot = 0;
+    s.mj_moved = 0;
+    s.mj_got = 0;
+    s.mj_gen = 0;
+    s.mj_durable = 0;
+    s.mj_buf = [0; META_SLOT_SIZE];
+    s.mj_check = [0; META_SLOT_SIZE];
+    s.mj_rec = MetaRecord {
+        generation: 0,
+        term: 0,
+        voted_for: 0,
+        durable_index: 0,
+        durable_term: 0,
+        current_voters: 0,
+        joint_voters: 0,
+        joint_active: false,
+    };
+    s.meta_last = None;
+    s.meta_dirty = false;
+    s.vote_wait = false;
+    s.vote_wait_cand = 0;
+    s.vote_wait_term = 0;
+    s.cand_wait_term = 0;
     s.durability_mode = 0;
     s.out_durable_horizon = -1;
     s.pending_transfer_to = 0;
@@ -1224,6 +1310,10 @@ pub unsafe fn step(
         // Horizon is seeded — now it is safe to accept new proposals.
         s.awaiting_replay = false;
     }
+
+    // 0a'. Metadata I/O in flight: the persist, and the grant, candidacy
+    //      or save waiting on it.
+    drive_meta(s, sys, now);
 
     // 0b. Metadata persist-error backoff drains one step at a time
     //     (consulted only by the throttled durable-hint save).
@@ -2938,8 +3028,12 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
     //    grant — an ex-voter's vote counted toward a majority is exactly
     //    how a post-downsize cluster elects two leaders.
     let term_ok = term >= s.current_term;
-    let vote_ok =
-        is_pre_vote || s.voted_for == REPLICA_NONE as i8 || s.voted_for == candidate as i8;
+    // A grant still waiting on its durable record holds this term's vote
+    // for its candidate exactly as an adopted one does.
+    let pending = s.vote_wait && s.vote_wait_term == s.current_term;
+    let vote_ok = is_pre_vote
+        || (s.voted_for == REPLICA_NONE as i8 && (!pending || s.vote_wait_cand == candidate))
+        || s.voted_for == candidate as i8;
     let log_ok = last_term > s.last_log_term
         || (last_term == s.last_log_term && last_index >= s.last_log_index);
 
@@ -3002,13 +3096,31 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
             s.voted_for
         };
         let current = s.current_term;
+        let want = meta_record_now(s, current, vote);
+        let busy_other = s.mj_phase != MJ_IDLE && !covers(&s.mj_rec, &want, false);
         match persist_meta_record(s, sys, current, vote) {
             PersistOutcome::Persisted => {
                 if granted {
+                    s.vote_wait = false;
                     s.voted_for = candidate as i8;
                 }
             }
-            _ => {
+            PersistOutcome::Transient if granted => {
+                // The grant's record is not durable yet. Nothing is
+                // adopted and nothing is answered: `drive_meta` answers the
+                // candidate the step the record is durable (or denies it if
+                // the term moves on first). A granted response never leaves
+                // ahead of its durable vote.
+                s.vote_wait = true;
+                s.vote_wait_cand = candidate;
+                s.vote_wait_term = current;
+                return;
+            }
+            out => {
+                if out == PersistOutcome::Transient && busy_other {
+                    // The term advance waits behind another record.
+                    s.meta_dirty = true;
+                }
                 granted = false;
             }
         }
@@ -4967,14 +5079,44 @@ fn build_meta_path_ex(partition_id: u16, root: bool) -> ([u8; META_PATH_MAX], us
     (buf, i)
 }
 
+// Boot-load phases (`ml_phase`).
+const ML_SLOTS: u8 = 0;
+const ML_FLAT: u8 = 1;
+
+// Slot-materialisation phases (`mz_phase`), per slot.
+const MZ_START: u8 = 0;
+const MZ_OPEN: u8 = 1;
+const MZ_MKDIR_ROOT: u8 = 2;
+const MZ_MKDIR_PART: u8 = 3;
+const MZ_SEEK: u8 = 4;
+const MZ_PROBE: u8 = 5;
+const MZ_REWIND: u8 = 6;
+const MZ_WRITE: u8 = 7;
+const MZ_FSYNC: u8 = 8;
+const MZ_NAME: u8 = 9;
+
+// Directories `materialize_meta_slots` minted whose names are not
+// fenced yet (`meta_dirs_unfenced` bits).
+const META_DIR_ROOT: u8 = 1 << 0;
+const META_DIR_PART: u8 = 1 << 1;
+
+// Persist phases (`mj_phase`).
+const MJ_IDLE: u8 = 0;
+const MJ_SEEK: u8 = 1;
+const MJ_WRITE: u8 = 2;
+const MJ_FSYNC: u8 = 3;
+const MJ_REWIND: u8 = 4;
+const MJ_CHECK: u8 = 5;
+
 /// Load persistent Raft state from `raft/[p<id>/]meta`.
 ///
-/// Returns `true` if the FS provider is still initialising (FS_OPEN returned
-/// E_AGAIN) and the caller must RETRY on a later step: at cold boot the fat32
-/// provider isn't ready when `module_new` runs, and a one-shot load would
-/// miss the metadata and restart the node fresh. Returns `false` once the
-/// load resolves (loaded, or the file genuinely doesn't exist = fresh
-/// deploy).
+/// Returns `true` while the load has not resolved and the caller must
+/// RETRY on a later step: at cold boot the fat32 provider isn't ready when
+/// `module_new` runs, and every open and read is non-blocking — an
+/// `EAGAIN` or a part-delivered slot is resumed where it stopped, never
+/// read as "no metadata" (a recovering node would restart fresh).
+/// Returns `false` once the load resolves (loaded, or the files genuinely
+/// don't exist = fresh deploy).
 ///
 /// # Safety
 ///
@@ -4989,51 +5131,66 @@ unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
     // A slot that is missing, short, torn, or foreign simply does not
     // compete — recovery never adopts an unverified record.
     // Generation 0 is never written, so it is a safe "nothing yet" floor.
-    let mut best: Option<(u8, MetaRecord)> = None;
-    let mut best_gen: u64 = 0;
-    let mut retry = false;
-    for slot in 0..META_SLOTS as u8 {
-        let (mut path, plen) = build_meta_slot_path(s.partition_id, root, slot);
-        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
-        if fd == FS_E_AGAIN {
-            retry = true;
+    // A slot that has not answered yet holds the whole load: it may hold
+    // the HIGHER generation, and resolving on the other one would adopt
+    // an older term and vote — a node that re-votes in a term it has
+    // already voted in.
+    while s.ml_phase == ML_SLOTS && (s.ml_slot as usize) < META_SLOTS {
+        let slot = s.ml_slot;
+        if s.ml_fd < 0 {
+            let (mut path, plen) = build_meta_slot_path(s.partition_id, root, slot);
+            let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+            if later(fd) {
+                return true;
+            }
+            if fd < 0 {
+                s.ml_slot += 1;
+                continue;
+            }
+            s.ml_fd = fd;
+            s.ml_got = 0;
+        }
+        let mut got = s.ml_got as usize;
+        let io = fs_step::read_into(
+            sys.provider_call,
+            s.ml_fd,
+            s.ml_buf.as_mut_ptr(),
+            META_SLOT_SIZE,
+            &mut got,
+        );
+        s.ml_got = got as u8;
+        if io == Io::Later {
+            return true;
+        }
+        (sys.provider_call)(s.ml_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.ml_fd = -1;
+        s.ml_slot += 1;
+        if io != Io::Done {
             continue;
         }
-        if fd < 0 {
-            continue;
-        }
-        let mut buf = [0u8; META_SLOT_SIZE];
-        let n = (sys.provider_call)(fd, FS_READ, buf.as_mut_ptr(), META_SLOT_SIZE);
-        (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-        if n != META_SLOT_SIZE as i32 {
-            continue;
-        }
-        if let Some(rec) = decode_meta_slot(&buf) {
+        if let Some(rec) = decode_meta_slot(&s.ml_buf) {
+            let best_gen = s.ml_best.map_or(0, |(_, r)| r.generation);
             if rec.generation > best_gen {
-                best_gen = rec.generation;
-                best = Some((slot, rec));
+                s.ml_best = Some((slot, rec));
             }
         }
     }
-    // One inconclusive slot is enough to defer the whole load: the slot
-    // that did not answer may hold the HIGHER generation, and resolving on
-    // the other one would adopt an older term and vote — a node that
-    // re-votes in a term it has already voted in.
-    if retry {
-        return true; // FS provider initialising — retry later
-    }
 
-    let rec = match best {
+    let rec = match s.ml_best {
         Some((slot, rec)) => {
             s.meta_slot = slot;
             s.meta_generation = rec.generation;
+            s.meta_last = Some(rec);
             rec
         }
-        None => match load_flat_metadata(s, sys, root) {
-            FlatLoad::Retry => return true,
-            FlatLoad::None => return false,
-            FlatLoad::Record(rec) => rec,
-        },
+        None => {
+            s.ml_phase = ML_FLAT;
+            match load_flat_metadata(s, sys, root) {
+                FlatLoad::Retry => return true,
+                FlatLoad::None => return false,
+                FlatLoad::Record(rec) => rec,
+            }
+        }
     };
 
     {
@@ -5087,7 +5244,7 @@ unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
 
 /// Outcome of the flat-record read.
 enum FlatLoad {
-    /// FS provider still initialising — the caller retries on a later step.
+    /// Not answered yet — the caller retries on a later step.
     Retry,
     /// No flat record: a fresh deploy, or a store already holding
     /// slot records.
@@ -5095,9 +5252,10 @@ enum FlatLoad {
     Record(MetaRecord),
 }
 
-/// Read a flat record. Called only when neither slot validates, so a
-/// store holding this shape yields its term and vote instead of the
-/// node starting fresh.
+/// Read a flat record, resumably (the open and the read are re-asked
+/// until answered). Called only when neither slot validates, so a store
+/// holding this shape yields its term and vote instead of the node
+/// starting fresh.
 ///
 /// The record's log fields pair a durable index with the volatile tip
 /// term, so they do not describe one entry and no claim about the log
@@ -5109,25 +5267,36 @@ enum FlatLoad {
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` per the module ABI.
 unsafe fn load_flat_metadata(s: &mut Raft, sys: &SyscallTable, root: bool) -> FlatLoad {
-    let (mut path, plen) = build_meta_path_ex(s.partition_id, root);
-    let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
-    if fd == FS_E_AGAIN {
+    if s.ml_fd < 0 {
+        let (mut path, plen) = build_meta_path_ex(s.partition_id, root);
+        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+        if later(fd) {
+            return FlatLoad::Retry;
+        }
+        if fd < 0 {
+            return FlatLoad::None;
+        }
+        s.ml_fd = fd;
+        s.ml_got = 0;
+    }
+    let mut got = s.ml_got as usize;
+    let io = fs_step::read_into(
+        sys.provider_call,
+        s.ml_fd,
+        s.ml_buf.as_mut_ptr(),
+        META_FLAT_SIZE,
+        &mut got,
+    );
+    s.ml_got = got as u8;
+    if io == Io::Later {
         return FlatLoad::Retry;
     }
-    if fd < 0 {
-        return FlatLoad::None;
-    }
-    let mut buf = [0u8; META_FLAT_SIZE];
-    let n = (sys.provider_call)(fd, FS_READ, buf.as_mut_ptr(), META_FLAT_SIZE);
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    // Compared as a SIGNED count: a provider still initialising answers
-    // E_AGAIN here as well as at the open, and every other negative return
-    // is a failed read, not a record. Widening either to `usize` first
-    // turns them into a huge length that passes the floor and hands the
-    // caller a zeroed buffer as persisted state.
-    if n == FS_E_AGAIN {
-        return FlatLoad::Retry;
-    }
+    (sys.provider_call)(s.ml_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    s.ml_fd = -1;
+    // A failed read is not a record: every negative answer other than
+    // "not yet" leaves nothing to interpret.
+    let n = if matches!(io, Io::Fail(_)) { 0 } else { got };
+    let buf = s.ml_buf;
     // The flat shape has exactly two defined lengths: 25 bytes without
     // the voter-set trailer, or the full 28 with it. Nothing checksums
     // this record, so a length the format never writes is not a record
@@ -5135,13 +5304,13 @@ unsafe fn load_flat_metadata(s: &mut Raft, sys: &SyscallTable, root: bool) -> Fl
     // and its term and vote may be ones the writer went on to refuse.
     // Refuse the whole thing rather than adopt fields that happen to
     // look complete.
-    if n != META_FLAT_MIN as i32 && n != META_FLAT_SIZE as i32 {
+    if n != META_FLAT_MIN && n != META_FLAT_SIZE {
         if n > 0 {
             dev_log(sys, 2, b"[raft] meta flat partial".as_ptr(), 24);
         }
         return FlatLoad::None;
     }
-    let has_voters = n == META_FLAT_SIZE as i32 && buf[25] != 0;
+    let has_voters = n == META_FLAT_SIZE && buf[25] != 0;
     dev_log(sys, 3, b"[raft] meta flat".as_ptr(), 16);
     FlatLoad::Record(MetaRecord {
         generation: 0,
@@ -5165,7 +5334,8 @@ unsafe fn load_flat_metadata(s: &mut Raft, sys: &SyscallTable, root: bool) -> Fl
 /// owns the only open path: the next attempt runs it again, reopens
 /// what was closed, finds the file already at full size and leaves its
 /// record untouched. Leaving the flag set would strand the persist on a
-/// closed descriptor for good.
+/// closed descriptor for good. Any persist or materialisation in flight
+/// is abandoned with it.
 ///
 /// # Safety
 ///
@@ -5178,6 +5348,9 @@ unsafe fn mark_meta_failure(s: &mut Raft, sys: &SyscallTable, slot: u8) -> Persi
         s.meta_fds[idx] = -1;
     }
     s.meta_slots_materialized = false;
+    s.mz_phase = MZ_START;
+    s.mz_slot = 0;
+    s.mj_phase = MJ_IDLE;
     s.meta_write_errors = s.meta_write_errors.saturating_add(1);
     s.meta_backoff_steps = 200;
     if !s.meta_fail_logged {
@@ -5187,72 +5360,56 @@ unsafe fn mark_meta_failure(s: &mut Raft, sys: &SyscallTable, slot: u8) -> Persi
     PersistOutcome::Failed
 }
 
-/// One-shot dir-mode self-heal: create the `raft/` parent chain (and
-/// the per-partition subdirectory) via FS_MKDIR. Single-level and
-/// EEXIST-idempotent on the linux provider; bare-metal FAT32 answers a
-/// clean ENOSYS, but root-path mode never reaches here anyway.
-///
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Raft` and supply a valid
-/// `&SyscallTable` per the module ABI.
-unsafe fn meta_mkdir_parents(s: &mut Raft, sys: &SyscallTable) {
-    let mut root = [0u8; 4];
-    root[..4].copy_from_slice(b"raft");
-    let _ = (sys.provider_call)(-1, FS_MKDIR, root.as_mut_ptr(), 4);
-    if s.partition_id != 0 {
-        // "raft/p<NNNN>" — the parent of the per-partition meta file.
-        let (mut path, plen) = build_meta_path(s.partition_id);
-        // Strip the trailing "/meta" (5 bytes) to get the directory.
-        let dir_len = plen - 5;
-        let _ = (sys.provider_call)(-1, FS_MKDIR, path.as_mut_ptr(), dir_len);
-    }
-    dev_log(sys, 3, b"[raft] mkdir raft".as_ptr(), 17);
-}
-
 /// Fill `name_fence_probe` from the provider's capability word (once
-/// per boot; a provider that cannot answer the probe stays unprobed and
-/// is treated as lacking the capability).
+/// per boot). `false` while the provider cannot answer yet (`EAGAIN`
+/// while it mounts): that is never latched as "absent". A provider that
+/// answers with an error is latched as lacking the capability.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn probe_name_fence(s: &mut Raft, sys: &SyscallTable) {
+unsafe fn probe_name_fence(s: &mut Raft, sys: &SyscallTable) -> bool {
     if s.name_fence_probe != NAME_FENCE_UNPROBED {
-        return;
+        return true;
     }
     let mut caps = [0u8; 4];
-    if (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4) == 4 {
-        let bits = u32::from_le_bytes(caps);
-        s.name_fence_probe = if bits & FS_CAP_FSYNC_NAME != 0 {
-            NAME_FENCE_PRESENT
-        } else {
-            NAME_FENCE_ABSENT
-        };
+    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+    if later(rc) {
+        return false;
     }
+    let bits = if rc == 4 { u32::from_le_bytes(caps) } else { 0 };
+    s.name_fence_probe = if bits & FS_CAP_FSYNC_NAME != 0 {
+        NAME_FENCE_PRESENT
+    } else {
+        NAME_FENCE_ABSENT
+    };
+    true
 }
 
-/// True when a slot name may be minted under the current posture.
-/// Strict on a provider with no `caps::FSYNC_NAME` answers false, and
-/// the caller refuses BEFORE the open: a persist that fails at the
-/// fence has already fsynced a record carrying a generation and a vote
-/// this node never adopted, which the next boot would then recover.
+/// Whether a slot name may be minted under the current posture:
+/// `Persisted` yes, `Transient` while the provider cannot say yet,
+/// `Failed` no. Strict on a provider with no `caps::FSYNC_NAME` refuses
+/// BEFORE the open: a persist that fails at the fence has already
+/// fsynced a record carrying a generation and a vote this node never
+/// adopted, which the next boot would then recover.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn name_fence_permits_create(s: &mut Raft, sys: &SyscallTable) -> bool {
-    probe_name_fence(s, sys);
+unsafe fn name_fence_permits_create(s: &mut Raft, sys: &SyscallTable) -> PersistOutcome {
+    if !probe_name_fence(s, sys) {
+        return PersistOutcome::Transient;
+    }
     if s.name_fence_probe == NAME_FENCE_PRESENT || s.name_fence != NAME_FENCE_STRICT {
-        return true;
+        return PersistOutcome::Persisted;
     }
     if !s.name_fence_logged {
         s.name_fence_logged = true;
         dev_log(sys, 2, b"[raft] no name fence".as_ptr(), 20);
     }
-    false
+    PersistOutcome::Failed
 }
 
 /// Publish the parent-directory entry naming a metadata slot.
@@ -5263,10 +5420,11 @@ unsafe fn name_fence_permits_create(s: &mut Raft, sys: &SyscallTable) -> bool {
 /// layout exists to prevent. The fence is therefore part of creating
 /// the slot, not a tidy-up after it.
 ///
-/// Returns `true` when the name may be treated as durable. A provider
-/// without `caps::FSYNC_NAME` cannot prove that: the strict posture
-/// refuses (the persist fails, and the caller withholds the vote or
-/// election that gated on it), while the auto posture proceeds and
+/// `Persisted` when the name may be treated as durable; `Transient`
+/// while `FS_FSYNC_NAME` is undecided (re-asked, same path, next step).
+/// A provider without `caps::FSYNC_NAME` cannot prove that: the strict
+/// posture refuses (the persist fails, and the caller withholds the vote
+/// or election that gated on it), while the auto posture proceeds and
 /// leaves the disposition visible in `RAFT_NAME_FENCE`.
 ///
 /// # Safety
@@ -5278,19 +5436,23 @@ unsafe fn publish_meta_name(
     sys: &SyscallTable,
     path: &mut [u8],
     plen: usize,
-) -> bool {
-    if !name_fence_permits_create(s, sys) {
-        return false;
+) -> PersistOutcome {
+    match name_fence_permits_create(s, sys) {
+        PersistOutcome::Persisted => {}
+        other => return other,
     }
     if s.name_fence_probe != NAME_FENCE_PRESENT {
         // Auto posture: the name goes out unfenced, and saying so is the
         // whole of what this posture offers over strict.
         s.name_unfenced = s.name_unfenced.saturating_add(1);
-        return true;
+        return PersistOutcome::Persisted;
     }
     let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, path.as_mut_ptr(), plen);
+    if later(rc) {
+        return PersistOutcome::Transient;
+    }
     if rc == 0 {
-        return true;
+        return PersistOutcome::Persisted;
     }
     // The provider advertised the capability and then failed the call:
     // a real fault in the store, not a posture the operator chose.
@@ -5298,7 +5460,7 @@ unsafe fn publish_meta_name(
         s.name_fence_fail_logged = true;
         dev_log(sys, 1, b"[raft] name fence FAIL".as_ptr(), 22);
     }
-    false
+    PersistOutcome::Failed
 }
 
 /// Bring BOTH slot files into existence, at full size, with both names
@@ -5334,6 +5496,10 @@ unsafe fn publish_meta_name(
 /// An existing slot is READ first and left alone if it is already full
 /// size — an upgrading node must not have its recovered state zeroed.
 ///
+/// A step machine over `mz_*`: `Transient` while a request is undecided
+/// (it is re-asked unchanged next step), `Persisted` once both slots are
+/// settled.
+///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
@@ -5342,72 +5508,190 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
     if s.meta_slots_materialized {
         return PersistOutcome::Persisted;
     }
-    for slot in 0..META_SLOTS as u8 {
+    while (s.mz_slot as usize) < META_SLOTS {
+        let slot = s.mz_slot;
         let idx = slot as usize;
-        // Same refusal as the persist path, for the same reason: under
-        // the strict posture a name that cannot be fenced is never
-        // minted, and the refusal comes before any FS work.
-        if !s.meta_name_published[idx] && !name_fence_permits_create(s, sys) {
-            return mark_meta_failure(s, sys, slot);
-        }
-        if s.meta_fds[idx] < 0 {
-            let (mut path, plen) =
-                build_meta_slot_path(s.partition_id, s.meta_root_path != 0, slot);
-            let mut opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
-            if opened == FS_E_AGAIN {
-                return PersistOutcome::Transient; // provider initialising
+        let (mut path, plen) = build_meta_slot_path(s.partition_id, s.meta_root_path != 0, slot);
+        match s.mz_phase {
+            MZ_START => {
+                // Same refusal as the persist path, for the same reason:
+                // under the strict posture a name that cannot be fenced is
+                // never minted, and the refusal comes before any FS work.
+                if !s.meta_name_published[idx] {
+                    match name_fence_permits_create(s, sys) {
+                        PersistOutcome::Persisted => {}
+                        PersistOutcome::Transient => return PersistOutcome::Transient,
+                        PersistOutcome::Failed => return mark_meta_failure(s, sys, slot),
+                    }
+                }
+                s.mz_phase = if s.meta_fds[idx] < 0 {
+                    MZ_OPEN
+                } else {
+                    MZ_SEEK
+                };
             }
-            if opened < 0 && s.meta_root_path == 0 && !s.meta_mkdir_attempted {
-                s.meta_mkdir_attempted = true;
-                meta_mkdir_parents(s, sys);
-                opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
-                if opened == FS_E_AGAIN {
+            MZ_OPEN => {
+                let opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+                if later(opened) {
+                    return PersistOutcome::Transient; // provider initialising
+                }
+                if opened < 0 {
+                    if s.meta_root_path == 0 && !s.meta_mkdir_attempted {
+                        // One-shot dir-mode self-heal: create the `raft/`
+                        // parent chain (and the per-partition subdirectory)
+                        // via FS_MKDIR, then retry the open.
+                        s.meta_mkdir_attempted = true;
+                        s.mz_phase = MZ_MKDIR_ROOT;
+                        continue;
+                    }
+                    return mark_meta_failure(s, sys, slot);
+                }
+                s.meta_fds[idx] = opened;
+                s.mz_phase = MZ_SEEK;
+            }
+            MZ_MKDIR_ROOT => {
+                let mut root = [0u8; 4];
+                root[..4].copy_from_slice(b"raft");
+                let rc = (sys.provider_call)(-1, FS_MKDIR, root.as_mut_ptr(), 4);
+                if later(rc) {
                     return PersistOutcome::Transient;
                 }
+                if rc == 0 {
+                    // Minted here: fenced before a slot inside it is
+                    // relied on (`MZ_NAME`).
+                    s.meta_dirs_unfenced |= META_DIR_ROOT;
+                }
+                s.mz_phase = if s.partition_id != 0 {
+                    MZ_MKDIR_PART
+                } else {
+                    dev_log(sys, 3, b"[raft] mkdir raft".as_ptr(), 17);
+                    MZ_OPEN
+                };
             }
-            if opened < 0 {
-                return mark_meta_failure(s, sys, slot);
+            MZ_MKDIR_PART => {
+                // "raft/p<NNNN>" — the parent of the per-partition meta file.
+                let (mut dir, dlen) = build_meta_path(s.partition_id);
+                // Strip the trailing "/meta" (5 bytes) to get the directory.
+                let rc = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dlen - 5);
+                if later(rc) {
+                    return PersistOutcome::Transient;
+                }
+                if rc == 0 {
+                    s.meta_dirs_unfenced |= META_DIR_PART;
+                }
+                dev_log(sys, 3, b"[raft] mkdir raft".as_ptr(), 17);
+                s.mz_phase = MZ_OPEN;
             }
-            s.meta_fds[idx] = opened;
-        }
-        let fd = s.meta_fds[idx];
-
-        // Size it, but only if it is not already sized. A short read is
-        // the test: a file this node created a moment ago reads 0, one
-        // written by a previous boot reads META_SLOT_SIZE and keeps
-        // whatever record it holds.
-        let zero = 0i32.to_le_bytes();
-        if (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4) < 0 {
-            return mark_meta_failure(s, sys, slot);
-        }
-        let mut probe = [0u8; META_SLOT_SIZE];
-        let have = (sys.provider_call)(fd, FS_READ, probe.as_mut_ptr(), META_SLOT_SIZE);
-        if have != META_SLOT_SIZE as i32 {
-            if (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4) < 0 {
-                return mark_meta_failure(s, sys, slot);
+            MZ_SEEK => {
+                // Size it, but only if it is not already sized. A short read
+                // is the test: a file this node created a moment ago reads
+                // 0, one written by a previous boot reads META_SLOT_SIZE and
+                // keeps whatever record it holds.
+                let zero = 0i32.to_le_bytes();
+                let rc = (sys.provider_call)(s.meta_fds[idx], FS_SEEK, zero.as_ptr() as *mut u8, 4);
+                if later(rc) {
+                    return PersistOutcome::Transient;
+                }
+                if rc < 0 {
+                    return mark_meta_failure(s, sys, slot);
+                }
+                s.mz_got = 0;
+                s.mz_phase = MZ_PROBE;
             }
-            let mut neutral = [0u8; META_SLOT_SIZE];
-            if (sys.provider_call)(fd, FS_WRITE, neutral.as_mut_ptr(), META_SLOT_SIZE)
-                != META_SLOT_SIZE as i32
-            {
-                return mark_meta_failure(s, sys, slot);
+            MZ_PROBE => {
+                let mut got = s.mz_got as usize;
+                let io = fs_step::read_into(
+                    sys.provider_call,
+                    s.meta_fds[idx],
+                    s.mj_check.as_mut_ptr(),
+                    META_SLOT_SIZE,
+                    &mut got,
+                );
+                s.mz_got = got as u8;
+                match io {
+                    Io::Later => return PersistOutcome::Transient,
+                    Io::Done => s.mz_phase = MZ_NAME,
+                    Io::End | Io::Fail(_) => s.mz_phase = MZ_REWIND,
+                }
             }
-            if (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) < 0 {
-                return mark_meta_failure(s, sys, slot);
+            MZ_REWIND => {
+                let zero = 0i32.to_le_bytes();
+                let rc = (sys.provider_call)(s.meta_fds[idx], FS_SEEK, zero.as_ptr() as *mut u8, 4);
+                if later(rc) {
+                    return PersistOutcome::Transient;
+                }
+                if rc < 0 {
+                    return mark_meta_failure(s, sys, slot);
+                }
+                s.mz_moved = 0;
+                s.mz_phase = MZ_WRITE;
             }
-        }
-
-        // Fence the name now — the point of the exercise is that the
-        // directory is settled before anything depends on it.
-        if !s.meta_name_published[idx] {
-            let (mut path, plen) =
-                build_meta_slot_path(s.partition_id, s.meta_root_path != 0, slot);
-            if !publish_meta_name(s, sys, &mut path, plen) {
-                return mark_meta_failure(s, sys, slot);
+            MZ_WRITE => {
+                let neutral = [0u8; META_SLOT_SIZE];
+                let mut moved = s.mz_moved as usize;
+                let io = fs_step::write_from(
+                    sys.provider_call,
+                    FS_WRITE,
+                    s.meta_fds[idx],
+                    neutral.as_ptr(),
+                    META_SLOT_SIZE,
+                    &mut moved,
+                );
+                s.mz_moved = moved as u8;
+                match io {
+                    Io::Later => return PersistOutcome::Transient,
+                    Io::Done => s.mz_phase = MZ_FSYNC,
+                    Io::End | Io::Fail(_) => return mark_meta_failure(s, sys, slot),
+                }
             }
-            s.meta_name_published[idx] = true;
+            MZ_FSYNC => {
+                let rc = (sys.provider_call)(s.meta_fds[idx], FS_FSYNC, core::ptr::null_mut(), 0);
+                if later(rc) {
+                    return PersistOutcome::Transient;
+                }
+                if rc < 0 {
+                    return mark_meta_failure(s, sys, slot);
+                }
+                s.mz_phase = MZ_NAME;
+            }
+            MZ_NAME => {
+                // Fence the name now — the point of the exercise is that the
+                // directory is settled before anything depends on it. The
+                // directories this boot minted come first, outermost first:
+                // a slot's entry survives a power cut only if they do.
+                if s.meta_dirs_unfenced & META_DIR_ROOT != 0 {
+                    let mut root = [0u8; 4];
+                    root[..4].copy_from_slice(b"raft");
+                    match publish_meta_name(s, sys, &mut root, 4) {
+                        PersistOutcome::Persisted => s.meta_dirs_unfenced &= !META_DIR_ROOT,
+                        PersistOutcome::Transient => return PersistOutcome::Transient,
+                        PersistOutcome::Failed => return mark_meta_failure(s, sys, slot),
+                    }
+                }
+                if s.meta_dirs_unfenced & META_DIR_PART != 0 {
+                    let (mut dir, dlen) = build_meta_path(s.partition_id);
+                    match publish_meta_name(s, sys, &mut dir, dlen - 5) {
+                        PersistOutcome::Persisted => s.meta_dirs_unfenced &= !META_DIR_PART,
+                        PersistOutcome::Transient => return PersistOutcome::Transient,
+                        PersistOutcome::Failed => return mark_meta_failure(s, sys, slot),
+                    }
+                }
+                if !s.meta_name_published[idx] {
+                    match publish_meta_name(s, sys, &mut path, plen) {
+                        PersistOutcome::Persisted => {}
+                        PersistOutcome::Transient => return PersistOutcome::Transient,
+                        PersistOutcome::Failed => return mark_meta_failure(s, sys, slot),
+                    }
+                    s.meta_name_published[idx] = true;
+                }
+                s.mz_slot += 1;
+                s.mz_phase = MZ_START;
+            }
+            _ => s.mz_phase = MZ_START,
         }
     }
+    s.mz_slot = 0;
+    s.mz_phase = MZ_START;
     s.meta_slots_materialized = true;
     PersistOutcome::Persisted
 }
@@ -5421,6 +5705,14 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
 /// The persisted `last_log_index` slot carries the DURABLE watermark
 /// (`local_durable_index`), not the volatile appended index, so a
 /// recovered node never claims durability it didn't have on disk.
+///
+/// One persist is in flight at a time, as a step machine over `mj_*`:
+/// the record is encoded when it starts, every request is re-asked
+/// unchanged until decided (nothing writes the slot between an fsync's
+/// ask and its decision), and the generation is adopted only once the
+/// fsync is durable and the read-back matches. `Transient` while it —
+/// or another record's persist — is still in flight; the record is never
+/// adopted before then. `drive_meta` resumes it every step.
 ///
 /// In the `persist_meta: 0` posture this is a no-op returning
 /// `Persisted`: nothing is supposed to persist, and the posture's own
@@ -5437,10 +5729,75 @@ unsafe fn persist_meta_record(
     term: Term,
     voted_for: i8,
 ) -> PersistOutcome {
+    persist_record(s, sys, term, voted_for, false)
+}
+
+/// The record a persist of `(term, voted_for)` would write now.
+fn meta_record_now(s: &Raft, term: Term, voted_for: i8) -> MetaRecord {
+    MetaRecord {
+        generation: s.meta_generation.wrapping_add(1),
+        term,
+        voted_for,
+        durable_index: s.local_durable_index,
+        // Paired with the durable index by the WAL's own ack — NOT
+        // `last_log_term`, which describes the volatile tip.
+        durable_term: s.local_durable_term,
+        current_voters: s.current_voters.0,
+        joint_voters: s.joint_voters.0,
+        joint_active: s.joint_active,
+    }
+}
+
+/// Whether record `have` (durable, or in flight) makes `want` true: the
+/// same term, vote and configuration — and, with `hint`, the same
+/// durable-index hint. The hint is throttled and replay re-derives the
+/// real index, so a vote or a candidacy does not wait for it to catch up
+/// (it moves with every WAL ack, and chasing it would never land).
+fn covers(have: &MetaRecord, want: &MetaRecord, hint: bool) -> bool {
+    have.term == want.term
+        && have.voted_for == want.voted_for
+        && have.current_voters == want.current_voters
+        && have.joint_voters == want.joint_voters
+        && have.joint_active == want.joint_active
+        && (!hint
+            || (have.durable_index == want.durable_index && have.durable_term == want.durable_term))
+}
+
+/// The persist primitive: `hint` asks for the durable-index hint to be
+/// current too (`save_metadata`).
+///
+/// # Safety
+/// Exclusive `&mut Raft`; `sys` must reach live kernel routines.
+unsafe fn persist_record(
+    s: &mut Raft,
+    sys: &SyscallTable,
+    term: Term,
+    voted_for: i8,
+    hint: bool,
+) -> PersistOutcome {
     if s.persist_meta == 0 {
         return PersistOutcome::Persisted;
     }
     s.meta_fs_step = true;
+    let want = meta_record_now(s, term, voted_for);
+    if s.mj_phase != MJ_IDLE {
+        if !covers(&s.mj_rec, &want, hint) {
+            // Another record's persist owns the slot. Drive it; this one
+            // is asked again once it lands.
+            let _ = continue_persist(s, sys);
+            return PersistOutcome::Transient;
+        }
+        return continue_persist(s, sys);
+    }
+    // What is already durable makes this true (a grant or a candidacy
+    // whose persist `drive_meta` finished, a repeated save): there is
+    // nothing to write, and writing it again would only delay what waits
+    // on it.
+    if let Some(last) = s.meta_last {
+        if covers(&last, &want, hint) {
+            return PersistOutcome::Persisted;
+        }
+    }
     // Both names and both file sizes are settled before the first
     // adopted generation, so from here on the directory is never
     // touched again — see `materialize_meta_slots`. The fds it opened
@@ -5452,74 +5809,130 @@ unsafe fn persist_meta_record(
     }
     // Target the INACTIVE slot. The active slot — the one recovery
     // would choose today — is never touched, so a failure anywhere
-    // between here and the fsync leaves it whole and readable.
+    // between here and the fsync leaves it whole and readable. The
+    // record is taken now, after materialisation, so it carries what is
+    // current when it is written.
     let slot = 1 - (s.meta_slot & 1);
-    let idx = slot as usize;
-    let fd = s.meta_fds[idx];
-
-    // Seek to start (overwrite)
-    let zero = 0i32.to_le_bytes();
-    if (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4) < 0 {
-        return mark_meta_failure(s, sys, slot);
-    }
-
-    let durable = s.local_durable_index;
-    let generation = s.meta_generation.wrapping_add(1);
+    let rec = meta_record_now(s, term, voted_for);
     let mut buf = [0u8; META_SLOT_SIZE];
-    encode_meta_slot(
-        &mut buf,
-        &MetaRecord {
-            generation,
-            term,
-            voted_for,
-            durable_index: durable,
-            // Paired with the durable index by the WAL's own ack — NOT
-            // `last_log_term`, which describes the volatile tip.
-            durable_term: s.local_durable_term,
-            current_voters: s.current_voters.0,
-            joint_voters: s.joint_voters.0,
-            joint_active: s.joint_active,
-        },
-    );
-    if (sys.provider_call)(fd, FS_WRITE, buf.as_mut_ptr(), META_SLOT_SIZE) != META_SLOT_SIZE as i32
-    {
-        return mark_meta_failure(s, sys, slot);
-    }
-    if (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0) < 0 {
-        return mark_meta_failure(s, sys, slot);
-    }
+    encode_meta_slot(&mut buf, &rec);
+    s.mj_rec = rec;
+    s.mj_buf = buf;
+    s.mj_slot = slot;
+    s.mj_gen = rec.generation;
+    s.mj_durable = rec.durable_index;
+    s.mj_moved = 0;
+    s.mj_got = 0;
+    s.mj_phase = MJ_SEEK;
+    continue_persist(s, sys)
+}
 
-    // Read the slot back and compare it byte for byte before adopting
-    // the new generation. The read goes through the same descriptor and
-    // may well be served from the provider's cache, so it proves the
-    // bytes reached the provider whole — a short or partial write is
-    // caught here — while the FSYNC above is what carries them to media.
-    let seek = 0i32.to_le_bytes();
-    if (sys.provider_call)(fd, FS_SEEK, seek.as_ptr() as *mut u8, 4) < 0 {
+/// Resume the persist in flight. `Persisted` once its record is durable,
+/// read back whole and adopted.
+///
+/// # Safety
+/// Exclusive `&mut Raft`; `sys` must reach live kernel routines.
+unsafe fn continue_persist(s: &mut Raft, sys: &SyscallTable) -> PersistOutcome {
+    let slot = s.mj_slot;
+    let idx = (slot & 1) as usize;
+    let fd = s.meta_fds[idx];
+    if fd < 0 {
         return mark_meta_failure(s, sys, slot);
     }
-    let mut check = [0u8; META_SLOT_SIZE];
-    if (sys.provider_call)(fd, FS_READ, check.as_mut_ptr(), META_SLOT_SIZE) != META_SLOT_SIZE as i32
-    {
-        return mark_meta_failure(s, sys, slot);
+    loop {
+        match s.mj_phase {
+            MJ_SEEK | MJ_REWIND => {
+                // Seek to start (overwrite, then read back).
+                let zero = 0i32.to_le_bytes();
+                let rc = (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4);
+                if later(rc) {
+                    return PersistOutcome::Transient;
+                }
+                if rc < 0 {
+                    return mark_meta_failure(s, sys, slot);
+                }
+                s.mj_phase = if s.mj_phase == MJ_SEEK {
+                    MJ_WRITE
+                } else {
+                    MJ_CHECK
+                };
+            }
+            MJ_WRITE => {
+                let mut moved = s.mj_moved as usize;
+                let io = fs_step::write_from(
+                    sys.provider_call,
+                    FS_WRITE,
+                    fd,
+                    s.mj_buf.as_ptr(),
+                    META_SLOT_SIZE,
+                    &mut moved,
+                );
+                s.mj_moved = moved as u8;
+                match io {
+                    Io::Later => return PersistOutcome::Transient,
+                    Io::Done => s.mj_phase = MJ_FSYNC,
+                    Io::End | Io::Fail(_) => return mark_meta_failure(s, sys, slot),
+                }
+            }
+            MJ_FSYNC => {
+                let rc = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                if later(rc) {
+                    // Taken, not decided: the byte-identical fsync is asked
+                    // again next step, and nothing writes the slot meanwhile.
+                    return PersistOutcome::Transient;
+                }
+                if rc < 0 {
+                    return mark_meta_failure(s, sys, slot);
+                }
+                s.mj_got = 0;
+                s.mj_phase = MJ_REWIND;
+            }
+            MJ_CHECK => {
+                // Read the slot back and compare it byte for byte before
+                // adopting the new generation. The read goes through the
+                // same descriptor and may well be served from the
+                // provider's cache, so it proves the bytes reached the
+                // provider whole — a short or partial write is caught here —
+                // while the FSYNC above is what carries them to media.
+                let mut got = s.mj_got as usize;
+                let io = fs_step::read_into(
+                    sys.provider_call,
+                    fd,
+                    s.mj_check.as_mut_ptr(),
+                    META_SLOT_SIZE,
+                    &mut got,
+                );
+                s.mj_got = got as u8;
+                match io {
+                    Io::Later => return PersistOutcome::Transient,
+                    Io::Done => {}
+                    Io::End | Io::Fail(_) => return mark_meta_failure(s, sys, slot),
+                }
+                if s.mj_check != s.mj_buf {
+                    return mark_meta_failure(s, sys, slot);
+                }
+                // The name was fenced at materialisation, before anything
+                // was adopted. Kept as a guard rather than deleted: if a
+                // future change ever reaches this point with an unpublished
+                // name, the record must not be adopted under a directory
+                // entry that may not survive.
+                if !s.meta_name_published[idx] {
+                    return mark_meta_failure(s, sys, slot);
+                }
+                // Adopt: from here recovery chooses this slot.
+                s.meta_slot = slot;
+                s.meta_generation = s.mj_gen;
+                s.meta_persisted_durable = s.mj_durable;
+                s.meta_last = Some(s.mj_rec);
+                s.mj_phase = MJ_IDLE;
+                return PersistOutcome::Persisted;
+            }
+            _ => {
+                s.mj_phase = MJ_IDLE;
+                return PersistOutcome::Transient;
+            }
+        }
     }
-    if check != buf {
-        return mark_meta_failure(s, sys, slot);
-    }
-
-    // The name was fenced at materialisation, before anything was
-    // adopted. Kept as a guard rather than deleted: if a future change
-    // ever reaches this point with an unpublished name, the record must
-    // not be adopted under a directory entry that may not survive.
-    if !s.meta_name_published[idx] {
-        return mark_meta_failure(s, sys, slot);
-    }
-
-    // Adopt: from here recovery chooses this slot.
-    s.meta_slot = slot;
-    s.meta_generation = generation;
-    s.meta_persisted_durable = durable;
-    PersistOutcome::Persisted
 }
 
 /// Persist the CURRENT in-memory `(term, voted_for)` — for call sites
@@ -5527,6 +5940,8 @@ unsafe fn persist_meta_record(
 /// voter-set changes, snapshot fast-forward, higher-term adoption's
 /// liveness exception). Failures are counted inside; callers that must
 /// gate externally visible effects use `persist_meta_record` directly.
+/// A save that cannot start because another record is in flight is
+/// remembered (`meta_dirty`) and made once that one lands.
 ///
 /// # Safety
 ///
@@ -5535,7 +5950,107 @@ unsafe fn persist_meta_record(
 unsafe fn save_metadata(s: &mut Raft, sys: &SyscallTable) -> PersistOutcome {
     let term = s.current_term;
     let voted = s.voted_for;
-    persist_meta_record(s, sys, term, voted)
+    let want = meta_record_now(s, term, voted);
+    let busy_other = s.mj_phase != MJ_IDLE && !covers(&s.mj_rec, &want, true);
+    let out = persist_record(s, sys, term, voted, true);
+    if out == PersistOutcome::Transient && busy_other {
+        s.meta_dirty = true;
+    }
+    out
+}
+
+/// Resume metadata I/O every step: the persist in flight, then whatever
+/// was waiting on it — a vote grant (answered only once its record is
+/// durable), a candidacy (begun only once its self-vote is durable), and
+/// a save asked for meanwhile.
+///
+/// # Safety
+/// Exclusive `&mut Raft`; `sys` must reach live kernel routines.
+unsafe fn drive_meta(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    if s.persist_meta == 0 {
+        return;
+    }
+    if s.mj_phase != MJ_IDLE {
+        let _ = continue_persist(s, sys);
+    }
+    if s.vote_wait {
+        settle_vote_wait(s, sys);
+    }
+    if s.cand_wait_term != 0 {
+        settle_cand_wait(s, sys, now);
+    }
+    if s.meta_dirty && s.mj_phase == MJ_IDLE && !s.vote_wait && s.cand_wait_term == 0 {
+        s.meta_dirty = false;
+        let _ = save_metadata(s, sys);
+    }
+}
+
+/// Answer a vote grant that was waiting on its durable record.
+///
+/// # Safety
+/// Exclusive `&mut Raft`; `sys` must reach live kernel routines.
+unsafe fn settle_vote_wait(s: &mut Raft, sys: &SyscallTable) {
+    let cand = s.vote_wait_cand;
+    let term = s.vote_wait_term;
+    if s.current_term != term {
+        // The term moved on while the record was being made durable: the
+        // grant is void. The candidate learns our term from the denial.
+        s.vote_wait = false;
+        send_vote_response(s, sys, cand, false);
+        return;
+    }
+    match persist_meta_record(s, sys, term, cand as i8) {
+        PersistOutcome::Transient => {}
+        PersistOutcome::Persisted => {
+            s.vote_wait = false;
+            s.voted_for = cand as i8;
+            send_vote_response(s, sys, cand, true);
+        }
+        PersistOutcome::Failed => {
+            s.vote_wait = false;
+            send_vote_response(s, sys, cand, false);
+        }
+    }
+}
+
+/// Begin a candidacy whose self-vote was waiting on its durable record.
+///
+/// # Safety
+/// Exclusive `&mut Raft`; `sys` must reach live kernel routines.
+unsafe fn settle_cand_wait(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    let prospective = s.cand_wait_term;
+    // Anything that moved the term (a higher term heard, a vote granted)
+    // or made this node a leader voids the candidacy.
+    if s.current_term.wrapping_add(1) != prospective || s.role == ROLE_LEADER {
+        s.cand_wait_term = 0;
+        return;
+    }
+    let self_vote = s.self_id as i8;
+    match persist_meta_record(s, sys, prospective, self_vote) {
+        PersistOutcome::Transient => {}
+        PersistOutcome::Persisted => {
+            s.cand_wait_term = 0;
+            s.current_term = prospective;
+            s.voted_for = self_vote;
+            begin_candidacy(s, sys, now, false);
+        }
+        PersistOutcome::Failed => {
+            s.cand_wait_term = 0;
+            s.election_deadline_ms = now + s.election_timeout_ms as u64;
+        }
+    }
+}
+
+/// Send a (real) vote response to `candidate`, carrying our term.
+///
+/// # Safety
+/// `sys` must reach live kernel routines per the module ABI.
+unsafe fn send_vote_response(s: &mut Raft, sys: &SyscallTable, candidate: u8, granted: bool) {
+    let mut resp = [0u8; 10];
+    wire::encode_vote_response(&mut resp, s.current_term, granted, s.self_id);
+    if wire_channels::writable(sys, s.out_rpc) {
+        rpc_send(s, sys, candidate, wire::MSG_REQUEST_VOTE_RESP, &resp[..10]);
+    }
 }
 
 // ── State transitions ───────────────────────────────────────
@@ -5711,19 +6226,40 @@ unsafe fn start_election(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: b
         // take candidacy. On failure nothing changed — no term
         // inflation leaks through response terms to depose healthy
         // leaders — and the re-armed deadline retries later.
+        //
+        // The persist is non-blocking: while its fsync is undecided the
+        // candidacy waits (`cand_wait_term`) and `drive_meta` begins it
+        // the step the self-vote is durable — never before.
         let prospective = s.current_term + 1;
         let self_vote = s.self_id as i8;
         match persist_meta_record(s, sys, prospective, self_vote) {
             PersistOutcome::Persisted => {
+                s.cand_wait_term = 0;
                 s.current_term = prospective;
                 s.voted_for = self_vote;
             }
-            _ => {
+            PersistOutcome::Transient => {
+                s.cand_wait_term = prospective;
+                s.election_deadline_ms = now + s.election_timeout_ms as u64;
+                return;
+            }
+            PersistOutcome::Failed => {
+                s.cand_wait_term = 0;
                 s.election_deadline_ms = now + s.election_timeout_ms as u64;
                 return;
             }
         }
     }
+    begin_candidacy(s, sys, now, pre_vote);
+}
+
+/// Take candidacy at the current term (its self-vote already durable for
+/// a real election): reset the tally, re-arm the jittered deadline, and
+/// ask the peers.
+///
+/// # Safety
+/// Exclusive `&mut Raft`; `sys` must reach live kernel routines.
+unsafe fn begin_candidacy(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: bool) {
     s.pre_vote_active = pre_vote;
 
     s.role = ROLE_CANDIDATE;

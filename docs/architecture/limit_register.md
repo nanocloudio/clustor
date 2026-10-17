@@ -382,4 +382,9 @@ FWD_FRAME_MAX | modules/app/consensus/replicator.rs | -
 # and nothing is bounded by them.
 SR_ST_NO_CAPACITY | modules/common/session_registry.rs | -
 SR_ST_DEADLINE_CAPACITY | modules/common/session_registry.rs | -
+
+# Phase tags. The convention keys on the NAME, and a phase named for what
+# it loads reads as a slot count — this is a state value, and nothing is
+# bounded by it.
+ML_SLOTS | modules/app/consensus/raft.rs | -
 ```

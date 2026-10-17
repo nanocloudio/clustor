@@ -305,6 +305,16 @@ path = "tests/volatile_cluster.rs"
 name = "wal_scan"
 path = "tests/wal_scan.rs"
 
+# Host-side coverage for the WAL against the non-blocking fs contract:
+# short counts, EAGAIN and EINPROGRESS on every call, a device that only
+# progresses between steps, and checks that no index is acknowledged
+# before it is durable and no write lands between an fsync's ask and its
+# decision. Mounts `modules/app/durability/wal.rs` via `#[path]` against
+# a mock SyscallTable; no fluxor-linux / .fmod prereqs, always runs.
+[[test]]
+name = "fs_async"
+path = "tests/fs_async.rs"
+
 # Host-side coverage for the correlated Raft <-> WAL truncation
 # handshake. Mounts `modules/app/consensus/raft.rs` and
 # `modules/app/durability/wal.rs` in one crate, wired to each other

@@ -90,11 +90,12 @@
 //! snapshot names its epoch, and only after the state recording that is
 //! durable.
 
+use super::fs_step::{self, later, Io};
 use super::sealed as sr;
 use super::{
-    dev_log, note_config, note_ledger_ack, publish_name, record_entry_loc, wal_frame, wire,
-    wire_channels, write_part, Wal, FS_CLOSE, FS_FSYNC, FS_MKDIR, FS_OPEN, FS_OPEN_CREATE, FS_READ,
-    FS_WRITE, STEP_BURST, WAL_PATH_MAX,
+    dev_log, end_replay_segment, fence_wal_dir, note_config, note_ledger_ack, publish_name,
+    record_entry_loc, wal_frame, wire, wire_channels, write_part, Step, Wal, FS_CLOSE, FS_FSYNC,
+    FS_MKDIR, FS_OPEN, FS_OPEN_CREATE, FS_WRITE, STEP_BURST, WAL_PATH_MAX,
 };
 use crate::abi::contracts::key_vault as kv;
 use crate::abi::SyscallTable;
@@ -140,7 +141,7 @@ pub mod fault {
     pub const VAULT: u8 = 6;
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct EpochMark {
     pub epoch: u32,
@@ -227,6 +228,29 @@ pub struct WalSeal {
     pub incarnations: u32,
     pub state_writes: u32,
     pub retired_epochs: u32,
+
+    // ── Non-blocking fs: allocator-state I/O in flight ──────────────
+    /// Boot load phase (`LD_*`) and what each slot read found.
+    ld_phase: u8,
+    ld_a: SlotRead,
+    ld_b: SlotRead,
+    /// The slot read in flight: descriptor, bytes, buffer.
+    rd_fd: i32,
+    rd_got: u16,
+    rd_buf: [u8; STATE_LEN],
+    /// The state write in flight (`SW_*`): descriptor, bytes written, the
+    /// slot, whether the parent self-heal was tried, the record and
+    /// effects it adopts, and its encoded bytes.
+    sw_phase: u8,
+    sw_fd: i32,
+    sw_moved: u16,
+    sw_slot: u8,
+    sw_mkdir: bool,
+    sw_rec: Record,
+    sw_fx: Effects,
+    sw_buf: [u8; STATE_LEN],
+    /// A rotation's new master, held while its state write is undecided.
+    rot_h: i32,
 }
 
 pub fn init(z: &mut WalSeal) {
@@ -274,6 +298,29 @@ pub fn init(z: &mut WalSeal) {
     z.incarnations = 0;
     z.state_writes = 0;
     z.retired_epochs = 0;
+    z.ld_phase = LD_SLOT0;
+    z.ld_a = SlotRead::Absent;
+    z.ld_b = SlotRead::Absent;
+    z.rd_fd = -1;
+    z.rd_got = 0;
+    z.rd_buf = [0; STATE_LEN];
+    z.sw_phase = SW_IDLE;
+    z.sw_fd = -1;
+    z.sw_moved = 0;
+    z.sw_slot = 0;
+    z.sw_mkdir = false;
+    z.sw_rec = Record {
+        gen: 0,
+        epoch: 0,
+        suite: 0,
+        inc_reserved: 0,
+        oldest_epoch: 0,
+        marks: [EpochMark::zero(); MAX_MARKS],
+        mark_count: 0,
+    };
+    z.sw_fx = NO_EFFECTS;
+    z.sw_buf = [0; STATE_LEN];
+    z.rot_h = -1;
 }
 
 /// Whether this WAL seals its frames.
@@ -502,7 +549,7 @@ fn state_path(partition_id: u16, root: bool, slot: u8, out: &mut [u8; WAL_PATH_M
 }
 
 /// The fields of one allocator record.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct Record {
     gen: u64,
     epoch: u32,
@@ -609,90 +656,307 @@ enum SlotErr {
     Key,
 }
 
-/// Read slot `slot`. `Err` when the file exists and does not hold an
-/// authentic record for this group; `Ok(None)` when it does not exist.
-unsafe fn read_slot(s: &mut Wal, sys: &SyscallTable, slot: u8) -> Result<Option<Record>, SlotErr> {
-    let mut path = [0u8; WAL_PATH_MAX];
-    let plen = state_path(s.partition_id, s.root_path != 0, slot, &mut path);
-    let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
-    if fd < 0 {
-        return Ok(None);
+/// What reading one slot found.
+#[derive(Clone, Copy)]
+enum SlotRead {
+    /// The slot file does not exist.
+    Absent,
+    Found(Record),
+    Err(SlotErr),
+}
+
+// Boot-load phases (`ld_phase`).
+const LD_SLOT0: u8 = 0;
+const LD_SLOT1: u8 = 1;
+const LD_PICK: u8 = 2;
+const LD_FRESH: u8 = 3;
+
+// Allocator-state write phases (`sw_phase`).
+const SW_IDLE: u8 = 0;
+const SW_OPEN: u8 = 1;
+const SW_MKDIR: u8 = 2;
+const SW_WRITE: u8 = 3;
+const SW_FSYNC: u8 = 4;
+const SW_NAME: u8 = 5;
+
+/// What adopting a state write does besides adopting its record. Carried
+/// by the write itself, so whichever step finishes it — the caller that
+/// started it, or the per-step drive — leaves the allocator consistent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Effects {
+    /// The new epoch's master to make current (rotation), or -1.
+    set_master: i32,
+    /// The next incarnation counter to adopt (a reservation), or `u64::MAX`.
+    set_inc_next: u64,
+    /// Masters of epochs `retire_from..retire_to` to destroy (retirement).
+    retire_from: u32,
+    retire_to: u32,
+    /// The state is created at this boot.
+    fresh: bool,
+}
+
+const NO_EFFECTS: Effects = Effects {
+    set_master: -1,
+    set_inc_next: u64::MAX,
+    retire_from: 0,
+    retire_to: 0,
+    fresh: false,
+};
+
+/// Read slot `slot`, resumably: the open and the read are re-asked until
+/// answered (`None` meanwhile). `Absent` only for an answered "no such
+/// file"; `Err` when the file exists and does not hold an authentic
+/// record for this group.
+unsafe fn read_slot(s: &mut Wal, sys: &SyscallTable, slot: u8) -> Option<SlotRead> {
+    if s.seal.rd_fd < 0 {
+        let mut path = [0u8; WAL_PATH_MAX];
+        let plen = state_path(s.partition_id, s.root_path != 0, slot, &mut path);
+        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+        if later(fd) {
+            return None;
+        }
+        if fd < 0 {
+            return Some(SlotRead::Absent);
+        }
+        s.seal.rd_fd = fd;
+        s.seal.rd_got = 0;
     }
-    let mut b = [0u8; STATE_LEN];
-    let n = (sys.provider_call)(fd, FS_READ, b.as_mut_ptr(), STATE_LEN);
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    if n != STATE_LEN as i32 {
-        return Err(SlotErr::Bad);
+    let mut got = s.seal.rd_got as usize;
+    let io = fs_step::read_into(
+        sys.provider_call,
+        s.seal.rd_fd,
+        s.seal.rd_buf.as_mut_ptr(),
+        STATE_LEN,
+        &mut got,
+    );
+    s.seal.rd_got = got as u16;
+    if io == Io::Later {
+        return None;
     }
+    (sys.provider_call)(s.seal.rd_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    s.seal.rd_fd = -1;
+    if io != Io::Done {
+        return Some(SlotRead::Err(SlotErr::Bad));
+    }
+    let b = s.seal.rd_buf;
     let Some(r) = decode_record(s, &b) else {
-        return Err(SlotErr::Bad);
+        return Some(SlotRead::Err(SlotErr::Bad));
     };
     let w = who(s);
     let master = master_for(&mut s.seal, w, sys, r.epoch);
     if master < 0 {
-        return Err(SlotErr::Key);
+        return Some(SlotRead::Err(SlotErr::Key));
     }
     let k = state_key(s, sys, master);
     if k < 0 {
-        return Err(SlotErr::Bad);
+        return Some(SlotRead::Err(SlotErr::Bad));
     }
     let mut tag = [0u8; 32];
     tag.copy_from_slice(&b[STATE_MAC_OFF..STATE_LEN]);
     let ok = sr::hmac_verify(sys, k, &b[..STATE_MAC_OFF], &tag);
     sr::destroy(sys, k);
     if ok {
-        Ok(Some(r))
+        Some(SlotRead::Found(r))
     } else {
-        Err(SlotErr::Bad)
+        Some(SlotRead::Err(SlotErr::Bad))
     }
 }
 
 /// Write `r` (its generation one past the current) to the slot not
-/// holding the current copy, durably, and adopt it. The record's epoch
-/// master must already be open as the current master or in the cache.
+/// holding the current copy, durably, and adopt it with `fx`. The MAC is
+/// taken under `mac_master` (or the record's epoch master when -1), which
+/// must be open.
+///
+/// One state write is in flight at a time, as a step machine over `sw_*`:
+/// the encoded, MAC'd bytes are fixed when it starts, every request is
+/// re-asked unchanged until decided, and the record and its effects are
+/// adopted only once its name fence answers. `Done` when THIS write
+/// (record and effects) has been adopted; `Later` while it — or another
+/// caller's write — is still in flight (the caller asks again next step,
+/// and recomputes its record from the then-current state); `Fail` when
+/// it was refused.
 #[inline(never)]
-unsafe fn write_state(s: &mut Wal, sys: &SyscallTable, r: &mut Record) -> bool {
+unsafe fn write_state(
+    s: &mut Wal,
+    sys: &SyscallTable,
+    r: &mut Record,
+    fx: Effects,
+    mac_master: i32,
+) -> Step {
     r.gen = s.seal.state_gen.wrapping_add(1);
-    let w = who(s);
-    let master = master_for(&mut s.seal, w, sys, r.epoch);
-    if master < 0 {
-        return false;
+    if s.seal.sw_phase == SW_IDLE {
+        let master = if mac_master >= 0 {
+            mac_master
+        } else {
+            let w = who(s);
+            master_for(&mut s.seal, w, sys, r.epoch)
+        };
+        if master < 0 {
+            return Step::Fail;
+        }
+        let mut b = [0u8; STATE_LEN];
+        encode_record(s, r, &mut b);
+        let k = state_key(s, sys, master);
+        if k < 0 {
+            return Step::Fail;
+        }
+        let mut tag = [0u8; 32];
+        let signed = sr::hmac(sys, k, &b[..STATE_MAC_OFF], &mut tag);
+        sr::destroy(sys, k);
+        if !signed {
+            return Step::Fail;
+        }
+        b[STATE_MAC_OFF..STATE_LEN].copy_from_slice(&tag);
+        s.seal.sw_buf = b;
+        s.seal.sw_rec = *r;
+        s.seal.sw_fx = fx;
+        s.seal.sw_slot = s.seal.state_slot ^ 1;
+        s.seal.sw_moved = 0;
+        s.seal.sw_mkdir = false;
+        s.seal.sw_phase = SW_OPEN;
     }
-    let mut b = [0u8; STATE_LEN];
-    encode_record(s, r, &mut b);
-    let k = state_key(s, sys, master);
-    if k < 0 {
-        return false;
+    let mine = s.seal.sw_rec == *r && s.seal.sw_fx == fx;
+    if !mine {
+        // Another write owns the slot; it is driven by its own caller and
+        // by the per-step drive. Ask again once it is adopted.
+        drive(s, sys);
+        return Step::Later;
     }
-    let mut tag = [0u8; 32];
-    let signed = sr::hmac(sys, k, &b[..STATE_MAC_OFF], &mut tag);
-    sr::destroy(sys, k);
-    if !signed {
-        return false;
+    drive_state_write(s, sys)
+}
+
+/// Resume the in-flight state write, if any. Called every step, so a
+/// write is finished — and its effects applied — whoever started it.
+///
+/// # Safety
+/// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
+pub unsafe fn drive(s: &mut Wal, sys: &SyscallTable) {
+    if s.seal.sw_phase != SW_IDLE {
+        let _ = drive_state_write(s, sys);
     }
-    b[STATE_MAC_OFF..STATE_LEN].copy_from_slice(&tag);
-    let slot = s.seal.state_slot ^ 1;
+}
+
+/// Close the state write's descriptor and idle the machine.
+unsafe fn sw_reset(s: &mut Wal, sys: &SyscallTable) {
+    if s.seal.sw_fd >= 0 {
+        (sys.provider_call)(s.seal.sw_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        s.seal.sw_fd = -1;
+    }
+    s.seal.sw_phase = SW_IDLE;
+}
+
+/// The state write was refused: nothing is adopted. A rotation's new
+/// master, which no durable record names, is let go.
+unsafe fn sw_refused(s: &mut Wal, sys: &SyscallTable) -> Step {
+    sw_reset(s, sys);
+    let h = s.seal.sw_fx.set_master;
+    if h >= 0 {
+        sr::destroy(sys, h);
+        if s.seal.rot_h == h {
+            s.seal.rot_h = -1;
+        }
+    }
+    Step::Fail
+}
+
+#[inline(never)]
+unsafe fn drive_state_write(s: &mut Wal, sys: &SyscallTable) -> Step {
     let mut path = [0u8; WAL_PATH_MAX];
-    let plen = state_path(s.partition_id, s.root_path != 0, slot, &mut path);
-    let mut fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
-    if fd < 0 && s.root_path == 0 {
-        // The first state write precedes the first segment, so it is the
-        // one that meets a missing `wal/` parent: create it and retry, as
-        // the segment opener does.
-        let mut dir = *b"wal";
-        let _ = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dir.len());
-        fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+    let plen = state_path(s.partition_id, s.root_path != 0, s.seal.sw_slot, &mut path);
+    loop {
+        match s.seal.sw_phase {
+            SW_OPEN => {
+                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+                if later(fd) {
+                    return Step::Later;
+                }
+                if fd < 0 {
+                    if s.root_path == 0 && !s.seal.sw_mkdir {
+                        // The first state write precedes the first segment,
+                        // so it is the one that meets a missing `wal/`
+                        // parent: create it and retry, as the segment opener
+                        // does.
+                        s.seal.sw_mkdir = true;
+                        s.seal.sw_phase = SW_MKDIR;
+                        continue;
+                    }
+                    return sw_refused(s, sys);
+                }
+                s.seal.sw_fd = fd;
+                s.seal.sw_phase = SW_WRITE;
+            }
+            SW_MKDIR => {
+                let mut dir = *b"wal";
+                let rc = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dir.len());
+                if later(rc) {
+                    return Step::Later;
+                }
+                if rc == 0 {
+                    // Minted here: fenced before the state inside it is
+                    // adopted (`SW_NAME`).
+                    s.dir_unfenced = true;
+                }
+                s.seal.sw_phase = SW_OPEN;
+            }
+            SW_WRITE => {
+                let mut moved = s.seal.sw_moved as usize;
+                let io = fs_step::write_from(
+                    sys.provider_call,
+                    FS_WRITE,
+                    s.seal.sw_fd,
+                    s.seal.sw_buf.as_ptr(),
+                    STATE_LEN,
+                    &mut moved,
+                );
+                s.seal.sw_moved = moved as u16;
+                match io {
+                    Io::Later => return Step::Later,
+                    Io::Done => s.seal.sw_phase = SW_FSYNC,
+                    Io::Fail(_) | Io::End => return sw_refused(s, sys),
+                }
+            }
+            SW_FSYNC => {
+                // Fenced before the close: CLOSE reports no write-back.
+                let rc = (sys.provider_call)(s.seal.sw_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                if later(rc) {
+                    return Step::Later;
+                }
+                if rc != 0 {
+                    return sw_refused(s, sys);
+                }
+                (sys.provider_call)(s.seal.sw_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                s.seal.sw_fd = -1;
+                s.seal.sw_phase = SW_NAME;
+            }
+            SW_NAME => match fence_wal_dir(s, sys) {
+                Step::Later => return Step::Later,
+                Step::Fail => return sw_refused(s, sys),
+                Step::Done => match publish_name(s, sys, &mut path, plen) {
+                    Step::Later => return Step::Later,
+                    Step::Fail => return sw_refused(s, sys),
+                    Step::Done => {
+                        sw_reset(s, sys);
+                        adopt_state(s, sys);
+                        return Step::Done;
+                    }
+                },
+            },
+            _ => {
+                sw_reset(s, sys);
+                return Step::Later;
+            }
+        }
     }
-    if fd < 0 {
-        return false;
-    }
-    let w = (sys.provider_call)(fd, FS_WRITE, b.as_mut_ptr(), STATE_LEN);
-    let f = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
-    (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    if w != STATE_LEN as i32 || f != 0 || !publish_name(s, sys, &mut path, plen) {
-        return false;
-    }
-    s.seal.state_slot = slot;
+}
+
+/// The state write is durable under its fenced name: adopt its record
+/// and apply its effects.
+unsafe fn adopt_state(s: &mut Wal, sys: &SyscallTable) {
+    let r = s.seal.sw_rec;
+    let fx = s.seal.sw_fx;
+    let old_master = s.seal.master;
+    let old_epoch = s.seal.epoch;
+    s.seal.state_slot = s.seal.sw_slot;
     s.seal.state_gen = r.gen;
     s.seal.epoch = r.epoch;
     s.seal.inc_reserved = r.inc_reserved;
@@ -700,7 +964,58 @@ unsafe fn write_state(s: &mut Wal, sys: &SyscallTable, r: &mut Record) -> bool {
     s.seal.marks = r.marks;
     s.seal.mark_count = r.mark_count;
     s.seal.state_writes = s.seal.state_writes.saturating_add(1);
-    true
+    if fx.fresh {
+        s.seal.fresh = true;
+    }
+    if fx.set_inc_next != u64::MAX {
+        s.seal.inc_next = fx.set_inc_next;
+    }
+    if fx.set_master >= 0 {
+        // A rotation: the new master is current, and the old one is kept
+        // readable for segments still sealed under it.
+        s.seal.master = fx.set_master;
+        if s.seal.rot_h == fx.set_master {
+            s.seal.rot_h = -1;
+        }
+        let mut placed = false;
+        for i in 0..MASTER_CACHE {
+            if s.seal.masters[i].1 < 0 {
+                s.seal.masters[i] = (old_epoch, old_master);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            sr::destroy(sys, old_master);
+        }
+        s.seal.inc_next = s.seal.inc_reserved;
+        s.seal.rotations = s.seal.rotations.saturating_add(1);
+        // The boundary the rotation was wanted at has been served.
+        s.seal.rotate_requested = false;
+        s.seal.stale = false;
+        dev_log(sys, 3, b"[wal] seal epoch rotated".as_ptr(), 24);
+    }
+    if fx.retire_to > fx.retire_from {
+        // Retirement: the floor naming no epoch below `retire_to` is
+        // durable, so their masters may go.
+        for epoch in fx.retire_from..fx.retire_to {
+            for i in 0..MASTER_CACHE {
+                if s.seal.masters[i].1 >= 0 && s.seal.masters[i].0 == epoch {
+                    sr::destroy(sys, s.seal.masters[i].1);
+                    s.seal.masters[i] = (0, -1);
+                }
+            }
+            if s.seal.read_key >= 0 && s.seal.read_epoch == epoch {
+                sr::destroy(sys, s.seal.read_key);
+                s.seal.read_key = -1;
+            }
+            let mut label = [0u8; sr::MASTER_LABEL_CAP];
+            let n = master_label(who(s), epoch, &mut label);
+            sr::destroy_label(sys, &label[..n]);
+            s.seal.retired_epochs = s.seal.retired_epochs.saturating_add(1);
+        }
+        dev_log(sys, 3, b"[wal] seal epoch retired".as_ptr(), 24);
+    }
 }
 
 fn current_record(s: &Wal) -> Record {
@@ -751,7 +1066,10 @@ fn add_mark(r: &mut Record, epoch: u32, segment: u32) -> bool {
 #[inline(never)]
 pub unsafe fn boot_step(s: &mut Wal, sys: &SyscallTable) -> Option<i32> {
     match s.seal.phase {
-        PHASE_READY => None,
+        PHASE_READY => {
+            drive(s, sys);
+            None
+        }
         PHASE_FAULT => Some(0),
         _ => {
             load(s, sys);
@@ -760,90 +1078,130 @@ pub unsafe fn boot_step(s: &mut Wal, sys: &SyscallTable) -> Option<i32> {
     }
 }
 
+/// The fresh allocator record this boot creates when no state exists.
+fn fresh_record(s: &Wal) -> Record {
+    let mut r = Record {
+        gen: 0,
+        epoch: 1,
+        suite: s.seal.suite,
+        inc_reserved: 0,
+        oldest_epoch: 1,
+        marks: [EpochMark::zero(); MAX_MARKS],
+        mark_count: 0,
+    };
+    add_mark(&mut r, 1, 1);
+    r
+}
+
+/// The boot load, resumed across steps: read slot 0, read slot 1 (each
+/// re-asked until answered — an unanswered slot may hold the newer
+/// generation), pick, and either adopt or durably create the state.
 #[inline(never)]
 unsafe fn load(s: &mut Wal, sys: &SyscallTable) {
-    let Some(vsuite) = sr::vault_suite(s.seal.suite) else {
-        fail(s, sys, fault::VAULT, b"[wal] seal: unknown aead suite");
-        return;
-    };
-    if !sr::suite_offered(sys, vsuite) {
-        fail(s, sys, fault::VAULT, b"[wal] seal: suite not offered");
-        return;
-    }
-    let a = read_slot(s, sys, 0);
-    let b = read_slot(s, sys, 1);
-    let pick = match (a, b) {
-        (Ok(Some(x)), Ok(Some(y))) => Some(if y.gen > x.gen { (y, 1) } else { (x, 0) }),
-        (Ok(Some(x)), _) => Some((x, 0)),
-        (_, Ok(Some(y))) => Some((y, 1)),
-        (Ok(None), Ok(None)) => None,
-        (a, b) => {
-            if matches!(a, Err(SlotErr::Key)) || matches!(b, Err(SlotErr::Key)) {
-                fail(s, sys, fault::KEY, b"[wal] seal: key epoch unavailable");
-            } else {
-                fail(s, sys, fault::STATE, b"[wal] seal: state unauthentic");
-            }
+    if s.seal.ld_phase == LD_SLOT0 {
+        let Some(vsuite) = sr::vault_suite(s.seal.suite) else {
+            fail(s, sys, fault::VAULT, b"[wal] seal: unknown aead suite");
+            return;
+        };
+        if !sr::suite_offered(sys, vsuite) {
+            fail(s, sys, fault::VAULT, b"[wal] seal: suite not offered");
             return;
         }
-    };
-    match pick {
-        Some((r, slot)) => {
-            if r.suite != s.seal.suite {
-                fail(
-                    s,
-                    sys,
-                    fault::VAULT,
-                    b"[wal] seal: suite differs from state",
-                );
-                return;
+        let Some(a) = read_slot(s, sys, 0) else {
+            return;
+        };
+        s.seal.ld_a = a;
+        s.seal.ld_phase = LD_SLOT1;
+    }
+    if s.seal.ld_phase == LD_SLOT1 {
+        let Some(b) = read_slot(s, sys, 1) else {
+            return;
+        };
+        s.seal.ld_b = b;
+        s.seal.ld_phase = LD_PICK;
+    }
+    if s.seal.ld_phase == LD_PICK {
+        let pick = match (s.seal.ld_a, s.seal.ld_b) {
+            (SlotRead::Found(x), SlotRead::Found(y)) => {
+                Some(if y.gen > x.gen { (y, 1) } else { (x, 0) })
             }
-            let h = open_master(who(s), sys, r.epoch, false);
-            if h < 0 {
-                fail(s, sys, fault::KEY, b"[wal] seal: key epoch unavailable");
-                return;
-            }
-            s.seal.master = h;
-            s.seal.state_gen = r.gen;
-            s.seal.state_slot = slot;
-            s.seal.epoch = r.epoch;
-            s.seal.inc_reserved = r.inc_reserved;
-            s.seal.oldest_epoch = r.oldest_epoch;
-            s.seal.marks = r.marks;
-            s.seal.mark_count = r.mark_count;
-            // The cache may hold this epoch from the MAC check.
-            for i in 0..MASTER_CACHE {
-                if s.seal.masters[i].1 == h {
-                    s.seal.masters[i] = (0, -1);
+            (SlotRead::Found(x), _) => Some((x, 0)),
+            (_, SlotRead::Found(y)) => Some((y, 1)),
+            (SlotRead::Absent, SlotRead::Absent) => None,
+            (a, b) => {
+                if matches!(a, SlotRead::Err(SlotErr::Key))
+                    || matches!(b, SlotRead::Err(SlotErr::Key))
+                {
+                    fail(s, sys, fault::KEY, b"[wal] seal: key epoch unavailable");
+                } else {
+                    fail(s, sys, fault::STATE, b"[wal] seal: state unauthentic");
                 }
-            }
-        }
-        None => {
-            let h = open_master(who(s), sys, 1, true);
-            if h < 0 {
-                fail(s, sys, fault::VAULT, b"[wal] seal: master unavailable");
                 return;
             }
-            s.seal.master = h;
-            s.seal.epoch = 1;
-            s.seal.state_gen = 0;
-            s.seal.state_slot = 1;
-            let mut r = Record {
-                gen: 0,
-                epoch: 1,
-                suite: s.seal.suite,
-                inc_reserved: 0,
-                oldest_epoch: 1,
-                marks: [EpochMark::zero(); MAX_MARKS],
-                mark_count: 0,
-            };
-            add_mark(&mut r, 1, 1);
-            if !write_state(s, sys, &mut r) {
-                fail(s, sys, fault::STATE, b"[wal] seal: state write failed");
+        };
+        match pick {
+            Some((r, slot)) => {
+                if r.suite != s.seal.suite {
+                    fail(
+                        s,
+                        sys,
+                        fault::VAULT,
+                        b"[wal] seal: suite differs from state",
+                    );
+                    return;
+                }
+                let h = open_master(who(s), sys, r.epoch, false);
+                if h < 0 {
+                    fail(s, sys, fault::KEY, b"[wal] seal: key epoch unavailable");
+                    return;
+                }
+                s.seal.master = h;
+                s.seal.state_gen = r.gen;
+                s.seal.state_slot = slot;
+                s.seal.epoch = r.epoch;
+                s.seal.inc_reserved = r.inc_reserved;
+                s.seal.oldest_epoch = r.oldest_epoch;
+                s.seal.marks = r.marks;
+                s.seal.mark_count = r.mark_count;
+                // The cache may hold this epoch from the MAC check.
+                for i in 0..MASTER_CACHE {
+                    if s.seal.masters[i].1 == h {
+                        s.seal.masters[i] = (0, -1);
+                    }
+                }
+                finish_load(s, sys);
                 return;
             }
-            s.seal.fresh = true;
+            None => {
+                let h = open_master(who(s), sys, 1, true);
+                if h < 0 {
+                    fail(s, sys, fault::VAULT, b"[wal] seal: master unavailable");
+                    return;
+                }
+                s.seal.master = h;
+                s.seal.epoch = 1;
+                s.seal.state_gen = 0;
+                s.seal.state_slot = 1;
+                s.seal.ld_phase = LD_FRESH;
+            }
         }
     }
+    if s.seal.ld_phase == LD_FRESH {
+        let mut r = fresh_record(s);
+        let fx = Effects {
+            fresh: true,
+            ..NO_EFFECTS
+        };
+        match write_state(s, sys, &mut r, fx, -1) {
+            Step::Later => {}
+            Step::Fail => fail(s, sys, fault::STATE, b"[wal] seal: state write failed"),
+            Step::Done => finish_load(s, sys),
+        }
+    }
+}
+
+/// The allocator state is in hand: draw the salt and become ready.
+unsafe fn finish_load(s: &mut Wal, sys: &SyscallTable) {
     if !sr::random_fill(sys, &mut s.seal.salt) {
         fail(s, sys, fault::VAULT, b"[wal] seal: no random source");
         return;
@@ -902,65 +1260,60 @@ pub fn request_rotation(s: &mut Wal) {
     }
 }
 
-/// Create the next epoch's master and durably name it current.
+/// Create the next epoch's master and durably name it current. The new
+/// master is opened once and held (`rot_h`) across the steps its state
+/// write takes; the rotation takes effect when that write is adopted
+/// (`adopt_state`), and a refused write lets the master go.
 #[inline(never)]
-unsafe fn rotate_epoch(s: &mut Wal, sys: &SyscallTable) -> bool {
+unsafe fn rotate_epoch(s: &mut Wal, sys: &SyscallTable) -> Step {
     let next = s.seal.epoch.max(s.seal.max_epoch_seen).saturating_add(1);
-    let h = open_master(who(s), sys, next, true);
-    if h < 0 {
-        return false;
+    if s.seal.rot_h < 0 {
+        let h = open_master(who(s), sys, next, true);
+        if h < 0 {
+            return Step::Fail;
+        }
+        s.seal.rot_h = h;
     }
+    let h = s.seal.rot_h;
     let mut r = current_record(s);
     r.epoch = next;
     if !add_mark(&mut r, next, s.segment_seq) {
-        return false;
+        sr::destroy(sys, h);
+        s.seal.rot_h = -1;
+        return Step::Fail;
     }
     if s.seal.saw_frame && r.inc_reserved <= s.seal.max_counter_seen {
         r.inc_reserved = s.seal.max_counter_seen.saturating_add(1);
     }
-    // The state's MAC is under the new master: hold it as current for
-    // the write, and put the old one back if the write fails.
-    let old = s.seal.master;
-    let old_epoch = s.seal.epoch;
-    s.seal.master = h;
-    s.seal.epoch = next;
-    if !write_state(s, sys, &mut r) {
-        s.seal.master = old;
-        s.seal.epoch = old_epoch;
-        return false;
-    }
-    // Keep the old master readable for segments still sealed under it.
-    let mut placed = false;
-    for i in 0..MASTER_CACHE {
-        if s.seal.masters[i].1 < 0 {
-            s.seal.masters[i] = (old_epoch, old);
-            placed = true;
-            break;
-        }
-    }
-    if !placed {
-        sr::destroy(sys, old);
-    }
-    s.seal.inc_next = s.seal.inc_reserved;
-    s.seal.rotations = s.seal.rotations.saturating_add(1);
-    dev_log(sys, 3, b"[wal] seal epoch rotated".as_ptr(), 24);
-    true
+    // The state's MAC is under the new master.
+    let fx = Effects {
+        set_master: h,
+        ..NO_EFFECTS
+    };
+    write_state(s, sys, &mut r, fx, h)
 }
 
 /// Make the writer ready to seal the next frame: at a boundary, change
 /// epoch if wanted; open an incarnation if none is open (reserving a
 /// counter range durably first when the reserved one is used up).
-/// False holds the append: nothing is sealed, nothing acknowledged.
+/// Anything but `Done` holds the append: nothing is sealed, nothing
+/// acknowledged. `Later` is a state write still undecided (not an
+/// error); `Fail` a refusal.
 ///
 /// # Safety
 /// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
 #[inline(never)]
-pub unsafe fn ensure_writable(s: &mut Wal, sys: &SyscallTable) -> bool {
+pub(super) unsafe fn ensure_writable(s: &mut Wal, sys: &SyscallTable) -> Step {
     if s.seal.phase != PHASE_READY {
-        return false;
+        return Step::Fail;
     }
     if boundary_wanted(s) && s.cursor == 0 && !s.seal.write_open {
-        if !rotate_epoch(s, sys) {
+        let rotated = rotate_epoch(s, sys);
+        if rotated == Step::Later {
+            // The new epoch's state write is undecided: hold the append.
+            return Step::Later;
+        }
+        if rotated == Step::Fail {
             s.seal.rotations_refused = s.seal.rotations_refused.saturating_add(1);
             if s.seal.stale {
                 // Appending under the stale epoch could repeat a nonce.
@@ -970,7 +1323,7 @@ pub unsafe fn ensure_writable(s: &mut Wal, sys: &SyscallTable) -> bool {
                     b"[wal] seal: stale state, rotation failed".as_ptr(),
                     40,
                 );
-                return false;
+                return Step::Fail;
             }
         }
         s.seal.rotate_requested = false;
@@ -980,7 +1333,7 @@ pub unsafe fn ensure_writable(s: &mut Wal, sys: &SyscallTable) -> bool {
         close_incarnation(s, sys);
     }
     if s.seal.write_open {
-        return true;
+        return Step::Done;
     }
     if s.seal.inc_next >= s.seal.inc_reserved {
         let mut r = current_record(s);
@@ -994,18 +1347,27 @@ pub unsafe fn ensure_writable(s: &mut Wal, sys: &SyscallTable) -> bool {
         if base > u64::MAX - INCARNATION_STRIDE {
             // The counter never wraps: a new epoch gives a new key domain.
             s.seal.rotate_requested = true;
-            return false;
+            return Step::Fail;
         }
         r.inc_reserved = base + INCARNATION_STRIDE;
         if !add_mark(&mut r, s.seal.epoch, s.segment_seq) {
-            return false;
+            return Step::Fail;
         }
-        if !write_state(s, sys, &mut r) {
-            return false;
+        // The reservation is durable before any incarnation of it seals a
+        // frame; until its write is adopted the append is held.
+        let fx = Effects {
+            set_inc_next: base,
+            ..NO_EFFECTS
+        };
+        match write_state(s, sys, &mut r, fx, -1) {
+            Step::Done => {}
+            other => return other,
         }
-        s.seal.inc_next = base;
-    } else if !mark_current(s, sys) {
-        return false;
+    } else {
+        match mark_current(s, sys) {
+            Step::Done => {}
+            other => return other,
+        }
     }
     let mut inc = [0u8; sr::INCARNATION_LEN];
     inc[0..8].copy_from_slice(&s.seal.salt);
@@ -1021,7 +1383,7 @@ pub unsafe fn ensure_writable(s: &mut Wal, sys: &SyscallTable) -> bool {
         &ctx,
     );
     if k < 0 {
-        return false;
+        return Step::Fail;
     }
     s.seal.inc_next += 1;
     s.seal.write_open = true;
@@ -1030,23 +1392,23 @@ pub unsafe fn ensure_writable(s: &mut Wal, sys: &SyscallTable) -> bool {
     s.seal.write_epoch = s.seal.epoch;
     s.seal.write_seq = 0;
     s.seal.incarnations = s.seal.incarnations.saturating_add(1);
-    true
+    Step::Done
 }
 
 /// Make sure the state's marks cover the segment being written under
 /// the current epoch, writing the state when they do not.
-unsafe fn mark_current(s: &mut Wal, sys: &SyscallTable) -> bool {
+unsafe fn mark_current(s: &mut Wal, sys: &SyscallTable) -> Step {
     let n = s.seal.mark_count as usize;
     for i in 0..n {
         if s.seal.marks[i].epoch == s.seal.epoch {
-            return true;
+            return Step::Done;
         }
     }
     let mut r = current_record(s);
     if !add_mark(&mut r, s.seal.epoch, s.segment_seq) {
-        return false;
+        return Step::Fail;
     }
-    write_state(s, sys, &mut r)
+    write_state(s, sys, &mut r, NO_EFFECTS, -1)
 }
 
 /// Seal `payload_len` bytes of `msg_buf` into `write_buf` at `pos` as
@@ -1248,19 +1610,16 @@ fn note_nonce(s: &mut Wal, inc: &[u8; sr::INCARNATION_LEN], seq: u64) -> bool {
 /// End replay of the open segment. `torn` marks the walk tainted so no
 /// later segment is acknowledged over the hole.
 unsafe fn end_segment(s: &mut Wal, sys: &SyscallTable, torn: bool) -> i32 {
-    if torn {
-        s.replay_tainted = true;
-    }
-    (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
-    s.replay_fd = -1;
-    s.replay_seg += 1;
+    end_replay_segment(s, sys, torn);
     0
 }
 
 /// Replay up to `max_frames` sealed frames of the open segment. The
 /// sealed twin of `step_replay`'s frame loop: the same acks, ledger
 /// latch, location ring and gap rule, fed only by frames whose tag
-/// verified.
+/// verified. A frame the provider has only part-delivered is resumed at
+/// `replay_got` next step (the prefix stays in `msg_buf`, which nothing
+/// else touches during replay).
 ///
 /// # Safety
 /// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
@@ -1274,18 +1633,25 @@ pub unsafe fn replay_frames(s: &mut Wal, sys: &SyscallTable, max_frames: usize) 
         frames += 1;
         let frame_start = s.replay_pos;
         let remaining = s.replay_file_size.saturating_sub(s.replay_pos) as usize;
-        if remaining < sr::WAL_PREFIX_LEN {
+        if s.replay_got == 0 && remaining < sr::WAL_PREFIX_LEN {
             // A terminator, or nothing: the segment's live data ends here.
             return end_segment(s, sys, false);
         }
-        let n = (sys.provider_call)(
-            s.replay_fd,
-            FS_READ,
-            s.msg_buf.as_mut_ptr(),
-            sr::WAL_PREFIX_LEN,
-        );
-        if n < sr::WAL_PREFIX_LEN as i32 {
-            return end_segment(s, sys, true);
+        if (s.replay_got as usize) < sr::WAL_PREFIX_LEN {
+            let mut got = s.replay_got as usize;
+            let io = fs_step::read_into(
+                sys.provider_call,
+                s.replay_fd,
+                s.msg_buf.as_mut_ptr(),
+                sr::WAL_PREFIX_LEN,
+                &mut got,
+            );
+            s.replay_got = got as u32;
+            match io {
+                Io::Later => return 0,
+                Io::Done => {}
+                Io::End | Io::Fail(_) => return end_segment(s, sys, true),
+            }
         }
         let frame_len = match sr::wal_parse_prefix(
             &s.msg_buf[..sr::WAL_PREFIX_LEN],
@@ -1295,19 +1661,25 @@ pub unsafe fn replay_frames(s: &mut Wal, sys: &SyscallTable, max_frames: usize) 
             sr::WalPrefix::Garbage => return end_segment(s, sys, true),
             sr::WalPrefix::Frame { frame_len } => frame_len as usize,
         };
-        if frame_len > remaining - sr::WAL_PREFIX_LEN {
+        if frame_len > remaining.saturating_sub(sr::WAL_PREFIX_LEN) {
             // Short ciphertext or absent tag at the physical tail.
             return end_segment(s, sys, true);
         }
-        let n2 = (sys.provider_call)(
+        let mut got = (s.replay_got as usize).saturating_sub(sr::WAL_PREFIX_LEN);
+        let io = fs_step::read_into(
+            sys.provider_call,
             s.replay_fd,
-            FS_READ,
             s.msg_buf.as_mut_ptr().add(sr::WAL_PREFIX_LEN),
             frame_len,
+            &mut got,
         );
-        if (n2 as usize) < frame_len {
-            return end_segment(s, sys, true);
+        s.replay_got = (sr::WAL_PREFIX_LEN + got) as u32;
+        match io {
+            Io::Later => return 0,
+            Io::Done => {}
+            Io::End | Io::Fail(_) => return end_segment(s, sys, true),
         }
+        s.replay_got = 0;
         s.replay_pos += (sr::WAL_PREFIX_LEN + frame_len) as u32;
         let total = sr::WAL_PREFIX_LEN + frame_len;
         let seg = s.replay_seg;
@@ -1448,25 +1820,12 @@ pub unsafe fn maybe_retire(s: &mut Wal, sys: &SyscallTable) -> bool {
     }
     r.marks = kept;
     r.mark_count = k as u8;
-    if !write_state(s, sys, &mut r) {
-        return true;
-    }
-    for epoch in from..live {
-        for i in 0..MASTER_CACHE {
-            if s.seal.masters[i].1 >= 0 && s.seal.masters[i].0 == epoch {
-                sr::destroy(sys, s.seal.masters[i].1);
-                s.seal.masters[i] = (0, -1);
-            }
-        }
-        if s.seal.read_key >= 0 && s.seal.read_epoch == epoch {
-            sr::destroy(sys, s.seal.read_key);
-            s.seal.read_key = -1;
-        }
-        let mut label = [0u8; sr::MASTER_LABEL_CAP];
-        let n = master_label(who(s), epoch, &mut label);
-        sr::destroy_label(sys, &label[..n]);
-        s.seal.retired_epochs = s.seal.retired_epochs.saturating_add(1);
-    }
-    dev_log(sys, 3, b"[wal] seal epoch retired".as_ptr(), 24);
-    true
+    // The masters below the floor are destroyed when the record naming
+    // the floor is adopted (`adopt_state`) — whichever step finishes it.
+    let fx = Effects {
+        retire_from: from,
+        retire_to: live,
+        ..NO_EFFECTS
+    };
+    write_state(s, sys, &mut r, fx, -1) != Step::Later
 }

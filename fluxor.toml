@@ -100,6 +100,10 @@ prefix = "tests/wal_truncate.rs"
 reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
 
 [[ci.hygiene.allow_crate_root]]
+prefix = "tests/fs_async.rs"
+reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
+
+[[ci.hygiene.allow_crate_root]]
 prefix = "tests/sealed_wal.rs"
 reason = """include!s the SDK runtime and compiles no_std PIC module sources verbatim into a host crate; each test uses a subset of that surface."""
 
