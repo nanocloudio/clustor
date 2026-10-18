@@ -670,8 +670,8 @@ pub struct Raft {
     /// Throttles the durable-path persist so we don't fsync metadata on every
     /// single durable-index advance (which would double the WAL fsync load).
     meta_persisted_durable: Index,
-    /// Set true by load_metadata on a recovery boot (persisted durable index
-    /// > 0). On the first step after the WAL hands over its high-water, raft
+    /// Set true by load_metadata on a recovery boot (persisted durable
+    /// index > 0). On the first step after the WAL hands over its high-water, raft
     /// raises the apply horizon to the recovered durable base so apply seeds
     /// its horizon there — otherwise it would gap (expecting index 1 while
     /// the WAL replay re-acks committed entries at the recovered base) and
@@ -913,7 +913,7 @@ pub fn init(s: &mut Raft) {
     s.current_term = 0;
     s.self_id = 0;
     s.role = ROLE_FOLLOWER;
-    s.leader_id = REPLICA_NONE as i8;
+    s.leader_id = REPLICA_NONE;
     s.voter_count = 1;
     s.probes = [ProbeSlot::empty(); MAX_INFLIGHT_PROBES];
     s.next_probe_id = 1;
@@ -1009,7 +1009,7 @@ pub fn init(s: &mut Raft) {
     s.correlation_ids = [0u64; MAX_BATCH_PROPOSALS];
     s.correlation_origin = [ORIGIN_LOCAL; MAX_BATCH_PROPOSALS];
     s.strict_fallback = false;
-    s.voted_for = REPLICA_NONE as i8;
+    s.voted_for = REPLICA_NONE;
     s.frozen = false;
     s.meta_fs_step = false;
     s.ml_phase = ML_SLOTS;
@@ -1231,10 +1231,8 @@ pub unsafe fn on_peer_term(s: &mut Raft, sys: &SyscallTable, term: Term) {
             2,
             b"[raft] deposed p=",
             s.partition_id,
-            b" t=",
-            s.current_term.min(u32::MAX as u64) as u32,
-            b" resp_t=",
-            term.min(u32::MAX as u64) as u32,
+            (b" t=", s.current_term.min(u32::MAX as u64) as u32),
+            (b" resp_t=", term.min(u32::MAX as u64) as u32),
         );
         become_follower(s, sys, term);
     }
@@ -1610,8 +1608,9 @@ unsafe fn handle_read_index_probe_resp(s: &mut Raft, sys: &SyscallTable, plen: u
     }
     // Same ballot rule as elections: only active voters confirm a
     // ReadIndex fence (and both sets must confirm while joint).
-    if !s.current_voters.contains(replica) && !(s.joint_active && s.joint_voters.contains(replica))
-    {
+    let in_ballot =
+        s.current_voters.contains(replica) || (s.joint_active && s.joint_voters.contains(replica));
+    if !in_ballot {
         return;
     }
     for i in 0..MAX_INFLIGHT_PROBES {
@@ -2281,10 +2280,8 @@ unsafe fn drain_commit_in(s: &mut Raft, sys: &SyscallTable) {
                         3,
                         b"[raft] commit age p=",
                         s.partition_id,
-                        b" idx=",
-                        e.min(u32::MAX as u64) as u32,
-                        b" us=",
-                        lat.min(u32::MAX as u64) as u32,
+                        (b" idx=", e.min(u32::MAX as u64) as u32),
+                        (b" us=", lat.min(u32::MAX as u64) as u32),
                     );
                 }
             }
@@ -2360,14 +2357,14 @@ unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
             // was accepted, so this is the ONLY authoritative signal that our
             // tip is a fiction. Resync down to what the WAL actually holds and
             // replay from there.
-            if let Some(expected) = wire::decode_wal_reject(&s.msg_buf[..plen.max(0) as usize]) {
+            if let Some(expected) = wire::decode_wal_reject(&s.msg_buf[..plen as usize]) {
                 resync_to_wal(s, sys, expected);
             }
             continue;
         }
         if msg_type == wire::MSG_WAL_TRUNCATE_ACK {
             if let Some((keep, req_id, durable)) =
-                wire::decode_wal_truncate_ack(&s.msg_buf[..plen.max(0) as usize])
+                wire::decode_wal_truncate_ack(&s.msg_buf[..plen as usize])
             {
                 apply_truncate_ack(s, sys, keep, req_id, durable);
             }
@@ -3032,7 +3029,7 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
     // for its candidate exactly as an adopted one does.
     let pending = s.vote_wait && s.vote_wait_term == s.current_term;
     let vote_ok = is_pre_vote
-        || (s.voted_for == REPLICA_NONE as i8 && (!pending || s.vote_wait_cand == candidate))
+        || (s.voted_for == REPLICA_NONE && (!pending || s.vote_wait_cand == candidate))
         || s.voted_for == candidate as i8;
     let log_ok = last_term > s.last_log_term
         || (last_term == s.last_log_term && last_index >= s.last_log_index);
@@ -3183,7 +3180,9 @@ unsafe fn handle_vote_response(s: &mut Raft, sys: &SyscallTable, msg_type: u8, p
 
     // Only ballots from the active voter set(s) count: a learner or an
     // ex-voter that missed its revoke must not move the tally.
-    if !s.current_voters.contains(voter) && !(s.joint_active && s.joint_voters.contains(voter)) {
+    let in_ballot =
+        s.current_voters.contains(voter) || (s.joint_active && s.joint_voters.contains(voter));
+    if !in_ballot {
         return;
     }
 
@@ -3242,10 +3241,8 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
                 2,
                 b"[raft] ae stale p=",
                 s.partition_id,
-                b" t=",
-                s.current_term.min(u32::MAX as u64) as u32,
-                b" ae_t=",
-                term.min(u32::MAX as u64) as u32,
+                (b" t=", s.current_term.min(u32::MAX as u64) as u32),
+                (b" ae_t=", term.min(u32::MAX as u64) as u32),
             );
         }
         send_append_response(s, sys, false, false);
@@ -3311,10 +3308,8 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
             3,
             b"[raft] ae gap p=",
             s.partition_id,
-            b" prev=",
-            prev_log_index.min(u32::MAX as u64) as u32,
-            b" last=",
-            s.last_log_index.min(u32::MAX as u64) as u32,
+            (b" prev=", prev_log_index.min(u32::MAX as u64) as u32),
+            (b" last=", s.last_log_index.min(u32::MAX as u64) as u32),
         );
         send_append_response(s, sys, false, false);
         return;
@@ -3335,10 +3330,8 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
                 3,
                 b"[raft] ae conflict p=",
                 s.partition_id,
-                b" prev=",
-                prev_log_index.min(u32::MAX as u64) as u32,
-                b" last=",
-                s.last_log_index.min(u32::MAX as u64) as u32,
+                (b" prev=", prev_log_index.min(u32::MAX as u64) as u32),
+                (b" last=", s.last_log_index.min(u32::MAX as u64) as u32),
             );
             send_append_response(s, sys, false, false);
             return;
@@ -3384,10 +3377,8 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
                 3,
                 b"[raft] ae conflict p=",
                 s.partition_id,
-                b" at=",
-                entry_index.min(u32::MAX as u64) as u32,
-                b" last=",
-                s.last_log_index.min(u32::MAX as u64) as u32,
+                (b" at=", entry_index.min(u32::MAX as u64) as u32),
+                (b" last=", s.last_log_index.min(u32::MAX as u64) as u32),
             );
             send_append_response(s, sys, false, false);
             return;
@@ -3511,10 +3502,8 @@ unsafe fn note_unverified(s: &mut Raft, sys: &SyscallTable, index: Index) {
             2,
             b"[raft] ae unverified p=",
             s.partition_id,
-            b" at=",
-            index.min(u32::MAX as u64) as u32,
-            b" last=",
-            s.last_log_index.min(u32::MAX as u64) as u32,
+            (b" at=", index.min(u32::MAX as u64) as u32),
+            (b" last=", s.last_log_index.min(u32::MAX as u64) as u32),
         );
     }
 }
@@ -3686,10 +3675,8 @@ unsafe fn rpc_send_on(
             2,
             b"[raft] rpc refused p=",
             partition_id,
-            b" n=",
-            *refused,
-            b" mt=",
-            u32::from(msg_type),
+            (b" n=", *refused),
+            (b" mt=", u32::from(msg_type)),
         );
     }
     false
@@ -3709,10 +3696,8 @@ unsafe fn log_p(
     level: u8,
     tag: &[u8],
     partition: u16,
-    f1: &[u8],
-    v1: u32,
-    f2: &[u8],
-    v2: u32,
+    (f1, v1): (&[u8], u32),
+    (f2, v2): (&[u8], u32),
 ) {
     let mut line = [0u8; 80];
     let mut pos = super::log_fmt::log_field(&mut line, 0, tag, partition as u32);
@@ -3898,10 +3883,8 @@ unsafe fn step_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
                 2,
                 b"[raft] hb late p=",
                 s.partition_id,
-                b" gap=",
-                since_hb.min(u32::MAX as u64) as u32,
-                b" t=",
-                s.current_term.min(u32::MAX as u64) as u32,
+                (b" gap=", since_hb.min(u32::MAX as u64) as u32),
+                (b" t=", s.current_term.min(u32::MAX as u64) as u32),
             );
         }
         send_heartbeat(s, sys);
@@ -4364,10 +4347,9 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
                     && wire::has_admin_magic(&s.msg_buf[..plen as usize])
                     && !s.flush_deferred
                     && s.last_log_index.saturating_sub(s.commit_index) < MAX_UNCOMMITTED_INFLIGHT
+                    && append_to_batch(s, sys, 0, plen as usize, 0, ORIGIN_LOCAL, now)
                 {
-                    if append_to_batch(s, sys, 0, plen as usize, 0, ORIGIN_LOCAL, now) {
-                        continue;
-                    }
+                    continue;
                 }
                 if frozen {
                     s.proposals_dropped_frozen = s.proposals_dropped_frozen.saturating_add(1);
@@ -4672,13 +4654,15 @@ unsafe fn append_noop(s: &mut Raft, sys: &SyscallTable) {
         let mut ae_buf = [0u8; wire::AE_HDR_LEN];
         let total = wire::encode_append_entries(
             &mut ae_buf,
-            s.current_term,
-            s.self_id,
-            prev_log_index,
-            prev_log_term,
-            s.commit_index,
-            s.current_term,
-            new_index,
+            &wire::AppendEntriesHdr {
+                term: s.current_term,
+                leader_id: s.self_id,
+                prev_log_index,
+                prev_log_term,
+                leader_commit: s.commit_index,
+                entry_term: s.current_term,
+                entry_index: new_index,
+            },
             &[],
         );
         if total > 0 {
@@ -4779,13 +4763,15 @@ unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
         let mut ae_buf = [0u8; PROPOSAL_BATCH_CAP + wire::AE_HDR_LEN];
         let total = wire::encode_append_entries(
             &mut ae_buf,
-            s.current_term,
-            s.self_id,
-            prev_log_index,
-            prev_log_term,
-            s.commit_index,
-            s.current_term,
-            new_index,
+            &wire::AppendEntriesHdr {
+                term: s.current_term,
+                leader_id: s.self_id,
+                prev_log_index,
+                prev_log_term,
+                leader_commit: s.commit_index,
+                entry_term: s.current_term,
+                entry_index: new_index,
+            },
             &s.proposal_batch[..batch_len],
         );
 
@@ -4886,13 +4872,15 @@ unsafe fn send_heartbeat(s: &mut Raft, sys: &SyscallTable) {
     let mut hb = [0u8; wire::AE_HDR_LEN];
     let _ = wire::encode_append_entries(
         &mut hb,
-        s.current_term,
-        s.self_id,
-        s.last_log_index,
-        s.last_log_term,
-        s.commit_index,
-        0,
-        0,
+        &wire::AppendEntriesHdr {
+            term: s.current_term,
+            leader_id: s.self_id,
+            prev_log_index: s.last_log_index,
+            prev_log_term: s.last_log_term,
+            leader_commit: s.commit_index,
+            entry_term: 0,
+            entry_index: 0,
+        },
         &[],
     );
 
@@ -4911,10 +4899,8 @@ unsafe fn send_heartbeat(s: &mut Raft, sys: &SyscallTable) {
             2,
             b"[raft] hb skipped p=",
             s.partition_id,
-            b" n=",
-            s.heartbeats_skipped,
-            b" t=",
-            s.current_term.min(u32::MAX as u64) as u32,
+            (b" n=", s.heartbeats_skipped),
+            (b" t=", s.current_term.min(u32::MAX as u64) as u32),
         );
     }
 }
@@ -6080,7 +6066,7 @@ unsafe fn become_follower(s: &mut Raft, sys: &SyscallTable, term: Term) {
 fn become_follower_mem(s: &mut Raft, term: Term) {
     s.current_term = term;
     s.role = ROLE_FOLLOWER;
-    s.voted_for = REPLICA_NONE as i8;
+    s.voted_for = REPLICA_NONE;
     s.votes_granted.clear();
     s.votes_rejected.clear();
     s.pre_vote_active = false;
@@ -6148,10 +6134,8 @@ unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
         3,
         b"[raft] leader p=",
         s.partition_id,
-        b" t=",
-        s.current_term.min(u32::MAX as u64) as u32,
-        b" last=",
-        s.last_log_index.min(u32::MAX as u64) as u32,
+        (b" t=", s.current_term.min(u32::MAX as u64) as u32),
+        (b" last=", s.last_log_index.min(u32::MAX as u64) as u32),
     );
 
     // Owe the log a current-term no-op (Raft §5.4.2): committing it is
@@ -6319,20 +6303,19 @@ unsafe fn begin_candidacy(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: 
         3,
         b"[raft] elect p=",
         s.partition_id,
-        b" since_ae=",
-        now.wrapping_sub(s.last_ae_ms).min(u32::MAX as u64) as u32,
-        b" t=",
-        req_term.min(u32::MAX as u64) as u32,
+        (
+            b" since_ae=",
+            now.wrapping_sub(s.last_ae_ms).min(u32::MAX as u64) as u32,
+        ),
+        (b" t=", req_term.min(u32::MAX as u64) as u32),
     );
     log_p(
         sys,
         3,
         b"[raft] elect rx p=",
         s.partition_id,
-        b" rpc=",
-        s.rpc_total,
-        b" stale=",
-        s.ae_stale,
+        (b" rpc=", s.rpc_total),
+        (b" stale=", s.ae_stale),
     );
 }
 

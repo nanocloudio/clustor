@@ -1448,9 +1448,11 @@ pub unsafe fn seal_into(s: &mut Wal, sys: &SyscallTable, pos: usize, payload_len
         true,
         &nonce,
         &aad,
-        base.add(ct),
-        payload_len,
-        base.add(ct + payload_len),
+        sr::AeadBuf {
+            data: base.add(ct),
+            len: payload_len,
+            tag: base.add(ct + payload_len),
+        },
     );
     if rc != sr::Aead::Ok {
         return false;
@@ -1540,9 +1542,11 @@ pub unsafe fn open_stored(
         false,
         &nonce,
         &aad,
-        base.add(sr::WAL_HDR_LEN),
-        c,
-        base.add(sr::WAL_HDR_LEN + c),
+        sr::AeadBuf {
+            data: base.add(sr::WAL_HDR_LEN),
+            len: c,
+            tag: base.add(sr::WAL_HDR_LEN + c),
+        },
     ) {
         sr::Aead::Ok => Opened::Ok { ct_len: h.ct_len },
         sr::Aead::AuthFailed => Opened::AuthFailed,

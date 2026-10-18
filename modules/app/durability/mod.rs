@@ -48,14 +48,14 @@
 //!   4. `ledger`   — cross-node ack drain + quorum recompute (disk
 //!      variant only). Bound (`ledger::step`): ≤32 acks + ≤1 quorum
 //!      recompute and proof emit.
-//!   4b. high-water seam — the wal's current `(term, index)` is
+//!      4b. high-water seam — the wal's current `(term, index)` is
 //!      delivered to `snapshot::on_wal_high_water`: the capture point
 //!      for a demand-triggered snapshot. O(1).
 //!   5. `snapshot` — floors, external triggers, install transfer.
 //!      Bound (`snapshot::step`): ≤4 frames per input family + ≤1
 //!      app-body chunk + ≤1 demand-triggered capture (a synchronous
 //!      finalise, reported as a cold-FS step → Burst).
-//!   5b. install fast-forward — an accepted peer install latches
+//!      5b. install fast-forward — an accepted peer install latches
 //!      `(term, index)` for `wal::on_snapshot_installed`, so the wal
 //!      advances its append contract past the prefix the snapshot
 //!      subsumes before the next entry arrives. O(1).
@@ -104,6 +104,12 @@ mod wire_channels;
 
 #[path = "../../common/step_accounting.rs"]
 mod step_accounting;
+// Shared by `wal` and `snapshot`: mounted once here so both see the
+// same `Io` and sealed-record types.
+#[path = "../../common/fs_step.rs"]
+mod fs_step;
+#[path = "../../common/sealed_record.rs"]
+mod sealed;
 
 mod keys;
 #[cfg(not(feature = "volatile"))]
@@ -136,8 +142,8 @@ define_params! {
         => |s, d, len| {
             let dst = &mut s.slots[0].wal.seal.cluster;
             let n = if len > dst.len() { dst.len() } else { len };
-            for i in 0..dst.len() { dst[i] = 0; }
-            for i in 0..n { dst[i] = *d.add(i); }
+            for b in dst.iter_mut() { *b = 0; }
+            for (i, b) in dst.iter_mut().enumerate().take(n) { *b = *d.add(i); }
         };
 
     // Partition slot for multi-Raft graphs. Stamped into segment and
@@ -342,9 +348,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,

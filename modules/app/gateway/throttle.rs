@@ -118,15 +118,11 @@ pub unsafe fn next_external(
     if t.in_proposals < 0 {
         return None;
     }
-    if t.out_rejected >= 0 {
-        if !wire_channels::writable(sys, t.out_rejected) {
-            return None;
-        }
+    if t.out_rejected >= 0 && !wire_channels::writable(sys, t.out_rejected) {
+        return None;
     }
-    if t.entry_credits > 0 && t.out_admitted >= 0 {
-        if !wire_channels::writable(sys, t.out_admitted) {
-            return None;
-        }
+    if t.entry_credits > 0 && t.out_admitted >= 0 && !wire_channels::writable(sys, t.out_admitted) {
+        return None;
     }
     if !wire_channels::readable(sys, t.in_proposals) {
         return None;
@@ -190,22 +186,17 @@ pub unsafe fn on_proposal(
     let mut admitted = false;
     if (unlimited || (t.entry_credits > 0 && t.byte_credits >= payload_len as i32))
         && t.out_admitted >= 0
+        && wire_channels::writable(sys, t.out_admitted)
     {
-        if wire_channels::writable(sys, t.out_admitted) {
-            let written = wire_channels::channel_write_msg(
-                sys,
-                t.out_admitted,
-                wire::MSG_CLIENT_PROPOSAL,
-                frame,
-            );
-            if written > 0 {
-                if !unlimited {
-                    t.entry_credits -= 1;
-                    t.byte_credits -= payload_len as i32;
-                }
-                t.admitted_count += 1;
-                admitted = true;
+        let written =
+            wire_channels::channel_write_msg(sys, t.out_admitted, wire::MSG_CLIENT_PROPOSAL, frame);
+        if written > 0 {
+            if !unlimited {
+                t.entry_credits -= 1;
+                t.byte_credits -= payload_len as i32;
             }
+            t.admitted_count += 1;
+            admitted = true;
         }
     }
     if !admitted {
@@ -226,15 +217,13 @@ pub unsafe fn on_proposal(
         );
         // External tee for observers (e.g. the operations module's
         // proposal-rejection feedback). Best-effort.
-        if t.out_rejected >= 0 {
-            if wire_channels::writable(sys, t.out_rejected) {
-                wire_channels::channel_write_msg(
-                    sys,
-                    t.out_rejected,
-                    wire::MSG_CLIENT_REJECT_INTERNAL,
-                    &env[..wire::CLIENT_REJECT_INTERNAL_LEN],
-                );
-            }
+        if t.out_rejected >= 0 && wire_channels::writable(sys, t.out_rejected) {
+            wire_channels::channel_write_msg(
+                sys,
+                t.out_rejected,
+                wire::MSG_CLIENT_REJECT_INTERNAL,
+                &env[..wire::CLIENT_REJECT_INTERNAL_LEN],
+            );
         }
         t.rejected_count += 1;
         return Some(env);

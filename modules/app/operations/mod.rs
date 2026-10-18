@@ -8,12 +8,12 @@
 //!   - [`admin`]     — idempotency-keyed admin workflows → raft.
 //!   - [`telemetry`] — metrics fan-in, readiness, /metrics export.
 //!   - [`http`]      — diagnostic + write-bridge request handling
-//!                     (`http` feature). HTTP mechanics live outside
-//!                     the module: wave's `http` server parses the
-//!                     wire and is the requester of an exchange
-//!                     (SDK `contracts/exchange.rs`) whose provider is
-//!                     this component — request records on
-//!                     `request_in`, answers on `response_out`.
+//!     (`http` feature). HTTP mechanics live outside
+//!     the module: wave's `http` server parses the
+//!     wire and is the requester of an exchange
+//!     (SDK `contracts/exchange.rs`) whose provider is
+//!     this component — request records on
+//!     `request_in`, answers on `response_out`.
 //!
 //! Every admin command — wire or HTTP — is admitted through the rbac
 //! component; there is no path around it. The `headless` variant
@@ -187,9 +187,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -408,12 +412,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 wire::SOURCE_ID_HTTP,
             ];
             let present: usize = if cfg!(feature = "http") { 4 } else { 3 };
-            for c in 0..present {
+            for (c, &comp_id) in COMP_IDS.iter().enumerate().take(present) {
                 let cum = s.comp_step[c].cumulative();
                 for (i, &v) in cum.iter().enumerate() {
                     telemetry::on_typed_sample(
                         &mut s.telemetry,
-                        COMP_IDS[c],
+                        comp_id,
                         0,
                         wire::hist::COMP_STEP_BASE + i as u16,
                         wire::METRIC_KIND_HISTOGRAM,

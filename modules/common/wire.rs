@@ -2870,30 +2870,32 @@ pub fn decode_term_index(buf: &[u8]) -> Option<(u64, u64)> {
 // shape are migrated to call `decode_append_entries` below.
 pub const AE_HDR_LEN: usize = 49;
 
+/// The fixed AppendEntries header fields, in wire order.
+#[derive(Clone, Copy)]
+pub struct AppendEntriesHdr {
+    pub term: u64,
+    pub leader_id: u8,
+    pub prev_log_index: u64,
+    pub prev_log_term: u64,
+    pub leader_commit: u64,
+    pub entry_term: u64,
+    pub entry_index: u64,
+}
+
 #[inline]
-pub fn encode_append_entries(
-    buf: &mut [u8],
-    term: u64,
-    leader_id: u8,
-    prev_log_index: u64,
-    prev_log_term: u64,
-    leader_commit: u64,
-    entry_term: u64,
-    entry_index: u64,
-    body: &[u8],
-) -> usize {
+pub fn encode_append_entries(buf: &mut [u8], h: &AppendEntriesHdr, body: &[u8]) -> usize {
     let total = AE_HDR_LEN + body.len();
     if buf.len() < total {
         return 0;
     }
     Writer::new(buf)
-        .u64(term)
-        .u8(leader_id)
-        .u64(prev_log_index)
-        .u64(prev_log_term)
-        .u64(leader_commit)
-        .u64(entry_term)
-        .u64(entry_index);
+        .u64(h.term)
+        .u8(h.leader_id)
+        .u64(h.prev_log_index)
+        .u64(h.prev_log_term)
+        .u64(h.leader_commit)
+        .u64(h.entry_term)
+        .u64(h.entry_index);
     if !body.is_empty() {
         buf[AE_HDR_LEN..total].copy_from_slice(body);
     }

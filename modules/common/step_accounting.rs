@@ -110,9 +110,9 @@ impl CompStepHist {
     pub fn cumulative(&self) -> [i64; COMP_STEP_BUCKETS] {
         let mut out = [0i64; COMP_STEP_BUCKETS];
         let mut cum: i64 = 0;
-        for i in 0..COMP_STEP_BUCKETS {
-            cum += i64::from(self.buckets[i]);
-            out[i] = cum;
+        for (o, &b) in out.iter_mut().zip(self.buckets.iter()) {
+            cum += i64::from(b);
+            *o = cum;
         }
         out
     }

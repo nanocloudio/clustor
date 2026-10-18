@@ -26,10 +26,7 @@ use super::collections::Crc32c;
 use super::types::{Index, Term};
 use super::wal_frame;
 
-#[path = "../../common/fs_step.rs"]
-mod fs_step;
-#[path = "../../common/sealed_record.rs"]
-mod sealed;
+use super::{fs_step, sealed};
 #[path = "wal_seal.rs"]
 pub mod wal_seal;
 use super::{
@@ -5750,10 +5747,8 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
     // job is to write entries, the FsyncAck is a downstream
     // optimisation. Skipping the ack is fine; skipping the write
     // would silently drop committed log entries.
-    if s.out_flushed >= 0 {
-        if !wire_channels::writable(sys, s.out_flushed) {
-            return;
-        }
+    if s.out_flushed >= 0 && !wire_channels::writable(sys, s.out_flushed) {
+        return;
     }
 
     // Read entry — unless `msg_buf` still holds one we consumed but could not

@@ -557,12 +557,14 @@ unsafe fn drain_migration_commands(s: &mut ModuleState, sys: &SyscallTable, now:
                 migration::begin(
                     &mut s.migration,
                     now,
-                    migration_id,
-                    source_prg,
-                    target_prg,
-                    epoch,
-                    shard_count,
-                    base_shard,
+                    &migration::MigrationPlan {
+                        migration_id,
+                        source_prg,
+                        target_prg,
+                        epoch,
+                        shard_count,
+                        base_shard,
+                    },
                 );
             }
             wire::ADMIN_OP_TENANT_QUOTA => {
@@ -672,9 +674,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     _in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -951,11 +957,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             && s.leader_id == s.self_id
         {
             let want = s.peer_count as u16;
-            if placement::prg_count(&s.placement) != want {
-                if placement::set_prg_count(&mut s.placement, want) {
-                    s.topology_auto_set = s.topology_auto_set.wrapping_add(1);
-                    dev_log(sys, 3, b"[cp] topology auto".as_ptr(), 18);
-                }
+            if placement::prg_count(&s.placement) != want
+                && placement::set_prg_count(&mut s.placement, want)
+            {
+                s.topology_auto_set = s.topology_auto_set.wrapping_add(1);
+                dev_log(sys, 3, b"[cp] topology auto".as_ptr(), 18);
             }
         }
 

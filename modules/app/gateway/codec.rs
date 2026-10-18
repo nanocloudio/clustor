@@ -379,7 +379,7 @@ pub unsafe fn next_client_request(
     let (msg_type, plen) =
         wire_channels::channel_read_msg(sys, c.in_client_requests, &mut c.msg_buf);
     let pl = plen as usize;
-    if pl < 2 || pl > 2048 {
+    if !(2..=2048).contains(&pl) {
         return Pulled::Skipped; // need at least the u16 conn_id
     }
     out[..pl].copy_from_slice(&c.msg_buf[..pl]);
@@ -495,7 +495,7 @@ pub unsafe fn on_request(
         _ => {
             // Epoch validation: if the local node has seen a newer
             // placement epoch than the request implies, reject.
-            if c.min_epoch != 0 && (c.placement_epoch as u32) < c.min_epoch {
+            if c.min_epoch != 0 && c.placement_epoch < c.min_epoch {
                 c.stale_epoch_rejected += 1;
                 return Route::Respond(build_reject_wire(
                     origin,

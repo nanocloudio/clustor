@@ -182,11 +182,9 @@ pub unsafe fn step(c: &mut Cp, sys: &SyscallTable, now: u64) {
             break;
         }
     }
-    if c.out_capabilities >= 0 {
-        if wire_channels::writable(sys, c.out_capabilities) {
-            // [schema_version:u16 = 1] [mqtt_enabled:u8 = 1]
-            let caps = [0x01u8, 0x00, 0x01];
-            wire_channels::channel_write_msg(sys, c.out_capabilities, 0xD3, &caps);
-        }
+    if c.out_capabilities >= 0 && wire_channels::writable(sys, c.out_capabilities) {
+        // [schema_version:u16 = 1] [mqtt_enabled:u8 = 1]
+        let caps = [0x01u8, 0x00, 0x01];
+        wire_channels::channel_write_msg(sys, c.out_capabilities, 0xD3, &caps);
     }
 }

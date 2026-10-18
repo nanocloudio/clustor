@@ -47,11 +47,9 @@ pub unsafe fn step(k: &mut Keys, sys: &SyscallTable, now: u64) -> u32 {
         k.dek_epoch += 1;
 
         // Also trigger cert refresh
-        if k.out_cert >= 0 {
-            if wire_channels::writable(sys, k.out_cert) {
-                let buf = k.dek_epoch.to_le_bytes();
-                wire_channels::channel_write_msg(sys, k.out_cert, wire::MSG_CERT_REFRESH, &buf);
-            }
+        if k.out_cert >= 0 && wire_channels::writable(sys, k.out_cert) {
+            let buf = k.dek_epoch.to_le_bytes();
+            wire_channels::channel_write_msg(sys, k.out_cert, wire::MSG_CERT_REFRESH, &buf);
         }
     }
     k.dek_epoch

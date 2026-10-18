@@ -264,28 +264,20 @@ pub unsafe fn evaluate(r: &mut Rbac, sys: &SyscallTable, origin: Origin, payload
         // Tee the authorized envelope to any external observer.
         // Best-effort: an unwired or full port costs one poll and
         // never gates the dispatch table's delivery to `admin`.
-        if r.out_authorized >= 0 {
-            if wire_channels::writable(sys, r.out_authorized) {
-                wire_channels::channel_write_msg(
-                    sys,
-                    r.out_authorized,
-                    wire::MSG_ADMIN_COMMAND,
-                    payload,
-                );
-            }
+        if r.out_authorized >= 0 && wire_channels::writable(sys, r.out_authorized) {
+            wire_channels::channel_write_msg(
+                sys,
+                r.out_authorized,
+                wire::MSG_ADMIN_COMMAND,
+                payload,
+            );
         }
     } else {
-        if origin == Origin::Wire && r.out_denied >= 0 {
-            if wire_channels::writable(sys, r.out_denied) {
-                let cid = conn_id.to_le_bytes();
-                let resp = [cid[0], cid[1], wire::ADMIN_STATUS_REJECTED];
-                wire_channels::channel_write_msg(
-                    sys,
-                    r.out_denied,
-                    wire::MSG_ADMIN_RESPONSE,
-                    &resp,
-                );
-            }
+        if origin == Origin::Wire && r.out_denied >= 0 && wire_channels::writable(sys, r.out_denied)
+        {
+            let cid = conn_id.to_le_bytes();
+            let resp = [cid[0], cid[1], wire::ADMIN_STATUS_REJECTED];
+            wire_channels::channel_write_msg(sys, r.out_denied, wire::MSG_ADMIN_RESPONSE, &resp);
         }
         r.denied_count += 1;
     }
@@ -293,12 +285,10 @@ pub unsafe fn evaluate(r: &mut Rbac, sys: &SyscallTable, origin: Origin, payload
     // Audit envelope: `[authorized:u8][role:u8][conn_id:u16 LE]`.
     // External consumers see it on `audit_events`; the telemetry
     // component counts it like any other `MSG_METRICS` envelope.
-    if r.out_audit >= 0 {
-        if wire_channels::writable(sys, r.out_audit) {
-            let cid = conn_id.to_le_bytes();
-            let audit = [authorized as u8, role, cid[0], cid[1]];
-            wire_channels::channel_write_msg(sys, r.out_audit, wire::MSG_METRICS, &audit);
-        }
+    if r.out_audit >= 0 && wire_channels::writable(sys, r.out_audit) {
+        let cid = conn_id.to_le_bytes();
+        let audit = [authorized as u8, role, cid[0], cid[1]];
+        wire_channels::channel_write_msg(sys, r.out_audit, wire::MSG_METRICS, &audit);
     }
 
     authorized
@@ -477,5 +467,5 @@ fn prefix_match(svid: &[u8], prefix: &[u8], prefix_len: usize) -> bool {
     if svid.len() < prefix_len {
         return false;
     }
-    &svid[..prefix_len] == &prefix[..prefix_len]
+    svid[..prefix_len] == prefix[..prefix_len]
 }

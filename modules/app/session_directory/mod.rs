@@ -621,9 +621,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -1139,41 +1143,42 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         // 5) Snapshot export on request. The registry state is small
         //    enough to serialize and stream inline in one step.
-        if s.in_snapshot_request >= 0 && s.out_snapshot_export >= 0 {
-            if wire_channels::readable(sys, s.in_snapshot_request) {
-                let (msg_type, plen) =
-                    wire_channels::channel_read_msg(sys, s.in_snapshot_request, &mut s.msg_buf);
-                let req = if msg_type == wire::MSG_APP_SNAPSHOT_REQUEST {
-                    wire::decode_term_index(&s.msg_buf[..plen as usize])
-                } else {
-                    None
-                };
-                if let Some((term, last_idx)) = req {
-                    if s.registry.snapshot(&mut s.snap_buf) > 0 {
-                        let total = SessionRegistry::SNAPSHOT_LEN;
-                        let mut off = 0usize;
-                        let mut ok = true;
-                        while off < total && ok {
-                            let n = SNAP_CHUNK.min(total - off);
-                            let done = off + n == total;
-                            let mut out = [0u8; wire::APP_SNAPSHOT_HDR + SNAP_CHUNK];
-                            let en = wire::encode_app_snapshot_chunk(
-                                &mut out,
-                                term,
-                                last_idx,
-                                off as u64,
-                                done,
-                                &s.snap_buf[off..off + n],
-                            );
-                            ok = en > 0
-                                && wire_channels::channel_write_msg(
-                                    sys,
-                                    s.out_snapshot_export,
-                                    wire::MSG_APP_SNAPSHOT_CHUNK,
-                                    &out[..en],
-                                ) > 0;
-                            off += n;
-                        }
+        if s.in_snapshot_request >= 0
+            && s.out_snapshot_export >= 0
+            && wire_channels::readable(sys, s.in_snapshot_request)
+        {
+            let (msg_type, plen) =
+                wire_channels::channel_read_msg(sys, s.in_snapshot_request, &mut s.msg_buf);
+            let req = if msg_type == wire::MSG_APP_SNAPSHOT_REQUEST {
+                wire::decode_term_index(&s.msg_buf[..plen as usize])
+            } else {
+                None
+            };
+            if let Some((term, last_idx)) = req {
+                if s.registry.snapshot(&mut s.snap_buf) > 0 {
+                    let total = SessionRegistry::SNAPSHOT_LEN;
+                    let mut off = 0usize;
+                    let mut ok = true;
+                    while off < total && ok {
+                        let n = SNAP_CHUNK.min(total - off);
+                        let done = off + n == total;
+                        let mut out = [0u8; wire::APP_SNAPSHOT_HDR + SNAP_CHUNK];
+                        let en = wire::encode_app_snapshot_chunk(
+                            &mut out,
+                            term,
+                            last_idx,
+                            off as u64,
+                            done,
+                            &s.snap_buf[off..off + n],
+                        );
+                        ok = en > 0
+                            && wire_channels::channel_write_msg(
+                                sys,
+                                s.out_snapshot_export,
+                                wire::MSG_APP_SNAPSHOT_CHUNK,
+                                &out[..en],
+                            ) > 0;
+                        off += n;
                     }
                 }
             }

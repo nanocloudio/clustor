@@ -222,33 +222,31 @@ pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
     if l.proof_pending {
         if l.out_quorum < 0 {
             l.proof_pending = false; // no consumer wired
-        } else {
-            if wire_channels::writable(sys, l.out_quorum) {
-                let mut proof = [0u8; wire::DURABILITY_PROOF_LEN];
-                wire::encode_durability_proof(
-                    &mut proof,
-                    l.partition_id,
-                    l.committed_term,
-                    l.committed_index,
-                    l.self_id,
-                );
-                // Bare envelope, deliberately: the proof's own payload
-                // already carries `partition_id` (see
-                // `encode_durability_proof` above), so consumers filter
-                // on that. Wrapping it in the partitioned envelope too
-                // would duplicate the field AND break `quantum`'s
-                // `flow` module, which reads this same channel.
-                let w = wire_channels::channel_write_msg(
-                    sys,
-                    l.out_quorum,
-                    wire::MSG_DURABILITY_PROOF,
-                    &proof,
-                );
-                if w > 0 {
-                    l.proof_pending = false;
-                    // Debug level: fires per quorum event — hot path.
-                    dev_log(sys, 4, b"[dur] quorum".as_ptr(), 12);
-                }
+        } else if wire_channels::writable(sys, l.out_quorum) {
+            let mut proof = [0u8; wire::DURABILITY_PROOF_LEN];
+            wire::encode_durability_proof(
+                &mut proof,
+                l.partition_id,
+                l.committed_term,
+                l.committed_index,
+                l.self_id,
+            );
+            // Bare envelope, deliberately: the proof's own payload
+            // already carries `partition_id` (see
+            // `encode_durability_proof` above), so consumers filter
+            // on that. Wrapping it in the partitioned envelope too
+            // would duplicate the field AND break `quantum`'s
+            // `flow` module, which reads this same channel.
+            let w = wire_channels::channel_write_msg(
+                sys,
+                l.out_quorum,
+                wire::MSG_DURABILITY_PROOF,
+                &proof,
+            );
+            if w > 0 {
+                l.proof_pending = false;
+                // Debug level: fires per quorum event — hot path.
+                dev_log(sys, 4, b"[dur] quorum".as_ptr(), 12);
             }
         }
     }

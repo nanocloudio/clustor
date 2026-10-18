@@ -427,13 +427,6 @@ pub unsafe fn step(s: &mut Repl, ae: &mut SeamRing<8192>, sys: &SyscallTable) {
     emit_metrics(s, sys);
 }
 
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut Repl` (or shared
-/// `&Repl` where the signature uses one) and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-
 /// Sampled replication timeline line (indexes divisible by 32), so an
 /// entry's send, ack and commit can be read off the log side by side.
 ///
@@ -602,25 +595,24 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                 if (replica as usize) < MAX_NODES
                     && durable_index > s.last_forwarded_durable[replica as usize]
                     && s.out_cross_durability_ack >= 0
+                    && wire_channels::writable(sys, s.out_cross_durability_ack)
                 {
-                    if wire_channels::writable(sys, s.out_cross_durability_ack) {
-                        let mut ack = [0u8; 17];
-                        wire::encode_fsync_ack(&mut ack, term, durable_index, replica);
-                        let w = wire_channels::channel_write_partitioned(
-                            sys,
-                            s.out_cross_durability_ack,
-                            s.partition_id,
-                            wire::MSG_FSYNC_ACK,
-                            &ack[..17],
-                        );
-                        // Only mark forwarded on a CONFIRMED write: the
-                        // strictly-advancing filter above suppresses any
-                        // re-send, so recording a failed write here would
-                        // permanently drop this follower's fsync evidence
-                        // and stall quorum-fsync commit on a quiescent tail.
-                        if w > 0 {
-                            s.last_forwarded_durable[replica as usize] = durable_index;
-                        }
+                    let mut ack = [0u8; 17];
+                    wire::encode_fsync_ack(&mut ack, term, durable_index, replica);
+                    let w = wire_channels::channel_write_partitioned(
+                        sys,
+                        s.out_cross_durability_ack,
+                        s.partition_id,
+                        wire::MSG_FSYNC_ACK,
+                        &ack[..17],
+                    );
+                    // Only mark forwarded on a CONFIRMED write: the
+                    // strictly-advancing filter above suppresses any
+                    // re-send, so recording a failed write here would
+                    // permanently drop this follower's fsync evidence
+                    // and stall quorum-fsync commit on a quiescent tail.
+                    if w > 0 {
+                        s.last_forwarded_durable[replica as usize] = durable_index;
                     }
                 }
 
@@ -1175,16 +1167,18 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
     let mut ae_buf = [0u8; 4096];
     let total = wire::encode_append_entries(
         &mut ae_buf,
-        ae_term,
-        s.self_id,
-        prev_idx,
-        prev_term,
-        // leader_commit: raft's ACTUAL commit index (E11 hint). The log
-        // tip would let a follower apply entries replicated to only
-        // leader+itself, which the next leader may legally truncate.
-        s.commit_hint,
-        term,
-        index,
+        &wire::AppendEntriesHdr {
+            term: ae_term,
+            leader_id: s.self_id,
+            prev_log_index: prev_idx,
+            prev_log_term: prev_term,
+            // raft's ACTUAL commit index (E11 hint). The log
+            // tip would let a follower apply entries replicated to only
+            // leader+itself, which the next leader may legally truncate.
+            leader_commit: s.commit_hint,
+            entry_term: term,
+            entry_index: index,
+        },
         body,
     );
     if total == 0 {

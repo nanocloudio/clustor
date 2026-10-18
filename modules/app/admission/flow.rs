@@ -116,12 +116,7 @@ pub unsafe fn step(f: &mut Flow, sys: &SyscallTable, now: u64) {
         let p = fp_mul(f.kp, error);
         f.integral += error;
         // Anti-windup clamp
-        if f.integral > 2048 {
-            f.integral = 2048;
-        }
-        if f.integral < -2048 {
-            f.integral = -2048;
-        }
+        f.integral = f.integral.clamp(-2048, 2048);
         let i = fp_mul(f.ki, f.integral);
         let d = fp_mul(f.kd, error - f.last_error);
         f.last_error = error;
@@ -172,33 +167,31 @@ pub unsafe fn step(f: &mut Flow, sys: &SyscallTable, now: u64) {
         }
 
         // 3. Emit credit update
-        if f.out_credits >= 0 {
-            if wire_channels::writable(sys, f.out_credits) {
-                if f.entry_rate_per_sec > 0 {
-                    let mut buf = [0u8; wire::THROTTLE_REFILL_LEN];
-                    wire::encode_throttle_refill(
-                        &mut buf,
-                        f.entry_credits,
-                        f.byte_credits,
-                        f.entry_credit_max,
-                        f.byte_credit_max,
-                    );
-                    wire_channels::channel_write_msg(
-                        sys,
-                        f.out_credits,
-                        wire::MSG_THROTTLE_REFILL,
-                        &buf,
-                    );
-                } else {
-                    let mut buf = [0u8; 8];
-                    wire::encode_credits(&mut buf, f.entry_credits, f.byte_credits);
-                    wire_channels::channel_write_msg(
-                        sys,
-                        f.out_credits,
-                        wire::MSG_THROTTLE_CREDITS,
-                        &buf,
-                    );
-                }
+        if f.out_credits >= 0 && wire_channels::writable(sys, f.out_credits) {
+            if f.entry_rate_per_sec > 0 {
+                let mut buf = [0u8; wire::THROTTLE_REFILL_LEN];
+                wire::encode_throttle_refill(
+                    &mut buf,
+                    f.entry_credits,
+                    f.byte_credits,
+                    f.entry_credit_max,
+                    f.byte_credit_max,
+                );
+                wire_channels::channel_write_msg(
+                    sys,
+                    f.out_credits,
+                    wire::MSG_THROTTLE_REFILL,
+                    &buf,
+                );
+            } else {
+                let mut buf = [0u8; 8];
+                wire::encode_credits(&mut buf, f.entry_credits, f.byte_credits);
+                wire_channels::channel_write_msg(
+                    sys,
+                    f.out_credits,
+                    wire::MSG_THROTTLE_CREDITS,
+                    &buf,
+                );
             }
         }
     }

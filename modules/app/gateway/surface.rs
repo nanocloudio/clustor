@@ -180,49 +180,44 @@ pub unsafe fn next_request(su: &mut Surface, sys: &SyscallTable, out: &mut [u8; 
         | wire::MSG_PRE_VOTE_RESP
         | wire::MSG_HEARTBEAT
         | wire::MSG_HEARTBEAT_RESP => {
-            if su.out_raft_rpc >= 0 {
-                if wire_channels::writable(sys, su.out_raft_rpc) {
-                    // consensus.rpc expects 5-byte partitioned
-                    // envelopes. Client-injected Raft RPCs are
-                    // admin-side and don't carry a partition tag,
-                    // so we stamp partition_id=0; in multi-
-                    // partition deployments those frames will be
-                    // dropped by every raft instance with id != 0.
-                    let payload = &su.msg_buf[payload_start..payload_end];
-                    wire_channels::channel_write_partitioned(
-                        sys,
-                        su.out_raft_rpc,
-                        0,
-                        msg_type,
-                        payload,
-                    );
-                    su.requests_routed += 1;
-                }
+            if su.out_raft_rpc >= 0 && wire_channels::writable(sys, su.out_raft_rpc) {
+                // consensus.rpc expects 5-byte partitioned
+                // envelopes. Client-injected Raft RPCs are
+                // admin-side and don't carry a partition tag,
+                // so we stamp partition_id=0; in multi-
+                // partition deployments those frames will be
+                // dropped by every raft instance with id != 0.
+                let payload = &su.msg_buf[payload_start..payload_end];
+                wire_channels::channel_write_partitioned(
+                    sys,
+                    su.out_raft_rpc,
+                    0,
+                    msg_type,
+                    payload,
+                );
+                su.requests_routed += 1;
             }
             Inbound::Handled
         }
         wire::MSG_ADMIN_COMMAND => {
-            if su.out_admin_req >= 0 {
-                if wire_channels::writable(sys, su.out_admin_req) {
-                    // Prepend per-message conn_id so the admin consumer can
-                    // correlate responses back to this connection.
-                    let mut framed = [0u8; 2048];
-                    if payload_end - payload_start > framed.len() - 2 {
-                        su.requests_routed += 1;
-                        return Inbound::Oversize { conn_id };
-                    }
-                    framed[..2].copy_from_slice(&conn_id.to_le_bytes());
-                    let pl = payload_end - payload_start;
-                    framed[2..2 + pl]
-                        .copy_from_slice(&su.msg_buf[payload_start..payload_start + pl]);
-                    wire_channels::channel_write_msg(
-                        sys,
-                        su.out_admin_req,
-                        msg_type,
-                        &framed[..2 + pl],
-                    );
+            if su.out_admin_req >= 0 && wire_channels::writable(sys, su.out_admin_req) {
+                // Prepend per-message conn_id so the admin consumer can
+                // correlate responses back to this connection.
+                let mut framed = [0u8; 2048];
+                if payload_end - payload_start > framed.len() - 2 {
                     su.requests_routed += 1;
+                    return Inbound::Oversize { conn_id };
                 }
+                framed[..2].copy_from_slice(&conn_id.to_le_bytes());
+                let pl = payload_end - payload_start;
+                framed[2..2 + pl].copy_from_slice(&su.msg_buf[payload_start..payload_start + pl]);
+                wire_channels::channel_write_msg(
+                    sys,
+                    su.out_admin_req,
+                    msg_type,
+                    &framed[..2 + pl],
+                );
+                su.requests_routed += 1;
             }
             Inbound::Handled
         }

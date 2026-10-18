@@ -381,49 +381,51 @@ pub unsafe fn step(p: &mut Placement, sys: &SyscallTable) {
     // because this component owns the epoch and the fence but not the
     // PRG topology. Consumers that read only the leading epoch (the
     // gateway) are unaffected by the longer frame.
-    if (!p.emitted || p.update_pending) && p.out_routing >= 0 {
-        if wire_channels::writable(sys, p.out_routing) {
-            let mut buf = [0u8; 11];
-            buf[0..4].copy_from_slice(&p.current_epoch.to_le_bytes());
-            buf[4..6].copy_from_slice(&p.prg_count.to_le_bytes());
-            buf[6..8].copy_from_slice(&p.local_prg.to_le_bytes());
-            buf[8..10].copy_from_slice(&p.fenced_prg.to_le_bytes());
-            buf[10] = u8::from(p.fenced_active);
-            wire_channels::channel_write_msg(sys, p.out_routing, wire::MSG_PLACEMENT_UPDATE, &buf);
-            p.emitted = true;
-            p.update_pending = false;
-        }
+    if (!p.emitted || p.update_pending)
+        && p.out_routing >= 0
+        && wire_channels::writable(sys, p.out_routing)
+    {
+        let mut buf = [0u8; 11];
+        buf[0..4].copy_from_slice(&p.current_epoch.to_le_bytes());
+        buf[4..6].copy_from_slice(&p.prg_count.to_le_bytes());
+        buf[6..8].copy_from_slice(&p.local_prg.to_le_bytes());
+        buf[8..10].copy_from_slice(&p.fenced_prg.to_le_bytes());
+        buf[10] = u8::from(p.fenced_active);
+        wire_channels::channel_write_msg(sys, p.out_routing, wire::MSG_PLACEMENT_UPDATE, &buf);
+        p.emitted = true;
+        p.update_pending = false;
     }
 
     // Emit a kpg-keyed epoch event each time the placement epoch
     // advances. Downstream consumers fence in-flight session frames
     // on receipt; see the component doc for the wire shape and
     // reason-byte conventions.
-    if p.current_epoch != p.prev_epoch && p.out_epoch_events >= 0 {
-        if wire_channels::writable(sys, p.out_epoch_events) {
-            // Bootstrap is the very first transition out of
-            // `prev_epoch = 0`. Any subsequent placement change
-            // (admin op or, eventually, rebalance) reuses this
-            // emission point — until those inputs are wired, the
-            // post-bootstrap branch never fires, but the reason byte
-            // is honest about which class of transition the consumer
-            // is observing.
-            let reason = if p.prev_epoch == 0 {
-                EPOCH_REASON_BOOTSTRAP
-            } else {
-                EPOCH_REASON_ADMIN
-            };
-            let mut buf = [0u8; 7];
-            buf[0..2].copy_from_slice(&DEFAULT_KPG_ID.to_le_bytes());
-            buf[2..6].copy_from_slice(&p.current_epoch.to_le_bytes());
-            buf[6] = reason;
-            wire_channels::channel_write_msg(
-                sys,
-                p.out_epoch_events,
-                wire::MSG_PLACEMENT_EPOCH_EVENT,
-                &buf,
-            );
-            p.prev_epoch = p.current_epoch;
-        }
+    if p.current_epoch != p.prev_epoch
+        && p.out_epoch_events >= 0
+        && wire_channels::writable(sys, p.out_epoch_events)
+    {
+        // Bootstrap is the very first transition out of
+        // `prev_epoch = 0`. Any subsequent placement change
+        // (admin op or, eventually, rebalance) reuses this
+        // emission point — until those inputs are wired, the
+        // post-bootstrap branch never fires, but the reason byte
+        // is honest about which class of transition the consumer
+        // is observing.
+        let reason = if p.prev_epoch == 0 {
+            EPOCH_REASON_BOOTSTRAP
+        } else {
+            EPOCH_REASON_ADMIN
+        };
+        let mut buf = [0u8; 7];
+        buf[0..2].copy_from_slice(&DEFAULT_KPG_ID.to_le_bytes());
+        buf[2..6].copy_from_slice(&p.current_epoch.to_le_bytes());
+        buf[6] = reason;
+        wire_channels::channel_write_msg(
+            sys,
+            p.out_epoch_events,
+            wire::MSG_PLACEMENT_EPOCH_EVENT,
+            &buf,
+        );
+        p.prev_epoch = p.current_epoch;
     }
 }

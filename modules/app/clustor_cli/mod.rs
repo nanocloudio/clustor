@@ -148,7 +148,7 @@ enum HexErr {
 }
 
 fn hex_decode(hex: &[u8], out: &mut [u8]) -> Result<usize, HexErr> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(HexErr::NotHex);
     }
     if out.len() < hex.len() / 2 {
@@ -264,8 +264,8 @@ fn cmd_wal_frame(s: &mut State, a: usize, b: usize) -> (usize, i32) {
 }
 
 /// `wal-scan <segment_hex>`: walk framed entries with replay's exact
-/// validation (durability/wal.rs). Reports term/index per entry (payloads of
-/// >= 16 bytes carry term(8 LE) + index(8 LE) first, wire::decode_term_index's
+/// validation (durability/wal.rs). Reports term/index per entry (payloads
+/// of >= 16 bytes carry term(8 LE) + index(8 LE) first, wire::decode_term_index's
 /// layout), then either the clean-segment summary (exit 0) or the truncation
 /// point (exit 1 — the durable prefix ends there).
 fn cmd_wal_scan(s: &mut State, a: usize, b: usize) -> (usize, i32) {

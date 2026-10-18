@@ -232,17 +232,15 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     // legitimately repeat a body), no admin apply, no admin response. `cmd`
     // is `[op_code][op_body]`, so the proposal body is `cmd[1..]`.
     if op_code == wire::ADMIN_OP_PROPOSE {
-        if a.out_proposal >= 0 && cmd_len > 1 {
-            if wire_channels::writable(sys, a.out_proposal) {
-                let written = wire_channels::channel_write_msg(
-                    sys,
-                    a.out_proposal,
-                    wire::MSG_CLIENT_PROPOSAL,
-                    &cmd[1..cmd_len],
-                );
-                if written > 0 {
-                    dev_report_step_effect(sys, step_effect::WORK_DONE);
-                }
+        if a.out_proposal >= 0 && cmd_len > 1 && wire_channels::writable(sys, a.out_proposal) {
+            let written = wire_channels::channel_write_msg(
+                sys,
+                a.out_proposal,
+                wire::MSG_CLIENT_PROPOSAL,
+                &cmd[1..cmd_len],
+            );
+            if written > 0 {
+                dev_report_step_effect(sys, step_effect::WORK_DONE);
             }
         }
         return;

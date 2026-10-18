@@ -452,7 +452,7 @@ unsafe fn build_export(t: &mut Telemetry, sys: &SyscallTable) -> usize {
             m as i32,
             STEP_HISTOGRAM_QUERY,
             sb.as_mut_ptr() as *mut u8,
-            (STEP_HIST_BUCKETS * 4) as usize,
+            STEP_HIST_BUCKETS * 4,
         );
         if rc < 0 {
             continue;
@@ -466,8 +466,8 @@ unsafe fn build_export(t: &mut Telemetry, sys: &SyscallTable) -> usize {
             continue;
         }
         let mut c: i64 = 0;
-        for i in 0..STEP_HIST_BUCKETS {
-            c += i64::from(sb[i]);
+        for (i, &b) in sb.iter().enumerate() {
+            c += i64::from(b);
             pos = push_record(
                 &mut t.export_buf,
                 pos,
@@ -576,29 +576,25 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
             -1,
             STEP_HISTOGRAM_QUERY,
             sb.as_mut_ptr() as *mut u8,
-            (STEP_HIST_BUCKETS * 4) as usize,
+            STEP_HIST_BUCKETS * 4,
         );
         if rc >= 0 {
             t.step_buckets = sb;
         }
 
         // Readyz: 1 byte (ready flag)
-        if t.out_readyz >= 0 {
-            if wire_channels::writable(sys, t.out_readyz) {
-                let buf = [t.ready as u8];
-                wire_channels::channel_write_msg(sys, t.out_readyz, wire::MSG_READYZ, &buf);
-            }
+        if t.out_readyz >= 0 && wire_channels::writable(sys, t.out_readyz) {
+            let buf = [t.ready as u8];
+            wire_channels::channel_write_msg(sys, t.out_readyz, wire::MSG_READYZ, &buf);
         }
 
         // Why: `[version:u8 = 1][timing_pause_reason:u8]`. The reason
         // vocabulary is `wire::TIMING_PAUSE_*`; 0 = nothing paused / not
         // applicable. Extend with further blocking reasons as they gain
         // reporters.
-        if t.out_why >= 0 {
-            if wire_channels::writable(sys, t.out_why) {
-                let buf = [1u8, timing_pause_reason(t)];
-                wire_channels::channel_write_msg(sys, t.out_why, wire::MSG_WHY, &buf);
-            }
+        if t.out_why >= 0 && wire_channels::writable(sys, t.out_why) {
+            let buf = [1u8, timing_pause_reason(t)];
+            wire_channels::channel_write_msg(sys, t.out_why, wire::MSG_WHY, &buf);
         }
 
         // Export: full latest-value table. The payload is the binary record
@@ -608,15 +604,13 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
         // cache.
         let len = build_export(t, sys);
         t.export_len = len as u16;
-        if t.out_export >= 0 {
-            if wire_channels::writable(sys, t.out_export) {
-                wire_channels::channel_write_msg(
-                    sys,
-                    t.out_export,
-                    wire::MSG_METRICS,
-                    &t.export_buf[..len],
-                );
-            }
+        if t.out_export >= 0 && wire_channels::writable(sys, t.out_export) {
+            wire_channels::channel_write_msg(
+                sys,
+                t.out_export,
+                wire::MSG_METRICS,
+                &t.export_buf[..len],
+            );
         }
     }
 }

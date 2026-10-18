@@ -19,10 +19,7 @@ use super::types::{Index, Term};
 use super::{dev_log, dev_millis, fmt_u32_raw, wire, wire_channels};
 use crate::abi::contracts::key_vault as kv;
 
-#[path = "../../common/fs_step.rs"]
-mod fs_step;
-#[path = "../../common/sealed_record.rs"]
-mod sealed;
+use super::{fs_step, sealed};
 use fs_step::{later, Io};
 
 const FS_OPEN: u32 = 0x0900;
@@ -950,9 +947,11 @@ unsafe fn seal_chunk_out(s: &mut Snapshot, sys: &SyscallTable, flags: u8) -> boo
         true,
         &nonce,
         &aad,
-        base.add(sealed::SNAP_HDR_LEN),
-        c,
-        base.add(sealed::SNAP_HDR_LEN + c),
+        sealed::AeadBuf {
+            data: base.add(sealed::SNAP_HDR_LEN),
+            len: c,
+            tag: base.add(sealed::SNAP_HDR_LEN + c),
+        },
     );
     if rc != sealed::Aead::Ok {
         s.seal_failures = s.seal_failures.saturating_add(1);
@@ -1087,9 +1086,11 @@ unsafe fn read_chunk(
         false,
         &nonce,
         &aad,
-        base.add(hl),
-        c,
-        base.add(hl + c),
+        sealed::AeadBuf {
+            data: base.add(hl),
+            len: c,
+            tag: base.add(hl + c),
+        },
     ) {
         sealed::Aead::Ok => {}
         sealed::Aead::AuthFailed => return Err(ChunkErr::Auth),
@@ -1471,12 +1472,9 @@ pub unsafe fn step(s: &mut Snapshot, sys: &SyscallTable) -> bool {
                 continue;
             }
             let pl = plen as usize;
-            match msg_type {
-                wire::MSG_INSTALL_SNAPSHOT => {
-                    ingest_install_chunk(s, sys, pl);
-                    cold_fs = true; // chunk ingest persists to disk
-                }
-                _ => {}
+            if msg_type == wire::MSG_INSTALL_SNAPSHOT {
+                ingest_install_chunk(s, sys, pl);
+                cold_fs = true; // chunk ingest persists to disk
             }
         }
     }
@@ -1912,12 +1910,10 @@ unsafe fn capture_done(s: &mut Snapshot, sys: &SyscallTable, durable: bool, ptr_
     // retires segments). Same durable-or-no-FS gate as the import
     // path; skipped when the port is unwired or briefly full (the next
     // trigger re-signals).
-    if s.out_installed >= 0 {
-        if wire_channels::writable(sys, s.out_installed) {
-            let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
-            wire::encode_snapshot_installed(&mut buf, term, index, term, s.wmembership, blen > 0);
-            write_installed(s, sys, wire::MSG_SNAPSHOT_INSTALLED, &buf);
-        }
+    if s.out_installed >= 0 && wire_channels::writable(sys, s.out_installed) {
+        let mut buf = [0u8; wire::SNAPSHOT_INSTALLED_LEN];
+        wire::encode_snapshot_installed(&mut buf, term, index, term, s.wmembership, blen > 0);
+        write_installed(s, sys, wire::MSG_SNAPSHOT_INSTALLED, &buf);
     }
     // Tell the app the snapshot at `index` is now DURABLE, on the same
     // control channel that carries REQUEST/RESET. An app worker gates its

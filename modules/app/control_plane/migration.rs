@@ -184,18 +184,29 @@ pub fn source_prg(m: &Migration) -> u16 {
     m.source_prg
 }
 
+/// What `begin` records: the migration's id, the source and target
+/// groups, the placement epoch it is recorded against, and the shard batch.
+#[derive(Clone, Copy)]
+pub struct MigrationPlan {
+    pub migration_id: u64,
+    pub source_prg: u16,
+    pub target_prg: u16,
+    pub epoch: u64,
+    pub shard_count: u16,
+    pub base_shard: u32,
+}
+
 /// Begin a migration. Refused while one is already in flight
 /// (MIG-SERIAL) — the caller retries once the current one terminates.
-pub fn begin(
-    m: &mut Migration,
-    now: u64,
-    migration_id: u64,
-    source_prg: u16,
-    target_prg: u16,
-    epoch: u64,
-    shard_count: u16,
-    base_shard: u32,
-) -> bool {
+pub fn begin(m: &mut Migration, now: u64, plan: &MigrationPlan) -> bool {
+    let MigrationPlan {
+        migration_id,
+        source_prg,
+        target_prg,
+        epoch,
+        shard_count,
+        base_shard,
+    } = *plan;
     if is_active(m) || migration_id == 0 {
         return false;
     }

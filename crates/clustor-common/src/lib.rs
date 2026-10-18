@@ -33,10 +33,6 @@ pub mod types;
 pub mod collections;
 
 #[rustfmt::skip]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "encode_append_entries mirrors the AppendEntries header field-for-field; the PIC call sites pass each field directly"
-)]
 #[path = "../common/wire.rs"]
 pub mod wire;
 

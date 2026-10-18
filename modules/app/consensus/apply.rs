@@ -37,6 +37,7 @@
 //!   1. `apply_index >= required_commit`, AND
 //!   2. We have observed a `MSG_READ_PERMIT` from the read gate within
 //!      `READ_PERMIT_TTL_MS` (CP cache is Fresh/Cached).
+//!
 //! The response body is empty — the substrate guarantees the
 //! linearization point has been reached. State-machine consumers
 //! consult their replicated state (built from `committed_entries`) and
@@ -394,6 +395,15 @@ pub unsafe fn arm(_s: &mut Apply, sys: &SyscallTable) {
     dev_log(sys, 3, b"[apply] init".as_ptr(), 12);
 }
 
+/// The latches `step` consumes this tick: the E6 RESET and the raft and
+/// commit horizons.
+#[derive(Clone, Copy)]
+pub struct Horizons {
+    pub reset: Option<(Term, Index)>,
+    pub raft_horizon: Option<(Term, Index)>,
+    pub commit_horizon: Option<(Term, Index)>,
+}
+
 /// One apply step. Delivery order (owned by the dispatch table, cited
 /// here): the E6 RESET latch is consumed FIRST (ordering reviewed:
 /// reset index ≥ any queued horizon at install time), then raft's body
@@ -411,13 +421,16 @@ pub unsafe fn step(
     s: &mut Apply,
     sys: &SyscallTable,
     now: u64,
-    reset: Option<(Term, Index)>,
-    raft_horizon: Option<(Term, Index)>,
-    commit_horizon: Option<(Term, Index)>,
+    horizons: Horizons,
     bodies: &mut SeamRing<8192>,
     probe_replies: &mut [(u64, u64, u8); PROBE_QUEUE_SLOTS],
     probe_reply_count: &mut u8,
 ) {
+    let Horizons {
+        reset,
+        raft_horizon,
+        commit_horizon,
+    } = horizons;
     let work_before = s.entries_applied;
 
     // 0) E6 RESET first (before any drain).
@@ -1284,8 +1297,7 @@ unsafe fn drain_read_probe_replies(
     reply_count: &mut u8,
 ) {
     let n = (*reply_count as usize).min(PROBE_QUEUE_SLOTS);
-    for k in 0..n {
-        let (corr_id, confirmed_commit, confirmed_byte) = replies[k];
+    for &(corr_id, confirmed_commit, confirmed_byte) in replies.iter().take(n) {
         let confirmed = confirmed_byte != 0;
         // Find the AWAITING_PROBE slot for this correlation id.
         let mut slot_idx: Option<usize> = None;
@@ -1383,11 +1395,11 @@ unsafe fn drain_pending_reads(s: &mut Apply, sys: &SyscallTable, now: u64) {
         // either arm us or reject. We still observe the read-timeout
         // below so a stuck probe doesn't pile up forever.
         if slot.phase == READ_PHASE_AWAITING_PROBE {
-            if now.wrapping_sub(slot.submitted_ms) > READ_TIMEOUT_MS {
-                if emit_read_reject(s, sys, slot.correlation_id, wire::CLIENT_REJECT_FALLBACK) {
-                    s.pending_reads[i] = PendingRead::empty();
-                    s.reads_timed_out += 1;
-                }
+            if now.wrapping_sub(slot.submitted_ms) > READ_TIMEOUT_MS
+                && emit_read_reject(s, sys, slot.correlation_id, wire::CLIENT_REJECT_FALLBACK)
+            {
+                s.pending_reads[i] = PendingRead::empty();
+                s.reads_timed_out += 1;
             }
             continue;
         }
@@ -1403,11 +1415,11 @@ unsafe fn drain_pending_reads(s: &mut Apply, sys: &SyscallTable, now: u64) {
 
         // Timeout: still waiting after READ_TIMEOUT_MS — reject so the
         // client doesn't hang. CP-fallback is the canonical reason.
-        if now.wrapping_sub(slot.submitted_ms) > READ_TIMEOUT_MS {
-            if emit_read_reject(s, sys, slot.correlation_id, wire::CLIENT_REJECT_FALLBACK) {
-                s.pending_reads[i] = PendingRead::empty();
-                s.reads_timed_out += 1;
-            }
+        if now.wrapping_sub(slot.submitted_ms) > READ_TIMEOUT_MS
+            && emit_read_reject(s, sys, slot.correlation_id, wire::CLIENT_REJECT_FALLBACK)
+        {
+            s.pending_reads[i] = PendingRead::empty();
+            s.reads_timed_out += 1;
         }
     }
 }

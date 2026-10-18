@@ -28,7 +28,7 @@
 //!      committed-admin ring (E9) filled LAST step (preserving the
 //!      channel edges' next-step timing), plus the commit-horizon
 //!      latch (E4) raised last step.
-//!   2b. leader hint — E11: raft's role delivered to the replicator,
+//!      2b. leader hint — E11: raft's role delivered to the replicator,
 //!      which may only ship AppendEntries while this node leads.
 //!   3. voter latch  — E10 delivered to commit + replicator in the
 //!      same step raft applies a config change.
@@ -39,7 +39,7 @@
 //!      `apply::on_entry_reply` (gap refetch), clear →
 //!      `replicator::on_wal_reply` (catch-up AE synthesis). ≤16/step.
 //!   6. match drain  — E2 coalesced per-replica max → `commit::on_match`.
-//!   6b. relaxed self-match — in `durability_mode: relaxed` there is
+//!      6b. relaxed self-match — in `durability_mode: relaxed` there is
 //!      no durability-proof source to advance commit's self slot, so
 //!      raft's log tip is delivered to `commit::on_match` for it
 //!      (same read-then-deliver shape as the E11 leader hint). O(1).
@@ -400,9 +400,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -1405,9 +1409,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 &mut s.slots[i].apply,
                 sys,
                 now,
-                reset,
-                raft_horizon,
-                commit_horizon,
+                apply::Horizons {
+                    reset,
+                    raft_horizon,
+                    commit_horizon,
+                },
                 &mut s.slots[i].raft.outbox_bodies,
                 &mut s.slots[i].raft.probe_reply_out,
                 &mut s.slots[i].raft.probe_reply_count,

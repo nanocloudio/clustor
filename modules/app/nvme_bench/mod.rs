@@ -362,9 +362,13 @@ pub extern "C" fn module_state_size() -> u32 {
 #[link_section = ".text.module_init"]
 pub extern "C" fn module_init(_syscalls: *const c_void) {}
 
+/// # Safety
+/// Kernel module-ABI entry point: `state` is the loader-owned instance block
+/// of `state_size` bytes, `syscalls` the kernel's syscall table, and `params`
+/// the config TLV blob of `params_len` bytes (may be null when it is empty).
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_new"]
-pub extern "C" fn module_new(
+pub unsafe extern "C" fn module_new(
     in_chan: i32,
     out_chan: i32,
     _ctrl_chan: i32,
@@ -1040,11 +1044,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         break;
                     }
                 }
-                if s.phase == PH_SEQ
-                    && s.blocks_done >= s.seq_blocks
-                    && sync_tail(s, sys)
-                    && s.phase == PH_SEQ
-                {
+                // `sync_tail` aborts to PH_REPORT on a failed fsync, so the
+                // phase is read again once it has fenced.
+                let fenced =
+                    s.phase == PH_SEQ && s.blocks_done >= s.seq_blocks && sync_tail(s, sys);
+                if fenced && s.phase == PH_SEQ {
                     seq_complete(s, sys);
                 }
             }
@@ -1084,11 +1088,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         break;
                     }
                 }
-                if s.phase == PH_RAND
-                    && s.blocks_done >= s.rand_blocks
-                    && sync_tail(s, sys)
-                    && s.phase == PH_RAND
-                {
+                // `sync_tail` aborts to PH_REPORT on a failed fsync, so the
+                // phase is read again once it has fenced.
+                let fenced =
+                    s.phase == PH_RAND && s.blocks_done >= s.rand_blocks && sync_tail(s, sys);
+                if fenced && s.phase == PH_RAND {
                     let elapsed = dev_micros(sys).wrapping_sub(s.phase_start_us);
                     s.rand_kbps = kbps(s.bytes_written, elapsed);
                     let mut p = 0usize;

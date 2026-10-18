@@ -590,6 +590,15 @@ pub enum Aead {
     Refused(i32),
 }
 
+/// The in-place buffer `aead` seals or opens: `len` bytes at `data`, and
+/// the 16-byte tag at `tag`.
+#[derive(Clone, Copy)]
+pub struct AeadBuf {
+    pub data: *mut u8,
+    pub len: usize,
+    pub tag: *mut u8,
+}
+
 /// Seal (`seal`) or open `len` bytes at `data` in place under `key`,
 /// the 16-byte tag at `tag`.
 ///
@@ -602,10 +611,9 @@ pub unsafe fn aead(
     seal: bool,
     nonce: &[u8; NONCE_LEN],
     aad: &[u8],
-    data: *mut u8,
-    len: usize,
-    tag: *mut u8,
+    buf: AeadBuf,
 ) -> Aead {
+    let AeadBuf { data, len, tag } = buf;
     use kv::units as u;
     let mut arg = [0u8; u::HEADER_LEN + u::ENTRY_LEN];
     put(&mut arg, u::COUNT, &1u16.to_le_bytes());
