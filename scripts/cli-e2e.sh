@@ -22,7 +22,7 @@ log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 timeout 900 "$FLX" modules build --target bcm2712 >"$log" 2>&1 \
   || { no cli "fluxor modules build failed: $(tail -3 "$log" | tr '\n' ' ')"; finish; exit; }
-timeout 300 "$FLX" install packaging/cli/workload.toml >"$log" 2>&1 \
+timeout 300 "$FLX" install packaging/applet/clustor/workload.toml >"$log" 2>&1 \
   || { no cli "applet install failed: $(tail -3 "$log" | tr '\n' ' ')"; finish; exit; }
 
 got=$(timeout 30 "$FLX" exec clustor -- help 2>/dev/null)

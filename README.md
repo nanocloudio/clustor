@@ -80,7 +80,7 @@ The product CLI is itself a PIC fmod, run by fluxor rather than
 built as a host cargo binary:
 
 ```sh
-fluxor install packaging/cli/workload.toml     # one-time registration
+fluxor install packaging/applet/clustor/workload.toml     # one-time registration
 fluxor exec clustor -- help
 fluxor exec clustor -- crc <payload-hex>       # CRC32C of a payload
 fluxor exec clustor -- wal-frame <payload-hex> # frame a payload as a WAL entry
@@ -91,7 +91,7 @@ fluxor exec clustor -- wal-scan <segment-hex>  # durable-prefix scan of a segmen
 module's replay, so its verdict on a segment image is the durable
 prefix a replica would recover. Module source:
 [`modules/app/clustor_cli/`](modules/app/clustor_cli/); packaging:
-[`packaging/cli/`](packaging/cli/).
+[`packaging/applet/clustor/`](packaging/applet/clustor/).
 
 ## Repository layout
 
@@ -100,7 +100,7 @@ prefix a replica would recover. Module source:
 | `modules/app/`    | `no_std` PIC modules: the seven substrate modules, `session_directory`, `partition_router`, the `consensus_bench` / `nvme_bench` drivers, `example_consumer`, and `clustor_cli`. `fluxor modules build` packs each into a `.fmod`, plus one per declared variant (`durability` has a `volatile` variant, `operations` a `headless` one). |
 | `modules/common/` | Shared types, wire constants, the WAL frame contract, the consumer facade, and the HTTP admin mapping. Pulled into each app module via `#[path]`. |
 | `crates/`         | `clustor-common`, the publishable cargo crate re-exporting the pure `no_std` subset of `modules/common/` for host consumers. |
-| `packaging/`      | Distribution packaging; `packaging/cli/` holds the CLI applet's graph and workload manifest. |
+| `packaging/`      | Distribution packaging; `packaging/applet/clustor/` holds the CLI applet's graph and workload manifest. |
 | `tools/`          | The `clustor-bench` host crate (`clustor-scrape`, `clustor-loadgen`) and repository scripts. |
 | `docs/`           | Stable reference: guides (`docs/guides/`) and architecture (`docs/architecture/`). Indexed by [`docs/overview.md`](docs/overview.md). |
 | `fluxor.toml`     | Project manifest for the `fluxor` CLI: identity, dependencies, project policy. |

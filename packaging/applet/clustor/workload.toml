@@ -1,5 +1,5 @@
 # Workload source manifest for the `clustor` CLI applet
-# (rfc_cli_execution.md §5). `fluxor install packaging/cli/workload.toml`
+# (rfc_cli_execution.md §5). `fluxor install packaging/applet/clustor/workload.toml`
 # registers it so `fluxor exec clustor -- <cmd>` dispatches to the
 # clustor_cli PIC fmod. The graph (linux.yaml, beside this file) is the
 # cli-applet graph: cli_in → clustor_cli → cli_out.

@@ -81,6 +81,9 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Uncommitted leader entries | `MAX_UNCOMMITTED_INFLIGHT` | modules/app/consensus/raft.rs | — | Typed value 48. Raft stops pulling proposals until commit advances; this is the principal quorum-latency throughput window. It must stay at or below apply and tail-ring capacity. |
 | WAL-unacknowledged entries | `MAX_WAL_UNACKED` | modules/app/consensus/raft.rs | — | Typed value 256. Raft stops admission when the WAL falls behind; a stalled WAL becomes backpressure rather than unbounded divergence. |
 | Pending WAL requests in replicator | `MAX_PENDING_WAL_REQS` | modules/app/consensus/replicator.rs | 16 | Backpressures further work while WAL request/reply state is occupied. |
+| Catch-up resend window | `CATCHUP_WINDOW` | modules/app/consensus/replicator.rs | — | Pacing; typed value 8 entries. What a NACK re-ships to a lagging peer in one round: enough to keep its stream pipelined while the leader appends hundreds a second (one entry per round trip never caught up), bounded so a NACK never re-ships the whole tail. Past it the peer NACKs again and is fed the next window. |
+| Configuration entries above the base | `CFG_LOG` | modules/common/wire.rs | 16 | Shape: Raft takes one membership change at a time, so all but the newest one or two are committed; when the list is full the oldest is folded into the configuration base. Nothing is refused. |
+| Shard-ownership override map | `SHARD_MAP_MAX_ENTRIES` | modules/common/wire.rs | 256 | Wire contract: the producer never emits a larger map, because a consumer that dropped the tail would resolve those shards to their baseline owner while other nodes used the override — split ownership. Quantum's `edge_routing_core::MAX_SHARD_OVERRIDES` is sized to match. |
 | ReadIndex seam queue | `PROBE_QUEUE_SLOTS` | modules/app/consensus/seam.rs | 8 | A full Raft reply queue currently drops the confirmation silently. This is a correctness-sensitive lossy boundary and should become retained backpressure or an explicit reject. |
 | Client correlation ids in flight | `CORR_RING` | modules/app/gateway/codec.rs | 64 | Lossy capacity: correlation ids held between proposal submission and commit. Overflow evicts the oldest entry; that client's response is then dropped and counted. Fail-open by design — a dropped response never becomes a misrouted one. |
 | Assigned-index → connection map | `IDX_RING` | modules/app/gateway/codec.rs | 64 | Lossy capacity: `wal_index → conn_id` for committed proposals, same eviction and drop-not-misroute contract as `CORR_RING`. |
@@ -251,6 +254,9 @@ Every name here also appears in a table above; the gate requires it, so
 the machine-checked list and the human one cannot become two registers.
 
 ```limit-register
+CATCHUP_WINDOW | modules/app/consensus/replicator.rs | 8
+CFG_LOG | modules/common/wire.rs | 16
+SHARD_MAP_MAX_ENTRIES | modules/common/wire.rs | 256
 MAX_CHUNK_BODY | modules/app/durability/snapshot.rs | 4 * 1024
 RETENTION_FLOOR_SLOTS | modules/app/durability/wal.rs | 32
 MAX_COMMAND_BYTES | modules/common/replica_facade.rs | 4096
@@ -351,6 +357,19 @@ so the count reaching zero means the register is complete rather than that
 someone stopped reading the report.
 
 ```limit-register-exempt
+# Telemetry metric ids whose names end in a capacity word: a number naming a
+# series, not a bound anything reaches.
+APPLY_QUEUE_DEPTH | modules/common/wire.rs | -
+REPL_INFLIGHT_DEPTH | modules/common/wire.rs | -
+TIMING_DUE_DEPTH | modules/common/wire.rs | -
+WAL_PENDING_DEPTH | modules/common/wire.rs | -
+# A message type byte (the Raft AppendEntries RPC), not an entry count.
+MSG_APPEND_ENTRIES | modules/common/wire.rs | -
+# The modulus of apply's dedup watermarks (an index's residue picks its
+# shard, each holding the highest index applied): a hashing width, nothing
+# is refused or evicted at it.
+DEDUP_SHARDS | modules/app/consensus/apply.rs | -
+
 # Wire and on-disk record widths: a layout, not a ceiling anything reaches.
 META_FLAT_SIZE | modules/app/consensus/raft.rs | -
 META_SLOT_SIZE | modules/app/consensus/raft.rs | -
