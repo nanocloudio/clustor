@@ -17,19 +17,24 @@
 // It is NOT part of replicated state — it gates what the leader proposes,
 // never what apply does.
 
+use super::slot_index::SlotIndex;
+
 // ── Capacity ────────────────────────────────────────────────────────
 //
 // Capacity is partitioned per owner, not pooled: one consumer exhausting its
 // allocation cannot starve another owner's registrations. Owner namespaces
-// are compiled constants for now; every replica of a PRG must run the same
-// build, which the existing module-artifact discipline already guarantees.
+// are compiled constants, so every replica of a PRG must run the same build
+// — which deploying one module artifact per group guarantees.
 
 /// Consumer namespaces the index can host.
 pub const TM_MAX_OWNERS: usize = 4;
 
-/// Total deadline slots (the sum of all per-owner capacities may not
-/// exceed this). Fixed so the state and its snapshot have static size.
-pub const TM_MAX_DEADLINES: usize = 64;
+// Total deadline slots are the `N` of `TimingState<N>`: the embedding
+// state machine sizes them from its own profile (the session registry
+// asks for two per session — a key TTL and a transfer grant — so a
+// profile of 4096 sessions embeds `TimingState<8192>`). The sum of the
+// per-owner capacities may not exceed `N`; a TTL command never silently
+// clamps at some fixed table size.
 
 /// Opaque deadline identity width.
 pub const TM_ID: usize = 16;
@@ -64,9 +69,10 @@ impl Deadline {
 
 /// Canonical total order: `(due_at_ms, owner, id bytes, generation)`.
 /// Equal-time deadlines therefore fire in the same order on every
-/// replica. At most one live entry exists per `(owner, id)` — the
-/// generation component is a vestigial tiebreaker, kept for defense
-/// in depth and snapshot-order validation.
+/// replica. At most one live entry exists per `(owner, id)`, so the order
+/// is strict over live entries without the generation; it is included so
+/// the order is total over any two deadlines, including two entries of
+/// a malformed image.
 #[inline]
 fn cmp_canonical(a: &Deadline, b: &Deadline) -> core::cmp::Ordering {
     use core::cmp::Ordering;
@@ -136,62 +142,155 @@ pub struct TimeApplied {
     pub logical_now_ms: u64,
     /// Due deadlines handed to consumers by this entry (≤ TM_BATCH_MAX).
     pub fired: u16,
-    /// Due work left after the bounded batch. Non-zero tells the
-    /// leader to propose `TimeDrain` continuation entries; a new
-    /// leader derives the same need from this replicated state.
-    pub due_remaining: u16,
+    /// Due work left after the bounded batch, saturating at
+    /// [`TM_DUE_DEPTH_MAX`]. Non-zero tells the leader to propose
+    /// `TimeDrain` continuation entries; a new leader derives the same
+    /// need from this replicated state.
+    pub due_remaining: u32,
 }
 
 // ── Timing state ────────────────────────────────────────────────────
+
+/// Bytes of a snapshot section header:
+/// `[version:u16][live:u32][logical_now_ms:u64][capacity:u32]
+/// [caps:u32 × TM_MAX_OWNERS]`.
+pub const TM_SNAPSHOT_HDR_LEN: usize = 2 + 4 + 8 + 4 + 4 * TM_MAX_OWNERS;
+/// Bytes of one snapshot entry: `[due_at_ms:u64][owner:u16][id:16]
+/// [generation:u64]`.
+pub const TM_SNAPSHOT_ENTRY_LEN: usize = 8 + 2 + TM_ID + 8;
+
+/// The due backlog [`TimingState::due_depth`] counts up to. Past it the
+/// gauge saturates: a backlog that deep already tells the leader to keep
+/// proposing `TimeDrain`, and counting further would cost apply time in
+/// proportion to the backlog.
+pub const TM_DUE_DEPTH_MAX: usize = 256;
+
+/// Index key of a deadline: `[owner:u16 LE][id:16]`.
+const TM_KEY: usize = 2 + TM_ID;
+
+/// No node.
+const NONE: u32 = u32::MAX;
 
 /// Replicated timing state. Embed in the consumer state machine and
 /// snapshot/restore through [`TimingState::snapshot`] /
 /// [`TimingState::restore`] as one section of the consumer blob.
 ///
-/// The index is a fixed-capacity array kept packed and sorted in
-/// canonical order — insertion is O(N) shift, the due pass pops from
-/// the front, and the snapshot is the array verbatim. N is small and
-/// bounded, and the byte image is canonical by construction.
+/// Deadlines live in a fixed arena of `N` nodes, ordered by a binary
+/// min-heap in canonical order and found by `(owner, id)` through a
+/// [`SlotIndex`]: registering, rescheduling, cancelling and popping are
+/// O(log N), and whether anything is due is O(1). The heap's layout is a
+/// function of the committed history alone — every operation moves
+/// entries by comparing them in canonical order, a strict total order
+/// since `(owner, id)` is unique — so every replica holds the same heap,
+/// and the snapshot streams it position by position. A restored replica
+/// places each entry back at the position it streamed from, so it holds
+/// that same heap too. Which arena node backs a position is not part of
+/// the state: nodes are never compared, exported or observed.
 #[repr(C)]
-pub struct TimingState {
+pub struct TimingState<const N: usize> {
     /// PRG logical time: unsigned milliseconds since the Unix epoch,
     /// monotone and saturating.
     pub logical_now_ms: u64,
-    /// Live entries (occupy `slots[..live]` in canonical order).
-    pub live: u16,
+    /// Live deadlines (`heap[..live]`).
+    pub live: u32,
     /// Per-owner capacity partition (configured, replicated in the
     /// snapshot so restore can reject an incompatible deployment).
-    pub caps: [u16; TM_MAX_OWNERS],
-    /// Live count per owner (maintained, also derivable from slots).
-    pub owner_live: [u16; TM_MAX_OWNERS],
-    /// Unused tail slots are always zeroed so the snapshot image is
-    /// byte-identical across replicas.
-    pub slots: [Deadline; TM_MAX_DEADLINES],
+    pub caps: [u32; TM_MAX_OWNERS],
+    /// Live count per owner.
+    pub owner_live: [u32; TM_MAX_OWNERS],
+    /// Deadline arena, addressed by node.
+    nodes: [Deadline; N],
+    /// The min-heap: `heap[p]` is the node at position `p`.
+    heap: [u32; N],
+    /// Position of each live node in `heap`.
+    pos: [u32; N],
+    /// Free nodes, a stack (`free[..free_len]`).
+    free: [u32; N],
+    free_len: u32,
+    /// `(owner, id)` → node.
+    index: SlotIndex<N, TM_KEY>,
 }
 
-impl TimingState {
-    /// `caps` must sum to at most [`TM_MAX_DEADLINES`]; excess is
-    /// clamped owner-by-owner (deterministic — config is identical on
-    /// every replica by deployment discipline).
-    pub const fn new(caps: [u16; TM_MAX_OWNERS]) -> Self {
+impl<const N: usize> TimingState<N> {
+    pub const SNAPSHOT_VERSION: u16 = 3;
+    pub const SLOT_LEN: usize = TM_SNAPSHOT_ENTRY_LEN;
+    pub const SNAPSHOT_HDR_LEN: usize = TM_SNAPSHOT_HDR_LEN;
+
+    /// `caps` must sum to at most `N`; excess is clamped owner-by-owner
+    /// (deterministic — config is identical on every replica by
+    /// deployment discipline).
+    pub const fn clamp_caps(caps: [u32; TM_MAX_OWNERS]) -> [u32; TM_MAX_OWNERS] {
         let mut clamped = caps;
-        let mut used: u32 = 0;
+        let mut used: u64 = 0;
         let mut i = 0;
         while i < TM_MAX_OWNERS {
-            let room = TM_MAX_DEADLINES as u32 - used;
-            if clamped[i] as u32 > room {
-                clamped[i] = room as u16;
+            let room = N as u64 - used;
+            if clamped[i] as u64 > room {
+                clamped[i] = room as u32;
             }
-            used += clamped[i] as u32;
+            used += clamped[i] as u64;
+            i += 1;
+        }
+        clamped
+    }
+
+    pub const fn new(caps: [u32; TM_MAX_OWNERS]) -> Self {
+        let mut free = [0u32; N];
+        let mut i = 0;
+        while i < N {
+            free[i] = (N - 1 - i) as u32;
             i += 1;
         }
         TimingState {
             logical_now_ms: 0,
             live: 0,
-            caps: clamped,
+            caps: Self::clamp_caps(caps),
             owner_live: [0; TM_MAX_OWNERS],
-            slots: [Deadline::zero(); TM_MAX_DEADLINES],
+            nodes: [Deadline::zero(); N],
+            heap: [0; N],
+            pos: [NONE; N],
+            free,
+            free_len: N as u32,
+            index: SlotIndex::new(),
         }
+    }
+
+    /// Initialise in place: every byte of the state, so it is what makes a
+    /// raw state block an index (a profile-sized state is too large to
+    /// build on the stack and copy into the module's state block).
+    pub fn reset(&mut self, caps: [u32; TM_MAX_OWNERS]) {
+        self.logical_now_ms = 0;
+        self.caps = Self::clamp_caps(caps);
+        let mut i = 0;
+        while i < N {
+            self.nodes[i] = Deadline::zero();
+            self.pos[i] = NONE;
+            i += 1;
+        }
+        self.live = 0;
+        self.clear();
+    }
+
+    /// Drop every deadline, keeping time and caps. Only live nodes hold
+    /// anything, so only they are cleared; the free stack and the index
+    /// are rebuilt empty.
+    pub fn clear(&mut self) {
+        let mut p = 0;
+        while p < self.live as usize {
+            let node = self.heap[p] as usize;
+            self.nodes[node] = Deadline::zero();
+            self.pos[node] = NONE;
+            p += 1;
+        }
+        let mut i = 0;
+        while i < N {
+            self.free[i] = (N - 1 - i) as u32;
+            i += 1;
+        }
+        self.free_len = N as u32;
+        self.live = 0;
+        self.owner_live = [0; TM_MAX_OWNERS];
+        self.index.reset();
     }
 
     #[inline]
@@ -199,52 +298,108 @@ impl TimingState {
         self.logical_now_ms
     }
 
-    fn find(&self, owner: u16, id: &[u8; TM_ID]) -> Option<usize> {
-        let mut i = 0;
-        while i < self.live as usize {
-            if self.slots[i].owner == owner && self.slots[i].id == *id {
-                return Some(i);
-            }
-            i += 1;
-        }
-        None
+    fn key(owner: u16, id: &[u8; TM_ID]) -> [u8; TM_KEY] {
+        let mut k = [0u8; TM_KEY];
+        k[0..2].copy_from_slice(&owner.to_le_bytes());
+        k[2..].copy_from_slice(id);
+        k
     }
 
-    /// Position where `d` belongs in canonical order.
-    fn insert_pos(&self, d: &Deadline) -> usize {
-        let mut i = 0;
-        while i < self.live as usize {
-            if cmp_canonical(d, &self.slots[i]) == core::cmp::Ordering::Less {
-                return i;
-            }
-            i += 1;
-        }
-        self.live as usize
+    #[inline]
+    fn at(&self, p: usize) -> &Deadline {
+        &self.nodes[self.heap[p] as usize]
     }
 
-    fn remove_at(&mut self, pos: usize) -> Deadline {
-        let d = self.slots[pos];
-        let mut i = pos;
-        while i + 1 < self.live as usize {
-            self.slots[i] = self.slots[i + 1];
-            i += 1;
+    #[inline]
+    fn less(&self, a: usize, b: usize) -> bool {
+        cmp_canonical(self.at(a), self.at(b)) == core::cmp::Ordering::Less
+    }
+
+    fn swap(&mut self, a: usize, b: usize) {
+        self.heap.swap(a, b);
+        self.pos[self.heap[a] as usize] = a as u32;
+        self.pos[self.heap[b] as usize] = b as u32;
+    }
+
+    fn sift_up(&mut self, mut p: usize) {
+        while p > 0 {
+            let parent = (p - 1) / 2;
+            if !self.less(p, parent) {
+                break;
+            }
+            self.swap(p, parent);
+            p = parent;
+        }
+    }
+
+    fn sift_down(&mut self, mut p: usize) {
+        let live = self.live as usize;
+        loop {
+            let l = 2 * p + 1;
+            if l >= live {
+                break;
+            }
+            let r = l + 1;
+            let c = if r < live && self.less(r, l) { r } else { l };
+            if !self.less(c, p) {
+                break;
+            }
+            self.swap(p, c);
+            p = c;
+        }
+    }
+
+    /// Restore heap order around position `p` after its entry changed.
+    fn settle(&mut self, p: usize) {
+        if p > 0 && self.less(p, (p - 1) / 2) {
+            self.sift_up(p);
+        } else {
+            self.sift_down(p);
+        }
+    }
+
+    /// Add `d` (whose `(owner, id)` is absent) at the end of the heap
+    /// without ordering it. False when the arena is full.
+    fn push_raw(&mut self, d: Deadline) -> bool {
+        if self.free_len == 0 {
+            return false;
+        }
+        self.free_len -= 1;
+        let node = self.free[self.free_len as usize];
+        let p = self.live as usize;
+        self.nodes[node as usize] = d;
+        self.heap[p] = node;
+        self.pos[node as usize] = p as u32;
+        self.live += 1;
+        self.owner_live[d.owner as usize] += 1;
+        self.index.insert(&Self::key(d.owner, &d.id), node)
+    }
+
+    /// Remove the entry at heap position `p`.
+    fn remove_at(&mut self, p: usize) -> Deadline {
+        let node = self.heap[p];
+        let d = self.nodes[node as usize];
+        let last = self.live as usize - 1;
+        if p != last {
+            self.swap(p, last);
         }
         self.live -= 1;
-        self.slots[self.live as usize] = Deadline::zero();
+        if p != last {
+            self.settle(p);
+        }
+        let _ = self.index.remove(&Self::key(d.owner, &d.id));
+        self.nodes[node as usize] = Deadline::zero();
+        self.pos[node as usize] = NONE;
+        self.free[self.free_len as usize] = node;
+        self.free_len += 1;
         self.owner_live[d.owner as usize] -= 1;
         d
     }
 
-    fn insert_sorted(&mut self, d: Deadline) {
-        let pos = self.insert_pos(&d);
-        let mut i = self.live as usize;
-        while i > pos {
-            self.slots[i] = self.slots[i - 1];
-            i -= 1;
-        }
-        self.slots[pos] = d;
-        self.live += 1;
-        self.owner_live[d.owner as usize] += 1;
+    /// Heap position of `(owner, id)`, if live.
+    fn find(&self, owner: u16, id: &[u8; TM_ID]) -> Option<usize> {
+        let node = self.index.find(&Self::key(owner, id))?;
+        Some(self.pos[node as usize] as usize)
     }
 
     /// Register or atomically replace a deadline. Called only while applying
@@ -262,32 +417,33 @@ impl TimingState {
         if generation == u64::MAX {
             return Err(RegisterError::GenerationOverflow);
         }
-        if let Some(pos) = self.find(owner, &id) {
-            let cur = self.slots[pos];
+        if let Some(p) = self.find(owner, &id) {
+            let node = self.heap[p] as usize;
+            let cur = self.nodes[node];
             if cur.generation == generation && cur.due_at_ms == due_at_ms {
                 return Ok(RegisterResult::Unchanged);
             }
             if generation < cur.generation {
                 return Err(RegisterError::StaleGeneration);
             }
-            self.remove_at(pos);
-            self.insert_sorted(Deadline {
-                due_at_ms,
-                owner,
-                id,
-                generation,
-            });
+            self.nodes[node].generation = generation;
+            self.nodes[node].due_at_ms = due_at_ms;
+            self.settle(p);
             return Ok(RegisterResult::Replaced);
         }
         if self.owner_live[owner as usize] >= self.caps[owner as usize] {
             return Err(RegisterError::CapacityExceeded);
         }
-        self.insert_sorted(Deadline {
+        let d = Deadline {
             due_at_ms,
             owner,
             id,
             generation,
-        });
+        };
+        if !self.push_raw(d) {
+            return Err(RegisterError::CapacityExceeded);
+        }
+        self.sift_up(self.live as usize - 1);
         Ok(RegisterResult::Registered)
     }
 
@@ -297,13 +453,13 @@ impl TimingState {
         if owner as usize >= TM_MAX_OWNERS {
             return CancelResult::NotFound;
         }
-        let Some(pos) = self.find(owner, id) else {
+        let Some(p) = self.find(owner, id) else {
             return CancelResult::NotFound;
         };
-        if self.slots[pos].generation != generation {
+        if self.at(p).generation != generation {
             return CancelResult::StaleGeneration;
         }
-        self.remove_at(pos);
+        self.remove_at(p);
         CancelResult::Cancelled
     }
 
@@ -319,27 +475,51 @@ impl TimingState {
         }
     }
 
+    /// Whether any deadline is due at the applied logical time.
+    #[inline]
+    pub fn has_due(&self) -> bool {
+        self.live > 0 && self.at(0).due_at_ms <= self.logical_now_ms
+    }
+
     /// Pop the canonically-first due deadline, if any. The caller (the
     /// consumer state machine's bounded due pass) invokes the owning
     /// consumer's due handler inline, at most [`TM_BATCH_MAX`] per
     /// applied entry.
     pub fn pop_due(&mut self) -> Option<Deadline> {
-        if self.live == 0 || self.slots[0].due_at_ms > self.logical_now_ms {
+        if !self.has_due() {
             return None;
         }
         Some(self.remove_at(0))
     }
 
-    /// Due entries not yet delivered (the drain backlog).
-    pub fn due_depth(&self) -> u16 {
-        let mut n = 0u16;
-        let mut i = 0;
-        while i < self.live as usize {
-            if self.slots[i].due_at_ms > self.logical_now_ms {
-                break; // sorted: nothing later can be due
+    /// Due entries not yet delivered (the drain backlog), saturating at
+    /// [`TM_DUE_DEPTH_MAX`]. The due entries are exactly a subtree at the
+    /// heap's root (a node is due only if its parent is), so the count
+    /// walks that subtree and nothing below it.
+    pub fn due_depth(&self) -> u32 {
+        let mut stack = [0u32; TM_DUE_DEPTH_MAX + 2];
+        let mut top = 0usize;
+        let mut n = 0u32;
+        if self.live > 0 {
+            stack[0] = 0;
+            top = 1;
+        }
+        while top > 0 && (n as usize) < TM_DUE_DEPTH_MAX {
+            top -= 1;
+            let p = stack[top] as usize;
+            if self.at(p).due_at_ms > self.logical_now_ms {
+                continue;
             }
             n += 1;
-            i += 1;
+            let l = 2 * p + 1;
+            if l < self.live as usize {
+                stack[top] = l as u32;
+                top += 1;
+            }
+            if l + 1 < self.live as usize {
+                stack[top] = (l + 1) as u32;
+                top += 1;
+            }
         }
         n
     }
@@ -351,162 +531,194 @@ impl TimingState {
         if self.live == 0 {
             None
         } else {
-            Some(self.slots[0].due_at_ms)
+            Some(self.at(0).due_at_ms)
         }
     }
 
     // ── Snapshot section ────────────────────────────────────────────
     //
-    // Fixed-size, canonical, versioned. Layout (all LE):
-    //   [version:u16][live:u16][logical_now_ms:u64]
-    //   [caps:u16 × TM_MAX_OWNERS]
-    //   [slot × TM_MAX_DEADLINES] where
-    //     slot = [due_at_ms:u64][owner:u16][id:16][generation:u64]
-    // Unused slots are zero. Fixed size keeps the embedding consumer
-    // snapshot statically sized and the byte image replica-identical.
+    // Streamed, versioned: a header then the LIVE entries only, in heap
+    // order, so the image scales with what is scheduled rather than with
+    // the profile's capacity. Layout (all LE):
+    //   header [version:u16][live:u32][logical_now_ms:u64][capacity:u32]
+    //          [caps:u32 × TM_MAX_OWNERS]
+    //   entry  [due_at_ms:u64][owner:u16][id:16][generation:u64] × live
+    // `capacity` is `N`: a replica built with another profile fails the
+    // install closed rather than reading a differently sized index.
 
-    pub const SNAPSHOT_VERSION: u16 = 1;
-    pub const SLOT_LEN: usize = 8 + 2 + TM_ID + 8;
-    pub const SNAPSHOT_LEN: usize =
-        2 + 2 + 8 + 2 * TM_MAX_OWNERS + TM_MAX_DEADLINES * Self::SLOT_LEN;
-
-    pub fn snapshot(&self, dst: &mut [u8]) -> i32 {
-        if dst.len() < Self::SNAPSHOT_LEN {
-            return -1;
-        }
-        dst[0..2].copy_from_slice(&Self::SNAPSHOT_VERSION.to_le_bytes());
-        dst[2..4].copy_from_slice(&self.live.to_le_bytes());
-        dst[4..12].copy_from_slice(&self.logical_now_ms.to_le_bytes());
-        let mut o = 12;
-        let mut i = 0;
-        while i < TM_MAX_OWNERS {
-            dst[o..o + 2].copy_from_slice(&self.caps[i].to_le_bytes());
-            o += 2;
-            i += 1;
-        }
-        i = 0;
-        while i < TM_MAX_DEADLINES {
-            let d = &self.slots[i];
-            dst[o..o + 8].copy_from_slice(&d.due_at_ms.to_le_bytes());
-            dst[o + 8..o + 10].copy_from_slice(&d.owner.to_le_bytes());
-            dst[o + 10..o + 10 + TM_ID].copy_from_slice(&d.id);
-            dst[o + 26..o + 34].copy_from_slice(&d.generation.to_le_bytes());
-            o += Self::SLOT_LEN;
-            i += 1;
-        }
-        Self::SNAPSHOT_LEN as i32
+    /// Bytes the whole section occupies right now.
+    pub fn snapshot_len(&self) -> usize {
+        Self::SNAPSHOT_HDR_LEN + self.live as usize * Self::SLOT_LEN
     }
 
-    /// Restore fails closed (returns false, state untouched on the
-    /// validation path) on: unknown version, capacity-config mismatch,
-    /// over-capacity counts, duplicate `(owner, id)`, non-canonical
-    /// order, or a logical-time regression against the state being
-    /// replaced (time is monotone in log order, so a genuine install
-    /// never rewinds it — a rewind is corruption).
-    pub fn restore(&mut self, src: &[u8]) -> bool {
-        if src.len() < Self::SNAPSHOT_LEN {
-            return false;
+    pub fn snapshot_header(&self, dst: &mut [u8]) -> usize {
+        if dst.len() < Self::SNAPSHOT_HDR_LEN {
+            return 0;
         }
-        let version = u16::from_le_bytes([src[0], src[1]]);
-        if version != Self::SNAPSHOT_VERSION {
-            return false;
-        }
-        let live = u16::from_le_bytes([src[2], src[3]]);
-        if live as usize > TM_MAX_DEADLINES {
-            return false;
-        }
-        let logical = u64::from_le_bytes([
-            src[4], src[5], src[6], src[7], src[8], src[9], src[10], src[11],
-        ]);
-        if logical < self.logical_now_ms {
-            return false;
-        }
-        let mut o = 12;
+        dst[0..2].copy_from_slice(&Self::SNAPSHOT_VERSION.to_le_bytes());
+        dst[2..6].copy_from_slice(&self.live.to_le_bytes());
+        dst[6..14].copy_from_slice(&self.logical_now_ms.to_le_bytes());
+        dst[14..18].copy_from_slice(&(N as u32).to_le_bytes());
+        let mut o = 18;
         let mut i = 0;
         while i < TM_MAX_OWNERS {
-            let cap = u16::from_le_bytes([src[o], src[o + 1]]);
-            if cap != self.caps[i] {
-                return false;
-            }
-            o += 2;
+            dst[o..o + 4].copy_from_slice(&self.caps[i].to_le_bytes());
+            o += 4;
             i += 1;
         }
-        let mut slots = [Deadline::zero(); TM_MAX_DEADLINES];
-        let mut owner_live = [0u16; TM_MAX_OWNERS];
-        i = 0;
-        while i < TM_MAX_DEADLINES {
-            let due_at_ms = u64::from_le_bytes([
-                src[o],
-                src[o + 1],
-                src[o + 2],
-                src[o + 3],
-                src[o + 4],
-                src[o + 5],
-                src[o + 6],
-                src[o + 7],
-            ]);
-            let owner = u16::from_le_bytes([src[o + 8], src[o + 9]]);
-            let mut id = [0u8; TM_ID];
-            id.copy_from_slice(&src[o + 10..o + 26]);
-            let generation = u64::from_le_bytes([
-                src[o + 26],
-                src[o + 27],
-                src[o + 28],
-                src[o + 29],
-                src[o + 30],
-                src[o + 31],
-                src[o + 32],
-                src[o + 33],
-            ]);
-            let d = Deadline {
-                due_at_ms,
-                owner,
-                id,
-                generation,
-            };
-            if i < live as usize {
-                if owner as usize >= TM_MAX_OWNERS || generation == u64::MAX {
-                    return false;
-                }
-                owner_live[owner as usize] += 1;
-                if owner_live[owner as usize] > self.caps[owner as usize] {
-                    return false;
-                }
-                if i > 0 {
-                    let prev = &slots[i - 1];
-                    // Strictly ascending: also rejects duplicates.
-                    if cmp_canonical(prev, &d) != core::cmp::Ordering::Less {
-                        return false;
-                    }
-                    if prev.owner == d.owner && prev.id == d.id {
-                        return false;
-                    }
-                }
-                // Duplicate (owner, id) at different due times would
-                // pass the adjacent check; scan back for it.
-                let mut j = 0;
-                while j + 1 < i {
-                    if slots[j].owner == d.owner && slots[j].id == d.id {
-                        return false;
-                    }
-                    j += 1;
-                }
-                slots[i] = d;
-            } else if d != Deadline::zero() {
-                return false; // tail must be zeroed
-            }
-            o += Self::SLOT_LEN;
+        Self::SNAPSHOT_HDR_LEN
+    }
+
+    /// The entry at heap position `i`; 0 when out of range.
+    pub fn snapshot_entry(&self, i: usize, dst: &mut [u8]) -> usize {
+        if i >= self.live as usize || dst.len() < Self::SLOT_LEN {
+            return 0;
+        }
+        let d = self.at(i);
+        dst[0..8].copy_from_slice(&d.due_at_ms.to_le_bytes());
+        dst[8..10].copy_from_slice(&d.owner.to_le_bytes());
+        dst[10..10 + TM_ID].copy_from_slice(&d.id);
+        dst[26..34].copy_from_slice(&d.generation.to_le_bytes());
+        Self::SLOT_LEN
+    }
+
+    /// Whole section into `dst` (host convenience over the streamed
+    /// form).
+    pub fn snapshot(&self, dst: &mut [u8]) -> i32 {
+        let total = self.snapshot_len();
+        if dst.len() < total {
+            return -1;
+        }
+        let mut o = self.snapshot_header(dst);
+        let mut i = 0;
+        while i < self.live as usize {
+            o += self.snapshot_entry(i, &mut dst[o..]);
             i += 1;
         }
+        total as i32
+    }
+
+    fn decode_entry(src: &[u8]) -> Deadline {
+        let mut id = [0u8; TM_ID];
+        id.copy_from_slice(&src[10..26]);
+        Deadline {
+            due_at_ms: u64::from_le_bytes([
+                src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+            ]),
+            owner: u16::from_le_bytes([src[8], src[9]]),
+            id,
+            generation: u64::from_le_bytes([
+                src[26], src[27], src[28], src[29], src[30], src[31], src[32], src[33],
+            ]),
+        }
+    }
+
+    /// Validate a header against this state's configuration: version,
+    /// capacity (`N`), per-owner caps, a live count within capacity, and
+    /// no logical-time regression against the state being replaced (time
+    /// is monotone in log order, so a genuine install never rewinds it —
+    /// a rewind is corruption). Returns `(live, logical_now_ms)`.
+    pub fn check_header(&self, src: &[u8]) -> Option<(u32, u64)> {
+        if src.len() < Self::SNAPSHOT_HDR_LEN {
+            return None;
+        }
+        if u16::from_le_bytes([src[0], src[1]]) != Self::SNAPSHOT_VERSION {
+            return None;
+        }
+        let live = u32::from_le_bytes([src[2], src[3], src[4], src[5]]);
+        if live as usize > N {
+            return None;
+        }
+        let logical = u64::from_le_bytes([
+            src[6], src[7], src[8], src[9], src[10], src[11], src[12], src[13],
+        ]);
+        if logical < self.logical_now_ms {
+            return None;
+        }
+        if u32::from_le_bytes([src[14], src[15], src[16], src[17]]) != N as u32 {
+            return None;
+        }
+        let mut o = 18;
+        let mut i = 0;
+        while i < TM_MAX_OWNERS {
+            if u32::from_le_bytes([src[o], src[o + 1], src[o + 2], src[o + 3]]) != self.caps[i] {
+                return None;
+            }
+            o += 4;
+            i += 1;
+        }
+        Some((live, logical))
+    }
+
+    /// Streamed install, step 1: adopt a checked header. Clears every
+    /// entry; `restore_entry` then appends the `live` entries in order.
+    pub fn restore_header(&mut self, src: &[u8]) -> Option<u32> {
+        let (live, logical) = self.check_header(src)?;
+        self.clear();
         self.logical_now_ms = logical;
-        self.live = live;
-        self.owner_live = owner_live;
-        self.slots = slots;
-        true
+        Some(live)
+    }
+
+    /// Streamed install, step 2: place the next entry at the next heap
+    /// position, returning it. Fails closed on a bad owner, a generation
+    /// at the overflow sentinel, an owner over its cap, a repeated
+    /// `(owner, id)`, or an entry that does not order after its heap
+    /// parent — so an image that installs is a valid heap, the one the
+    /// exporter held.
+    pub fn restore_entry(&mut self, src: &[u8]) -> Option<Deadline> {
+        if src.len() < Self::SLOT_LEN || self.live as usize >= N {
+            return None;
+        }
+        let d = Self::decode_entry(src);
+        if d.owner as usize >= TM_MAX_OWNERS || d.generation == u64::MAX {
+            return None;
+        }
+        if self.owner_live[d.owner as usize] >= self.caps[d.owner as usize] {
+            return None;
+        }
+        let p = self.live as usize;
+        if p > 0 && cmp_canonical(self.at((p - 1) / 2), &d) != core::cmp::Ordering::Less {
+            return None;
+        }
+        if self.index.find(&Self::key(d.owner, &d.id)).is_some() {
+            return None;
+        }
+        if !self.push_raw(d) {
+            return None;
+        }
+        Some(d)
+    }
+
+    /// Whole-section restore (host convenience). Fails closed: a rejected
+    /// image leaves the index empty (time keeps the state's own value).
+    /// Returns the bytes consumed, or 0 on rejection.
+    pub fn restore(&mut self, src: &[u8]) -> usize {
+        let Some((live, _)) = self.check_header(src) else {
+            return 0;
+        };
+        let total = Self::SNAPSHOT_HDR_LEN + live as usize * Self::SLOT_LEN;
+        if src.len() < total {
+            return 0;
+        }
+        let logical = self.logical_now_ms;
+        if self.restore_header(src).is_none() {
+            return 0;
+        }
+        let mut i = 0;
+        while i < live as usize {
+            let at = Self::SNAPSHOT_HDR_LEN + i * Self::SLOT_LEN;
+            if self.restore_entry(&src[at..at + Self::SLOT_LEN]).is_none() {
+                self.clear();
+                self.logical_now_ms = logical;
+                return 0;
+            }
+            i += 1;
+        }
+        total
     }
 }
 
-// ── Clock guard (leader-side, unreplicated —) ───────────────────────
+// ── Clock guard (leader-side, unreplicated) ─────────────────────────
 
 /// Wall-clock health states. Anything but `Healthy` freezes time
 /// production: deadlines become late rather than firing from an

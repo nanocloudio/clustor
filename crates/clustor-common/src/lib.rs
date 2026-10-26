@@ -7,7 +7,7 @@
 //! and so on). The `common/` directory is symlinked at the crate
 //! root so cargo bundles the files at package time.
 //!
-//! The crate exposes only the pure no_std surface from RFC §6.5.1:
+//! The crate exposes only the pure no_std surface:
 //! constants, codecs, and state machines, with no `unsafe` and no
 //! syscalls. PIC-only channel I/O over fluxor's `SyscallTable`
 //! lives at `modules/common/wire_channels.rs` and is consumed
@@ -45,12 +45,21 @@ pub mod replica_facade;
 pub mod http_admin;
 
 #[rustfmt::skip]
+#[path = "../common/slot_index.rs"]
+pub mod slot_index;
+#[rustfmt::skip]
 #[path = "../common/timing.rs"]
 pub mod timing;
 
 #[rustfmt::skip]
 #[path = "../common/session_registry.rs"]
 pub mod session_registry;
+#[rustfmt::skip]
+#[path = "../common/transport_registry.rs"]
+pub mod transport_registry;
+#[rustfmt::skip]
+#[path = "../common/vip_registry.rs"]
+pub mod vip_registry;
 
 #[rustfmt::skip]
 #[path = "../common/wal_frame.rs"]

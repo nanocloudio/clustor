@@ -1,0 +1,1749 @@
+// VIP registry — the `vip/<service_address>` namespace of the session
+// directory: the replicated authority for who may
+// source a service address, under which epoch, and the opaque emission
+// token that proves it.
+//
+// Pure no_std, zero-alloc, DETERMINISTIC: `VipRegistry::apply` is a pure
+// function of (state, committed command body, digest fn); every replica
+// applying the same committed sequence holds byte-identical state. No
+// clocks, no randomness, no I/O. The digest (the SDK's SHA-256) is passed
+// in by the caller so this file stays pure; the capability seed is
+// replicated state (set at construction for host tests, or by the SEED
+// command the module proposes from the kernel CSPRNG once per group), so
+// every replica mints the same token and any replica can verify one.
+//
+// One record per `(service_id, address_family, prefix, prefix_len)`. The
+// phase sequence moves forward one step at a time:
+//
+//   UNASSIGNED → PREPARING_NEW → FENCING_OLD → OWNER_COMMITTED →
+//   ADDRESS_INSTALLED → ADVERTISED → ACTIVE → DRAINING → WITHDRAWN →
+//   EMISSION_DISABLED → RELEASED
+//
+// What the registry enforces:
+//
+// - **a claim is an epoch.** CLAIM_PREPARE starts `PREPARING_NEW` under a
+//   new `vip_epoch` from an unowned record (UNASSIGNED / RELEASED) or as a
+//   takeover of an owned one (any phase from OWNER_COMMITTED on); a claim
+//   already in flight must be ABORTed first. Every command names the epoch
+//   it expects and a stale one is refused `STALE_EPOCH`.
+// - **no owner commits past an unfenced predecessor.** The hosts owning
+//   the address when a takeover claim lands are its previous owners; each
+//   needs a FENCE_CONFIRM carrying the fence agent's custody generation
+//   before ACTIVATE commits the new owner, or the claim stays
+//   `BLOCKED_FENCE`. A predecessor that gracefully disabled emission
+//   (EMISSION_DISABLED) is its own acknowledgement and needs no fence.
+//   ACTIVATE also carries the ready-graph attestation; without it the
+//   claim is `NOT_READY`.
+// - **abort before commit only.** ABORT returns a claim in PREPARING_NEW or
+//   FENCING_OLD to the phase the record held when the claim was made —
+//   UNASSIGNED for a first claim. Past OWNER_COMMITTED a claim completes
+//   forward: the address may already be installed under the new owner.
+// - **emission tokens are minted here and nowhere else.** ACTIVATE mints
+//   an `EmissionToken` bound to `(service_id, prefix, owner_host,
+//   boot_incarnation, vip_epoch, authority_generation,
+//   unsafe_recovery_generation, allowed_interfaces)` plus a 16-byte
+//   capability: the first 16 bytes of SHA-256 over the replicated seed
+//   followed by those fields. Seed and fields are fixed-length, so no
+//   extension of a valid input is itself a valid input and the keyed
+//   digest is a sound MAC without HMAC's second pass. Tokens are a pure
+//   function of replicated state: any replica re-derives an owner's
+//   current token (`emission_token`), and a token stops verifying the
+//   moment authority moves past it. `verify_emission_token` is what a
+//   Fluxor `ip` / announcer side asks: it fails closed on a recovery
+//   generation or vip epoch behind the registry's, an authority generation
+//   that is not the current one, a host that is not a current owner under
+//   that boot incarnation, owners that may not emit — before their commit,
+//   or once DISABLE ended their emission, including through a takeover
+//   claim made after it — or a capability that does not recompute.
+// - **active/active is an owner set.** Mode is fixed at the first claim.
+//   In active/active a claim adds the prepared host to the set (bounded by
+//   `VB_MAX_OWNERS`, `CAPACITY` beyond) without fencing the owners that
+//   stay; RELEASE naming a fenced owner removes just that host while the
+//   set is ACTIVE.
+// - **unsafe recovery invalidates authority.** RECOVERY_MARK bumps
+//   `unsafe_recovery_generation`, returns a claim in FENCING_OLD to
+//   PREPARING_NEW with its fences voided, and marks every committed
+//   binding voided: its tokens no longer verify and its phase cannot
+//   advance until a new claim re-admits the owner through a fresh fence:
+//   re-admission after a recovery is explicit, never implied.
+// - **idempotent operations.** Every command carries `operation_id[16]`;
+//   the record (or the registry, for SEED and RECOVERY_MARK) remembers its
+//   last one, whole: a byte-identical retry gets the recorded reply, a
+//   different command under the same id `CONFLICT`.
+
+use super::slot_index::{SlotIndex, SlotSet};
+
+// ── Capacity ────────────────────────────────────────────────────────
+
+/// Owners (active/active set), prepared hosts and fences one binding names.
+pub const VB_MAX_OWNERS: usize = 8;
+
+/// Profiles: bindings per group (one group's share of a profile's
+/// concurrent VIP/prefix intents; VIP records are low-volume and reserved
+/// independently of sessions). A record lives as long as the group: a
+/// released binding keeps its `vip_epoch` so a stale coordinator's
+/// command for an old epoch is still refused, so the arena bounds the
+/// distinct keys a group ever claims.
+pub const VB_PROFILE_RP2350: usize = 16;
+pub const VB_PROFILE_PI5: usize = 1024;
+pub const VB_PROFILE_SERVER: usize = 16384;
+
+// ── Phases ──────────────────────────────────────────────────────────
+
+pub const VB_PHASE_UNASSIGNED: u8 = 0;
+pub const VB_PHASE_PREPARING_NEW: u8 = 1;
+pub const VB_PHASE_FENCING_OLD: u8 = 2;
+pub const VB_PHASE_OWNER_COMMITTED: u8 = 3;
+pub const VB_PHASE_ADDRESS_INSTALLED: u8 = 4;
+pub const VB_PHASE_ADVERTISED: u8 = 5;
+pub const VB_PHASE_ACTIVE: u8 = 6;
+pub const VB_PHASE_DRAINING: u8 = 7;
+pub const VB_PHASE_WITHDRAWN: u8 = 8;
+pub const VB_PHASE_EMISSION_DISABLED: u8 = 9;
+pub const VB_PHASE_RELEASED: u8 = 10;
+
+// ── Modes ───────────────────────────────────────────────────────────
+
+pub const VB_MODE_ACTIVE_PASSIVE: u8 = 0;
+pub const VB_MODE_ACTIVE_ACTIVE: u8 = 1;
+
+// ── Command opcodes ─────────────────────────────────────────────────
+
+pub const VB_OP_CLAIM_PREPARE: u8 = 1;
+pub const VB_OP_ABORT: u8 = 2;
+pub const VB_OP_FENCE_REQUEST: u8 = 3;
+pub const VB_OP_FENCE_CONFIRM: u8 = 4;
+pub const VB_OP_ACTIVATE: u8 = 5;
+pub const VB_OP_INSTALLED: u8 = 6;
+pub const VB_OP_ADVERTISED: u8 = 7;
+pub const VB_OP_ACTIVE: u8 = 8;
+pub const VB_OP_WITHDRAW: u8 = 9;
+pub const VB_OP_DISABLE: u8 = 10;
+pub const VB_OP_RELEASE: u8 = 11;
+pub const VB_OP_RECOVERY_MARK: u8 = 12;
+pub const VB_OP_SEED: u8 = 13;
+
+// ── Status codes ────────────────────────────────────────────────────
+
+pub const VB_ST_OK: u8 = 0;
+/// Identical operation already completed (reserved: a retry is answered
+/// with the recorded reply, whose status is the original's).
+pub const VB_ST_DUPLICATE: u8 = 1;
+pub const VB_ST_INVALID: u8 = 2;
+pub const VB_ST_UNAUTHORIZED: u8 = 3;
+pub const VB_ST_STALE_EPOCH: u8 = 4;
+pub const VB_ST_FUTURE_EPOCH: u8 = 5;
+pub const VB_ST_CONFLICT: u8 = 6;
+pub const VB_ST_CAPACITY: u8 = 7;
+/// Ready-graph attestation absent, or the registry is not yet seeded.
+pub const VB_ST_NOT_READY: u8 = 8;
+/// A previous owner has no confirmed fence.
+pub const VB_ST_BLOCKED_FENCE: u8 = 9;
+/// Not an edge of the phase sequence from the current phase.
+pub const VB_ST_UNSUPPORTED_STATE: u8 = 10;
+pub const VB_ST_INVARIANT_FAILURE: u8 = 11;
+pub const VB_ST_UNKNOWN_BINDING: u8 = 12;
+/// Voided by unsafe recovery until re-claimed.
+pub const VB_ST_RECOVERY_VOID: u8 = 13;
+pub const VB_ST_RECOVERY_STALE: u8 = 14;
+
+// ── Field sizes / payload layouts ───────────────────────────────────
+
+pub const VB_OP_ID: usize = 16;
+pub const VB_HOST_ID: usize = 16;
+pub const VB_BOOT_INCARNATION: usize = 16;
+pub const VB_POLICY_ID: usize = 16;
+pub const VB_SEED: usize = 32;
+pub const VB_CAPABILITY: usize = 16;
+/// Binding key: `[service_id:16][family:1][prefix_len:1][prefix:16]`.
+pub const VB_KEY: usize = 34;
+
+// Command layouts (after the opcode byte), all LE. Every binding command
+// begins `[op_id:16][key:34][expected_epoch:8]`.
+//
+//   CLAIM_PREPARE [common][mode:1][host:16][boot:16][policy:16]
+//                 [allowed_interfaces:4]
+//   ABORT         [common]
+//   FENCE_REQUEST [common][host:16]     (zero host: nothing to fence)
+//   FENCE_CONFIRM [common][host:16][fence_gen:4]
+//   ACTIVATE      [common][ready_graph:1]
+//   INSTALLED / ADVERTISED / ACTIVE [common]
+//   WITHDRAW / DISABLE / RELEASE    [common][host:16]
+//                 (host names the owner in active/active; zero for the set)
+//   RECOVERY_MARK [op_id:16][recovery_generation:8]
+//   SEED          [op_id:16][seed:32]
+
+pub const VB_COMMON_LEN: usize = 1 + VB_OP_ID + VB_KEY + 8;
+pub const VB_CLAIM_PREPARE_LEN: usize =
+    VB_COMMON_LEN + 1 + VB_HOST_ID + VB_BOOT_INCARNATION + VB_POLICY_ID + 4;
+pub const VB_ABORT_LEN: usize = VB_COMMON_LEN;
+pub const VB_FENCE_REQUEST_LEN: usize = VB_COMMON_LEN + VB_HOST_ID;
+pub const VB_FENCE_CONFIRM_LEN: usize = VB_COMMON_LEN + VB_HOST_ID + 4;
+pub const VB_ACTIVATE_LEN: usize = VB_COMMON_LEN + 1;
+pub const VB_STEP_LEN: usize = VB_COMMON_LEN;
+pub const VB_HOST_STEP_LEN: usize = VB_COMMON_LEN + VB_HOST_ID;
+pub const VB_RECOVERY_MARK_LEN: usize = 1 + VB_OP_ID + 8;
+pub const VB_SEED_LEN: usize = 1 + VB_OP_ID + VB_SEED;
+/// Largest command body (CLAIM_PREPARE).
+pub const VB_MAX_CMD: usize = VB_CLAIM_PREPARE_LEN;
+
+// ── Emission token ──────────────────────────────────────────────────
+
+/// `[service_id:16][family:1][prefix_len:1][prefix:16][owner_host:16]
+/// [boot_incarnation:16][vip_epoch:8][authority_generation:8]
+/// [unsafe_recovery_generation:8][allowed_interfaces:4][capability:16]`
+pub const VB_TOKEN_LEN: usize =
+    VB_KEY + VB_HOST_ID + VB_BOOT_INCARNATION + 8 + 8 + 8 + 4 + VB_CAPABILITY;
+const VB_TOKEN_FIELDS: usize = VB_TOKEN_LEN - VB_CAPABILITY;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct EmissionToken {
+    pub key: [u8; VB_KEY],
+    pub owner_host: [u8; VB_HOST_ID],
+    pub boot_incarnation: [u8; VB_BOOT_INCARNATION],
+    pub vip_epoch: u64,
+    pub authority_generation: u64,
+    pub unsafe_recovery_generation: u64,
+    pub allowed_interfaces: u32,
+    pub capability: [u8; VB_CAPABILITY],
+}
+
+impl EmissionToken {
+    pub const fn zero() -> Self {
+        EmissionToken {
+            key: [0; VB_KEY],
+            owner_host: [0; VB_HOST_ID],
+            boot_incarnation: [0; VB_BOOT_INCARNATION],
+            vip_epoch: 0,
+            authority_generation: 0,
+            unsafe_recovery_generation: 0,
+            allowed_interfaces: 0,
+            capability: [0; VB_CAPABILITY],
+        }
+    }
+
+    fn encode_fields(&self, dst: &mut [u8]) {
+        dst[0..34].copy_from_slice(&self.key);
+        dst[34..50].copy_from_slice(&self.owner_host);
+        dst[50..66].copy_from_slice(&self.boot_incarnation);
+        dst[66..74].copy_from_slice(&self.vip_epoch.to_le_bytes());
+        dst[74..82].copy_from_slice(&self.authority_generation.to_le_bytes());
+        dst[82..90].copy_from_slice(&self.unsafe_recovery_generation.to_le_bytes());
+        dst[90..94].copy_from_slice(&self.allowed_interfaces.to_le_bytes());
+    }
+
+    pub fn encode(&self, dst: &mut [u8]) -> usize {
+        if dst.len() < VB_TOKEN_LEN {
+            return 0;
+        }
+        self.encode_fields(dst);
+        dst[VB_TOKEN_FIELDS..VB_TOKEN_LEN].copy_from_slice(&self.capability);
+        VB_TOKEN_LEN
+    }
+
+    pub fn decode(src: &[u8]) -> Option<EmissionToken> {
+        if src.len() < VB_TOKEN_LEN {
+            return None;
+        }
+        let mut t = EmissionToken::zero();
+        t.key.copy_from_slice(&src[0..34]);
+        t.owner_host.copy_from_slice(&src[34..50]);
+        t.boot_incarnation.copy_from_slice(&src[50..66]);
+        t.vip_epoch = u64_at(src, 66);
+        t.authority_generation = u64_at(src, 74);
+        t.unsafe_recovery_generation = u64_at(src, 82);
+        t.allowed_interfaces = u32_at(src, 90);
+        t.capability
+            .copy_from_slice(&src[VB_TOKEN_FIELDS..VB_TOKEN_LEN]);
+        Some(t)
+    }
+
+    /// The capability: the first 16 bytes of `digest(seed || fields)`. The
+    /// seed never leaves the registry's replicated state; a holder cannot
+    /// forge a token for another epoch, host or incarnation.
+    fn capability_for(
+        seed: &[u8; VB_SEED],
+        fields: &[u8],
+        digest: DigestFn,
+    ) -> [u8; VB_CAPABILITY] {
+        let mut m = [0u8; VB_SEED + VB_TOKEN_FIELDS];
+        m[..VB_SEED].copy_from_slice(seed);
+        m[VB_SEED..].copy_from_slice(&fields[..VB_TOKEN_FIELDS]);
+        let d = digest(&m);
+        let mut c = [0u8; VB_CAPABILITY];
+        c.copy_from_slice(&d[..VB_CAPABILITY]);
+        c
+    }
+}
+
+/// SHA-256 (the SDK's `crypto/sha256.rs::sha256`), passed in by the host.
+pub type DigestFn = fn(&[u8]) -> [u8; 32];
+
+/// Equality in time independent of where the inputs differ, so comparing
+/// a presented capability against the true one reveals nothing about how
+/// much of it was right.
+fn ct_eq(a: &[u8; VB_CAPABILITY], b: &[u8; VB_CAPABILITY]) -> bool {
+    let mut diff = 0u8;
+    let mut i = 0;
+    while i < VB_CAPABILITY {
+        diff |= a[i] ^ b[i];
+        i += 1;
+    }
+    core::hint::black_box(diff) == 0
+}
+
+// ── Reply ───────────────────────────────────────────────────────────
+
+/// `[op:1][status:1][phase:1][mode:1][owner_count:1][token_present:1]
+/// [key:34][vip_epoch:8][authority_generation:8]
+/// [unsafe_recovery_generation:8][token: VB_TOKEN_LEN]`
+/// The token is zero unless `token_present` (ACTIVATE). A RECOVERY_MARK
+/// reply names no binding: its `vip_epoch` is the count of bindings it
+/// voided.
+pub const VB_REPLY_LEN: usize = 6 + VB_KEY + 8 + 8 + 8 + VB_TOKEN_LEN;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct VipReply {
+    pub op: u8,
+    pub status: u8,
+    pub phase: u8,
+    pub mode: u8,
+    pub owner_count: u8,
+    pub token_present: bool,
+    pub key: [u8; VB_KEY],
+    pub vip_epoch: u64,
+    pub authority_generation: u64,
+    pub unsafe_recovery_generation: u64,
+    pub token: EmissionToken,
+}
+
+impl VipReply {
+    pub const fn zero() -> Self {
+        VipReply {
+            op: 0,
+            status: 0,
+            phase: 0,
+            mode: 0,
+            owner_count: 0,
+            token_present: false,
+            key: [0; VB_KEY],
+            vip_epoch: 0,
+            authority_generation: 0,
+            unsafe_recovery_generation: 0,
+            token: EmissionToken::zero(),
+        }
+    }
+
+    pub fn encode(&self, dst: &mut [u8]) -> i32 {
+        if dst.len() < VB_REPLY_LEN {
+            return -1;
+        }
+        dst[0] = self.op;
+        dst[1] = self.status;
+        dst[2] = self.phase;
+        dst[3] = self.mode;
+        dst[4] = self.owner_count;
+        dst[5] = self.token_present as u8;
+        dst[6..40].copy_from_slice(&self.key);
+        dst[40..48].copy_from_slice(&self.vip_epoch.to_le_bytes());
+        dst[48..56].copy_from_slice(&self.authority_generation.to_le_bytes());
+        dst[56..64].copy_from_slice(&self.unsafe_recovery_generation.to_le_bytes());
+        let _ = self.token.encode(&mut dst[64..64 + VB_TOKEN_LEN]);
+        VB_REPLY_LEN as i32
+    }
+
+    pub fn decode(src: &[u8]) -> Option<VipReply> {
+        if src.len() < VB_REPLY_LEN || src[5] > 1 {
+            return None;
+        }
+        let mut r = VipReply::zero();
+        r.op = src[0];
+        r.status = src[1];
+        r.phase = src[2];
+        r.mode = src[3];
+        r.owner_count = src[4];
+        r.token_present = src[5] != 0;
+        r.key.copy_from_slice(&src[6..40]);
+        r.vip_epoch = u64_at(src, 40);
+        r.authority_generation = u64_at(src, 48);
+        r.unsafe_recovery_generation = u64_at(src, 56);
+        r.token = EmissionToken::decode(&src[64..64 + VB_TOKEN_LEN])?;
+        Some(r)
+    }
+}
+
+fn u32_at(src: &[u8], o: usize) -> u32 {
+    u32::from_le_bytes([src[o], src[o + 1], src[o + 2], src[o + 3]])
+}
+
+fn u64_at(src: &[u8], o: usize) -> u64 {
+    u64::from_le_bytes([
+        src[o],
+        src[o + 1],
+        src[o + 2],
+        src[o + 3],
+        src[o + 4],
+        src[o + 5],
+        src[o + 6],
+        src[o + 7],
+    ])
+}
+
+// ── Command builders (proposer side) ────────────────────────────────
+
+/// The binding key for `(service_id, family, prefix, prefix_len)`.
+pub fn vip_key(
+    service_id: &[u8; 16],
+    family: u8,
+    prefix: &[u8; 16],
+    prefix_len: u8,
+) -> [u8; VB_KEY] {
+    let mut k = [0u8; VB_KEY];
+    k[0..16].copy_from_slice(service_id);
+    k[16] = family;
+    k[17] = prefix_len;
+    k[18..34].copy_from_slice(prefix);
+    k
+}
+
+fn put_common(
+    dst: &mut [u8],
+    op: u8,
+    op_id: &[u8; VB_OP_ID],
+    key: &[u8; VB_KEY],
+    expected_epoch: u64,
+) -> usize {
+    dst[0] = op;
+    dst[1..17].copy_from_slice(op_id);
+    dst[17..51].copy_from_slice(key);
+    dst[51..59].copy_from_slice(&expected_epoch.to_le_bytes());
+    VB_COMMON_LEN
+}
+
+/// What a claim prepares: the mode, the host (under its boot
+/// incarnation) that will own the address, the advertisement policy and
+/// the interfaces/queues the token admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimPrepare {
+    pub mode: u8,
+    pub host: [u8; VB_HOST_ID],
+    pub boot: [u8; VB_BOOT_INCARNATION],
+    pub policy: [u8; VB_POLICY_ID],
+    pub allowed_interfaces: u32,
+}
+
+pub fn build_claim_prepare(
+    dst: &mut [u8],
+    op_id: &[u8; VB_OP_ID],
+    key: &[u8; VB_KEY],
+    expected_epoch: u64,
+    claim: &ClaimPrepare,
+) -> usize {
+    if dst.len() < VB_CLAIM_PREPARE_LEN || claim.mode > VB_MODE_ACTIVE_ACTIVE {
+        return 0;
+    }
+    let mut o = put_common(dst, VB_OP_CLAIM_PREPARE, op_id, key, expected_epoch);
+    dst[o] = claim.mode;
+    o += 1;
+    dst[o..o + 16].copy_from_slice(&claim.host);
+    o += 16;
+    dst[o..o + 16].copy_from_slice(&claim.boot);
+    o += 16;
+    dst[o..o + 16].copy_from_slice(&claim.policy);
+    o += 16;
+    dst[o..o + 4].copy_from_slice(&claim.allowed_interfaces.to_le_bytes());
+    VB_CLAIM_PREPARE_LEN
+}
+
+/// ABORT, INSTALLED, ADVERTISED and ACTIVE: a bare step.
+pub fn build_step(
+    dst: &mut [u8],
+    op: u8,
+    op_id: &[u8; VB_OP_ID],
+    key: &[u8; VB_KEY],
+    expected_epoch: u64,
+) -> usize {
+    if dst.len() < VB_STEP_LEN
+        || !matches!(
+            op,
+            VB_OP_ABORT | VB_OP_INSTALLED | VB_OP_ADVERTISED | VB_OP_ACTIVE
+        )
+    {
+        return 0;
+    }
+    put_common(dst, op, op_id, key, expected_epoch)
+}
+
+/// FENCE_REQUEST, WITHDRAW, DISABLE and RELEASE: a step naming a host.
+pub fn build_host_step(
+    dst: &mut [u8],
+    op: u8,
+    op_id: &[u8; VB_OP_ID],
+    key: &[u8; VB_KEY],
+    expected_epoch: u64,
+    host: &[u8; VB_HOST_ID],
+) -> usize {
+    if dst.len() < VB_HOST_STEP_LEN
+        || !matches!(
+            op,
+            VB_OP_FENCE_REQUEST | VB_OP_WITHDRAW | VB_OP_DISABLE | VB_OP_RELEASE
+        )
+    {
+        return 0;
+    }
+    let o = put_common(dst, op, op_id, key, expected_epoch);
+    dst[o..o + 16].copy_from_slice(host);
+    VB_HOST_STEP_LEN
+}
+
+/// `fence_gen` is the fence agent's custody generation (`MSG_ADDR_FENCED`);
+/// zero is never a generation.
+pub fn build_fence_confirm(
+    dst: &mut [u8],
+    op_id: &[u8; VB_OP_ID],
+    key: &[u8; VB_KEY],
+    expected_epoch: u64,
+    host: &[u8; VB_HOST_ID],
+    fence_gen: u32,
+) -> usize {
+    if dst.len() < VB_FENCE_CONFIRM_LEN || fence_gen == 0 {
+        return 0;
+    }
+    let o = put_common(dst, VB_OP_FENCE_CONFIRM, op_id, key, expected_epoch);
+    dst[o..o + 16].copy_from_slice(host);
+    dst[o + 16..o + 20].copy_from_slice(&fence_gen.to_le_bytes());
+    VB_FENCE_CONFIRM_LEN
+}
+
+pub fn build_activate(
+    dst: &mut [u8],
+    op_id: &[u8; VB_OP_ID],
+    key: &[u8; VB_KEY],
+    expected_epoch: u64,
+    ready_graph: bool,
+) -> usize {
+    if dst.len() < VB_ACTIVATE_LEN {
+        return 0;
+    }
+    let o = put_common(dst, VB_OP_ACTIVATE, op_id, key, expected_epoch);
+    dst[o] = ready_graph as u8;
+    VB_ACTIVATE_LEN
+}
+
+pub fn build_recovery_mark(dst: &mut [u8], op_id: &[u8; VB_OP_ID], generation: u64) -> usize {
+    if dst.len() < VB_RECOVERY_MARK_LEN {
+        return 0;
+    }
+    dst[0] = VB_OP_RECOVERY_MARK;
+    dst[1..17].copy_from_slice(op_id);
+    dst[17..25].copy_from_slice(&generation.to_le_bytes());
+    VB_RECOVERY_MARK_LEN
+}
+
+pub fn build_seed(dst: &mut [u8], op_id: &[u8; VB_OP_ID], seed: &[u8; VB_SEED]) -> usize {
+    if dst.len() < VB_SEED_LEN || *seed == [0; VB_SEED] {
+        return 0;
+    }
+    dst[0] = VB_OP_SEED;
+    dst[1..17].copy_from_slice(op_id);
+    dst[17..49].copy_from_slice(seed);
+    VB_SEED_LEN
+}
+
+// ── State ───────────────────────────────────────────────────────────
+
+/// The last operation a record (or the registry) answered: the whole
+/// command body, so a retry is recognised by comparing bytes — never by a
+/// hash, which a different command could collide with and be answered as
+/// if it had applied — and the reply to repeat to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct VipOpMemo {
+    pub present: bool,
+    pub cmd_len: u8,
+    pub cmd: [u8; VB_MAX_CMD],
+    pub reply: VipReply,
+}
+
+impl VipOpMemo {
+    /// `[present:1][cmd_len:1][cmd: VB_MAX_CMD][reply: VB_REPLY_LEN]`.
+    pub const LEN: usize = 1 + 1 + VB_MAX_CMD + VB_REPLY_LEN;
+
+    pub const fn empty() -> Self {
+        VipOpMemo {
+            present: false,
+            cmd_len: 0,
+            cmd: [0; VB_MAX_CMD],
+            reply: VipReply::zero(),
+        }
+    }
+
+    /// `Some(reply)` for a byte-identical retry; `Err(())` for a
+    /// conflicting reuse of the operation id; `Ok(None)` for a new
+    /// operation. `body` carries its operation id at `[1..17]`.
+    fn check(&self, body: &[u8]) -> Result<Option<VipReply>, ()> {
+        if !self.present || self.cmd[1..17] != body[1..17] {
+            return Ok(None);
+        }
+        if self.cmd_len as usize == body.len() && self.cmd[..body.len()] == *body {
+            return Ok(Some(self.reply));
+        }
+        Err(())
+    }
+
+    fn record(&mut self, body: &[u8], reply: VipReply) {
+        let n = body.len().min(VB_MAX_CMD);
+        self.cmd = [0; VB_MAX_CMD];
+        self.cmd[..n].copy_from_slice(&body[..n]);
+        self.cmd_len = n as u8;
+        self.present = true;
+        self.reply = reply;
+    }
+
+    fn encode(&self, dst: &mut [u8]) {
+        dst[0] = self.present as u8;
+        dst[1] = self.cmd_len;
+        dst[2..2 + VB_MAX_CMD].copy_from_slice(&self.cmd);
+        let _ = self
+            .reply
+            .encode(&mut dst[2 + VB_MAX_CMD..2 + VB_MAX_CMD + VB_REPLY_LEN]);
+    }
+
+    fn decode(src: &[u8]) -> Option<VipOpMemo> {
+        if src[0] > 1 || src[1] as usize > VB_MAX_CMD {
+            return None;
+        }
+        let mut m = VipOpMemo::empty();
+        m.present = src[0] != 0;
+        m.cmd_len = src[1];
+        m.cmd.copy_from_slice(&src[2..2 + VB_MAX_CMD]);
+        m.reply = VipReply::decode(&src[2 + VB_MAX_CMD..2 + VB_MAX_CMD + VB_REPLY_LEN])?;
+        Some(m)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct VipSlot {
+    pub used: bool,
+    pub voided: bool,
+    pub mode: u8,
+    pub phase: u8,
+    /// Phase the record held when the in-flight claim was made; ABORT
+    /// returns to it.
+    pub prior_phase: u8,
+    pub owner_count: u8,
+    pub prepared_count: u8,
+    pub previous_count: u8,
+    pub fence_count: u8,
+    pub key: [u8; VB_KEY],
+    pub vip_epoch: u64,
+    /// Bumped by every ACTIVATE; tokens name it.
+    pub authority_generation: u64,
+    /// The vip epoch the current owners' tokens were minted under (an
+    /// aborted later claim does not invalidate them).
+    pub token_epoch: u64,
+    /// Registry recovery generation at the last ACTIVATE.
+    pub unsafe_recovery_generation: u64,
+    pub allowed_interfaces: u32,
+    pub advertisement_policy_id: [u8; VB_POLICY_ID],
+    pub owners: [[u8; VB_HOST_ID]; VB_MAX_OWNERS],
+    pub owner_boot: [[u8; VB_BOOT_INCARNATION]; VB_MAX_OWNERS],
+    pub prepared: [[u8; VB_HOST_ID]; VB_MAX_OWNERS],
+    pub prepared_boot: [[u8; VB_BOOT_INCARNATION]; VB_MAX_OWNERS],
+    /// Owners the in-flight claim replaces: each needs a confirmed fence.
+    pub previous_owners: [[u8; VB_HOST_ID]; VB_MAX_OWNERS],
+    pub fenced_hosts: [[u8; VB_HOST_ID]; VB_MAX_OWNERS],
+    pub fence_gens: [u32; VB_MAX_OWNERS],
+    pub last_op: VipOpMemo,
+}
+
+impl VipSlot {
+    pub const fn empty() -> Self {
+        VipSlot {
+            used: false,
+            voided: false,
+            mode: VB_MODE_ACTIVE_PASSIVE,
+            phase: VB_PHASE_UNASSIGNED,
+            prior_phase: VB_PHASE_UNASSIGNED,
+            owner_count: 0,
+            prepared_count: 0,
+            previous_count: 0,
+            fence_count: 0,
+            key: [0; VB_KEY],
+            vip_epoch: 0,
+            authority_generation: 0,
+            token_epoch: 0,
+            unsafe_recovery_generation: 0,
+            allowed_interfaces: 0,
+            advertisement_policy_id: [0; VB_POLICY_ID],
+            owners: [[0; VB_HOST_ID]; VB_MAX_OWNERS],
+            owner_boot: [[0; VB_BOOT_INCARNATION]; VB_MAX_OWNERS],
+            prepared: [[0; VB_HOST_ID]; VB_MAX_OWNERS],
+            prepared_boot: [[0; VB_BOOT_INCARNATION]; VB_MAX_OWNERS],
+            previous_owners: [[0; VB_HOST_ID]; VB_MAX_OWNERS],
+            fenced_hosts: [[0; VB_HOST_ID]; VB_MAX_OWNERS],
+            fence_gens: [0; VB_MAX_OWNERS],
+            last_op: VipOpMemo::empty(),
+        }
+    }
+
+    fn owner_index(&self, host: &[u8; VB_HOST_ID]) -> Option<usize> {
+        (0..self.owner_count as usize).find(|&i| self.owners[i] == *host)
+    }
+
+    fn is_previous(&self, host: &[u8; VB_HOST_ID]) -> bool {
+        (0..self.previous_count as usize).any(|i| self.previous_owners[i] == *host)
+    }
+
+    fn fence_index(&self, host: &[u8; VB_HOST_ID]) -> Option<usize> {
+        (0..self.fence_count as usize).find(|&i| self.fenced_hosts[i] == *host)
+    }
+
+    fn every_previous_fenced(&self) -> bool {
+        (0..self.previous_count as usize)
+            .all(|i| self.fence_index(&self.previous_owners[i]).is_some())
+    }
+
+    /// Whether the current owners may source the address: from the commit
+    /// that made them owners until DISABLE ends their emission. A takeover
+    /// claim in flight leaves them that authority until its own commit —
+    /// unless the claim began after they had disabled emission, which is
+    /// why such a claim needs no fence.
+    fn owners_emit(&self) -> bool {
+        let emitting = |p: u8| (VB_PHASE_OWNER_COMMITTED..=VB_PHASE_WITHDRAWN).contains(&p);
+        match self.phase {
+            VB_PHASE_PREPARING_NEW | VB_PHASE_FENCING_OLD => emitting(self.prior_phase),
+            p => emitting(p),
+        }
+    }
+
+    fn clear_claim(&mut self) {
+        self.prepared = [[0; VB_HOST_ID]; VB_MAX_OWNERS];
+        self.prepared_boot = [[0; VB_BOOT_INCARNATION]; VB_MAX_OWNERS];
+        self.prepared_count = 0;
+        self.previous_owners = [[0; VB_HOST_ID]; VB_MAX_OWNERS];
+        self.previous_count = 0;
+        self.clear_fences();
+    }
+
+    fn clear_fences(&mut self) {
+        self.fenced_hosts = [[0; VB_HOST_ID]; VB_MAX_OWNERS];
+        self.fence_gens = [0; VB_MAX_OWNERS];
+        self.fence_count = 0;
+    }
+
+    fn remove_owner(&mut self, i: usize) {
+        let n = self.owner_count as usize;
+        let mut j = i;
+        while j + 1 < n {
+            self.owners[j] = self.owners[j + 1];
+            self.owner_boot[j] = self.owner_boot[j + 1];
+            j += 1;
+        }
+        self.owners[n - 1] = [0; VB_HOST_ID];
+        self.owner_boot[n - 1] = [0; VB_BOOT_INCARNATION];
+        self.owner_count -= 1;
+    }
+
+    /// Snapshot record layout (fixed `VB_SLOT_SNAP_LEN`): the scalar
+    /// fields in declaration order, then the host tables, then the memo.
+    fn encode(&self, dst: &mut [u8]) {
+        dst[0] = self.used as u8;
+        dst[1] = self.voided as u8;
+        dst[2] = self.mode;
+        dst[3] = self.phase;
+        dst[4] = self.prior_phase;
+        dst[5] = self.owner_count;
+        dst[6] = self.prepared_count;
+        dst[7] = self.previous_count;
+        dst[8] = self.fence_count;
+        dst[9..12].copy_from_slice(&[0; 3]);
+        dst[12..46].copy_from_slice(&self.key);
+        dst[46..48].copy_from_slice(&[0; 2]);
+        dst[48..56].copy_from_slice(&self.vip_epoch.to_le_bytes());
+        dst[56..64].copy_from_slice(&self.authority_generation.to_le_bytes());
+        dst[64..72].copy_from_slice(&self.token_epoch.to_le_bytes());
+        dst[72..80].copy_from_slice(&self.unsafe_recovery_generation.to_le_bytes());
+        dst[80..84].copy_from_slice(&self.allowed_interfaces.to_le_bytes());
+        dst[84..100].copy_from_slice(&self.advertisement_policy_id);
+        let mut o = 100;
+        let tables: [&[[u8; 16]; VB_MAX_OWNERS]; 6] = [
+            &self.owners,
+            &self.owner_boot,
+            &self.prepared,
+            &self.prepared_boot,
+            &self.previous_owners,
+            &self.fenced_hosts,
+        ];
+        for t in tables {
+            for h in t {
+                dst[o..o + 16].copy_from_slice(h);
+                o += 16;
+            }
+        }
+        for g in &self.fence_gens {
+            dst[o..o + 4].copy_from_slice(&g.to_le_bytes());
+            o += 4;
+        }
+        self.last_op.encode(&mut dst[o..o + VipOpMemo::LEN]);
+    }
+
+    fn decode(src: &[u8]) -> Option<VipSlot> {
+        let mut s = VipSlot::empty();
+        if src[0] > 1
+            || src[1] > 1
+            || src[2] > VB_MODE_ACTIVE_ACTIVE
+            || src[3] > VB_PHASE_RELEASED
+            || src[4] > VB_PHASE_RELEASED
+            || src[5..9].iter().any(|&c| c as usize > VB_MAX_OWNERS)
+        {
+            return None;
+        }
+        s.used = src[0] != 0;
+        s.voided = src[1] != 0;
+        s.mode = src[2];
+        s.phase = src[3];
+        s.prior_phase = src[4];
+        s.owner_count = src[5];
+        s.prepared_count = src[6];
+        s.previous_count = src[7];
+        s.fence_count = src[8];
+        s.key.copy_from_slice(&src[12..46]);
+        s.vip_epoch = u64_at(src, 48);
+        s.authority_generation = u64_at(src, 56);
+        s.token_epoch = u64_at(src, 64);
+        s.unsafe_recovery_generation = u64_at(src, 72);
+        s.allowed_interfaces = u32_at(src, 80);
+        s.advertisement_policy_id.copy_from_slice(&src[84..100]);
+        let mut o = 100;
+        {
+            let tables: [&mut [[u8; 16]; VB_MAX_OWNERS]; 6] = [
+                &mut s.owners,
+                &mut s.owner_boot,
+                &mut s.prepared,
+                &mut s.prepared_boot,
+                &mut s.previous_owners,
+                &mut s.fenced_hosts,
+            ];
+            for t in tables {
+                for h in t.iter_mut() {
+                    h.copy_from_slice(&src[o..o + 16]);
+                    o += 16;
+                }
+            }
+        }
+        for g in &mut s.fence_gens {
+            *g = u32_at(src, o);
+            o += 4;
+        }
+        s.last_op = VipOpMemo::decode(&src[o..o + VipOpMemo::LEN])?;
+        Some(s)
+    }
+}
+
+/// The replicated state machine. `N` is the binding arena (a power of two).
+#[repr(C)]
+pub struct VipRegistry<const N: usize> {
+    pub slots: [VipSlot; N],
+    /// binding key → slot. Derived; rebuilt on restore.
+    index: SlotIndex<N, VB_KEY>,
+    /// Which slots hold a binding; a new key takes the lowest free one.
+    /// Derived; rebuilt on restore.
+    occupied: SlotSet<N>,
+    pub admitted: u32,
+    pub live: u32,
+    /// Monotone; bumped by RECOVERY_MARK. Every token names the value it
+    /// was minted under and fails closed when behind.
+    pub unsafe_recovery_generation: u64,
+    pub applied: u64,
+    /// Capability seed: all-zero until seeded (ACTIVATE is NOT_READY).
+    pub seed: [u8; VB_SEED],
+    pub last_op: VipOpMemo,
+}
+
+impl<const N: usize> Default for VipRegistry<N> {
+    fn default() -> Self {
+        Self::new(&[0; VB_SEED])
+    }
+}
+
+impl<const N: usize> VipRegistry<N> {
+    const PROFILE_OK: () = assert!(N.is_power_of_two(), "vip profile: N must be a power of two");
+
+    /// `seed` is the capability seed — in deployment the kernel CSPRNG's
+    /// 32 bytes, replicated by the module through SEED so every replica
+    /// mints the same tokens; all-zero means "not yet seeded".
+    pub const fn new(seed: &[u8; VB_SEED]) -> Self {
+        let () = Self::PROFILE_OK;
+        VipRegistry {
+            slots: [VipSlot::empty(); N],
+            index: SlotIndex::new(),
+            occupied: SlotSet::new(),
+            admitted: N as u32,
+            live: 0,
+            unsafe_recovery_generation: 0,
+            applied: 0,
+            seed: *seed,
+            last_op: VipOpMemo::empty(),
+        }
+    }
+
+    /// Initialise in place, admitting `admitted` bindings (clamped to
+    /// `N`), unseeded: every byte of the state, so it is what makes a raw
+    /// state block a registry.
+    pub fn reset(&mut self, admitted: u32) {
+        let () = Self::PROFILE_OK;
+        let mut i = 0;
+        while i < N {
+            self.slots[i] = VipSlot::empty();
+            i += 1;
+        }
+        self.index.reset();
+        self.occupied.reset();
+        self.admitted = if admitted as usize > N {
+            N as u32
+        } else {
+            admitted
+        };
+        self.clear_counters();
+    }
+
+    /// Empty an initialised registry, keeping what it admits; the seed is
+    /// cleared with the rest (an installed image carries its own). A free
+    /// slot is always `VipSlot::empty()`, so only the occupied ones are
+    /// cleared.
+    pub fn clear(&mut self) {
+        let mut at = 0;
+        while let Some(i) = self.occupied.next_used(at) {
+            self.slots[i] = VipSlot::empty();
+            at = i + 1;
+        }
+        self.index.reset();
+        self.occupied.reset();
+        self.clear_counters();
+    }
+
+    fn clear_counters(&mut self) {
+        self.live = 0;
+        self.unsafe_recovery_generation = 0;
+        self.applied = 0;
+        self.seed = [0; VB_SEED];
+        self.last_op = VipOpMemo::empty();
+    }
+
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    pub fn seeded(&self) -> bool {
+        self.seed != [0; VB_SEED]
+    }
+
+    fn find(&self, key: &[u8; VB_KEY]) -> Option<usize> {
+        self.index.find(key).map(|i| i as usize)
+    }
+
+    /// The slot a new binding takes: the lowest free one, while the
+    /// admitted count has room.
+    fn find_free(&self) -> Option<usize> {
+        if self.live >= self.admitted {
+            return None;
+        }
+        self.occupied.lowest_free()
+    }
+
+    pub fn lookup(&self, key: &[u8; VB_KEY]) -> Option<&VipSlot> {
+        self.find(key).map(|i| &self.slots[i])
+    }
+
+    fn reply(&self, op: u8, status: u8, slot: &VipSlot) -> VipReply {
+        VipReply {
+            op,
+            status,
+            phase: slot.phase,
+            mode: slot.mode,
+            owner_count: slot.owner_count,
+            token_present: false,
+            key: slot.key,
+            vip_epoch: slot.vip_epoch,
+            authority_generation: slot.authority_generation,
+            unsafe_recovery_generation: self.unsafe_recovery_generation,
+            token: EmissionToken::zero(),
+        }
+    }
+
+    fn reply_bare(&self, op: u8, status: u8, key: &[u8; VB_KEY]) -> VipReply {
+        VipReply {
+            op,
+            status,
+            key: *key,
+            unsafe_recovery_generation: self.unsafe_recovery_generation,
+            ..VipReply::zero()
+        }
+    }
+
+    /// Derive the token the current owner `host` of `key` holds (any
+    /// replica computes the same one), or `None` when the host is not a
+    /// committed, unvoided owner.
+    pub fn emission_token(
+        &self,
+        key: &[u8; VB_KEY],
+        host: &[u8; VB_HOST_ID],
+        digest: DigestFn,
+    ) -> Option<EmissionToken> {
+        let slot = self.lookup(key)?;
+        if slot.voided || !slot.owners_emit() || !self.seeded() {
+            return None;
+        }
+        let i = slot.owner_index(host)?;
+        Some(self.mint(slot, i, digest))
+    }
+
+    fn mint(&self, slot: &VipSlot, owner: usize, digest: DigestFn) -> EmissionToken {
+        let mut t = EmissionToken {
+            key: slot.key,
+            owner_host: slot.owners[owner],
+            boot_incarnation: slot.owner_boot[owner],
+            vip_epoch: slot.token_epoch,
+            authority_generation: slot.authority_generation,
+            unsafe_recovery_generation: slot.unsafe_recovery_generation,
+            allowed_interfaces: slot.allowed_interfaces,
+            capability: [0; VB_CAPABILITY],
+        };
+        let mut fields = [0u8; VB_TOKEN_FIELDS];
+        t.encode_fields(&mut fields);
+        t.capability = EmissionToken::capability_for(&self.seed, &fields, digest);
+        t
+    }
+
+    /// What a Fluxor `ip` / NIC provider or `route_announcer` asks before
+    /// sourcing an address or originating a prefix: is this token the
+    /// current authority? Fails closed (`Err(VB_ST_*)`) on a recovery
+    /// generation or vip epoch behind the registry's, a stale authority
+    /// generation, a host that is not a committed owner under that boot
+    /// incarnation, a voided or non-emitting phase, or a capability that
+    /// does not recompute from the replicated seed.
+    pub fn verify_emission_token(&self, token: &EmissionToken, digest: DigestFn) -> Result<(), u8> {
+        if !self.seeded() {
+            return Err(VB_ST_NOT_READY);
+        }
+        if token.unsafe_recovery_generation < self.unsafe_recovery_generation {
+            return Err(VB_ST_STALE_EPOCH);
+        }
+        if token.unsafe_recovery_generation > self.unsafe_recovery_generation {
+            return Err(VB_ST_FUTURE_EPOCH);
+        }
+        let Some(slot) = self.lookup(&token.key) else {
+            return Err(VB_ST_UNKNOWN_BINDING);
+        };
+        if slot.voided {
+            return Err(VB_ST_RECOVERY_VOID);
+        }
+        if slot.owner_count == 0 || !slot.owners_emit() {
+            return Err(VB_ST_UNSUPPORTED_STATE);
+        }
+        if token.vip_epoch < slot.token_epoch {
+            return Err(VB_ST_STALE_EPOCH);
+        }
+        if token.vip_epoch > slot.token_epoch {
+            return Err(VB_ST_FUTURE_EPOCH);
+        }
+        if token.authority_generation != slot.authority_generation {
+            return Err(VB_ST_STALE_EPOCH);
+        }
+        let Some(i) = slot.owner_index(&token.owner_host) else {
+            return Err(VB_ST_UNAUTHORIZED);
+        };
+        if slot.owner_boot[i] != token.boot_incarnation
+            || slot.allowed_interfaces != token.allowed_interfaces
+        {
+            return Err(VB_ST_UNAUTHORIZED);
+        }
+        let expect = self.mint(slot, i, digest);
+        if !ct_eq(&expect.capability, &token.capability) {
+            return Err(VB_ST_UNAUTHORIZED);
+        }
+        Ok(())
+    }
+
+    /// Apply one committed command body. DETERMINISTIC given `digest`.
+    pub fn apply(&mut self, body: &[u8], digest: DigestFn) -> VipReply {
+        self.applied = self.applied.wrapping_add(1);
+        if body.is_empty() {
+            return VipReply {
+                status: VB_ST_INVALID,
+                ..VipReply::zero()
+            };
+        }
+        let op = body[0];
+        match op {
+            VB_OP_RECOVERY_MARK | VB_OP_SEED => return self.apply_registry_op(body),
+            _ => {}
+        }
+        let want = match op {
+            VB_OP_CLAIM_PREPARE => VB_CLAIM_PREPARE_LEN,
+            VB_OP_ABORT | VB_OP_INSTALLED | VB_OP_ADVERTISED | VB_OP_ACTIVE => VB_STEP_LEN,
+            VB_OP_FENCE_REQUEST | VB_OP_WITHDRAW | VB_OP_DISABLE | VB_OP_RELEASE => {
+                VB_HOST_STEP_LEN
+            }
+            VB_OP_FENCE_CONFIRM => VB_FENCE_CONFIRM_LEN,
+            VB_OP_ACTIVATE => VB_ACTIVATE_LEN,
+            _ => {
+                return VipReply {
+                    op,
+                    status: VB_ST_INVALID,
+                    ..VipReply::zero()
+                }
+            }
+        };
+        if body.len() < want {
+            return VipReply {
+                op,
+                status: VB_ST_INVALID,
+                ..VipReply::zero()
+            };
+        }
+        let mut key = [0u8; VB_KEY];
+        key.copy_from_slice(&body[17..51]);
+        let expected = u64_at(body, 51);
+        let found = self.find(&key);
+        if let Some(i) = found {
+            match self.slots[i].last_op.check(body) {
+                Ok(Some(r)) => return r,
+                Ok(None) => {}
+                Err(()) => return self.reply(op, VB_ST_CONFLICT, &self.slots[i]),
+            }
+        }
+        let reply = if op == VB_OP_CLAIM_PREPARE {
+            self.apply_claim(body, found, &key, expected, digest)
+        } else {
+            let Some(i) = found else {
+                return self.reply_bare(op, VB_ST_UNKNOWN_BINDING, &key);
+            };
+            if self.slots[i].vip_epoch != expected {
+                self.reply(op, VB_ST_STALE_EPOCH, &self.slots[i])
+            } else {
+                match op {
+                    VB_OP_ABORT => self.apply_abort(i),
+                    VB_OP_FENCE_REQUEST => self.apply_fence_request(body, i),
+                    VB_OP_FENCE_CONFIRM => self.apply_fence_confirm(body, i),
+                    VB_OP_ACTIVATE => self.apply_activate(body, i, digest),
+                    VB_OP_INSTALLED | VB_OP_ADVERTISED | VB_OP_ACTIVE => self.apply_forward(op, i),
+                    _ => self.apply_host_step(op, body, i),
+                }
+            }
+        };
+        if let Some(i) = self.find(&key) {
+            self.slots[i].last_op.record(body, reply);
+        }
+        reply
+    }
+
+    fn apply_registry_op(&mut self, body: &[u8]) -> VipReply {
+        let op = body[0];
+        let want = if op == VB_OP_SEED {
+            VB_SEED_LEN
+        } else {
+            VB_RECOVERY_MARK_LEN
+        };
+        if body.len() < want {
+            return VipReply {
+                op,
+                status: VB_ST_INVALID,
+                ..VipReply::zero()
+            };
+        }
+        match self.last_op.check(body) {
+            Ok(Some(r)) => return r,
+            Ok(None) => {}
+            Err(()) => return self.reply_bare(op, VB_ST_CONFLICT, &[0; VB_KEY]),
+        }
+        let reply = if op == VB_OP_SEED {
+            // One seed per group's life: re-seeding would invalidate every
+            // token without a recovery generation to explain it.
+            let mut seed = [0u8; VB_SEED];
+            seed.copy_from_slice(&body[17..49]);
+            if self.seeded() || seed == [0; VB_SEED] {
+                self.reply_bare(op, VB_ST_CONFLICT, &[0; VB_KEY])
+            } else {
+                self.seed = seed;
+                self.reply_bare(op, VB_ST_OK, &[0; VB_KEY])
+            }
+        } else {
+            let generation = u64_at(body, 17);
+            if generation <= self.unsafe_recovery_generation {
+                self.reply_bare(op, VB_ST_RECOVERY_STALE, &[0; VB_KEY])
+            } else {
+                self.unsafe_recovery_generation = generation;
+                let mut voided = 0u64;
+                let mut at = 0;
+                while let Some(i) = self.occupied.next_used(at) {
+                    let s = &mut self.slots[i];
+                    if s.phase == VB_PHASE_FENCING_OLD {
+                        // The fences were evidence under the old
+                        // generation; the claim re-fences.
+                        s.phase = VB_PHASE_PREPARING_NEW;
+                        s.clear_fences();
+                    } else if s.phase >= VB_PHASE_OWNER_COMMITTED && s.phase < VB_PHASE_RELEASED {
+                        s.voided = true;
+                        voided += 1;
+                    }
+                    at = i + 1;
+                }
+                let mut r = self.reply_bare(op, VB_ST_OK, &[0; VB_KEY]);
+                // A registry-level reply names no binding; its epoch field
+                // carries how many bindings the recovery voided.
+                r.vip_epoch = voided;
+                r
+            }
+        };
+        self.last_op.record(body, reply);
+        reply
+    }
+
+    fn apply_claim(
+        &mut self,
+        body: &[u8],
+        found: Option<usize>,
+        key: &[u8; VB_KEY],
+        expected: u64,
+        _digest: DigestFn,
+    ) -> VipReply {
+        let mode = body[59];
+        let mut host = [0u8; VB_HOST_ID];
+        host.copy_from_slice(&body[60..76]);
+        let mut boot = [0u8; VB_BOOT_INCARNATION];
+        boot.copy_from_slice(&body[76..92]);
+        let mut policy = [0u8; VB_POLICY_ID];
+        policy.copy_from_slice(&body[92..108]);
+        let allowed = u32_at(body, 108);
+        if mode > VB_MODE_ACTIVE_ACTIVE
+            || host == [0; VB_HOST_ID]
+            || boot == [0; VB_BOOT_INCARNATION]
+        {
+            return self.reply_bare(VB_OP_CLAIM_PREPARE, VB_ST_INVALID, key);
+        }
+        let i = match found {
+            Some(i) => i,
+            None => {
+                if expected != 0 {
+                    return self.reply_bare(VB_OP_CLAIM_PREPARE, VB_ST_STALE_EPOCH, key);
+                }
+                let Some(i) = self.find_free() else {
+                    return self.reply_bare(VB_OP_CLAIM_PREPARE, VB_ST_CAPACITY, key);
+                };
+                if !self.index.insert(key, i as u32) {
+                    return self.reply_bare(VB_OP_CLAIM_PREPARE, VB_ST_CAPACITY, key);
+                }
+                self.occupied.mark(i);
+                self.slots[i] = VipSlot::empty();
+                self.slots[i].used = true;
+                self.slots[i].key = *key;
+                self.slots[i].mode = mode;
+                self.live += 1;
+                i
+            }
+        };
+        let recovery = self.unsafe_recovery_generation;
+        let slot = &mut self.slots[i];
+        if slot.vip_epoch != expected {
+            return Self::reply_of(recovery, VB_OP_CLAIM_PREPARE, VB_ST_STALE_EPOCH, slot);
+        }
+        if slot.mode != mode {
+            return Self::reply_of(recovery, VB_OP_CLAIM_PREPARE, VB_ST_INVALID, slot);
+        }
+        match slot.phase {
+            VB_PHASE_PREPARING_NEW | VB_PHASE_FENCING_OLD => {
+                // A claim in flight: abort it first.
+                return Self::reply_of(
+                    recovery,
+                    VB_OP_CLAIM_PREPARE,
+                    VB_ST_UNSUPPORTED_STATE,
+                    slot,
+                );
+            }
+            _ => {}
+        }
+        let owned = slot.phase >= VB_PHASE_OWNER_COMMITTED && slot.phase < VB_PHASE_RELEASED;
+        let adding = owned && slot.mode == VB_MODE_ACTIVE_ACTIVE && !slot.voided;
+        if adding && slot.owner_index(&host).is_some() {
+            return Self::reply_of(recovery, VB_OP_CLAIM_PREPARE, VB_ST_INVALID, slot);
+        }
+        if adding && slot.owner_count as usize + 1 > VB_MAX_OWNERS {
+            return Self::reply_of(recovery, VB_OP_CLAIM_PREPARE, VB_ST_CAPACITY, slot);
+        }
+        slot.clear_claim();
+        // Previous owners: the hosts this claim displaces. Adding to an
+        // active/active set displaces nobody; a predecessor that disabled
+        // emission gracefully acknowledged its own cutoff.
+        if owned && !adding && slot.phase != VB_PHASE_EMISSION_DISABLED {
+            slot.previous_owners = slot.owners;
+            slot.previous_count = slot.owner_count;
+        }
+        slot.prior_phase = slot.phase;
+        slot.prepared[0] = host;
+        slot.prepared_boot[0] = boot;
+        slot.prepared_count = 1;
+        slot.advertisement_policy_id = policy;
+        slot.allowed_interfaces = allowed;
+        slot.vip_epoch += 1;
+        slot.phase = VB_PHASE_PREPARING_NEW;
+        Self::reply_of(recovery, VB_OP_CLAIM_PREPARE, VB_ST_OK, slot)
+    }
+
+    fn reply_of(recovery: u64, op: u8, status: u8, slot: &VipSlot) -> VipReply {
+        VipReply {
+            op,
+            status,
+            phase: slot.phase,
+            mode: slot.mode,
+            owner_count: slot.owner_count,
+            token_present: false,
+            key: slot.key,
+            vip_epoch: slot.vip_epoch,
+            authority_generation: slot.authority_generation,
+            unsafe_recovery_generation: recovery,
+            token: EmissionToken::zero(),
+        }
+    }
+
+    fn apply_abort(&mut self, i: usize) -> VipReply {
+        let recovery = self.unsafe_recovery_generation;
+        let slot = &mut self.slots[i];
+        if slot.phase != VB_PHASE_PREPARING_NEW && slot.phase != VB_PHASE_FENCING_OLD {
+            // Past commit a claim completes forward.
+            return Self::reply_of(recovery, VB_OP_ABORT, VB_ST_UNSUPPORTED_STATE, slot);
+        }
+        slot.clear_claim();
+        slot.phase = slot.prior_phase;
+        Self::reply_of(recovery, VB_OP_ABORT, VB_ST_OK, slot)
+    }
+
+    fn apply_fence_request(&mut self, body: &[u8], i: usize) -> VipReply {
+        let recovery = self.unsafe_recovery_generation;
+        let mut host = [0u8; VB_HOST_ID];
+        host.copy_from_slice(&body[59..75]);
+        let slot = &mut self.slots[i];
+        if slot.phase != VB_PHASE_PREPARING_NEW && slot.phase != VB_PHASE_FENCING_OLD {
+            return Self::reply_of(recovery, VB_OP_FENCE_REQUEST, VB_ST_UNSUPPORTED_STATE, slot);
+        }
+        if host != [0; VB_HOST_ID] && !slot.is_previous(&host) {
+            return Self::reply_of(recovery, VB_OP_FENCE_REQUEST, VB_ST_INVALID, slot);
+        }
+        slot.phase = VB_PHASE_FENCING_OLD;
+        Self::reply_of(recovery, VB_OP_FENCE_REQUEST, VB_ST_OK, slot)
+    }
+
+    fn apply_fence_confirm(&mut self, body: &[u8], i: usize) -> VipReply {
+        let recovery = self.unsafe_recovery_generation;
+        let mut host = [0u8; VB_HOST_ID];
+        host.copy_from_slice(&body[59..75]);
+        let fence_gen = u32_at(body, 75);
+        let slot = &mut self.slots[i];
+        // A fence is evidence about a previous owner of a claim being
+        // fenced, or about a current owner of an active/active set being
+        // removed; anything else is not a fence this record can use.
+        let fencing_claim = slot.phase == VB_PHASE_FENCING_OLD && slot.is_previous(&host);
+        let removing = slot.mode == VB_MODE_ACTIVE_ACTIVE
+            && slot.phase == VB_PHASE_ACTIVE
+            && !slot.voided
+            && slot.owner_index(&host).is_some();
+        if fence_gen == 0 || !(fencing_claim || removing) {
+            return Self::reply_of(recovery, VB_OP_FENCE_CONFIRM, VB_ST_INVALID, slot);
+        }
+        if let Some(k) = slot.fence_index(&host) {
+            slot.fence_gens[k] = fence_gen;
+        } else {
+            let k = slot.fence_count as usize;
+            if k >= VB_MAX_OWNERS {
+                return Self::reply_of(recovery, VB_OP_FENCE_CONFIRM, VB_ST_CAPACITY, slot);
+            }
+            slot.fenced_hosts[k] = host;
+            slot.fence_gens[k] = fence_gen;
+            slot.fence_count += 1;
+        }
+        Self::reply_of(recovery, VB_OP_FENCE_CONFIRM, VB_ST_OK, slot)
+    }
+
+    fn apply_activate(&mut self, body: &[u8], i: usize, digest: DigestFn) -> VipReply {
+        let recovery = self.unsafe_recovery_generation;
+        let ready = body[59] != 0;
+        let seeded = self.seeded();
+        let slot = &mut self.slots[i];
+        if slot.phase != VB_PHASE_FENCING_OLD {
+            return Self::reply_of(recovery, VB_OP_ACTIVATE, VB_ST_UNSUPPORTED_STATE, slot);
+        }
+        if !ready || !seeded {
+            return Self::reply_of(recovery, VB_OP_ACTIVATE, VB_ST_NOT_READY, slot);
+        }
+        if !slot.every_previous_fenced() {
+            return Self::reply_of(recovery, VB_OP_ACTIVATE, VB_ST_BLOCKED_FENCE, slot);
+        }
+        if slot.prepared_count != 1 {
+            return Self::reply_of(recovery, VB_OP_ACTIVATE, VB_ST_INVARIANT_FAILURE, slot);
+        }
+        let keep_set =
+            slot.mode == VB_MODE_ACTIVE_ACTIVE && slot.previous_count == 0 && !slot.voided;
+        let owner = if keep_set {
+            let k = slot.owner_count as usize;
+            if k >= VB_MAX_OWNERS {
+                return Self::reply_of(recovery, VB_OP_ACTIVATE, VB_ST_CAPACITY, slot);
+            }
+            slot.owners[k] = slot.prepared[0];
+            slot.owner_boot[k] = slot.prepared_boot[0];
+            slot.owner_count += 1;
+            k
+        } else {
+            slot.owners = [[0; VB_HOST_ID]; VB_MAX_OWNERS];
+            slot.owner_boot = [[0; VB_BOOT_INCARNATION]; VB_MAX_OWNERS];
+            slot.owners[0] = slot.prepared[0];
+            slot.owner_boot[0] = slot.prepared_boot[0];
+            slot.owner_count = 1;
+            0
+        };
+        slot.clear_claim();
+        slot.authority_generation += 1;
+        slot.token_epoch = slot.vip_epoch;
+        slot.unsafe_recovery_generation = recovery;
+        slot.voided = false;
+        slot.phase = VB_PHASE_OWNER_COMMITTED;
+        let snapshot = *slot;
+        let token = self.mint(&snapshot, owner, digest);
+        let mut r = Self::reply_of(recovery, VB_OP_ACTIVATE, VB_ST_OK, &snapshot);
+        r.token_present = true;
+        r.token = token;
+        r
+    }
+
+    /// INSTALLED, ADVERTISED, ACTIVE: one step forward each.
+    fn apply_forward(&mut self, op: u8, i: usize) -> VipReply {
+        let recovery = self.unsafe_recovery_generation;
+        let slot = &mut self.slots[i];
+        let (from, to) = match op {
+            VB_OP_INSTALLED => (VB_PHASE_OWNER_COMMITTED, VB_PHASE_ADDRESS_INSTALLED),
+            VB_OP_ADVERTISED => (VB_PHASE_ADDRESS_INSTALLED, VB_PHASE_ADVERTISED),
+            _ => (VB_PHASE_ADVERTISED, VB_PHASE_ACTIVE),
+        };
+        if slot.voided {
+            return Self::reply_of(recovery, op, VB_ST_RECOVERY_VOID, slot);
+        }
+        if slot.phase != from {
+            return Self::reply_of(recovery, op, VB_ST_UNSUPPORTED_STATE, slot);
+        }
+        slot.phase = to;
+        Self::reply_of(recovery, op, VB_ST_OK, slot)
+    }
+
+    /// WITHDRAW (ACTIVE → DRAINING → WITHDRAWN), DISABLE (→
+    /// EMISSION_DISABLED), RELEASE (→ RELEASED; or, in an ACTIVE
+    /// active/active set, remove the fenced owner it names).
+    fn apply_host_step(&mut self, op: u8, body: &[u8], i: usize) -> VipReply {
+        let recovery = self.unsafe_recovery_generation;
+        let mut host = [0u8; VB_HOST_ID];
+        host.copy_from_slice(&body[59..75]);
+        let slot = &mut self.slots[i];
+        if slot.voided {
+            return Self::reply_of(recovery, op, VB_ST_RECOVERY_VOID, slot);
+        }
+        let removing_one = op == VB_OP_RELEASE
+            && slot.mode == VB_MODE_ACTIVE_ACTIVE
+            && slot.phase == VB_PHASE_ACTIVE
+            && host != [0; VB_HOST_ID];
+        if removing_one {
+            let Some(k) = slot.owner_index(&host) else {
+                return Self::reply_of(recovery, op, VB_ST_INVALID, slot);
+            };
+            if slot.owner_count < 2 {
+                return Self::reply_of(recovery, op, VB_ST_UNSUPPORTED_STATE, slot);
+            }
+            if slot.fence_index(&host).is_none() {
+                return Self::reply_of(recovery, op, VB_ST_BLOCKED_FENCE, slot);
+            }
+            slot.remove_owner(k);
+            slot.clear_fences();
+            return Self::reply_of(recovery, op, VB_ST_OK, slot);
+        }
+        if host != [0; VB_HOST_ID] && slot.owner_index(&host).is_none() {
+            return Self::reply_of(recovery, op, VB_ST_INVALID, slot);
+        }
+        let to = match (op, slot.phase) {
+            (VB_OP_WITHDRAW, VB_PHASE_ACTIVE) => VB_PHASE_DRAINING,
+            (VB_OP_WITHDRAW, VB_PHASE_DRAINING) => VB_PHASE_WITHDRAWN,
+            (VB_OP_DISABLE, VB_PHASE_WITHDRAWN) => VB_PHASE_EMISSION_DISABLED,
+            (VB_OP_RELEASE, VB_PHASE_EMISSION_DISABLED) => VB_PHASE_RELEASED,
+            _ => return Self::reply_of(recovery, op, VB_ST_UNSUPPORTED_STATE, slot),
+        };
+        slot.phase = to;
+        if to == VB_PHASE_RELEASED {
+            slot.owners = [[0; VB_HOST_ID]; VB_MAX_OWNERS];
+            slot.owner_boot = [[0; VB_BOOT_INCARNATION]; VB_MAX_OWNERS];
+            slot.owner_count = 0;
+            slot.clear_fences();
+        }
+        Self::reply_of(recovery, op, VB_ST_OK, slot)
+    }
+
+    // ── Snapshot (streamed, versioned) ──────────────────────────────
+    //
+    //   header [version:u16 = 2][reserved:u16][arena N:u32][admitted:u32]
+    //          [record_count:u32][unsafe_recovery_generation:u64]
+    //          [applied:u64][seed:32][last_op: VipOpMemo::LEN]
+    //   record [slot:u32][VipSlot: VB_SLOT_SNAP_LEN] × record_count
+
+    pub const SNAPSHOT_VERSION: u16 = 2;
+
+    pub fn snapshot_len(&self) -> usize {
+        VB_SNAP_HDR_LEN + self.live as usize * VB_SNAP_RECORD_LEN
+    }
+
+    pub fn snapshot(&self, dst: &mut [u8]) -> i32 {
+        if dst.len() < self.snapshot_len() {
+            return -1;
+        }
+        let mut cur = VbExportCursor::new();
+        let mut o = 0;
+        loop {
+            let n = self.export_next(&mut cur, &mut dst[o..]);
+            if n == 0 {
+                break;
+            }
+            o += n;
+        }
+        o as i32
+    }
+
+    pub fn export_next(&self, cur: &mut VbExportCursor, dst: &mut [u8]) -> usize {
+        if cur.stage == VB_EXPORT_RECORDS {
+            match self.occupied.next_used(cur.pos as usize) {
+                Some(i) => cur.pos = i as u32,
+                None => cur.stage = VB_EXPORT_DONE,
+            }
+        }
+        if dst.len() < VbInstaller::stage_len(cur.stage) {
+            return 0;
+        }
+        match cur.stage {
+            VB_EXPORT_HEADER => {
+                dst[0..2].copy_from_slice(&Self::SNAPSHOT_VERSION.to_le_bytes());
+                dst[2..4].copy_from_slice(&0u16.to_le_bytes());
+                dst[4..8].copy_from_slice(&(N as u32).to_le_bytes());
+                dst[8..12].copy_from_slice(&self.admitted.to_le_bytes());
+                dst[12..16].copy_from_slice(&self.live.to_le_bytes());
+                dst[16..24].copy_from_slice(&self.unsafe_recovery_generation.to_le_bytes());
+                dst[24..32].copy_from_slice(&self.applied.to_le_bytes());
+                dst[32..64].copy_from_slice(&self.seed);
+                self.last_op.encode(&mut dst[64..64 + VipOpMemo::LEN]);
+                cur.stage = VB_EXPORT_RECORDS;
+                cur.pos = 0;
+                VB_SNAP_HDR_LEN
+            }
+            VB_EXPORT_RECORDS => {
+                dst[0..4].copy_from_slice(&cur.pos.to_le_bytes());
+                self.slots[cur.pos as usize].encode(&mut dst[4..4 + VB_SLOT_SNAP_LEN]);
+                cur.pos += 1;
+                VB_SNAP_RECORD_LEN
+            }
+            _ => 0,
+        }
+    }
+
+    pub fn restore(&mut self, src: &[u8]) -> bool {
+        let mut ins = self.install_begin();
+        let mut o = 0;
+        while o < src.len() {
+            match self.install_feed(&mut ins, &src[o..]) {
+                Ok(n) if n > 0 => o += n,
+                _ => break,
+            }
+        }
+        if o != src.len() {
+            ins.failed = true;
+        }
+        self.install_finish(&mut ins)
+    }
+
+    pub fn install_begin(&mut self) -> VbInstaller {
+        self.clear();
+        VbInstaller::new()
+    }
+
+    pub fn install_feed(
+        &mut self,
+        ins: &mut VbInstaller,
+        bytes: &[u8],
+    ) -> Result<usize, InstallRejected> {
+        if ins.failed {
+            return Err(InstallRejected);
+        }
+        let mut taken = 0;
+        while ins.stage != VB_EXPORT_DONE && taken < bytes.len() {
+            let want = VbInstaller::stage_len(ins.stage);
+            let need = want - ins.carry_len as usize;
+            let take = need.min(bytes.len() - taken);
+            ins.carry[ins.carry_len as usize..ins.carry_len as usize + take]
+                .copy_from_slice(&bytes[taken..taken + take]);
+            ins.carry_len += take as u16;
+            taken += take;
+            if (ins.carry_len as usize) < want {
+                break;
+            }
+            let ok = self.install_unit(ins);
+            ins.carry_len = 0;
+            if !ok {
+                ins.failed = true;
+                self.clear();
+                return Err(InstallRejected);
+            }
+        }
+        Ok(taken)
+    }
+
+    fn install_unit(&mut self, ins: &mut VbInstaller) -> bool {
+        let unit = ins.carry;
+        match ins.stage {
+            VB_EXPORT_HEADER => {
+                if u16::from_le_bytes([unit[0], unit[1]]) != Self::SNAPSHOT_VERSION
+                    || u32_at(&unit, 4) != N as u32
+                {
+                    return false;
+                }
+                let admitted = u32_at(&unit, 8);
+                let count = u32_at(&unit, 12);
+                if admitted != self.admitted || count > admitted {
+                    return false;
+                }
+                let Some(last_op) = VipOpMemo::decode(&unit[64..64 + VipOpMemo::LEN]) else {
+                    return false;
+                };
+                ins.expected = count;
+                self.unsafe_recovery_generation = u64_at(&unit, 16);
+                self.applied = u64_at(&unit, 24);
+                self.seed.copy_from_slice(&unit[32..64]);
+                self.last_op = last_op;
+                ins.stage = if count == 0 {
+                    VB_EXPORT_DONE
+                } else {
+                    VB_EXPORT_RECORDS
+                };
+                true
+            }
+            VB_EXPORT_RECORDS => {
+                let slot = u32_at(&unit, 0) as usize;
+                let Some(rec) = VipSlot::decode(&unit[4..4 + VB_SLOT_SNAP_LEN]) else {
+                    return false;
+                };
+                if slot >= N || !rec.used || self.occupied.is_used(slot) {
+                    return false;
+                }
+                if self.find(&rec.key).is_some() || !self.index.insert(&rec.key, slot as u32) {
+                    return false;
+                }
+                self.occupied.mark(slot);
+                self.slots[slot] = rec;
+                self.live += 1;
+                ins.seen += 1;
+                if ins.seen == ins.expected {
+                    ins.stage = VB_EXPORT_DONE;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn install_finish(&mut self, ins: &mut VbInstaller) -> bool {
+        let complete = !ins.failed && ins.stage == VB_EXPORT_DONE && ins.carry_len == 0;
+        if !complete {
+            ins.failed = true;
+            self.clear();
+        }
+        complete
+    }
+}
+
+/// Per-binding snapshot record (see `VipSlot::encode`): 100 scalar bytes,
+/// six 128-byte host tables, 32 bytes of fence generations, the memo.
+pub const VB_SLOT_SNAP_LEN: usize =
+    100 + 6 * 16 * VB_MAX_OWNERS + 4 * VB_MAX_OWNERS + VipOpMemo::LEN;
+pub const VB_SNAP_RECORD_LEN: usize = 4 + VB_SLOT_SNAP_LEN;
+pub const VB_SNAP_HDR_LEN: usize = 64 + VipOpMemo::LEN;
+pub const VB_SNAP_MAX_UNIT: usize = VB_SNAP_RECORD_LEN;
+
+pub const VB_EXPORT_HEADER: u8 = 0;
+pub const VB_EXPORT_RECORDS: u8 = 1;
+pub const VB_EXPORT_DONE: u8 = 2;
+
+/// A streamed install rejected the image; the registry is left cleared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InstallRejected;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct VbExportCursor {
+    pub stage: u8,
+    pub pos: u32,
+}
+
+impl Default for VbExportCursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VbExportCursor {
+    pub const fn new() -> Self {
+        VbExportCursor {
+            stage: VB_EXPORT_HEADER,
+            pos: 0,
+        }
+    }
+
+    pub fn done(&self) -> bool {
+        self.stage == VB_EXPORT_DONE
+    }
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct VbInstaller {
+    pub stage: u8,
+    pub failed: bool,
+    pub carry_len: u16,
+    pub expected: u32,
+    pub seen: u32,
+    pub carry: [u8; VB_SNAP_MAX_UNIT],
+}
+
+impl Default for VbInstaller {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VbInstaller {
+    pub const fn new() -> Self {
+        VbInstaller {
+            stage: VB_EXPORT_HEADER,
+            failed: false,
+            carry_len: 0,
+            expected: 0,
+            seen: 0,
+            carry: [0; VB_SNAP_MAX_UNIT],
+        }
+    }
+
+    pub fn done(&self) -> bool {
+        self.stage == VB_EXPORT_DONE && !self.failed
+    }
+
+    pub fn stage_len(stage: u8) -> usize {
+        match stage {
+            VB_EXPORT_HEADER => VB_SNAP_HDR_LEN,
+            VB_EXPORT_RECORDS => VB_SNAP_RECORD_LEN,
+            _ => 0,
+        }
+    }
+}

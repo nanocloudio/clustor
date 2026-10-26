@@ -37,7 +37,9 @@ absent so that "absent here is a bug" stays a checkable claim:
   `METRICS_CACHE_SLACK` delta, kept so the cap has one source rather
   than a second literal), `RESP_BODY_MAX` from the exchange contract
   record's own bounds, `SEND_STAGE_MAX` from
-  `ROUTE_FRAME_MAX`, `SR_MAX_CMD` from `SR_MAX_WRAPPED_KEY`,
+  `ROUTE_FRAME_MAX`, `SR_MAX_CMD` from `SR_MAX_WRAPPED_KEY`, `TR_MAX_CMD`
+  and `VB_MAX_CMD` from the transport and VIP command layouts, the session directory's `CMD_MAX`,
+  `SNAP_UNIT_MAX` and `REPLY_MAX` from the registries' own bounds,
   `SNAP_PTR_CANDIDATES` from `SNAP_PTR_SLOTS`, `FWD_FRAME_MAX` (one
   routed install frame the replicator holds) from `XFER_CHUNK_BODY`, and `EXPORT_TAIL_RECORDS`
   and `COMP_STEP_BUCKETS` from histogram bucket counts.
@@ -93,7 +95,7 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Non-voter auto-promotion lag | `VOTING_LAG_THRESHOLD` | modules/app/consensus/replicator.rs | — | Semantic; typed value 64 entries. How far behind a non-voting peer may be before it promotes to voting, which is when its `match_index` starts counting toward quorum. Smaller completes a joint transition sooner; larger biases toward "the new voter is genuinely caught up". |
 | Cached small HTTP envelopes | `ENVELOPE_CACHE` | modules/app/operations/http.rs | 1024 | Shape: bounds the cached `/readyz` and `/why` envelopes, which carry a single status byte. |
 | Snapshot verify read granularity | `SNAP_VERIFY_CHUNK` | modules/app/durability/snapshot.rs | 1024 | Shape: read granularity for the finalise-time CRC pass and the boot-time integrity check. A stack buffer, not module state — snapshot bodies are streamed, never held whole. |
-| Session-registry snapshot chunk | `SNAP_CHUNK` | modules/app/session_directory/mod.rs | 1024 | Shape: export chunk body. `SessionRegistry::SNAPSHOT_LEN` is ~13 KiB (64 session slots plus the timing section), so an export runs to fourteen chunks. |
+| Session-directory snapshot chunk | `SNAP_CHUNK` | modules/app/session_directory/mod.rs | 1024 | Shape: export chunk body. The image streams one record per live slot per namespace (~300 bytes a session, ~230 a flow, ~1.2 KiB a VIP binding) plus the timing section, so an idle rig exports in one chunk and a profile-sized export spans steps; the staging buffer is one chunk plus one unit, independent of the profile. |
 | Peer authority | `PEER_AUTHORITY_MAX` | modules/app/peer_router/mod.rs | 64 | Shape: the longest `host[:port]` a `peerN` parameter carries. A 63-byte DNS label with a port fits, which is the longest single label the wire allows; a longer value leaves that peer unconfigured rather than truncated, because a prefix of a name is a different host. One buffer per peer in module state, so the cost is `MAX_NODES × 64` B. |
 | Peer key fingerprint | `PEER_FP_MAX` | modules/app/peer_router/mod.rs | 32 | Shape: longest key fingerprint `MSG_PEER_IDENTITY` carries (SHA-256). |
 | Peer/client connection staging | `BUF_SIZE` | modules/app/peer_router/mod.rs | 8192 | Shape: per-connection staging, pinned to fluxor's `CHANNEL_BUFFER_SIZE` — nothing larger can transit a channel. Undersizing this drops frames silently at every hop (`channel_read_msg` discards oversized payloads, encoders return 0): followers wedge on the replication path and clients time out on the response path. |
@@ -136,11 +138,23 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Partitions a router will route to | `MAX_ROUTED_PARTITIONS` | modules/app/partition_router/mod.rs | 64 | Capacity: tracks the engine's `K_MAX`, and `num_partitions` is clamped to it at init. Deliberately not clamped to the port count — that would silently give a graph asking for 64 partitions four groups and leave sixty idle. |
 | Node-set identifier width | `NODE_SET_CAPACITY` | modules/common/types.rs | — | Typed value 8. This is the bitset envelope; active voters remain capped at `MAX_NODES` (7). |
 | Consumer facade default in-flight requests | `DEFAULT_INFLIGHT_CAPACITY` | modules/common/replica_facade.rs | 64 | Per-consumer backpressure table. Callers may select another capacity but must size correlation state and retry policy together. |
-| Sessions in the session registry | `SR_MAX_SESSIONS` | modules/common/session_registry.rs | 64 | Fixed-size replicated state; a BIND with no free slot is refused `SR_ST_NO_CAPACITY`. |
+| Session arena, RP2350 profile | `SR_PROFILE_RP2350` | modules/common/session_registry.rs | 64 | Capacity: the `rp2350` variant's static arena; a BIND past the admitted count is refused `SR_ST_NO_CAPACITY`. The `profile` parameter admits at most the variant's arena. |
+| Session arena, Pi 5 profile | `SR_PROFILE_PI5` | modules/common/session_registry.rs | 4096 | Capacity: the `pi5` variant's arena, one group's share of the Pi 5 paired-anchor envelope. |
+| Session arena, server profile | `SR_PROFILE_SERVER` | modules/common/session_registry.rs | 65536 | Capacity: the `server` variant's arena, one group's share of the server envelope. |
+| Deadline index, RP2350 profile | `SR_DEADLINES_RP2350` | modules/common/session_registry.rs | 128 | Capacity: two deadlines per session (a key TTL and a transfer grant), partitioned per owner so neither starves the other; a `KEY_PUT` or `GRANT_TRANSFER` whose deadline cannot register fails `SR_ST_DEADLINE_CAPACITY` without creating its object. |
+| Deadline index, Pi 5 profile | `SR_DEADLINES_PI5` | modules/common/session_registry.rs | 8192 | As above, sized to the Pi 5 arena. |
+| Deadline index, server profile | `SR_DEADLINES_SERVER` | modules/common/session_registry.rs | 131072 | As above, sized to the server arena. |
+| Standbys per protected flow | `TR_MAX_STANDBYS` | modules/common/transport_registry.rs | 3 | A BIND listing more is refused at encode and `TR_ST_INVALID` at apply; the reported fault tolerance is the number of current standbys, not this length. |
+| Flow arena, RP2350 profile | `TR_PROFILE_RP2350` | modules/common/transport_registry.rs | 64 | Capacity: a BIND past the admitted count is refused `TR_ST_NO_CAPACITY`. |
+| Flow arena, Pi 5 profile | `TR_PROFILE_PI5` | modules/common/transport_registry.rs | 4096 | Capacity, as above. |
+| Flow arena, server profile | `TR_PROFILE_SERVER` | modules/common/transport_registry.rs | 65536 | Capacity, as above. |
+| Owners, prepared hosts and fences per VIP binding | `VB_MAX_OWNERS` | modules/common/vip_registry.rs | 8 | Semantic: an active/active claim past eight owners is refused `VB_ST_CAPACITY`; a ninth fence confirmation likewise. |
+| VIP binding arena, RP2350 profile | `VB_PROFILE_RP2350` | modules/common/vip_registry.rs | 16 | Capacity: a claim for a new address past the admitted count is refused `VB_ST_CAPACITY`. VIP records are reserved independently of sessions, and a record lives as long as its group (a released binding keeps its epoch to refuse stale coordinators), so the arena bounds the distinct addresses a group ever claims. |
+| VIP binding arena, Pi 5 profile | `VB_PROFILE_PI5` | modules/common/vip_registry.rs | 1024 | Capacity, as above. |
+| VIP binding arena, server profile | `VB_PROFILE_SERVER` | modules/common/vip_registry.rs | 16384 | Capacity, as above. |
 | KEK-wrapped key blob | `SR_MAX_WRAPPED_KEY` | modules/common/session_registry.rs | 80 | A larger blob is refused at encode and at apply; the key is never stored. |
 | Pending session-directory proposals | `MAX_PENDING` | modules/app/session_directory/mod.rs | 16 | A full table leaves requests in the input channel. If the proposal channel fills after consumption, the request is dropped and the client must recover by reply-timeout retry; slots expire after 10 seconds. |
 | Deterministic-timing owners | `TM_MAX_OWNERS` | modules/common/timing.rs | 4 | Rejects another independently drained timing owner. |
-| Timing deadline slots | `TM_MAX_DEADLINES` | modules/common/timing.rs | 64 | A `KEY_PUT` whose TTL deadline cannot register fails `SR_ST_DEADLINE_CAPACITY` without storing the key. |
 | RBAC connection identities | `IDENTITY_SLOTS` | modules/app/operations/rbac.rs | 32 | Fail-closed capacity: a full table evicts its oldest binding, and with identity wired a connection with no binding is denied (never judged as `default_role`); the eviction is counted. Bindings die with their slot's revoke, so the table holds only connections that reported a verified identity and are still open. |
 | RBAC role keys | `ROLE_KEYS_MAX` | modules/app/operations/rbac.rs | 4 | Key fingerprints pinned per role (`operator_keyN`, `observer_keyN`); a fifth pins nothing. |
 | RBAC SVID prefix | `SVID_PREFIX_MAX` | modules/app/operations/rbac.rs | 64 | Identity matching sees at most this prefix; longer identities are truncated for role matching and require collision-safe provisioning. |
@@ -208,6 +222,7 @@ These deliberately defer work rather than refuse a finite workload:
 | WAL below-floor segment scan per step | `SCAN_RECORDS_PER_STEP` | modules/app/durability/wal.rs | 16 | Remaining records wait for another step. The scan cursor persists across steps and across served requests, so a sequential recovery resumes rather than rescanning from the segment start. |
 | WAL segment unlinks per step | `COMPACT_UNLINKS_PER_STEP` | modules/app/durability/wal.rs | 4 | Remaining deletions wait for another step. `FS_UNLINK` is synchronous, so `continue_compaction` paces a deep post-snapshot trim rather than unlinking the whole droppable range in one step. |
 | Deterministic-time drain batch | `TM_BATCH_MAX` | modules/common/timing.rs | 8 | Remaining deadlines wait for another committed drain. |
+| Reported due backlog | `TM_DUE_DEPTH_MAX` | modules/common/timing.rs | 256 | Shape: the due-depth gauge and `TimeApplied::due_remaining` saturate here. A backlog that deep already keeps the leader proposing `TimeDrain`; counting further would cost apply time in proportion to the backlog. Due work itself is unbounded by it. |
 
 Snapshot chunks are 4096 bytes as registered above. These values must be
 benchmarked with the 48-entry quorum window, the
@@ -327,11 +342,23 @@ MAX_LOCAL_PARTITIONS | modules/app/partition_router/mod.rs | 4
 MAX_ROUTED_PARTITIONS | modules/app/partition_router/mod.rs | 64
 NODE_SET_CAPACITY | modules/common/types.rs | 8
 DEFAULT_INFLIGHT_CAPACITY | modules/common/replica_facade.rs | 64
-SR_MAX_SESSIONS | modules/common/session_registry.rs | 64
+SR_PROFILE_RP2350 | modules/common/session_registry.rs | 64
+SR_PROFILE_PI5 | modules/common/session_registry.rs | 4096
+SR_PROFILE_SERVER | modules/common/session_registry.rs | 65536
+SR_DEADLINES_RP2350 | modules/common/session_registry.rs | 128
+SR_DEADLINES_PI5 | modules/common/session_registry.rs | 8192
+SR_DEADLINES_SERVER | modules/common/session_registry.rs | 131072
+TR_MAX_STANDBYS | modules/common/transport_registry.rs | 3
+TR_PROFILE_RP2350 | modules/common/transport_registry.rs | 64
+TR_PROFILE_PI5 | modules/common/transport_registry.rs | 4096
+TR_PROFILE_SERVER | modules/common/transport_registry.rs | 65536
+VB_MAX_OWNERS | modules/common/vip_registry.rs | 8
+VB_PROFILE_RP2350 | modules/common/vip_registry.rs | 16
+VB_PROFILE_PI5 | modules/common/vip_registry.rs | 1024
+VB_PROFILE_SERVER | modules/common/vip_registry.rs | 16384
 SR_MAX_WRAPPED_KEY | modules/common/session_registry.rs | 80
 MAX_PENDING | modules/app/session_directory/mod.rs | 16
 TM_MAX_OWNERS | modules/common/timing.rs | 4
-TM_MAX_DEADLINES | modules/common/timing.rs | 64
 IDENTITY_SLOTS | modules/app/operations/rbac.rs | 32
 ROLE_KEYS_MAX | modules/app/operations/rbac.rs | 4
 SVID_PREFIX_MAX | modules/app/operations/rbac.rs | 64
@@ -347,6 +374,7 @@ INCARNATION_STRIDE | modules/app/durability/wal_seal.rs | 64
 MASTER_CACHE | modules/app/durability/wal_seal.rs | 4
 SEEN_INCARNATIONS | modules/app/durability/wal_seal.rs | 16
 TM_BATCH_MAX | modules/common/timing.rs | 8
+TM_DUE_DEPTH_MAX | modules/common/timing.rs | 256
 ```
 
 The coverage half of the gate counts every ceiling-shaped `const` in a file
@@ -395,12 +423,22 @@ CLIENT_FRAME_MAX | modules/app/peer_router/mod.rs | -
 INB_STASH_MAX | modules/app/peer_router/mod.rs | -
 SEND_STAGE_MAX | modules/app/peer_router/mod.rs | -
 FWD_FRAME_MAX | modules/app/consensus/replicator.rs | -
+CMD_MAX | modules/app/session_directory/mod.rs | -
+SNAP_UNIT_MAX | modules/app/session_directory/mod.rs | -
+REPLY_MAX | modules/app/session_directory/mod.rs | -
 
 # Status codes. The convention keys on the NAME, and a reply status that
 # reports exhaustion reads as a capacity — these are values on the wire,
 # and nothing is bounded by them.
 SR_ST_NO_CAPACITY | modules/common/session_registry.rs | -
 SR_ST_DEADLINE_CAPACITY | modules/common/session_registry.rs | -
+TR_ST_NO_CAPACITY | modules/common/transport_registry.rs | -
+VB_ST_CAPACITY | modules/common/vip_registry.rs | -
+
+# Snapshot-stream stage tags. The convention keys on the NAME, and a stage
+# named for the records it streams reads as a count — this is a cursor
+# position, and nothing is bounded by it.
+SR_EXPORT_TIMING_ENTRIES | modules/common/session_registry.rs | -
 
 # Phase tags. The convention keys on the NAME, and a phase named for what
 # it loads reads as a slot count — this is a state value, and nothing is

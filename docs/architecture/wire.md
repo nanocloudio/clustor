@@ -229,7 +229,11 @@ per-module parser.
 `MSG_PLACEMENT_UPDATE` (0x80); `MSG_SR_REQUEST` (0x90) and
 `MSG_SR_REPLY` (0x91), the replicated session-registry boundary of
 `modules/app/session_directory` — a reply is sent only after the
-command is quorum-committed and applied; `MSG_PLACEMENT_EPOCH_EVENT`
+command is quorum-committed and applied; `MSG_TR_REQUEST` (0x92) /
+`MSG_TR_REPLY` (0x93) and `MSG_VB_REQUEST` (0x94) / `MSG_VB_REPLY`
+(0x95), the same boundary for the directory's transport and VIP
+namespaces (`[request_id:u64 LE][command body]` / `[request_id:u64
+LE][reply]`, see `architecture/session_directory.md`); `MSG_PLACEMENT_EPOCH_EVENT`
 (0xD5, `[kpg_id:u16][new_epoch:u32][reason:u8]`);
 `MSG_COMPACTION_FLOOR` (0xE1, `[kpg_id:u16][floor_revision:u64]`);
 `MSG_CLIENT_FRAME` (0xEA, `[conn_id:u16 LE][raw client bytes]`, the

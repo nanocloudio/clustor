@@ -173,7 +173,8 @@ strip = "symbols"
 name = "facade"
 path = "tests/facade.rs"
 
-# Ring-vs-binary telemetry parity (kernel-ring convergence R5 gate). Its own
+# Ring-vs-binary telemetry parity (the kernel-ring and channel histogram
+# wires agree). Its own
 # binary: the export hook is env-driven and must not leak into cluster.rs's
 # threaded tests.
 [[test]]
@@ -274,6 +275,18 @@ path = "tests/session_directory_face.rs"
 [[test]]
 name = "timing"
 path = "tests/timing.rs"
+
+[[test]]
+name = "slot_index"
+path = "tests/slot_index.rs"
+
+[[test]]
+name = "transport_registry"
+path = "tests/transport_registry.rs"
+
+[[test]]
+name = "vip_registry"
+path = "tests/vip_registry.rs"
 
 [[test]]
 name = "timing_cluster_e2e"

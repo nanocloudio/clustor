@@ -1,5 +1,5 @@
 //! session_directory — the session-directory / reservation-authority role
-//! from fluxor's as a Clustor replicated consumer.
+//! fluxor's session protocol defines, as a Clustor replicated consumer.
 //!
 //! The deterministic state machine lives in
 //! `modules/common/session_registry.rs` (host-tested by
@@ -22,18 +22,37 @@
 //!   before acted upon" are the same boundary, and it lives on exactly
 //!   this edge. There is no fast-path ack.
 //!
-//! - **Snapshots**: the registry serializes to a fixed-size blob;
-//!   export/install ride the standard `MSG_APP_SNAPSHOT_*` chunk
-//!   envelopes, chunked at `SNAP_CHUNK` bytes.
+//! - **Namespaces**: the same ports and log carry the
+//!   `transport/<flow_id>` namespace (`MSG_TR_REQUEST` / `MSG_TR_REPLY`,
+//!   `modules/common/transport_registry.rs`, magic `"TR"`) and the
+//!   `vip/<service_address>` namespace (`MSG_VB_REQUEST` /
+//!   `MSG_VB_REPLY`, `modules/common/vip_registry.rs`, magic `"VB"`)
+//!   beside the session registry (`"SR"`); each is its own deterministic
+//!   state machine, proposed, committed, acknowledged and snapshotted on
+//!   exactly the same path.
+//! - **Profiles**: the arenas are static per
+//!   `[[variant]]` (`rp2350` 64 sessions, `pi5` 4096, `server` 65536)
+//!   and the `profile` parameter names the capacity a deployment admits
+//!   and reports; a profile larger than the variant's arena refuses to
+//!   start rather than claim it.
+//! - **Snapshots**: every registry streams versioned records (a header,
+//!   one record per live slot, the timing section) rather than a
+//!   whole-arena image; export/install ride the standard
+//!   `MSG_APP_SNAPSHOT_*` chunk envelopes, chunked at `SNAP_CHUNK` bytes,
+//!   with one record's worth of staging rather than a buffer that scales
+//!   with the profile. An export spans steps and holds committed applies
+//!   until it completes, so the image is the state at one index; a
+//!   rejected install leaves the registries empty and holds applies until
+//!   an install succeeds (fail closed, never apply onto a partial image).
 //! - **Telemetry**: `MON_SESSION` lines (fluxor
 //!   `monitor-protocol.md`) on every continuity-relevant transition —
-//!   `reservation_granted`, `epoch_bump`, `fence_initiated` /
-//!   `fence_confirmed`, `vip_moved` (a fenced ACTIVATE),
-//!   `unsafe_recovery_epoch_void`, `rejected` — so
-//!   a failover is legible on the same channel as the rest of the
-//!   platform.
+//!   `attached` / `relocated`, `reservation_granted`, `epoch_bump`,
+//!   `fence_initiated` / `fence_confirmed`, `vip_moved` (a fenced session
+//!   ACTIVATE, and a committed VIP ACTIVATE), `detached`,
+//!   `unsafe_recovery_epoch_void`, `rejected` — so a failover is legible
+//!   on the same channel as the rest of the platform.
 //!
-//! **Fence honesty (R3).** This module records fence state and the
+//! **Fence honesty.** This module records fence state and the
 //! registry refuses an anchor takeover (ACTIVATE) until a fence is
 //! CONFIRMED against the anchor being replaced and the takeover presents
 //! that confirmation's generation, which enforces the ordering. It cannot
@@ -67,6 +86,7 @@
 //! | 6   | logical_staleness_ms   | u32 | 5000 | Duration-admission freshness bound: a TTL command observed while logical time lags wall time by more than this triggers a time-freshness barrier (admission-time only). |
 //! | 7   | partition_id           | u32 | 0    | The raft group whose log this directory is. An engine hosting several groups writes them all to one committed stream; only this group's entries apply here. |
 //! | 8   | forwarded_stream       | u8  | 0    | 1 = `committed_entries` is a forwarder's selection of the group's log (this directory's entries only, in order), so an index jump is an omission, not a loss. 0 = the whole log, where a gap is a fault recovered by snapshot install. |
+//! | 9   | profile                | u8  | 0    | Capacity profile admitted and reported: 0 = rp2350 (64 sessions / 64 flows / 16 VIP bindings), 1 = pi5 (4096 / 4096 / 1024), 2 = server (65536 / 65536 / 16384). Must fit the variant's arena or init fails (-3). |
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
@@ -97,6 +117,16 @@ mod face;
 mod replica_facade;
 #[path = "../../common/session_registry.rs"]
 mod session_registry;
+/// The SDK's SHA-256: the digest the VIP registry derives emission-token
+/// capabilities with (and the custody-context digest for bound keys).
+#[path = "../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs"]
+mod sha256;
+#[path = "../../common/slot_index.rs"]
+mod slot_index;
+#[path = "../../common/transport_registry.rs"]
+mod transport_registry;
+#[path = "../../common/vip_registry.rs"]
+mod vip_registry;
 use face::{
     grant_command, hello_ack, reply_to_frame, request_to_command, FACE_ATTACH, FACE_DETACH,
     FACE_EPOCH_BUMP, FACE_GRANT, FACE_NONE,
@@ -114,12 +144,103 @@ mod wire_channels;
 use replica_facade::{CommitOrderError, CommittedSubscriber, TAGGED_PROPOSAL_HDR};
 use session_registry::*;
 use timing::{ClockGuard, ClockHealth};
+use transport_registry::{
+    TrExportCursor, TrInstaller, TransportRegistry, TransportReply, TR_MAX_CMD, TR_OP_MOVE,
+    TR_PROFILE_PI5, TR_PROFILE_RP2350, TR_PROFILE_SERVER, TR_REPLY_LEN, TR_SNAP_MAX_UNIT, TR_ST_OK,
+};
+use vip_registry::{
+    build_seed, VbExportCursor, VbInstaller, VipRegistry, VipReply, VB_MAX_CMD, VB_OP_ACTIVATE,
+    VB_PROFILE_PI5, VB_PROFILE_RP2350, VB_PROFILE_SERVER, VB_REPLY_LEN, VB_SEED, VB_SNAP_MAX_UNIT,
+    VB_ST_OK,
+};
+
+// ── Profile (variant-selected arenas) ───────────────────────────────
+//
+// The arena is a compile-time size; the `profile` parameter admits at
+// most that. Variants: `rp2350` (default), `pi5`, `server`.
+
+#[cfg(feature = "profile-server")]
+mod profile {
+    use super::*;
+    pub const SESSIONS: usize = SR_PROFILE_SERVER;
+    pub const DEADLINES: usize = SR_DEADLINES_SERVER;
+    pub const FLOWS: usize = TR_PROFILE_SERVER;
+    pub const BINDINGS: usize = VB_PROFILE_SERVER;
+}
+#[cfg(all(feature = "profile-pi5", not(feature = "profile-server")))]
+mod profile {
+    use super::*;
+    pub const SESSIONS: usize = SR_PROFILE_PI5;
+    pub const DEADLINES: usize = SR_DEADLINES_PI5;
+    pub const FLOWS: usize = TR_PROFILE_PI5;
+    pub const BINDINGS: usize = VB_PROFILE_PI5;
+}
+#[cfg(not(any(feature = "profile-pi5", feature = "profile-server")))]
+mod profile {
+    use super::*;
+    pub const SESSIONS: usize = SR_PROFILE_RP2350;
+    pub const DEADLINES: usize = SR_DEADLINES_RP2350;
+    pub const FLOWS: usize = TR_PROFILE_RP2350;
+    pub const BINDINGS: usize = VB_PROFILE_RP2350;
+}
+
+type Registry = SessionRegistry<{ profile::SESSIONS }, { profile::DEADLINES }>;
+type Transport = TransportRegistry<{ profile::FLOWS }>;
+type Vip = VipRegistry<{ profile::BINDINGS }>;
+
+/// `profile` parameter values.
+const PROFILE_RP2350: u8 = 0;
+const PROFILE_PI5: u8 = 1;
+const PROFILE_SERVER: u8 = 2;
+
+/// Admitted `(sessions, flows, bindings)` for a profile value.
+fn profile_admits(profile: u8) -> Option<(usize, usize, usize)> {
+    match profile {
+        PROFILE_RP2350 => Some((SR_PROFILE_RP2350, TR_PROFILE_RP2350, VB_PROFILE_RP2350)),
+        PROFILE_PI5 => Some((SR_PROFILE_PI5, TR_PROFILE_PI5, VB_PROFILE_PI5)),
+        PROFILE_SERVER => Some((SR_PROFILE_SERVER, TR_PROFILE_SERVER, VB_PROFILE_SERVER)),
+        _ => None,
+    }
+}
+
+/// The digest every namespace derives with.
+fn digest(m: &[u8]) -> [u8; 32] {
+    sha256::sha256(m)
+}
 
 /// Two-byte prefix on every replicated registry command so registry
 /// entries are unambiguous in the shared raft log (admin ops, client
 /// KV commands, and future consumers share the same entry stream —
 /// an opcode byte alone is not a namespace).
 const SR_CMD_MAGIC: [u8; 2] = *b"SR";
+/// The transport namespace's prefix (`transport_registry.rs`).
+const TR_CMD_MAGIC: [u8; 2] = *b"TR";
+/// The VIP namespace's prefix (`vip_registry.rs`).
+const VB_CMD_MAGIC: [u8; 2] = *b"VB";
+
+/// Which namespace a pending proposal answers on.
+const NS_SR: u8 = 0;
+const NS_TR: u8 = 1;
+const NS_VB: u8 = 2;
+
+const fn max_usize(a: usize, b: usize) -> usize {
+    if a > b {
+        a
+    } else {
+        b
+    }
+}
+
+/// Largest command body any namespace replicates (derived from the
+/// registries' own bounds).
+const CMD_MAX: usize = max_usize(max_usize(SR_MAX_CMD, TR_MAX_CMD), VB_MAX_CMD);
+/// Largest streamed-snapshot unit any registry exports (derived).
+const SNAP_UNIT_MAX: usize = max_usize(
+    max_usize(SR_SNAP_MAX_UNIT, TR_SNAP_MAX_UNIT),
+    VB_SNAP_MAX_UNIT,
+);
+/// Largest reply any namespace encodes (derived).
+const REPLY_MAX: usize = max_usize(max_usize(SR_REPLY_LEN, TR_REPLY_LEN), VB_REPLY_LEN);
 
 /// Pending request table: correlation → request_id. Small — the
 /// directory is a control-plane service; a full table backpressures
@@ -137,10 +258,20 @@ const MAX_PENDING: usize = 16;
 /// the same policy as the consumed-but-unproposable drop in step 2.
 const PENDING_TTL_MS: u64 = 10_000;
 
-/// Snapshot chunk body size. The registry snapshot is
-/// `SessionRegistry::SNAPSHOT_LEN` bytes (~10.4 KiB), so exports run
-/// to a dozen chunks.
+/// Snapshot chunk body size. The streamed image is a header plus one
+/// record per live slot per namespace (~300 bytes a session, ~230 a flow,
+/// ~1.2 KiB a VIP binding), so an idle rig exports in one chunk and a
+/// full rp2350 arena in a few dozen; a profile-sized export spans steps.
+/// A record may be larger than a chunk: the staging holds a chunk plus
+/// the largest record.
 const SNAP_CHUNK: usize = 1024;
+
+/// Snapshot section order within one image: the session registry, the
+/// transport registry, then the VIP registry.
+const SNAP_SECTION_SR: u8 = 0;
+const SNAP_SECTION_TR: u8 = 1;
+const SNAP_SECTION_VB: u8 = 2;
+const SNAP_SECTION_DONE: u8 = 3;
 
 /// Scratch buffer: committed entries carry the command body
 /// (SR_CMD_MAGIC + SR_MAX_CMD) under a 16-byte entry header; snapshot
@@ -204,8 +335,12 @@ struct ModuleState {
     forwarded_stream: u8,
     _pad4: u8,
 
-    /// The replicated state machine.
-    registry: SessionRegistry,
+    /// The replicated state machines: sessions, flows and VIP bindings.
+    registry: Registry,
+    transport: Transport,
+    vip: Vip,
+    /// Capacity profile parameter (tag 9).
+    profile: u8,
 
     /// Strict-commit-order subscriber.
     subscriber: CommittedSubscriber,
@@ -232,6 +367,8 @@ struct ModuleState {
     pending_face: [u8; MAX_PENDING],
     /// The raft group the engine assigned each pending proposal to.
     pending_part: [u16; MAX_PENDING],
+    /// The namespace (`NS_*`) a pending proposal answers on.
+    pending_ns: [u8; MAX_PENDING],
 
     // Counters (metrics)
     requests_in: u32,
@@ -276,16 +413,44 @@ struct ModuleState {
     _pad1: [u8; 7],
     last_metrics_ms: u64,
 
-    /// Snapshot install cursor (bytes received into snap_buf).
+    /// Snapshot install: bytes received so far (the next chunk's offset),
+    /// the section being fed, and whether an install is in progress.
     snap_in_off: u32,
-    _pad2: u32,
+    install_section: u8,
+    install_active: bool,
+    /// Committed applies are held: an install began (or failed) and the
+    /// registries are not the state at the subscriber's cursor until one
+    /// succeeds.
+    hold_applies: bool,
+    _pad2: u8,
+    sr_installer: SrInstaller,
+    tr_installer: TrInstaller,
+    vb_installer: VbInstaller,
+
+    /// Snapshot export: active while an image is being streamed across
+    /// steps (committed applies hold so the image is one index's state).
+    export_active: bool,
+    export_section: u8,
+    _pad5: [u8; 2],
+    export_term: u64,
+    export_last_idx: u64,
+    export_off: u64,
+    sr_cursor: SrExportCursor,
+    tr_cursor: TrExportCursor,
+    vb_cursor: VbExportCursor,
+    /// A SEED proposal is in flight (do not propose another until it
+    /// commits or the pending slot expires).
+    seed_proposed_ms: u64,
+    /// Staged export bytes not yet framed (`snap_buf[..snap_staged]`).
+    snap_staged: u32,
+    _pad6: u32,
 
     msg_buf: [u8; MSG_BUF],
     mon_buf: [u8; 192],
-    /// Snapshot staging (install + export walk share it; the two never
-    /// overlap — install only happens while catching up, export only
-    /// on the snapshot engine's request).
-    snap_buf: [u8; SessionRegistry::SNAPSHOT_LEN],
+    /// Export staging: one chunk plus the largest unit that can straddle
+    /// its end. Install needs no staging (the installers carry a partial
+    /// unit themselves). Independent of the profile.
+    snap_buf: [u8; SNAP_CHUNK + SNAP_UNIT_MAX],
 }
 
 mod params_def {
@@ -324,6 +489,8 @@ mod params_def {
             => |s, d, len| { s.partition_id = p_u32(d, len, 0, 0) as u16; };
         8, forwarded_stream, u8, 0
             => |s, d, len| { s.forwarded_stream = p_u8(d, len, 0, 0); };
+        9, profile, u8, 0
+            => |s, d, len| { s.profile = p_u8(d, len, 0, 0); };
     }
 }
 
@@ -342,13 +509,22 @@ fn next_correlation(s: &mut ModuleState) -> u64 {
 /// route the reply. Returns false when the pending table or the
 /// proposal channel is full.
 unsafe fn propose(s: &mut ModuleState, request_id: u64, body: &[u8]) -> bool {
-    propose_on(s, request_id, body, FACE_NONE)
+    propose_ns(s, request_id, body, FACE_NONE, NS_SR)
 }
 
 /// `propose` for a command that answers a contract verb: the committed
 /// reply goes back on `ctrl_out` as that verb's frame.
 unsafe fn propose_on(s: &mut ModuleState, request_id: u64, body: &[u8], face: u8) -> bool {
+    propose_ns(s, request_id, body, face, NS_SR)
+}
+
+/// `propose` into namespace `ns`: the body is prefixed with that
+/// namespace's magic and the committed reply goes out as its message id.
+unsafe fn propose_ns(s: &mut ModuleState, request_id: u64, body: &[u8], face: u8, ns: u8) -> bool {
     let sys = &*s.syscalls;
+    if body.len() > CMD_MAX {
+        return false;
+    }
     let Some(slot) = (0..MAX_PENDING).find(|&i| !s.pending_used[i]) else {
         return false;
     };
@@ -356,10 +532,14 @@ unsafe fn propose_on(s: &mut ModuleState, request_id: u64, body: &[u8], face: u8
         return false;
     }
     let corr = next_correlation(s);
-    let mut tagged = [0u8; 2 + SR_MAX_CMD];
-    tagged[..2].copy_from_slice(&SR_CMD_MAGIC);
+    let mut tagged = [0u8; 2 + CMD_MAX];
+    tagged[..2].copy_from_slice(match ns {
+        NS_TR => &TR_CMD_MAGIC,
+        NS_VB => &VB_CMD_MAGIC,
+        _ => &SR_CMD_MAGIC,
+    });
     tagged[2..2 + body.len()].copy_from_slice(body);
-    let mut prop = [0u8; TAGGED_PROPOSAL_HDR + 2 + SR_MAX_CMD];
+    let mut prop = [0u8; TAGGED_PROPOSAL_HDR + 2 + CMD_MAX];
     let n = match replica_facade::build_tagged_proposal(&mut prop, corr, &tagged[..2 + body.len()])
     {
         Ok(n) => n,
@@ -380,6 +560,7 @@ unsafe fn propose_on(s: &mut ModuleState, request_id: u64, body: &[u8], face: u8
     s.pending_born_ms[slot] = dev_millis(sys);
     s.pending_used[slot] = true;
     s.pending_face[slot] = face;
+    s.pending_ns[slot] = ns;
     s.proposals_out = s.proposals_out.saturating_add(1);
     true
 }
@@ -568,6 +749,11 @@ unsafe fn mon_reply(s: &mut ModuleState, reply: &SessionReply) {
             SR_ST_UNKNOWN_SESSION => b"unknown_session",
             SR_ST_NO_CAPACITY => b"no_capacity",
             SR_ST_RECOVERY_STALE => b"recovery_stale",
+            SR_ST_DEADLINE_CAPACITY => b"deadline_capacity",
+            SR_ST_CONTEXT_MISMATCH => b"context_mismatch",
+            SR_ST_GRANT_INVALID => b"grant_invalid",
+            SR_ST_RESERVATION_BEHIND => b"reservation_behind",
+            SR_ST_MIRROR_REGRESSION => b"mirror_regression",
             _ => b"malformed",
         };
         (MON_EV_REJECTED, reason)
@@ -586,9 +772,10 @@ unsafe fn mon_reply(s: &mut ModuleState, reply: &SessionReply) {
             SR_OP_ACTIVATE => (MON_EV_VIP_MOVED, b""),
             SR_OP_UNBIND => (MON_EV_DETACHED, b""),
             SR_OP_RECOVERY_MARK => (MON_EV_UNSAFE_RECOVERY_EPOCH_VOID, b""),
-            // KEY_PUT / KEY_WIPE / RX_FLOOR are deliberately silent:
-            // key custody must not leak activity patterns to the log,
-            // and floor checkpoints are high-rate.
+            // Key custody (KEY_PUT, KEY_PUT_BOUND, KEY_WIPE, transfer
+            // grants and their consumption) is deliberately silent: it
+            // must not leak activity patterns to the log. RX_FLOOR,
+            // MIRROR_MARK and COUNTER_FLOOR are high-rate checkpoints.
             _ => return,
         }
     };
@@ -667,7 +854,7 @@ pub unsafe extern "C" fn module_new(
         s.smoke = 0;
         s.smoke_phase = SMOKE_IDLE;
         s._pad0 = 0;
-        s.registry = SessionRegistry::new();
+        s.profile = PROFILE_RP2350;
         s.subscriber = CommittedSubscriber::new(0);
         s.corr_counter = 0;
         s.pending_corr = [0; MAX_PENDING];
@@ -675,6 +862,9 @@ pub unsafe extern "C" fn module_new(
         s.pending_idx = [0; MAX_PENDING];
         s.pending_born_ms = [0; MAX_PENDING];
         s.pending_used = [false; MAX_PENDING];
+        s.pending_face = [FACE_NONE; MAX_PENDING];
+        s.pending_part = [0; MAX_PENDING];
+        s.pending_ns = [NS_SR; MAX_PENDING];
         s.requests_in = 0;
         s.proposals_out = 0;
         s.proposals_expired = 0;
@@ -696,7 +886,25 @@ pub unsafe extern "C" fn module_new(
         s._pad1 = [0; 7];
         s.last_metrics_ms = 0;
         s.snap_in_off = 0;
+        s.install_section = SNAP_SECTION_SR;
+        s.install_active = false;
+        s.hold_applies = false;
         s._pad2 = 0;
+        s.sr_installer = SrInstaller::new();
+        s.tr_installer = TrInstaller::new();
+        s.vb_installer = VbInstaller::new();
+        s.export_active = false;
+        s.export_section = SNAP_SECTION_SR;
+        s._pad5 = [0; 2];
+        s.export_term = 0;
+        s.export_last_idx = 0;
+        s.export_off = 0;
+        s.sr_cursor = SrExportCursor::new();
+        s.tr_cursor = TrExportCursor::new();
+        s.vb_cursor = VbExportCursor::new();
+        s.seed_proposed_ms = 0;
+        s.snap_staged = 0;
+        s._pad6 = 0;
 
         let is_tlv =
             !params.is_null() && params_len >= 4 && *params == 0xFE && *params.add(1) == 0x01;
@@ -708,6 +916,23 @@ pub unsafe extern "C" fn module_new(
         if s.smoke == 0 {
             s.smoke_phase = SMOKE_OFF;
         }
+        // The profile must fit this variant's arenas: a build admitting
+        // less than the named profile cannot claim it.
+        let Some((sessions, flows, bindings)) = profile_admits(s.profile) else {
+            dev_log(sys, 1, b"[sess_dir] unknown profile".as_ptr(), 26);
+            return -3;
+        };
+        if sessions > profile::SESSIONS || flows > profile::FLOWS || bindings > profile::BINDINGS {
+            dev_log(sys, 1, b"[sess_dir] profile exceeds arena".as_ptr(), 32);
+            return -3;
+        }
+        // In place: a profile-sized registry does not fit on the stack.
+        s.registry.reset(sessions as u32);
+        s.transport.reset(flows as u32);
+        // Unseeded: the leader proposes the group's capability seed from
+        // the kernel CSPRNG once (step 5.7); until it commits, ACTIVATE
+        // answers NOT_READY on every replica.
+        s.vip.reset(bindings as u32);
         s.clock_guard = ClockGuard::new(
             s.logical_max_step_ms as u64,
             s.clock_slew_tolerance_ms as u64,
@@ -732,7 +957,18 @@ unsafe fn apply_committed(s: &mut ModuleState, index: u64, command: &[u8]) {
         apply_timing_entry(s, command);
         return;
     }
-    if command.len() <= 2 || command[..2] != SR_CMD_MAGIC {
+    if command.len() <= 2 {
+        return;
+    }
+    if command[..2] == TR_CMD_MAGIC {
+        apply_committed_transport(s, index, &command[2..]);
+        return;
+    }
+    if command[..2] == VB_CMD_MAGIC {
+        apply_committed_vip(s, index, &command[2..]);
+        return;
+    }
+    if command[..2] != SR_CMD_MAGIC {
         return;
     }
     let body = &command[2..];
@@ -745,12 +981,9 @@ unsafe fn apply_committed(s: &mut ModuleState, index: u64, command: &[u8]) {
     mon_reply(s, &reply);
 
     // Route the reply if this replica proposed the entry at `index`.
-    let Some(slot) = (0..MAX_PENDING)
-        .find(|&i| s.pending_used[i] && s.pending_idx[i] != 0 && s.pending_idx[i] == index)
-    else {
+    let Some(slot) = take_pending(s, index, NS_SR) else {
         return;
     };
-    s.pending_used[slot] = false;
     let request_id = s.pending_req[slot];
     let face = s.pending_face[slot];
     s.pending_face[slot] = FACE_NONE;
@@ -789,6 +1022,106 @@ unsafe fn apply_committed(s: &mut ModuleState, index: u64, command: &[u8]) {
             s.replies_out = s.replies_out.saturating_add(1);
         }
     }
+}
+
+/// The pending slot whose assigned wal index is `index` in namespace
+/// `ns`, released. A proposal of another namespace at that index is this
+/// replica's too, but it is answered on its own path.
+fn take_pending(s: &mut ModuleState, index: u64, ns: u8) -> Option<usize> {
+    let slot = (0..MAX_PENDING).find(|&i| {
+        s.pending_used[i]
+            && s.pending_idx[i] != 0
+            && s.pending_idx[i] == index
+            && s.pending_ns[i] == ns
+    })?;
+    s.pending_used[slot] = false;
+    Some(slot)
+}
+
+/// A committed `"TR"` entry: apply to the transport registry on every
+/// replica; relay the reply as `MSG_TR_REPLY` when it was ours.
+unsafe fn apply_committed_transport(s: &mut ModuleState, index: u64, body: &[u8]) {
+    let sys = &*s.syscalls;
+    let reply: TransportReply = s.transport.apply(body);
+    if reply.status == TR_ST_OK {
+        s.applied_ok = s.applied_ok.saturating_add(1);
+        if reply.op == TR_OP_MOVE {
+            dev_log(sys, 3, b"[sess_dir] flow moved".as_ptr(), 21);
+        }
+    } else {
+        s.applied_rejected = s.applied_rejected.saturating_add(1);
+    }
+    let Some(slot) = take_pending(s, index, NS_TR) else {
+        return;
+    };
+    let request_id = s.pending_req[slot];
+    if s.out_replies >= 0 && request_id != 0 {
+        let mut out = [0u8; 8 + TR_REPLY_LEN];
+        out[..8].copy_from_slice(&request_id.to_le_bytes());
+        let _ = reply.encode(&mut out[8..]);
+        let wrote = wire_channels::channel_write_msg(sys, s.out_replies, wire::MSG_TR_REPLY, &out);
+        if wrote > 0 {
+            s.replies_out = s.replies_out.saturating_add(1);
+        }
+    }
+}
+
+/// A committed `"VB"` entry: apply to the VIP registry on every replica
+/// (a committed ACTIVATE is the address moving — `vip_moved` on the
+/// monitor channel, keyed by service id and vip epoch); relay the reply
+/// as `MSG_VB_REPLY` when it was ours.
+unsafe fn apply_committed_vip(s: &mut ModuleState, index: u64, body: &[u8]) {
+    let sys = &*s.syscalls;
+    let reply: VipReply = s.vip.apply(body, digest);
+    if reply.status == VB_ST_OK {
+        s.applied_ok = s.applied_ok.saturating_add(1);
+        if reply.op == VB_OP_ACTIVATE {
+            mon_vip_moved(s, &reply);
+        }
+    } else {
+        s.applied_rejected = s.applied_rejected.saturating_add(1);
+    }
+    let Some(slot) = take_pending(s, index, NS_VB) else {
+        return;
+    };
+    let request_id = s.pending_req[slot];
+    if s.out_replies >= 0 && request_id != 0 {
+        let mut out = [0u8; 8 + VB_REPLY_LEN];
+        out[..8].copy_from_slice(&request_id.to_le_bytes());
+        let _ = reply.encode(&mut out[8..]);
+        let wrote = wire_channels::channel_write_msg(sys, s.out_replies, wire::MSG_VB_REPLY, &out);
+        if wrote > 0 {
+            s.replies_out = s.replies_out.saturating_add(1);
+        }
+    }
+}
+
+/// `MON_EV_VIP_MOVED` for a committed VIP ACTIVATE: the service id in
+/// the session-id field, the vip epoch (low 32 bits) as the epoch.
+unsafe fn mon_vip_moved(s: &mut ModuleState, reply: &VipReply) {
+    let sys = &*s.syscalls;
+    if s.self_idx == 0xFF {
+        let idx = dev_self_index(sys);
+        if idx >= 0 {
+            s.self_idx = idx as u8;
+        }
+    }
+    let mut service_id = [0u8; 16];
+    service_id.copy_from_slice(&reply.key[..16]);
+    let mon_ptr = s.mon_buf.as_mut_ptr();
+    let _ = dev_mon_session(
+        sys,
+        s.self_idx,
+        MON_EV_VIP_MOVED,
+        service_id.as_ptr(),
+        reply.vip_epoch as u32,
+        core::ptr::null(),
+        core::ptr::null(),
+        b"vip_activate",
+        b"ok",
+        mon_ptr,
+        192,
+    );
 }
 
 /// Smoke sequence: BIND → RESERVE(4096) → RESERVE(4096). The second
@@ -835,6 +1168,100 @@ unsafe fn smoke_advance(s: &mut ModuleState, reply: &SessionReply) {
             dev_log(sys, 1, b"[sess_dir] smoke refused".as_ptr(), 24);
         }
         _ => {}
+    }
+}
+
+// ── Streamed snapshot helpers ───────────────────────────────────────
+
+/// Begin an install: clear the registries and hold applies until an
+/// image installs.
+fn install_begin(s: &mut ModuleState) {
+    s.sr_installer = s.registry.install_begin();
+    s.tr_installer = s.transport.install_begin();
+    s.vb_installer = s.vip.install_begin();
+    s.install_section = SNAP_SECTION_SR;
+    s.install_active = true;
+    s.hold_applies = true;
+    s.snap_in_off = 0;
+}
+
+/// Abandon an install: the registries stay cleared and applies held.
+fn install_abandon(s: &mut ModuleState) {
+    s.install_active = false;
+    s.snap_in_off = 0;
+    s.hold_applies = true;
+}
+
+/// Feed one chunk body through the sections in order. False on a
+/// rejected image.
+fn install_feed(s: &mut ModuleState, mut bytes: &[u8]) -> bool {
+    while !bytes.is_empty() {
+        match s.install_section {
+            SNAP_SECTION_SR => {
+                let Ok(n) = s.registry.install_feed(&mut s.sr_installer, bytes) else {
+                    return false;
+                };
+                bytes = &bytes[n..];
+                if s.sr_installer.done() {
+                    s.install_section = SNAP_SECTION_TR;
+                } else if n == 0 {
+                    return false;
+                }
+            }
+            SNAP_SECTION_TR => {
+                let Ok(n) = s.transport.install_feed(&mut s.tr_installer, bytes) else {
+                    return false;
+                };
+                bytes = &bytes[n..];
+                if s.tr_installer.done() {
+                    s.install_section = SNAP_SECTION_VB;
+                } else if n == 0 {
+                    return false;
+                }
+            }
+            SNAP_SECTION_VB => {
+                let Ok(n) = s.vip.install_feed(&mut s.vb_installer, bytes) else {
+                    return false;
+                };
+                bytes = &bytes[n..];
+                if s.vb_installer.done() {
+                    s.install_section = SNAP_SECTION_DONE;
+                } else if n == 0 {
+                    return false;
+                }
+            }
+            _ => return false, // bytes past the image's end
+        }
+    }
+    true
+}
+
+/// Every section must have ended exactly where its counts said.
+fn install_finish(s: &mut ModuleState) -> bool {
+    let sr = s.registry.install_finish(&mut s.sr_installer);
+    let tr = s.transport.install_finish(&mut s.tr_installer);
+    let vb = s.vip.install_finish(&mut s.vb_installer);
+    sr && tr && vb && s.install_section == SNAP_SECTION_DONE
+}
+
+/// Stage export units until a chunk is ready or the image ends.
+fn export_stage(s: &mut ModuleState) {
+    while (s.snap_staged as usize) < SNAP_CHUNK && s.export_section != SNAP_SECTION_DONE {
+        let at = s.snap_staged as usize;
+        let n = match s.export_section {
+            SNAP_SECTION_SR => s
+                .registry
+                .export_next(&mut s.sr_cursor, &mut s.snap_buf[at..]),
+            SNAP_SECTION_TR => s
+                .transport
+                .export_next(&mut s.tr_cursor, &mut s.snap_buf[at..]),
+            _ => s.vip.export_next(&mut s.vb_cursor, &mut s.snap_buf[at..]),
+        };
+        if n == 0 {
+            s.export_section += 1;
+            continue;
+        }
+        s.snap_staged += n as u32;
     }
 }
 
@@ -915,7 +1342,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         // 1) Committed entries — apply in strict order, reply on match.
+        //    Held while an export streams (the image is one index's
+        //    state) and from a begun or failed install until one
+        //    succeeds (never apply onto a partial image).
+        let hold = s.export_active || s.hold_applies;
         for _ in 0..16 {
+            if hold {
+                break;
+            }
             let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_entries, &mut s.msg_buf)
             else {
                 break;
@@ -935,7 +1369,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 Ok(entry) => {
                     // Copy the command out of msg_buf so apply can
                     // borrow module state freely.
-                    let mut cmd = [0u8; 2 + SR_MAX_CMD];
+                    let mut cmd = [0u8; 2 + CMD_MAX];
                     let n = entry.command.len().min(cmd.len());
                     cmd[..n].copy_from_slice(&entry.command[..n]);
                     let index = entry.index;
@@ -950,7 +1384,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         .map_or(0, |(_, term, _)| term);
                     s.subscriber.reset_to(observed - 1, term);
                     if let Ok(entry) = s.subscriber.ingest_committed_entry(&s.msg_buf[..plen]) {
-                        let mut cmd = [0u8; 2 + SR_MAX_CMD];
+                        let mut cmd = [0u8; 2 + CMD_MAX];
                         let n = entry.command.len().min(cmd.len());
                         cmd[..n].copy_from_slice(&entry.command[..n]);
                         let index = entry.index;
@@ -983,11 +1417,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 else {
                     break;
                 };
-                if msg_type != wire::MSG_SR_REQUEST {
-                    continue;
-                }
+                let (ns, cmd_max) = match msg_type {
+                    wire::MSG_SR_REQUEST => (NS_SR, SR_MAX_CMD),
+                    wire::MSG_TR_REQUEST => (NS_TR, TR_MAX_CMD),
+                    wire::MSG_VB_REQUEST => (NS_VB, VB_MAX_CMD),
+                    _ => continue,
+                };
                 let plen = plen as usize;
-                if plen <= 8 || plen > 8 + SR_MAX_CMD {
+                if plen <= 8 || plen > 8 + cmd_max {
                     continue;
                 }
                 s.requests_in = s.requests_in.saturating_add(1);
@@ -1001,14 +1438,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.msg_buf[6],
                     s.msg_buf[7],
                 ]);
-                let mut body = [0u8; SR_MAX_CMD];
+                let mut body = [0u8; CMD_MAX];
                 let blen = plen - 8;
                 body[..blen].copy_from_slice(&s.msg_buf[8..plen]);
                 // A request that cannot be proposed right now is
                 // DROPPED here (we already consumed the frame) — the
                 // requester retries on reply timeout. Dropping beats
                 // wedging the ring.
-                let _ = propose(s, request_id, &body[..blen]);
+                let _ = propose_ns(s, request_id, &body[..blen], FACE_NONE, ns);
             }
         }
 
@@ -1084,7 +1521,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // 4) Snapshot install (catch-up path).
+        // 4) Snapshot install (catch-up path): chunks feed the streamed
+        //    installers section by section; nothing is buffered whole.
         if s.in_snapshot_chunk >= 0 {
             for _ in 0..4 {
                 let Some((msg_type, plen)) =
@@ -1094,44 +1532,40 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 };
                 let pl = plen as usize;
                 match msg_type {
-                    wire::MSG_APP_SNAPSHOT_RESET => {
-                        s.snap_in_off = 0;
-                    }
+                    wire::MSG_APP_SNAPSHOT_RESET => install_begin(s),
                     wire::MSG_APP_SNAPSHOT_CHUNK => {
                         if let Some((_term, last_idx, off, done, hdr)) =
                             wire::decode_app_snapshot_chunk(&s.msg_buf[..pl])
                         {
-                            let body_len = pl - hdr;
-                            let off = off as usize;
-                            if off == s.snap_in_off as usize
-                                && off + body_len <= SessionRegistry::SNAPSHOT_LEN
-                            {
-                                s.snap_buf[off..off + body_len]
-                                    .copy_from_slice(&s.msg_buf[hdr..pl]);
-                                s.snap_in_off = (off + body_len) as u32;
-                                if done {
-                                    if s.snap_in_off as usize == SessionRegistry::SNAPSHOT_LEN
-                                        && s.registry.restore(&s.snap_buf)
-                                    {
-                                        s.subscriber = CommittedSubscriber::new(last_idx);
-                                        dev_log(
-                                            sys,
-                                            3,
-                                            b"[sess_dir] snapshot installed".as_ptr(),
-                                            29,
-                                        );
-                                    } else {
-                                        dev_log(
-                                            sys,
-                                            1,
-                                            b"[sess_dir] snapshot corrupt".as_ptr(),
-                                            27,
-                                        );
-                                    }
-                                    s.snap_in_off = 0;
-                                }
-                            } else {
+                            // An offset-zero chunk starts an image, whatever
+                            // an earlier transfer left half-fed: a sender that
+                            // restarts its transfer is not then refused for it.
+                            if off == 0 {
+                                install_begin(s);
+                            }
+                            if !s.install_active || off != u64::from(s.snap_in_off) {
                                 // Out-of-order chunk: abandon this install.
+                                install_abandon(s);
+                                continue;
+                            }
+                            let mut body = [0u8; MSG_BUF];
+                            let body_len = pl - hdr;
+                            body[..body_len].copy_from_slice(&s.msg_buf[hdr..pl]);
+                            if !install_feed(s, &body[..body_len]) {
+                                dev_log(sys, 1, b"[sess_dir] snapshot corrupt".as_ptr(), 27);
+                                install_abandon(s);
+                                continue;
+                            }
+                            s.snap_in_off = s.snap_in_off.saturating_add(body_len as u32);
+                            if done {
+                                if install_finish(s) {
+                                    s.subscriber = CommittedSubscriber::new(last_idx);
+                                    s.hold_applies = false;
+                                    dev_log(sys, 3, b"[sess_dir] snapshot installed".as_ptr(), 29);
+                                } else {
+                                    dev_log(sys, 1, b"[sess_dir] snapshot corrupt".as_ptr(), 27);
+                                }
+                                s.install_active = false;
                                 s.snap_in_off = 0;
                             }
                         }
@@ -1141,9 +1575,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        // 5) Snapshot export on request. The registry state is small
-        //    enough to serialize and stream inline in one step.
-        if s.in_snapshot_request >= 0
+        // 5) Snapshot export on request: streamed across steps, one
+        //    chunk per channel write, applies held meanwhile.
+        if !s.export_active
+            && s.in_snapshot_request >= 0
             && s.out_snapshot_export >= 0
             && wire_channels::readable(sys, s.in_snapshot_request)
         {
@@ -1155,31 +1590,58 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 None
             };
             if let Some((term, last_idx)) = req {
-                if s.registry.snapshot(&mut s.snap_buf) > 0 {
-                    let total = SessionRegistry::SNAPSHOT_LEN;
-                    let mut off = 0usize;
-                    let mut ok = true;
-                    while off < total && ok {
-                        let n = SNAP_CHUNK.min(total - off);
-                        let done = off + n == total;
-                        let mut out = [0u8; wire::APP_SNAPSHOT_HDR + SNAP_CHUNK];
-                        let en = wire::encode_app_snapshot_chunk(
-                            &mut out,
-                            term,
-                            last_idx,
-                            off as u64,
-                            done,
-                            &s.snap_buf[off..off + n],
-                        );
-                        ok = en > 0
-                            && wire_channels::channel_write_msg(
-                                sys,
-                                s.out_snapshot_export,
-                                wire::MSG_APP_SNAPSHOT_CHUNK,
-                                &out[..en],
-                            ) > 0;
-                        off += n;
-                    }
+                s.export_active = true;
+                s.export_section = SNAP_SECTION_SR;
+                s.export_term = term;
+                s.export_last_idx = last_idx;
+                s.export_off = 0;
+                s.sr_cursor = SrExportCursor::new();
+                s.tr_cursor = TrExportCursor::new();
+                s.vb_cursor = VbExportCursor::new();
+                s.snap_staged = 0;
+            }
+        }
+        if s.export_active {
+            for _ in 0..8 {
+                if !wire_channels::writable(sys, s.out_snapshot_export) {
+                    break;
+                }
+                export_stage(s);
+                let staged = s.snap_staged as usize;
+                let done = s.export_section == SNAP_SECTION_DONE;
+                if staged < SNAP_CHUNK && !done {
+                    // The staging cannot be short of a chunk before the end.
+                    s.export_active = false;
+                    break;
+                }
+                let n = SNAP_CHUNK.min(staged);
+                let last = done && n == staged;
+                let mut out = [0u8; wire::APP_SNAPSHOT_HDR + SNAP_CHUNK];
+                let en = wire::encode_app_snapshot_chunk(
+                    &mut out,
+                    s.export_term,
+                    s.export_last_idx,
+                    s.export_off,
+                    last,
+                    &s.snap_buf[..n],
+                );
+                if en == 0
+                    || wire_channels::channel_write_msg(
+                        sys,
+                        s.out_snapshot_export,
+                        wire::MSG_APP_SNAPSHOT_CHUNK,
+                        &out[..en],
+                    ) <= 0
+                {
+                    // The channel took nothing; the chunk stays staged.
+                    break;
+                }
+                s.snap_buf.copy_within(n..staged, 0);
+                s.snap_staged = (staged - n) as u32;
+                s.export_off += n as u64;
+                if last {
+                    s.export_active = false;
+                    break;
                 }
             }
         }
@@ -1214,7 +1676,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let logical = s.registry.timing.logical_now_ms();
             if health != ClockHealth::Healthy {
                 s.pause_reason = wire::TIMING_PAUSE_CLOCK_ALARM;
-            } else if s.registry.timing.due_depth() > 0 {
+            } else if s.registry.timing.has_due() {
                 // Committed due backlog: continue with drain entries
                 // through the already-committed time fence. Advancing
                 // pauses so due work stays within apply budgets.
@@ -1240,6 +1702,30 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             } else {
                 // No live deadlines: idle tick coalescing.
                 s.pause_reason = wire::TIMING_PAUSE_IDLE;
+            }
+        }
+
+        // 5.7) VIP capability seed, leader-proposed once per group from
+        //      the kernel CSPRNG and replicated like any command, so every
+        //      replica mints and verifies the same emission tokens. Not a
+        //      restart concern: the seed lives in the log and the
+        //      snapshot. Retried after the pending TTL if the proposal
+        //      was lost; a second committed SEED is refused CONFLICT.
+        if is_leader(s) && !s.vip.seeded() && !s.hold_applies {
+            let now = dev_millis(sys);
+            if now.wrapping_sub(s.seed_proposed_ms) > PENDING_TTL_MS {
+                let mut seed = [0u8; VB_SEED];
+                if dev_csprng_fill(sys, seed.as_mut_ptr(), VB_SEED) == 0 && seed != [0u8; VB_SEED] {
+                    let mut op_id = [0u8; 16];
+                    op_id[..8].copy_from_slice(&now.to_le_bytes());
+                    op_id[8] = s.replica_id;
+                    let mut cmd = [0u8; VB_MAX_CMD];
+                    let n = build_seed(&mut cmd, &op_id, &seed);
+                    if n > 0 && propose_ns(s, 0, &cmd[..n], FACE_NONE, NS_VB) {
+                        s.seed_proposed_ms = now;
+                        dev_log(sys, 3, b"[sess_dir] vip seed proposed".as_ptr(), 27);
+                    }
+                }
             }
         }
 

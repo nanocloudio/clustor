@@ -8,19 +8,22 @@ entry = "mod.rs"
 hardware_targets = ["bcm2712", "linux"]
 
 # Session directory / reservation authority — the durable single-writer
-# role fluxor's session protocol defines, backed by the replica group. State machine: modules/common/session_registry.rs;
-# gate tests: tests/session_registry.rs; doc:
+# role fluxor's session protocol defines, backed by the replica group, with
+# the transport and VIP namespaces beside it. State machines:
+# modules/common/{session,transport,vip}_registry.rs; gate tests:
+# tests/{session,transport,vip}_registry.rs; doc:
 # docs/architecture/session_directory.md.
 #
-# Capability semantics (fluxor capability_surface.md §Continuity Role):
+# Capability semantics (fluxor docs/architecture/capability_surface.md,
+# Capability Registry; validated under Continuity Validation):
 #   session.directory   — single-writer placement/continuity metadata
-#   session.reservation — quorum-committed counter-block grants (R2)
+#   session.reservation — quorum-committed counter-block grants
 #   security.key_wrap   — KEK-wrapped key custody the substrate cannot
-#                         read, TTL + quorum wipe (R1). The KEK itself
-#                         lives with the anchors/HSM, never here.
+#                         read, TTL + quorum wipe. The KEK itself lives
+#                         with the anchors/HSM, never here.
 #   durable.rpo_zero    — replies are relayed only from the committed-
 #                         entry stream, so anything acked through this
-#                         module is quorum-durable first (R5).
+#                         module is quorum-durable first.
 #
 # fence.enforceable is deliberately NOT declared: this module enforces
 # fence ORDERING (no takeover past a confirmed fence whose generation
@@ -34,14 +37,35 @@ capabilities = [
   "durable.rpo_zero",
 ]
 
+# Capacity profiles: the arenas are compile-time sizes, one variant per
+# qualification envelope. The `profile` parameter admits at most the
+# variant's arena; a graph asking a smaller variant for a larger profile
+# fails init rather than claim it.
+#   rp2350 — 64 sessions, 64 flows, 16 VIP bindings (the default)
+#   pi5    — 4096 / 4096 / 1024
+#   server — 65536 / 65536 / 16384
+[[variant]]
+name = "rp2350"
+features = ["profile-rp2350"]
+default = true
+
+[[variant]]
+name = "pi5"
+features = ["profile-pi5"]
+
+[[variant]]
+name = "server"
+features = ["profile-server"]
+
 # Committed entries from consensus (strict order).
 [[ports]]
 name = "committed_entries"
 direction = "input"
 content_type = "OctetStream"
 
-# MSG_SR_REQUEST from anchors / orchestrators:
-# [request_id:u64][SR_OP_* command body].
+# MSG_SR_REQUEST / MSG_TR_REQUEST / MSG_VB_REQUEST from anchors /
+# orchestrators: [request_id:u64][command body] of the session, transport
+# or VIP namespace (the message id names the namespace).
 [[ports]]
 name = "requests"
 index = 1
@@ -98,8 +122,9 @@ name = "proposals"
 direction = "output"
 content_type = "OctetStream"
 
-# MSG_SR_REPLY back to the requester — emitted ONLY after the command
-# is quorum-committed and applied (R2/R5 ack boundary).
+# MSG_SR_REPLY / MSG_TR_REPLY / MSG_VB_REPLY back to the requester —
+# emitted ONLY after the command is quorum-committed and applied (the ack
+# boundary in docs/architecture/session_directory.md).
 [[ports]]
 name = "replies"
 index = 1

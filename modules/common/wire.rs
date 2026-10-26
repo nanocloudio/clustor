@@ -2160,7 +2160,7 @@ pub mod metric_ids {
     pub const CBENCH_BLOCKED: u16 = 0x0003;
 
     // timing (source_id = 0x19) — deterministic replicated timing, emitted
-    // by the deadline-enabled consumer module (session_directory today).
+    // by the deadline-enabled consumer module (the session directory).
     /// Gauge: committed PRG logical time (ms since epoch).
     pub const TIMING_LOGICAL_TIME_MS: u16 = 0x0001;
     /// Gauge: disciplined wall time minus logical time on the leader
@@ -2357,13 +2357,30 @@ pub fn decode_metric_sample(buf: &[u8]) -> Option<(u8, u16, u16, u8, i64)> {
 // is one of the `SR_OP_*` layouts in `modules/common/session_registry.rs`
 // (opcode byte first). The directory replays the body verbatim as a
 // tagged raft proposal; the reply is sent ONLY after the command is
-// quorum-committed and applied — the R2/R5 "durable before ack"
-// invariant lives on this boundary.
+// quorum-committed and applied — the "durable before ack" invariant
+// lives on this boundary.
 //
 // `MSG_SR_REPLY`: session_directory → requester. Payload:
 // `[request_id:u64 LE][SessionReply (SR_REPLY_LEN bytes)]`.
 pub const MSG_SR_REQUEST: u8 = 0x90;
 pub const MSG_SR_REPLY: u8 = 0x91;
+
+// The directory's other namespaces ride the same `requests` / `replies`
+// ports, told apart by message id; the module prefixes the replicated
+// body with the namespace magic (`"SR"`, `"TR"`, `"VB"`).
+//
+// `MSG_TR_REQUEST`: `[request_id:u64 LE][transport_registry command body]`
+// (`TR_OP_*` layouts in `modules/common/transport_registry.rs`);
+// `MSG_TR_REPLY`: `[request_id:u64 LE][TransportReply (TR_REPLY_LEN
+// bytes)]`, the session reply's 38-byte shape.
+pub const MSG_TR_REQUEST: u8 = 0x92;
+pub const MSG_TR_REPLY: u8 = 0x93;
+// `MSG_VB_REQUEST`: `[request_id:u64 LE][vip_registry command body]`
+// (`VB_OP_*` layouts in `modules/common/vip_registry.rs`);
+// `MSG_VB_REPLY`: `[request_id:u64 LE][VipReply (VB_REPLY_LEN bytes)]`,
+// carrying the minted emission token on a committed ACTIVATE.
+pub const MSG_VB_REQUEST: u8 = 0x94;
+pub const MSG_VB_REPLY: u8 = 0x95;
 
 // Routing
 pub const MSG_PLACEMENT_UPDATE: u8 = 0x80;
@@ -2688,7 +2705,7 @@ pub fn decode_shard_map_entry(buf: &[u8], i: usize) -> Option<(u32, u16)> {
 /// form specifically — a global-epoch transition is a different message
 /// with a different shape and must not be given this id.
 ///
-/// `reason` field — values shipped today:
+/// `reason` field values:
 ///   0 = bootstrap (initial placement-router epoch on launch)
 ///   1 = admin     (operator-driven placement change, reserved)
 ///   2 = rebalance (substrate-driven, reserved)
@@ -3240,9 +3257,9 @@ pub fn decode_tagged_proposal(buf: &[u8]) -> Option<(u64, usize)> {
 
 /// Size of the virtual-shard space. Fixed for the life of a cluster:
 /// changing it rehashes every key and is a full-cluster migration, not an
-/// operation. Sized so that a large cluster still gets tens of shards per
-/// partition, keeping the smallest possible load movement small (see
-/// quantum's).
+/// operation. Sized so that a cluster of thousands of partitions still
+/// gets tens of shards per partition, keeping the smallest possible load
+/// movement small.
 pub const VIRTUAL_SHARDS: u32 = 1 << 18;
 
 /// Reduce a routing-key hash to a virtual-shard id.

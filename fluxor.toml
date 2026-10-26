@@ -17,11 +17,11 @@ fluxor = "0.0.1"
 wave   = "0.0.1"
 
 [ci]
-# Module targets to build in CI phase 3. Clustor is host-only today;
-# the cluster harness consumes `bcm2712` `.fmod` artefacts as PIC on
-# linux/aarch64. This list is silicon and host tokens only — never a
+# Module targets to build in CI phase 3. Clustor's modules build for
+# `bcm2712`, and the cluster harness runs those `.fmod` artefacts as PIC
+# on linux/aarch64. This list is silicon and host tokens only — never a
 # board (`pi5` is a board; its modules are the `bcm2712` artefacts
-# already listed). Add `rp2350` here when that backend lands.
+# already listed).
 targets = ["bcm2712"]
 
 # The limit register's coverage half fails rather than reports. Every
@@ -118,6 +118,14 @@ reason = """include!s the SDK runtime and compiles operations' no_std http compo
 [[ci.hygiene.allow_crate_root]]
 prefix = "tests/rbac_identity.rs"
 reason = """include!s the SDK runtime and compiles the no_std rbac component verbatim into a host crate; each test uses a subset of that surface."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/session_registry.rs"
+reason = """mounts the staged SDK SHA-256 verbatim into a host crate for the key custody-context digest; the SDK's block copies are unsafe, the test holds none."""
+
+[[ci.hygiene.allow_crate_root]]
+prefix = "tests/vip_registry.rs"
+reason = """mounts the staged SDK SHA-256 verbatim into a host crate to derive and verify emission-token capabilities; the SDK's block copies are unsafe, the test holds none."""
 
 [[ci.hygiene.allow_crate_root]]
 prefix = "tests/gateway_namespaces.rs"
