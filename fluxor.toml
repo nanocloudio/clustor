@@ -128,6 +128,10 @@ prefix = "tests/vip_registry.rs"
 reason = """mounts the staged SDK SHA-256 verbatim into a host crate to derive and verify emission-token capabilities; the SDK's block copies are unsafe, the test holds none."""
 
 [[ci.hygiene.allow_crate_root]]
+prefix = "tests/vip_token_reissue.rs"
+reason = """mounts the staged SDK SHA-256 verbatim into a host crate to derive and verify reissued emission tokens; the SDK's block copies are unsafe, the test holds none."""
+
+[[ci.hygiene.allow_crate_root]]
 prefix = "tests/gateway_namespaces.rs"
 reason = """include!s the SDK runtime and compiles the gateway's no_std codec and surface verbatim into a host crate against a mock SyscallTable; each test uses a subset of that surface."""
 

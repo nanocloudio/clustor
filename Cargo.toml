@@ -289,6 +289,10 @@ name = "vip_registry"
 path = "tests/vip_registry.rs"
 
 [[test]]
+name = "vip_token_reissue"
+path = "tests/vip_token_reissue.rs"
+
+[[test]]
 name = "timing_cluster_e2e"
 path = "tests/timing_cluster_e2e.rs"
 

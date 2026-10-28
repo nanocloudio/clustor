@@ -241,8 +241,9 @@ was made. Every command carries `operation_id[16]`, the key and
 | `ACTIVATE` (5) | `[ready_graph:1]` | → `OWNER_COMMITTED`: every previous owner fenced (`blocked_fence`), the graph attested (`not_ready`), the registry seeded; bumps `authority_generation`, mints the token. |
 | `INSTALLED` (6) / `ADVERTISED` (7) / `ACTIVE` (8) | — | One step each. |
 | `WITHDRAW` (9) / `DISABLE` (10) / `RELEASE` (11) | `[host:16]` | `ACTIVE → DRAINING → WITHDRAWN`, `→ EMISSION_DISABLED`, `→ RELEASED` (owners cleared); `RELEASE` naming a fenced owner of an `ACTIVE` active/active set removes just that host. |
-| `RECOVERY_MARK` (12) | `[op_id:16][generation:8]` | Bumps `unsafe_recovery_generation`; a fence in flight returns to `PREPARING_NEW`; every committed binding is void until re-claimed and re-fenced. The reply's `vip_epoch` is the count of bindings voided. |
+| `RECOVERY_MARK` (12) | `[op_id:16][generation:8]` | Bumps `unsafe_recovery_generation`; a claim in flight returns to `PREPARING_NEW` with its fences voided and every current owner of the record to fence (an active/active add becomes a replacement; its `ABORT` leaves the record void); every committed binding is void until re-claimed and re-fenced. The reply's `vip_epoch` is the count of committed bindings voided. |
 | `SEED` (13) | `[op_id:16][seed:32]` | Once per group: the capability seed. |
+| `TOKEN_REISSUE` (14) | `[host:16][boot:16]` | A read in log order, changing nothing and recording no operation: the token `emission_token` derives for `host` now, when the epoch is the binding's, `host` is a committed owner under `boot`, the owners may emit, no confirmed fence names `host` and the binding's authority is current (`recovery_void` otherwise). |
 
 The reply is `[op][status][phase][mode][owner_count][token_present]
 [key:34][vip_epoch:8][authority_generation:8]
@@ -277,6 +278,22 @@ answers `not_ready` everywhere. A token is a pure function of that
 state: `emission_token` re-derives the current one for any owner on any
 replica, a restart loses nothing, and a cached token stops verifying the
 moment authority moves past it.
+
+`TOKEN_REISSUE` is how an owner reads that token back over the wire. Every
+`ACTIVATE` advances the binding's authority generation, and in an
+active/active set the owners already in it did not propose the join that
+advanced it, so the `ACTIVATE` reply carrying the new generation never
+reaches them. The read is committed through the log rather than answered
+from a local replica, so it is ordered after the join it follows and a
+lagging follower cannot hand back an older generation. It answers only a
+committed owner that may emit, under the boot incarnation it was admitted
+with (a rebooted host re-claims), not named by a confirmed fence, on a
+binding whose authority is current: voided by `RECOVERY_MARK` or committed
+under an older recovery generation, it answers `recovery_void`. The token
+it returns names the binding's current generations, so it stops verifying
+at the next authority move like any other. A claim over an
+`EMISSION_DISABLED` active/active set replaces the set rather than joining
+it, so a disabled owner is never re-admitted by another host's commit.
 
 ## Streamed snapshot
 

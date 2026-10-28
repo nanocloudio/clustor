@@ -48,8 +48,9 @@
 //   digest is a sound MAC without HMAC's second pass. Tokens are a pure
 //   function of replicated state: any replica re-derives an owner's
 //   current token (`emission_token`), and a token stops verifying the
-//   moment authority moves past it. `verify_emission_token` is what a
-//   Fluxor `ip` / announcer side asks: it fails closed on a recovery
+//   moment authority moves past it. TOKEN_REISSUE is how an owner reads
+//   its current token back over the wire (below). `verify_emission_token`
+//   is what a Fluxor `ip` / announcer side asks: it fails closed on a recovery
 //   generation or vip epoch behind the registry's, an authority generation
 //   that is not the current one, a host that is not a current owner under
 //   that boot incarnation, owners that may not emit — before their commit,
@@ -59,13 +60,32 @@
 //   In active/active a claim adds the prepared host to the set (bounded by
 //   `VB_MAX_OWNERS`, `CAPACITY` beyond) without fencing the owners that
 //   stay; RELEASE naming a fenced owner removes just that host while the
-//   set is ACTIVE.
+//   set is ACTIVE. A claim over an EMISSION_DISABLED set replaces it: the
+//   disabled owners acknowledged their cutoff and are not re-admitted by
+//   another host's commit.
+// - **an owner re-reads its token.** Every ACTIVATE advances the binding's
+//   authority generation, and in an active/active set the owners already
+//   in it are not the proposer of the join that advanced it, so the reply
+//   carrying the new token never reaches them. TOKEN_REISSUE `[common]
+//   [host:16][boot:16]` is that owner asking, in log order, for the token
+//   `emission_token` derives for it now. It is a read: it changes no
+//   binding, records no operation (a retry of the record's last mutating
+//   command still repeats its reply), and is answered with a token only
+//   when the epoch is the binding's, the host is a committed owner under
+//   that boot incarnation, the owners may emit, no confirmed fence names
+//   the host, and the binding's authority is not void — neither voided by
+//   RECOVERY_MARK nor older than the registry's recovery generation. The
+//   token names the binding's current generations, so it stops verifying
+//   at the next authority move like any other.
 // - **unsafe recovery invalidates authority.** RECOVERY_MARK bumps
 //   `unsafe_recovery_generation`, returns a claim in FENCING_OLD to
 //   PREPARING_NEW with its fences voided, and marks every committed
 //   binding voided: its tokens no longer verify and its phase cannot
 //   advance until a new claim re-admits the owner through a fresh fence:
-//   re-admission after a recovery is explicit, never implied.
+//   re-admission after a recovery is explicit, never implied. A claim in
+//   flight over an owned record is re-fenced the same way: every current
+//   owner becomes a previous owner to fence (an active/active add becomes
+//   a replacement), and an ABORT returns the record voided.
 // - **idempotent operations.** Every command carries `operation_id[16]`;
 //   the record (or the registry, for SEED and RECOVERY_MARK) remembers its
 //   last one, whole: a byte-identical retry gets the recorded reply, a
@@ -122,6 +142,8 @@ pub const VB_OP_DISABLE: u8 = 10;
 pub const VB_OP_RELEASE: u8 = 11;
 pub const VB_OP_RECOVERY_MARK: u8 = 12;
 pub const VB_OP_SEED: u8 = 13;
+/// Read an owner's current emission token (changes nothing).
+pub const VB_OP_TOKEN_REISSUE: u8 = 14;
 
 // ── Status codes ────────────────────────────────────────────────────
 
@@ -171,6 +193,7 @@ pub const VB_KEY: usize = 34;
 //   WITHDRAW / DISABLE / RELEASE    [common][host:16]
 //                 (host names the owner in active/active; zero for the set)
 //   RECOVERY_MARK [op_id:16][recovery_generation:8]
+//   TOKEN_REISSUE [common][host:16][boot:16]
 //   SEED          [op_id:16][seed:32]
 
 pub const VB_COMMON_LEN: usize = 1 + VB_OP_ID + VB_KEY + 8;
@@ -184,6 +207,7 @@ pub const VB_STEP_LEN: usize = VB_COMMON_LEN;
 pub const VB_HOST_STEP_LEN: usize = VB_COMMON_LEN + VB_HOST_ID;
 pub const VB_RECOVERY_MARK_LEN: usize = 1 + VB_OP_ID + 8;
 pub const VB_SEED_LEN: usize = 1 + VB_OP_ID + VB_SEED;
+pub const VB_TOKEN_REISSUE_LEN: usize = VB_COMMON_LEN + VB_HOST_ID + VB_BOOT_INCARNATION;
 /// Largest command body (CLAIM_PREPARE).
 pub const VB_MAX_CMD: usize = VB_CLAIM_PREPARE_LEN;
 
@@ -298,7 +322,8 @@ fn ct_eq(a: &[u8; VB_CAPABILITY], b: &[u8; VB_CAPABILITY]) -> bool {
 /// `[op:1][status:1][phase:1][mode:1][owner_count:1][token_present:1]
 /// [key:34][vip_epoch:8][authority_generation:8]
 /// [unsafe_recovery_generation:8][token: VB_TOKEN_LEN]`
-/// The token is zero unless `token_present` (ACTIVATE). A RECOVERY_MARK
+/// The token is zero unless `token_present` (ACTIVATE, TOKEN_REISSUE). A
+/// RECOVERY_MARK
 /// reply names no binding: its `vip_epoch` is the count of bindings it
 /// voided.
 pub const VB_REPLY_LEN: usize = 6 + VB_KEY + 8 + 8 + 8 + VB_TOKEN_LEN;
@@ -530,6 +555,28 @@ pub fn build_activate(
     let o = put_common(dst, VB_OP_ACTIVATE, op_id, key, expected_epoch);
     dst[o] = ready_graph as u8;
     VB_ACTIVATE_LEN
+}
+
+/// TOKEN_REISSUE: `host` asks for its current token under
+/// `expected_epoch`, naming the boot incarnation it was admitted under.
+pub fn build_token_reissue(
+    dst: &mut [u8],
+    op_id: &[u8; VB_OP_ID],
+    key: &[u8; VB_KEY],
+    expected_epoch: u64,
+    host: &[u8; VB_HOST_ID],
+    boot: &[u8; VB_BOOT_INCARNATION],
+) -> usize {
+    if dst.len() < VB_TOKEN_REISSUE_LEN
+        || *host == [0; VB_HOST_ID]
+        || *boot == [0; VB_BOOT_INCARNATION]
+    {
+        return 0;
+    }
+    let o = put_common(dst, VB_OP_TOKEN_REISSUE, op_id, key, expected_epoch);
+    dst[o..o + 16].copy_from_slice(host);
+    dst[o + 16..o + 32].copy_from_slice(boot);
+    VB_TOKEN_REISSUE_LEN
 }
 
 pub fn build_recovery_mark(dst: &mut [u8], op_id: &[u8; VB_OP_ID], generation: u64) -> usize {
@@ -985,9 +1032,18 @@ impl<const N: usize> VipRegistry<N> {
         }
     }
 
+    /// Whether `slot`'s owners hold authority under the registry's current
+    /// recovery generation: not voided by RECOVERY_MARK, and committed at
+    /// it. A claim in flight over an owned record at a recovery is not
+    /// voided (it re-fences instead), but its owners' authority predates
+    /// the recovery all the same.
+    fn authority_current(&self, slot: &VipSlot) -> bool {
+        !slot.voided && slot.unsafe_recovery_generation == self.unsafe_recovery_generation
+    }
+
     /// Derive the token the current owner `host` of `key` holds (any
     /// replica computes the same one), or `None` when the host is not a
-    /// committed, unvoided owner.
+    /// committed owner that may emit under the current recovery generation.
     pub fn emission_token(
         &self,
         key: &[u8; VB_KEY],
@@ -995,7 +1051,7 @@ impl<const N: usize> VipRegistry<N> {
         digest: DigestFn,
     ) -> Option<EmissionToken> {
         let slot = self.lookup(key)?;
-        if slot.voided || !slot.owners_emit() || !self.seeded() {
+        if !self.authority_current(slot) || !slot.owners_emit() || !self.seeded() {
             return None;
         }
         let i = slot.owner_index(host)?;
@@ -1081,6 +1137,7 @@ impl<const N: usize> VipRegistry<N> {
         let op = body[0];
         match op {
             VB_OP_RECOVERY_MARK | VB_OP_SEED => return self.apply_registry_op(body),
+            VB_OP_TOKEN_REISSUE => return self.apply_token_reissue(body, digest),
             _ => {}
         }
         let want = match op {
@@ -1142,6 +1199,61 @@ impl<const N: usize> VipRegistry<N> {
         reply
     }
 
+    /// TOKEN_REISSUE: answered from the replicated state at this log
+    /// position, changing none of it. No operation memo is consulted or
+    /// recorded: a read cannot conflict with a command, and recording it
+    /// would displace the record's last mutating command, whose retry must
+    /// still repeat its reply.
+    fn apply_token_reissue(&self, body: &[u8], digest: DigestFn) -> VipReply {
+        let op = VB_OP_TOKEN_REISSUE;
+        if body.len() < VB_TOKEN_REISSUE_LEN {
+            return VipReply {
+                op,
+                status: VB_ST_INVALID,
+                ..VipReply::zero()
+            };
+        }
+        let mut key = [0u8; VB_KEY];
+        key.copy_from_slice(&body[17..51]);
+        let expected = u64_at(body, 51);
+        let mut host = [0u8; VB_HOST_ID];
+        host.copy_from_slice(&body[59..75]);
+        let mut boot = [0u8; VB_BOOT_INCARNATION];
+        boot.copy_from_slice(&body[75..91]);
+        if host == [0; VB_HOST_ID] || boot == [0; VB_BOOT_INCARNATION] {
+            return self.reply_bare(op, VB_ST_INVALID, &key);
+        }
+        let Some(i) = self.find(&key) else {
+            return self.reply_bare(op, VB_ST_UNKNOWN_BINDING, &key);
+        };
+        let slot = &self.slots[i];
+        let status = if !self.seeded() {
+            VB_ST_NOT_READY
+        } else if expected < slot.vip_epoch {
+            VB_ST_STALE_EPOCH
+        } else if expected > slot.vip_epoch {
+            VB_ST_FUTURE_EPOCH
+        } else if !self.authority_current(slot) {
+            VB_ST_RECOVERY_VOID
+        } else if slot.owner_count == 0 || !slot.owners_emit() {
+            VB_ST_UNSUPPORTED_STATE
+        } else {
+            match slot.owner_index(&host) {
+                Some(k) if slot.owner_boot[k] == boot && slot.fence_index(&host).is_none() => {
+                    let mut r = self.reply(op, VB_ST_OK, slot);
+                    r.token_present = true;
+                    r.token = self.mint(slot, k, digest);
+                    return r;
+                }
+                // Not an owner, an owner under another boot incarnation
+                // (its authority died with the boot it was admitted
+                // under), or one whose fence is confirmed (cut off).
+                _ => VB_ST_UNAUTHORIZED,
+            }
+        };
+        self.reply(op, status, slot)
+    }
+
     fn apply_registry_op(&mut self, body: &[u8]) -> VipReply {
         let op = body[0];
         let want = if op == VB_OP_SEED {
@@ -1182,11 +1294,23 @@ impl<const N: usize> VipRegistry<N> {
                 let mut at = 0;
                 while let Some(i) = self.occupied.next_used(at) {
                     let s = &mut self.slots[i];
-                    if s.phase == VB_PHASE_FENCING_OLD {
+                    if s.phase == VB_PHASE_PREPARING_NEW || s.phase == VB_PHASE_FENCING_OLD {
                         // The fences were evidence under the old
-                        // generation; the claim re-fences.
+                        // generation; the claim re-fences. Owners it was
+                        // to keep (an active/active add) hold authority
+                        // from before the recovery: they are fenced like
+                        // any predecessor, and the add becomes a
+                        // replacement. Owners that disabled emission
+                        // acknowledged their own cutoff already.
                         s.phase = VB_PHASE_PREPARING_NEW;
                         s.clear_fences();
+                        if s.previous_count == 0
+                            && s.owner_count > 0
+                            && s.prior_phase != VB_PHASE_EMISSION_DISABLED
+                        {
+                            s.previous_owners = s.owners;
+                            s.previous_count = s.owner_count;
+                        }
                     } else if s.phase >= VB_PHASE_OWNER_COMMITTED && s.phase < VB_PHASE_RELEASED {
                         s.voided = true;
                         voided += 1;
@@ -1268,7 +1392,12 @@ impl<const N: usize> VipRegistry<N> {
             _ => {}
         }
         let owned = slot.phase >= VB_PHASE_OWNER_COMMITTED && slot.phase < VB_PHASE_RELEASED;
-        let adding = owned && slot.mode == VB_MODE_ACTIVE_ACTIVE && !slot.voided;
+        // A disabled set is not joined: its owners acknowledged their
+        // cutoff, and another host's commit must not re-admit them.
+        let adding = owned
+            && slot.mode == VB_MODE_ACTIVE_ACTIVE
+            && !slot.voided
+            && slot.phase != VB_PHASE_EMISSION_DISABLED;
         if adding && slot.owner_index(&host).is_some() {
             return Self::reply_of(recovery, VB_OP_CLAIM_PREPARE, VB_ST_INVALID, slot);
         }
@@ -1319,6 +1448,16 @@ impl<const N: usize> VipRegistry<N> {
         }
         slot.clear_claim();
         slot.phase = slot.prior_phase;
+        // Back to an owned record whose authority predates a recovery that
+        // landed while the claim was in flight: void, as the recovery
+        // would have left it had the claim not been there.
+        if slot.owner_count > 0
+            && slot.phase >= VB_PHASE_OWNER_COMMITTED
+            && slot.phase < VB_PHASE_RELEASED
+            && slot.unsafe_recovery_generation < recovery
+        {
+            slot.voided = true;
+        }
         Self::reply_of(recovery, VB_OP_ABORT, VB_ST_OK, slot)
     }
 
@@ -1385,8 +1524,13 @@ impl<const N: usize> VipRegistry<N> {
         if slot.prepared_count != 1 {
             return Self::reply_of(recovery, VB_OP_ACTIVATE, VB_ST_INVARIANT_FAILURE, slot);
         }
-        let keep_set =
-            slot.mode == VB_MODE_ACTIVE_ACTIVE && slot.previous_count == 0 && !slot.voided;
+        // The claim was an add to a live set (see `apply_claim`): nobody
+        // to fence, a set that was not disabled, authority not void.
+        let keep_set = slot.mode == VB_MODE_ACTIVE_ACTIVE
+            && slot.previous_count == 0
+            && !slot.voided
+            && slot.prior_phase != VB_PHASE_EMISSION_DISABLED
+            && slot.unsafe_recovery_generation == recovery;
         let owner = if keep_set {
             let k = slot.owner_count as usize;
             if k >= VB_MAX_OWNERS {

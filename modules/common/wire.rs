@@ -2378,7 +2378,8 @@ pub const MSG_TR_REPLY: u8 = 0x93;
 // `MSG_VB_REQUEST`: `[request_id:u64 LE][vip_registry command body]`
 // (`VB_OP_*` layouts in `modules/common/vip_registry.rs`);
 // `MSG_VB_REPLY`: `[request_id:u64 LE][VipReply (VB_REPLY_LEN bytes)]`,
-// carrying the minted emission token on a committed ACTIVATE.
+// carrying the minted emission token on a committed ACTIVATE and the
+// re-derived one on a TOKEN_REISSUE.
 pub const MSG_VB_REQUEST: u8 = 0x94;
 pub const MSG_VB_REPLY: u8 = 0x95;
 
