@@ -40,6 +40,27 @@
 // - **unsafe-recovery voiding.** RECOVERY_MARK voids every bound flow:
 //   MIRROR_MARK and MOVE are refused `RECOVERY_VOID` until a BIND at the
 //   committed epoch re-establishes the binding under a new one.
+// - **per-flow emission tokens are minted here.** MOVE_FENCED is MOVE
+//   naming the fence generation that ended the old emitter's authority
+//   (the custody generation the session namespace's FENCE_CONFIRM
+//   carried). It commits the same promotion, and the promoted anchor's
+//   `FlowToken` is then a pure function of replicated state: the flow, the
+//   epoch that move committed, the anchor and the fence generation — the
+//   fields of Wormhole's `cc_emission_token` — and a 16-byte capability,
+//   the first 16 bytes of SHA-256 over the group's capability seed (the VIP
+//   registry's, replicated once by SEED), a domain tag and those fields
+//   (`flow_token`). The seed is passed in, so this file stays pure; an
+//   unseeded group mints nothing. A token verifies (`verify_flow_token`)
+//   while its anchor is the flow's primary under the move that minted it:
+//   a re-BIND of the standby set keeps it (the emitter did not change), a
+//   plain MOVE, TOMBSTONE or RECOVERY_MARK ends it for good, and a
+//   re-admission after recovery needs a new fenced MOVE. The module relays
+//   the token in the trailer of the MOVE_FENCED reply. Through
+//   `apply_fenced` the fence generation is not taken on trust: a
+//   MOVE_FENCED commits only if the session namespace holds a confirmed
+//   fence of exactly that generation on the emitter being replaced (the
+//   session directory's committed apply answers from the flow's session
+//   record), so a token is never minted past an unconfirmed fence.
 //
 // A proposer routes a flow to its group by `wire::shard_for_key` over
 // `wire::fnv1a_64(flow_id)` — a virtual shard, fixed for the cluster's
@@ -67,6 +88,9 @@ pub const TR_OP_MIRROR_MARK: u8 = 3;
 pub const TR_OP_TOMBSTONE: u8 = 4;
 pub const TR_OP_RETIRE: u8 = 5;
 pub const TR_OP_RECOVERY_MARK: u8 = 6;
+/// MOVE naming the fence generation that ended the old emitter: mints the
+/// promoted anchor's per-flow emission token.
+pub const TR_OP_MOVE_FENCED: u8 = 7;
 
 // ── Status codes ────────────────────────────────────────────────────
 
@@ -92,6 +116,10 @@ pub const TR_ST_TOMBSTONED: u8 = 9;
 pub const TR_ST_RECOVERY_VOID: u8 = 10;
 /// RECOVERY_MARK with a non-advancing recovery epoch.
 pub const TR_ST_RECOVERY_STALE: u8 = 11;
+/// A flow token that is not the current emitter's (`verify_flow_token`):
+/// no token minted, another anchor, epoch or fence generation, an
+/// unseeded group, or a capability that does not recompute.
+pub const TR_ST_UNAUTHORIZED: u8 = 12;
 
 // ── Record states ───────────────────────────────────────────────────
 
@@ -115,6 +143,8 @@ pub const TR_ANCHOR_ID: usize = 8;
 //                   the committed primary (a primary moves by MOVE); the
 //                   standby set is replaced and the epoch advances.
 //   MOVE          [op_id][flow][expected_epoch][new_primary:8]
+//   MOVE_FENCED   [op_id][flow][expected_epoch][new_primary:8][fence_gen:4]
+//                   fence_gen ≠ 0; otherwise exactly MOVE.
 //   MIRROR_MARK   [op_id][flow][expected_epoch][anchor:8][mirror_epoch:8]
 //                 [mirror_generation:8]
 //                   anchor = the primary → the committed horizon; a standby
@@ -126,6 +156,7 @@ pub const TR_ANCHOR_ID: usize = 8;
 pub const TR_COMMON_LEN: usize = 1 + TR_OP_ID + TR_FLOW_ID + 4;
 pub const TR_BIND_LEN: usize = TR_COMMON_LEN + TR_ANCHOR_ID + 1 + TR_ANCHOR_ID * TR_MAX_STANDBYS;
 pub const TR_MOVE_LEN: usize = TR_COMMON_LEN + TR_ANCHOR_ID;
+pub const TR_MOVE_FENCED_LEN: usize = TR_MOVE_LEN + 4;
 pub const TR_MIRROR_MARK_LEN: usize = TR_COMMON_LEN + TR_ANCHOR_ID + 8 + 8;
 pub const TR_TOMBSTONE_LEN: usize = TR_COMMON_LEN;
 pub const TR_RETIRE_LEN: usize = TR_COMMON_LEN;
@@ -204,6 +235,133 @@ impl TransportReply {
     }
 }
 
+// ── Per-flow emission token ─────────────────────────────────────────
+
+pub const TR_SEED: usize = 32;
+pub const TR_CAPABILITY: usize = 16;
+/// `[flow:16][epoch:4][anchor:8][fence_gen:4][capability:16]`: the fields
+/// of Wormhole's `cc_emission_token(flow_id, new_epoch, anchor,
+/// fence_gen)`, in its order, then the capability.
+pub const TR_TOKEN_LEN: usize = TR_FLOW_ID + 4 + TR_ANCHOR_ID + 4 + TR_CAPABILITY;
+const TR_TOKEN_FIELDS: usize = TR_TOKEN_LEN - TR_CAPABILITY;
+/// Domain tag ahead of the fields under the seed, so a flow token's MAC
+/// input is never another namespace's.
+const TR_TOKEN_TAG: [u8; 8] = *b"TRFLOW01";
+
+pub type DigestFn = fn(&[u8]) -> [u8; 32];
+
+/// `apply_fenced`'s question: does `(flow, old_primary, fence_gen)` name a
+/// confirmed, unconsumed fence on the emitter a MOVE_FENCED replaces?
+pub type FenceConfirmed<'a> = dyn Fn(&[u8; TR_FLOW_ID], &[u8; TR_ANCHOR_ID], u32) -> bool + 'a;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct FlowToken {
+    pub flow_id: [u8; TR_FLOW_ID],
+    /// The emitter epoch the minting MOVE_FENCED committed.
+    pub epoch: u32,
+    pub anchor: [u8; TR_ANCHOR_ID],
+    pub fence_gen: u32,
+    pub capability: [u8; TR_CAPABILITY],
+}
+
+impl FlowToken {
+    pub const fn zero() -> Self {
+        FlowToken {
+            flow_id: [0; TR_FLOW_ID],
+            epoch: 0,
+            anchor: [0; TR_ANCHOR_ID],
+            fence_gen: 0,
+            capability: [0; TR_CAPABILITY],
+        }
+    }
+
+    fn encode_fields(&self, dst: &mut [u8]) {
+        dst[0..16].copy_from_slice(&self.flow_id);
+        dst[16..20].copy_from_slice(&self.epoch.to_le_bytes());
+        dst[20..28].copy_from_slice(&self.anchor);
+        dst[28..32].copy_from_slice(&self.fence_gen.to_le_bytes());
+    }
+
+    pub fn encode(&self, dst: &mut [u8]) -> usize {
+        if dst.len() < TR_TOKEN_LEN {
+            return 0;
+        }
+        self.encode_fields(dst);
+        dst[TR_TOKEN_FIELDS..TR_TOKEN_LEN].copy_from_slice(&self.capability);
+        TR_TOKEN_LEN
+    }
+
+    pub fn decode(src: &[u8]) -> Option<FlowToken> {
+        if src.len() < TR_TOKEN_LEN {
+            return None;
+        }
+        let mut t = FlowToken::zero();
+        t.flow_id.copy_from_slice(&src[0..16]);
+        t.epoch = u32_at(src, 16);
+        t.anchor.copy_from_slice(&src[20..28]);
+        t.fence_gen = u32_at(src, 28);
+        t.capability
+            .copy_from_slice(&src[TR_TOKEN_FIELDS..TR_TOKEN_LEN]);
+        Some(t)
+    }
+
+    /// The capability: the first 16 bytes of `digest(seed || tag ||
+    /// fields)`. Seed, tag and fields are fixed-length, so no extension of
+    /// a valid input is itself a valid input; a holder cannot forge a
+    /// token for another flow, epoch, anchor or fence.
+    pub fn capability_for(seed: &[u8; TR_SEED], fields: &[u8], digest: DigestFn) -> [u8; 16] {
+        let mut m = [0u8; TR_SEED + 8 + TR_TOKEN_FIELDS];
+        m[..TR_SEED].copy_from_slice(seed);
+        m[TR_SEED..TR_SEED + 8].copy_from_slice(&TR_TOKEN_TAG);
+        m[TR_SEED + 8..].copy_from_slice(&fields[..TR_TOKEN_FIELDS]);
+        let d = digest(&m);
+        let mut c = [0u8; TR_CAPABILITY];
+        c.copy_from_slice(&d[..TR_CAPABILITY]);
+        c
+    }
+}
+
+fn ct_eq(a: &[u8; TR_CAPABILITY], b: &[u8; TR_CAPABILITY]) -> bool {
+    let mut d = 0u8;
+    let mut i = 0;
+    while i < TR_CAPABILITY {
+        d |= a[i] ^ b[i];
+        i += 1;
+    }
+    d == 0
+}
+
+/// The trailer every `MSG_TR_REPLY` carries after the `TransportReply`:
+/// `[token_present:1][reserved:3][token: TR_TOKEN_LEN]`, the token zero
+/// unless present. Fixed-length, so a reader of the 38-byte reply alone
+/// still reads it, and the wire reply is `TR_WIRE_REPLY_LEN` bytes.
+pub const TR_TOKEN_TRAILER_LEN: usize = 4 + TR_TOKEN_LEN;
+pub const TR_WIRE_REPLY_LEN: usize = TR_REPLY_LEN + TR_TOKEN_TRAILER_LEN;
+
+pub fn encode_token_trailer(token: Option<&FlowToken>, dst: &mut [u8]) -> usize {
+    if dst.len() < TR_TOKEN_TRAILER_LEN {
+        return 0;
+    }
+    dst[..TR_TOKEN_TRAILER_LEN].copy_from_slice(&[0; TR_TOKEN_TRAILER_LEN]);
+    if let Some(t) = token {
+        dst[0] = 1;
+        let _ = t.encode(&mut dst[4..]);
+    }
+    TR_TOKEN_TRAILER_LEN
+}
+
+/// `Some(None)` for a well-formed trailer without a token.
+pub fn decode_token_trailer(src: &[u8]) -> Option<Option<FlowToken>> {
+    if src.len() < TR_TOKEN_TRAILER_LEN || src[0] > 1 || src[1..4] != [0; 3] {
+        return None;
+    }
+    if src[0] == 0 {
+        return Some(None);
+    }
+    FlowToken::decode(&src[4..]).map(Some)
+}
+
 fn u32_at(src: &[u8], o: usize) -> u32 {
     u32::from_le_bytes([src[o], src[o + 1], src[o + 2], src[o + 3]])
 }
@@ -279,6 +437,26 @@ pub fn build_move(
     let o = put_common(dst, TR_OP_MOVE, op_id, flow, expected_epoch);
     dst[o..o + 8].copy_from_slice(new_primary);
     TR_MOVE_LEN
+}
+
+/// MOVE_FENCED: promote `new_primary` as MOVE does, naming the fence
+/// generation (≠ 0) that ended the old emitter; the committed reply's
+/// trailer carries the new emitter's `FlowToken`.
+pub fn build_move_fenced(
+    dst: &mut [u8],
+    op_id: &[u8; TR_OP_ID],
+    flow: &[u8; TR_FLOW_ID],
+    expected_epoch: u32,
+    new_primary: &[u8; TR_ANCHOR_ID],
+    fence_gen: u32,
+) -> usize {
+    if dst.len() < TR_MOVE_FENCED_LEN || fence_gen == 0 {
+        return 0;
+    }
+    let o = put_common(dst, TR_OP_MOVE_FENCED, op_id, flow, expected_epoch);
+    dst[o..o + 8].copy_from_slice(new_primary);
+    dst[o + 8..o + 12].copy_from_slice(&fence_gen.to_le_bytes());
+    TR_MOVE_FENCED_LEN
 }
 
 pub fn build_mirror_mark(
@@ -426,6 +604,11 @@ pub struct FlowSlot {
     pub standby_mirror_epoch: [u64; TR_MAX_STANDBYS],
     pub standby_mirror_generation: [u64; TR_MAX_STANDBYS],
     pub last_op: OpMemo,
+    /// The epoch the MOVE_FENCED that made `primary` the emitter committed,
+    /// and the fence generation it named: the token's fields. Zero when the
+    /// primary holds no token (bound, moved unfenced, tombstoned or voided).
+    pub token_epoch: u32,
+    pub fence_gen: u32,
 }
 
 impl FlowSlot {
@@ -443,6 +626,8 @@ impl FlowSlot {
             standby_mirror_epoch: [0; TR_MAX_STANDBYS],
             standby_mirror_generation: [0; TR_MAX_STANDBYS],
             last_op: OpMemo::empty(),
+            token_epoch: 0,
+            fence_gen: 0,
         }
     }
 
@@ -462,6 +647,7 @@ impl FlowSlot {
     ///   [flow_id:16][primary:8][standbys:8×3][mirror_epoch:8]
     ///   [mirror_generation:8][standby_mirror_epoch:8×3]
     ///   [standby_mirror_generation:8×3][last_op: OpMemo::LEN]
+    ///   [token_epoch:4][fence_gen:4]
     fn encode(&self, dst: &mut [u8]) {
         dst[0] = self.state;
         dst[1] = self.voided as u8;
@@ -489,6 +675,9 @@ impl FlowSlot {
         }
         o += 24;
         self.last_op.encode(&mut dst[o..o + OpMemo::LEN]);
+        o += OpMemo::LEN;
+        dst[o..o + 4].copy_from_slice(&self.token_epoch.to_le_bytes());
+        dst[o + 4..o + 8].copy_from_slice(&self.fence_gen.to_le_bytes());
     }
 
     fn decode(src: &[u8]) -> Option<FlowSlot> {
@@ -521,6 +710,17 @@ impl FlowSlot {
         }
         o += 24;
         s.last_op = OpMemo::decode(&src[o..o + OpMemo::LEN])?;
+        o += OpMemo::LEN;
+        s.token_epoch = u32_at(src, o);
+        s.fence_gen = u32_at(src, o + 4);
+        // A token names a fence and an epoch the flow reached; a primary
+        // tombstoned or voided holds none.
+        if (s.token_epoch == 0) != (s.fence_gen == 0)
+            || s.token_epoch > s.epoch
+            || (s.token_epoch != 0 && (s.state != TR_STATE_BOUND || s.voided))
+        {
+            return None;
+        }
         Some(s)
     }
 }
@@ -630,6 +830,127 @@ impl<const N: usize> TransportRegistry<N> {
         self.find(flow).map(|i| &self.slots[i])
     }
 
+    fn mint(slot: &FlowSlot, seed: &[u8; TR_SEED], digest: DigestFn) -> FlowToken {
+        let mut t = FlowToken {
+            flow_id: slot.flow_id,
+            epoch: slot.token_epoch,
+            anchor: slot.primary,
+            fence_gen: slot.fence_gen,
+            capability: [0; TR_CAPABILITY],
+        };
+        let mut fields = [0u8; TR_TOKEN_FIELDS];
+        t.encode_fields(&mut fields);
+        t.capability = FlowToken::capability_for(seed, &fields, digest);
+        t
+    }
+
+    /// The token the current emitter of `flow` holds (any replica derives
+    /// the same one from `seed`, the group's capability seed), or `None`
+    /// when the emitter was not promoted by a MOVE_FENCED, the flow is
+    /// tombstoned or voided, or the group is unseeded.
+    pub fn flow_token(
+        &self,
+        flow: &[u8; TR_FLOW_ID],
+        seed: &[u8; TR_SEED],
+        digest: DigestFn,
+    ) -> Option<FlowToken> {
+        let slot = self.lookup(flow)?;
+        if *seed == [0; TR_SEED]
+            || slot.state != TR_STATE_BOUND
+            || slot.voided
+            || slot.token_epoch == 0
+        {
+            return None;
+        }
+        Some(Self::mint(slot, seed, digest))
+    }
+
+    /// A continuity provider's token check as Fluxor's TRANSPORT_CONTINUITY
+    /// asks it on `auth_req` (`MSG_TOKEN_CHECK` 0xC2: `[token:TR_TOKEN_LEN]`),
+    /// answered as `MSG_TOKEN_VERDICT` (0xC3) wants it: `[token][verdict]`,
+    /// the verdict 0 for the flow's current emitter's token and otherwise
+    /// `0x80 |` the registry's refusal. `None` for a check that is not one.
+    pub fn answer_token_check(
+        &self,
+        req: &[u8],
+        seed: &[u8; TR_SEED],
+        digest: DigestFn,
+        out: &mut [u8; TR_TOKEN_LEN + 1],
+    ) -> Option<u8> {
+        if req.len() != TR_TOKEN_LEN {
+            return None;
+        }
+        let verdict = match FlowToken::decode(req) {
+            Some(t) => match self.verify_flow_token(&t, seed, digest) {
+                Ok(()) => 0,
+                Err(code) => 0x80 | code,
+            },
+            None => 0x80 | TR_ST_INVALID,
+        };
+        out[..TR_TOKEN_LEN].copy_from_slice(req);
+        out[TR_TOKEN_LEN] = verdict;
+        Some(verdict)
+    }
+
+    /// What a continuity provider asks before enabling a promoted anchor's
+    /// emission: is this the token of the flow's current emitter? Fails
+    /// closed (`Err(TR_ST_*)`): an unknown flow, a tombstoned or voided
+    /// one, an epoch other than the one the minting move committed (an
+    /// older token after a later move, or one from a future the registry
+    /// has not reached), another anchor or fence generation, an unseeded
+    /// group, or a capability that does not recompute from `seed`.
+    pub fn verify_flow_token(
+        &self,
+        token: &FlowToken,
+        seed: &[u8; TR_SEED],
+        digest: DigestFn,
+    ) -> Result<(), u8> {
+        if *seed == [0; TR_SEED] {
+            return Err(TR_ST_UNAUTHORIZED);
+        }
+        let Some(slot) = self.lookup(&token.flow_id) else {
+            return Err(TR_ST_UNKNOWN_FLOW);
+        };
+        if slot.state == TR_STATE_TOMBSTONE {
+            return Err(TR_ST_TOMBSTONED);
+        }
+        if slot.voided {
+            return Err(TR_ST_RECOVERY_VOID);
+        }
+        if slot.token_epoch == 0 || token.epoch != slot.token_epoch {
+            return Err(TR_ST_STALE_EPOCH);
+        }
+        if token.anchor != slot.primary || token.fence_gen != slot.fence_gen {
+            return Err(TR_ST_UNAUTHORIZED);
+        }
+        let expect = Self::mint(slot, seed, digest);
+        if !ct_eq(&expect.capability, &token.capability) {
+            return Err(TR_ST_UNAUTHORIZED);
+        }
+        Ok(())
+    }
+
+    /// The token a committed reply's trailer carries: the emitter's, when
+    /// `reply` is a MOVE_FENCED that committed the epoch the flow holds
+    /// now (a retried MOVE_FENCED is answered with its recorded reply;
+    /// once the flow has moved past it, there is no token to carry).
+    pub fn reply_token(
+        &self,
+        reply: &TransportReply,
+        seed: &[u8; TR_SEED],
+        digest: DigestFn,
+    ) -> Option<FlowToken> {
+        if reply.op != TR_OP_MOVE_FENCED || reply.status != TR_ST_OK {
+            return None;
+        }
+        let t = self.flow_token(&reply.flow_id, seed, digest)?;
+        if t.epoch == reply.epoch {
+            Some(t)
+        } else {
+            None
+        }
+    }
+
     fn reply(op: u8, status: u8, slot: &FlowSlot) -> TransportReply {
         TransportReply {
             op,
@@ -651,8 +972,25 @@ impl<const N: usize> TransportRegistry<N> {
     }
 
     /// Apply one committed command body. DETERMINISTIC. Returns the reply
-    /// the proposing replica relays.
+    /// the proposing replica relays. A MOVE_FENCED's fence generation is
+    /// taken as named; `apply_fenced` checks it.
     pub fn apply(&mut self, body: &[u8]) -> TransportReply {
+        self.apply_fenced(body, &|_, _, _| true)
+    }
+
+    /// `apply`, with `fence_confirmed(flow, old_primary, fence_gen)` asked
+    /// before a new MOVE_FENCED promotes anything: is there a confirmed
+    /// fence of exactly this generation on the emitter being replaced? The
+    /// session directory answers it from the session namespace's record of
+    /// the flow (replicated state applied in log order, so every replica
+    /// answers alike); a no is `UNAUTHORIZED`, recorded like any refusal.
+    /// A retry is answered from the record's memo before it is asked, so
+    /// the fence the takeover's ACTIVATE later consumed is not needed again.
+    pub fn apply_fenced(
+        &mut self,
+        body: &[u8],
+        fence_confirmed: &FenceConfirmed<'_>,
+    ) -> TransportReply {
         self.applied = self.applied.wrapping_add(1);
         if body.is_empty() {
             return TransportReply::fail(0, TR_ST_INVALID);
@@ -664,6 +1002,7 @@ impl<const N: usize> TransportRegistry<N> {
         let want = match op {
             TR_OP_BIND => TR_BIND_LEN,
             TR_OP_MOVE => TR_MOVE_LEN,
+            TR_OP_MOVE_FENCED => TR_MOVE_FENCED_LEN,
             TR_OP_MIRROR_MARK => TR_MIRROR_MARK_LEN,
             TR_OP_TOMBSTONE => TR_TOMBSTONE_LEN,
             TR_OP_RETIRE => TR_RETIRE_LEN,
@@ -697,7 +1036,7 @@ impl<const N: usize> TransportRegistry<N> {
                     return Self::reply(op, TR_ST_STALE_EPOCH, &self.slots[i]);
                 }
                 match op {
-                    TR_OP_MOVE => self.apply_move(body, i),
+                    TR_OP_MOVE | TR_OP_MOVE_FENCED => self.apply_move(op, body, i, fence_confirmed),
                     TR_OP_MIRROR_MARK => self.apply_mirror_mark(body, i),
                     TR_OP_TOMBSTONE => self.apply_tombstone(i),
                     _ => self.apply_retire(i),
@@ -831,28 +1170,45 @@ impl<const N: usize> TransportRegistry<N> {
         Self::reply(TR_OP_BIND, TR_ST_OK, slot)
     }
 
-    fn apply_move(&mut self, body: &[u8], i: usize) -> TransportReply {
+    fn apply_move(
+        &mut self,
+        op: u8,
+        body: &[u8],
+        i: usize,
+        fence_confirmed: &FenceConfirmed<'_>,
+    ) -> TransportReply {
         let mut new_primary = [0u8; TR_ANCHOR_ID];
         new_primary.copy_from_slice(&body[37..45]);
+        let fence_gen = if op == TR_OP_MOVE_FENCED {
+            u32_at(body, 45)
+        } else {
+            0
+        };
         let slot = &mut self.slots[i];
+        if op == TR_OP_MOVE_FENCED && fence_gen == 0 {
+            return Self::reply(op, TR_ST_INVALID, slot);
+        }
         if slot.state == TR_STATE_TOMBSTONE {
-            return Self::reply(TR_OP_MOVE, TR_ST_TOMBSTONED, slot);
+            return Self::reply(op, TR_ST_TOMBSTONED, slot);
         }
         if slot.voided {
-            return Self::reply(TR_OP_MOVE, TR_ST_RECOVERY_VOID, slot);
+            return Self::reply(op, TR_ST_RECOVERY_VOID, slot);
+        }
+        if fence_gen != 0 && !fence_confirmed(&slot.flow_id, &slot.primary, fence_gen) {
+            return Self::reply(op, TR_ST_UNAUTHORIZED, slot);
         }
         let Some(k) = slot.standby_index(&new_primary) else {
-            return Self::reply(TR_OP_MOVE, TR_ST_NOT_A_STANDBY, slot);
+            return Self::reply(op, TR_ST_NOT_A_STANDBY, slot);
         };
         if (
             slot.standby_mirror_epoch[k],
             slot.standby_mirror_generation[k],
         ) < (slot.mirror_epoch, slot.mirror_generation)
         {
-            return Self::reply(TR_OP_MOVE, TR_ST_MIRROR_BEHIND, slot);
+            return Self::reply(op, TR_ST_MIRROR_BEHIND, slot);
         }
         let Some(next) = slot.epoch.checked_add(1) else {
-            return Self::reply(TR_OP_MOVE, TR_ST_INVALID, slot);
+            return Self::reply(op, TR_ST_INVALID, slot);
         };
         // The promoted standby leaves the standby list; the old primary is
         // not a standby (it holds no mirror of the new emitter) — it is
@@ -871,7 +1227,16 @@ impl<const N: usize> TransportRegistry<N> {
         slot.standby_count -= 1;
         slot.primary = new_primary;
         slot.epoch = next;
-        Self::reply(TR_OP_MOVE, TR_ST_OK, slot)
+        // The new emitter holds a token only if the move named the fence
+        // that ended the old one; an unfenced move leaves none.
+        if fence_gen != 0 {
+            slot.token_epoch = next;
+            slot.fence_gen = fence_gen;
+        } else {
+            slot.token_epoch = 0;
+            slot.fence_gen = 0;
+        }
+        Self::reply(op, TR_ST_OK, slot)
     }
 
     fn apply_mirror_mark(&mut self, body: &[u8], i: usize) -> TransportReply {
@@ -919,6 +1284,8 @@ impl<const N: usize> TransportRegistry<N> {
             return Self::reply(TR_OP_TOMBSTONE, TR_ST_INVALID, slot);
         };
         slot.state = TR_STATE_TOMBSTONE;
+        slot.token_epoch = 0;
+        slot.fence_gen = 0;
         slot.primary = [0; TR_ANCHOR_ID];
         slot.standbys = [[0; TR_ANCHOR_ID]; TR_MAX_STANDBYS];
         slot.standby_count = 0;
@@ -959,7 +1326,11 @@ impl<const N: usize> TransportRegistry<N> {
             let mut at = 0;
             while let Some(i) = self.occupied.next_used(at) {
                 if self.slots[i].state == TR_STATE_BOUND {
+                    // Authority after a recovery is re-admitted explicitly:
+                    // the voided emitter's token never verifies again.
                     self.slots[i].voided = true;
+                    self.slots[i].token_epoch = 0;
+                    self.slots[i].fence_gen = 0;
                     voided += 1;
                 }
                 at = i + 1;
@@ -979,13 +1350,15 @@ impl<const N: usize> TransportRegistry<N> {
 
     // ── Snapshot (streamed, versioned) ──────────────────────────────
     //
-    //   header [version:u16 = 2][reserved:u16][arena N:u32][admitted:u32]
+    //   header [version:u16 = 3][reserved:u16][arena N:u32][admitted:u32]
     //          [record_count:u32][recovery_epoch:u32][applied:u64]
     //          [last_op: OpMemo::LEN]
     //   record [slot:u32][FlowSlot: TR_SLOT_SNAP_LEN] × record_count, in
     //          slot order
+    //
+    // Version 3 appended each flow's token fields to its record.
 
-    pub const SNAPSHOT_VERSION: u16 = 2;
+    pub const SNAPSHOT_VERSION: u16 = 3;
 
     pub fn snapshot_len(&self) -> usize {
         TR_SNAP_HDR_LEN + self.live as usize * TR_SNAP_RECORD_LEN
@@ -1163,8 +1536,8 @@ impl<const N: usize> TransportRegistry<N> {
 
 /// Per-flow snapshot record (see `FlowSlot::encode`): 32 header and
 /// identity bytes, 24 of standbys, 16 of the primary's horizon, 48 of the
-/// standbys' horizons, then the memo.
-pub const TR_SLOT_SNAP_LEN: usize = 120 + OpMemo::LEN;
+/// standbys' horizons, then the memo and the 8 bytes of token fields.
+pub const TR_SLOT_SNAP_LEN: usize = 120 + OpMemo::LEN + 8;
 pub const TR_SNAP_RECORD_LEN: usize = 4 + TR_SLOT_SNAP_LEN;
 pub const TR_SNAP_HDR_LEN: usize = 28 + OpMemo::LEN;
 pub const TR_SNAP_MAX_UNIT: usize = TR_SNAP_RECORD_LEN;

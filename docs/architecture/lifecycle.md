@@ -342,6 +342,11 @@ commits (`modules/app/consensus/raft.rs`):
   receive the log and count toward no quorum. A replica named as a voter,
   current or joint, is never also a learner.
 
+Under a multi-site map (`site_map`, `min_sites`) each of those
+majorities must also span `min_sites` sites — both configurations, in
+commit, durability, elections and ReadIndex alike
+([multi_site.md](multi_site.md)).
+
 Every op's body carries the COMPLETE id set rather than a delta, so
 replaying an entry lands the configuration it names instead of applying
 a change twice.

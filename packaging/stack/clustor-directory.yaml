@@ -1,0 +1,207 @@
+# clustor-directory: Clustor's session directory as a stack another
+# project's graph includes — a one-voter replica group (consensus,
+# durability, the admission and control-plane feedback, operations) with
+# `session_directory` as its replicated consumer.
+#
+#   requests ─▶ directory ── proposals ──▶ consensus ── committed ──▶ directory ─▶ replies
+#                                              ⇅ peer_router ⇅ net_in / net_out
+#
+# What the includer reaches is the directory's own pair: `requests` takes
+# `MSG_SR_REQUEST` / `MSG_TR_REQUEST` / `MSG_VB_REQUEST` / `MSG_FO_REQUEST`
+# / `MSG_RG_REQUEST` / `MSG_OP_REQUEST` / `MSG_AT_REQUEST` /
+# `MSG_RS_REQUEST` (`[request_id u64][command body]`), and `replies`
+# answers each one only once its entry is committed and applied — the
+# directory's "quorum-durable before emit" boundary, unchanged by being
+# included. A continuity coordinator's `MOVE_FENCED` comes back with its
+# `FlowToken` trailer exactly as it does in Clustor's own graphs.
+#
+# The group is one voter: `peer_router` listens on `listen_port` and names
+# itself as its only peer, so the includer wires the platform's socket
+# surface to `net_in` / `net_out` (`linux_net.net_out → <as>.net_in`,
+# `<as>.net_out → linux_net.net_in`) and the group elects itself. The WAL
+# lives in the runtime's state directory (`FLUXOR_STATE_DIR`), as every
+# Clustor graph's does. A multi-voter directory is Clustor's own graphs
+# (`configs/session-directory-3node.yaml`); this stack is the shape a
+# graph that needs a directory beside its own modules takes.
+#
+# `smoke` is the directory's own boot smoke (1: BIND → RESERVE → RESERVE;
+# 2: also a KEY_PUT whose committed expiry proves deterministic time),
+# which Clustor's suite uses to prove the stack composes; an includer
+# leaves it 0.
+stack: clustor-directory
+version: 0.1.0
+description: >-
+  Clustor's session directory (session, transport, VIP, failover,
+  region, operation, attachment and reservation namespaces) over a
+  one-voter replica group, reached through its request/reply pair.
+
+params:
+  self_id:
+    type: integer
+    default: 0
+    min: 0
+    max: 255
+    description: The replica's raft id, stamped into the directory's correlation ids
+  listen_port:
+    type: integer
+    required: true
+    min: 1
+    max: 65535
+    example: 18790
+    description: The peer router's TCP port (the group's own replication listener)
+  smoke:
+    type: integer
+    default: 0
+    min: 0
+    max: 2
+    description: The directory's boot smoke (0 off; 1 grants; 2 grants and a committed expiry)
+
+exports:
+  requests: session_directory.requests
+  replies: session_directory.replies
+  net_in: peer_router.net_in
+  net_out: peer_router.net_out
+
+modules:
+  - name: peer_router
+    params:
+      self_id: ${param:self_id}
+      peer_count: 1
+      listen_port: ${param:listen_port}
+      peer0: "127.0.0.1:${param:listen_port}"
+  - name: gateway
+    params:
+      self_id: ${param:self_id}
+  - name: consensus
+    params:
+      self_id: ${param:self_id}
+      voter_count: 1
+      heartbeat_interval_ms: 150
+      peer_count: 1
+  - name: session_directory
+    params:
+      replica_id: ${param:self_id}
+      smoke: ${param:smoke}
+  - name: durability
+    params:
+      self_id: ${param:self_id}
+      voter_count: 1
+      partition_id: 0
+  - name: control_plane
+  - name: admission
+  - name: operations
+
+wiring:
+  # peer_router → the group.
+  - from: peer_router.cleartext
+    to: gateway.requests
+  - from: peer_router.peer_rx
+    to: consensus.ack
+  - from: peer_router.raft_rpc
+    to: consensus.rpc
+  - from: gateway.admin_req
+    to: operations.admin_req
+  - from: gateway.responses
+    to: peer_router.client_resp
+
+  # Proposals: the gateway's and the directory's, frame-atomic fan-in.
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  # The directory is the tagged proposer: it needs the
+  # correlation → index assignments to attribute its replies.
+  - from: consensus.proposal_assigned
+    to: session_directory.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
+  # The deterministic-time producer's leader fence.
+  - from: consensus.leader_state
+    to: session_directory.leader_state
+
+  - from: admission.credits
+    to: gateway.credit_supply
+
+  # Replication.
+  - from: consensus.net_out
+    to: peer_router.peer_tx
+  - from: consensus.lag_signal
+    to: admission.lag
+  - from: consensus.rpc_out
+    to: peer_router.peer_tx
+
+  # Persistence.
+  - from: consensus.log_append
+    to: durability.entries
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  - from: consensus.cross_durability_ack
+    to: durability.ack
+  - from: durability.quorum_durable
+    to: consensus.durable
+
+  # Commit → apply, and the gap refetch.
+  - from: consensus.entry_request
+    to: durability.entry_request
+    rate: transaction
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+  - from: gateway.reads
+    to: consensus.read
+  - from: consensus.applied
+    to: gateway.applied
+
+  # Snapshots.
+  - from: durability.export_chunks
+    to: consensus.snapshot_rx
+  - from: consensus.snapshot_import
+    to: durability.import_chunks
+  - from: durability.manifest_auth
+    to: peer_router.peer_tx
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
+
+  # Control plane.
+  - from: control_plane.proof
+    to: admission.proof
+  - from: admission.cache_state
+    to: consensus.cp_state
+  - from: admission.strict_fallback
+    to: consensus.cp_state
+  - from: admission.permits
+    to: consensus.read_permits
+  - from: control_plane.routing
+    to: gateway.placement
+
+  # Admin.
+  - from: operations.denied
+    to: gateway.admin_responses
+  - from: operations.raft_commands
+    to: consensus.admin_proposals
+  - from: consensus.admin_applied
+    to: operations.admin_applied
+  - from: operations.responses
+    to: gateway.admin_responses
+  - from: operations.raft_proposal
+    to: consensus.proposals
+
+  # Telemetry.
+  - from: consensus.metrics
+    to: operations.ingest
+  - from: durability.metrics
+    to: operations.ingest
+  - from: admission.metrics
+    to: operations.ingest
+  - from: peer_router.metrics
+    to: operations.ingest
+  - from: gateway.metrics
+    to: operations.ingest
+
+  # The directory as the group's replicated consumer.
+  - from: consensus.committed_entries
+    to: session_directory.committed_entries
+  - from: session_directory.proposals
+    to: consensus.proposals_tagged
+  - from: session_directory.metrics
+    to: operations.ingest

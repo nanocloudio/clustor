@@ -170,3 +170,183 @@ pub fn quorum_index_for_set(progress: &[Index; MAX_NODES], voters: NodeSet) -> I
     let quorum_pos = k / 2;
     scratch[quorum_pos]
 }
+
+// ── Site-aware quorum (the multi-site group) ────────────────────────────
+//
+// A group whose voters span sites (failure domains a whole power, network
+// or building loss takes out together) counts a quorum as a majority of
+// the voter set that ALSO spans at least `min_sites` distinct sites. The
+// majority half is Raft's: any two quorums share a voter, so safety is
+// unchanged; the site half only removes quorums, so an entry is committed,
+// a leader elected and a ReadIndex confirmed only with copies in
+// `min_sites` sites — a committed entry survives the loss of any
+// `min_sites - 1` sites whole. `SiteMap::flat()` (every replica in site 0,
+// `min_sites` 1) is plain majority, so a graph that declares no sites is
+// the group it always was. docs/architecture/multi_site.md is the design.
+
+/// Bits of `SiteMap::sites` per replica: up to 16 sites.
+pub const SITE_BITS: u32 = 4;
+/// The most distinct sites a map can name.
+pub const SITE_MAX: usize = 16;
+
+/// Each replica id's site, `SITE_BITS` per id (id 0 lowest), and the
+/// fewest distinct sites a quorum must span.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SiteMap {
+    pub sites: u32,
+    pub min_sites: u8,
+}
+
+/// Why a voter set's placement cannot do what its map asks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SiteFault {
+    /// The voters span fewer sites than `min_sites`: no quorum can ever form.
+    TooFewSites { spanned: u8, min_sites: u8 },
+    /// Losing this site leaves no quorum: the voters left are not a
+    /// majority, or span fewer than `min_sites` sites.
+    LossOf { site: u8 },
+}
+
+impl SiteMap {
+    /// Every replica in one site, a quorum a plain majority.
+    pub const fn flat() -> Self {
+        Self {
+            sites: 0,
+            min_sites: 1,
+        }
+    }
+
+    /// The map a graph declares: `sites` packed `SITE_BITS` per replica id,
+    /// `min_sites` clamped to at least 1.
+    pub const fn new(sites: u32, min_sites: u8) -> Self {
+        Self {
+            sites,
+            min_sites: if min_sites == 0 { 1 } else { min_sites },
+        }
+    }
+
+    /// Whether this map asks anything beyond a plain majority.
+    pub const fn is_flat(self) -> bool {
+        self.min_sites <= 1
+    }
+
+    /// Replica `id`'s site.
+    pub const fn site_of(self, id: ReplicaId) -> u8 {
+        if id as u32 >= 32 / SITE_BITS {
+            return 0;
+        }
+        ((self.sites >> (id as u32 * SITE_BITS)) & ((1 << SITE_BITS) - 1)) as u8
+    }
+
+    /// The distinct sites the members of `set` sit in.
+    pub fn spanned(self, set: NodeSet) -> u8 {
+        let mut seen: u16 = 0;
+        for id in 0..NODE_SET_CAPACITY {
+            if set.contains(id) {
+                seen |= 1u16 << self.site_of(id);
+            }
+        }
+        seen.count_ones() as u8
+    }
+
+    /// Whether `votes` is a quorum of `voters`: a majority of the set that
+    /// spans at least `min_sites` sites.
+    pub fn quorum(self, votes: NodeSet, voters: NodeSet) -> bool {
+        let inside = NodeSet(votes.0 & voters.0);
+        inside.count() > voters.count() / 2 && self.spanned(inside) >= self.min_sites
+    }
+
+    /// Whether the group stays live with any one site gone whole: the
+    /// voters can form a quorum at all, and with every voter of any one of
+    /// their sites removed the rest are still a majority of the set across
+    /// `min_sites` sites. A group that passes this survives a site loss
+    /// with no reconfiguration; one that fails it (two sites with
+    /// `min_sites` 2 — every commit in both, RPO zero) stops committing
+    /// until an operator acts.
+    pub fn check(self, voters: NodeSet) -> Result<(), SiteFault> {
+        let spanned = self.spanned(voters);
+        if spanned < self.min_sites {
+            return Err(SiteFault::TooFewSites {
+                spanned,
+                min_sites: self.min_sites,
+            });
+        }
+        let mut done: u16 = 0;
+        for id in 0..NODE_SET_CAPACITY {
+            if !voters.contains(id) {
+                continue;
+            }
+            let site = self.site_of(id);
+            if done & (1u16 << site) != 0 {
+                continue;
+            }
+            done |= 1u16 << site;
+            let mut left = voters;
+            for j in 0..NODE_SET_CAPACITY {
+                if self.site_of(j) == site {
+                    left.remove(j);
+                }
+            }
+            if !self.quorum(left, voters) {
+                return Err(SiteFault::LossOf { site });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The highest index replicated on a quorum of `voters` under `map`: the
+/// largest `progress` value whose holders (every voter at or past it) are
+/// a majority spanning `map.min_sites` sites. Under a flat map this is
+/// `quorum_index_for_set`. A member with no progress slot counts as a
+/// permanent zero, as there.
+pub fn quorum_index_sited(progress: &[Index; MAX_NODES], voters: NodeSet, map: SiteMap) -> Index {
+    if map.is_flat() {
+        return quorum_index_for_set(progress, voters);
+    }
+    let at = |id: u8| -> Index {
+        if (id as usize) < MAX_NODES {
+            progress[id as usize]
+        } else {
+            0
+        }
+    };
+    let mut best: Index = 0;
+    for c in 0..NODE_SET_CAPACITY {
+        if !voters.contains(c) {
+            continue;
+        }
+        let candidate = at(c);
+        if candidate <= best {
+            continue;
+        }
+        let mut holders = NodeSet::empty();
+        for id in 0..NODE_SET_CAPACITY {
+            if voters.contains(id) && at(id) >= candidate {
+                holders.insert(id);
+            }
+        }
+        if map.quorum(holders, voters) {
+            best = candidate;
+        }
+    }
+    best
+}
+
+/// `quorum_index_sited` over the first `voter_count` ids (a group that has
+/// seen no voter-set update yet).
+pub fn quorum_index_count_sited(
+    progress: &[Index; MAX_NODES],
+    voter_count: u8,
+    map: SiteMap,
+) -> Index {
+    if map.is_flat() {
+        return quorum_index(progress, voter_count);
+    }
+    let mut voters = NodeSet::empty();
+    for id in 0..(voter_count as usize).min(MAX_NODES) {
+        voters.insert(id as u8);
+    }
+    quorum_index_sited(progress, voters, map)
+}

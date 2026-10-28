@@ -69,6 +69,11 @@ mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
 
+mod inbound_gate;
+
+// The walk's header is the wire's partitioned envelope.
+const _: () = assert!(inbound_gate::HDR == wire::PARTITIONED_HDR);
+
 use types::*;
 
 // Connection slot table. Sized to hold every concurrent peer link plus
@@ -237,6 +242,13 @@ define_params! {
     28, voters, u8, 0
         => |s, d, len| { s.voters = p_u8(d, len, 0, 0); };
 
+    // 1: relay each client connection's peer (`MSG_PEER` from the
+    // transport) on `cleartext` as `MSG_CLIENT_PEER` under the client id,
+    // ahead of its first frame — for a consumer that names a connection
+    // by its client. 0 (default): nothing but frames and closes.
+    29, forward_peer, u8, 0
+        => |s, d, len| { s.forward_peer = p_u8(d, len, 0, 0); };
+
     // The principal prefix `require_identity: principal` completes with a
     // replica's id. One that does not fit is not taken (names nothing).
     27, principal_prefix, str, 0
@@ -287,6 +299,7 @@ use abi::contracts::net::net_proto;
 const NMSG_ACCEPT: u8 = net_proto::MSG_ACCEPTED;
 const NMSG_DATA: u8 = net_proto::MSG_DATA;
 const NMSG_CLOSED: u8 = net_proto::MSG_CLOSED;
+const NMSG_PEER: u8 = net_proto::MSG_PEER;
 const NMSG_BOUND: u8 = net_proto::MSG_BOUND;
 const NMSG_CONNOK: u8 = net_proto::MSG_CONNECTED;
 
@@ -454,6 +467,8 @@ struct ModuleState {
     /// or above it is a learner slot, admitted to the group when its
     /// principal binds (0: none admitted here).
     voters: u8,
+    /// `forward_peer`: relay client peers as `MSG_CLIENT_PEER`.
+    forward_peer: u8,
     /// Per learner slot: when its ADD_LEARNER is next asked (while its
     /// principal stays bound), and whether this binding's first ask is
     /// still to be logged. Asked again and again — at bind the group may
@@ -613,6 +628,10 @@ struct ModuleState {
     rx_by_replica: [u32; MAX_NODES],
     tx_by_replica: [u32; MAX_NODES],
     inb_stalls: u32,
+    /// Per-input refusal tracking for the inbound walk: a destination
+    /// that accepts nothing for `inbound_gate::SHED_AFTER_MS` has its
+    /// records shed so it cannot hold every other event behind it.
+    inb_gate: inbound_gate::Gate,
     /// Net events taken off `net_in` since the last accounting line.
     net_events: u32,
     last_account_ms: u64,
@@ -729,6 +748,7 @@ pub unsafe extern "C" fn module_new(
         s.rx_by_replica = [0; MAX_NODES];
         s.tx_by_replica = [0; MAX_NODES];
         s.inb_stalls = 0;
+        s.inb_gate = inbound_gate::Gate::new();
         s.net_events = 0;
         s.last_account_ms = 0;
         s.frames_dropped = 0;
@@ -820,6 +840,8 @@ unsafe fn account(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     pos = log_fmt::log_field(&mut line, pos, b" stall=", s.inb_stalls);
     pos = log_fmt::log_field(&mut line, pos, b" refused=", s.tx_refused);
     pos = log_fmt::log_field(&mut line, pos, b" cref=", s.client_refused);
+    pos = log_fmt::log_field(&mut line, pos, b" shed=", s.inb_gate.shed[DEST_RPC]);
+    pos = log_fmt::log_field(&mut line, pos, b"/", s.inb_gate.shed[DEST_REPL]);
     dev_log(sys, 3, line.as_ptr(), pos);
     let mut line = [0u8; 96];
     let mut pos = log_fmt::log_field(&mut line, 0, b"[pr] id claims_refused=", s.claims_refused);
@@ -1629,6 +1651,23 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                         }
                     }
                 }
+                NMSG_PEER => {
+                    // `[conn_id][family][addr:16][port]`: the client of a
+                    // connection this router claimed, under its client id.
+                    if s.forward_peer == 0 || payload_len < net_proto::PEER_LEN {
+                        continue;
+                    }
+                    let slot = find_conn(s, conn_id);
+                    if slot >= MAX_CONNS || s.cleartext < 0 {
+                        continue;
+                    }
+                    let mut rec = [0u8; net_proto::PEER_LEN];
+                    rec.copy_from_slice(&s.buf[NET_FRAME_HDR..NET_FRAME_HDR + net_proto::PEER_LEN]);
+                    rec[..2].copy_from_slice(&(slot as u16).to_le_bytes());
+                    if !deliver_client_frame(s, sys, wire::MSG_CLIENT_PEER, &rec, now) {
+                        break;
+                    }
+                }
                 NMSG_CONNOK => {
                     // Outbound connection established — send identity. Claimed by
                     // requester tag, so a fanned `net_out` hands this module only
@@ -2143,7 +2182,11 @@ unsafe fn ingest_peer_bytes(
 /// Walk complete records in `bytes`, delivering each to the input its
 /// type belongs on. A trailing partial record is saved as the peer's
 /// tail. `Err(offset)` names the record whose destination refused; every
-/// record before it went out, nothing at or after it did.
+/// record before it went out, nothing at or after it did. A destination
+/// that has accepted nothing for `inbound_gate::SHED_AFTER_MS` does not
+/// hold the walk: its records are shed whole and counted (see
+/// `inbound_gate`), so one wedged input cannot stall every event behind
+/// it.
 ///
 /// # Safety
 ///
@@ -2157,58 +2200,109 @@ unsafe fn route_peer_records(
     bytes: &[u8],
 ) -> Result<(), usize> {
     let r = rid as usize;
-    let mut off = 0usize;
-    while off < bytes.len() {
-        let left = bytes.len() - off;
-        if left < wire::PARTITIONED_HDR {
-            break;
+    let mut sink = PeerSink {
+        sys,
+        partitions: s.partitions,
+        raft_rpc: s.raft_rpc,
+        peer_rx: s.peer_rx,
+    };
+    let episodes = s.inb_gate.episodes;
+    let (end, w) = inbound_gate::walk(
+        bytes,
+        ROUTE_FRAME_MAX,
+        dev_millis(sys),
+        &mut s.inb_gate,
+        &mut sink,
+    );
+    s.rx_by_replica[r] = s.rx_by_replica[r].wrapping_add(w.delivered);
+    s.partitions_refused = s.partitions_refused.wrapping_add(w.partitions_refused);
+    // A shed record is a dropped frame: counted where every other
+    // routing loss is, so the metric export sees it too.
+    s.frames_dropped = s
+        .frames_dropped
+        .wrapping_add(w.untrusted)
+        .wrapping_add(w.shed);
+    for (d, before) in episodes.iter().enumerate() {
+        if s.inb_gate.episodes[d] != *before {
+            let m: &[u8] = if d == DEST_RPC {
+                b"[pr] raft_rpc wedged; shedding its records"
+            } else {
+                b"[pr] peer_rx wedged; shedding its records"
+            };
+            dev_log(sys, 2, m.as_ptr(), m.len());
         }
-        let len = u16::from_le_bytes([bytes[off + 3], bytes[off + 4]]) as usize;
-        let rec_len = wire::PARTITIONED_HDR + len;
-        if rec_len > ROUTE_FRAME_MAX {
-            // A length no legal record has: the stream is desynced
-            // (or hostile). Nothing after this point can be trusted;
-            // drop it, count it, and let the liveness reaper or the
-            // peer's next dial start a clean stream.
+    }
+    match end {
+        inbound_gate::End::Held(off) => Err(off),
+        inbound_gate::End::Desync => {
+            // A length no legal record has: the stream is desynced (or
+            // hostile). Nothing after this point can be trusted; drop
+            // it, count it, and let the liveness reaper or the peer's
+            // next dial start a clean stream.
             s.frames_dropped = s.frames_dropped.wrapping_add(1);
             dev_log(sys, 2, b"[pr] record desync".as_ptr(), 18);
-            return Ok(());
+            Ok(())
         }
-        if left < rec_len {
-            break;
+        inbound_gate::End::Tail(off) => {
+            let rest = bytes.len() - off;
+            if rest > 0 {
+                s.peer_tail[r][..rest].copy_from_slice(&bytes[off..]);
+                s.peer_tail_len[r] = rest as u16;
+            }
+            Ok(())
         }
-        let partition = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
-        if !peer_policy::partition_admitted(s.partitions, partition) {
-            // Out of this graph's groups: not this peer's to speak for.
-            s.partitions_refused = s.partitions_refused.wrapping_add(1);
-            off += rec_len;
-            continue;
-        }
-        let msg_type = bytes[off + 2];
-        let dest = peer_dest(s, msg_type);
-        if dest < 0 {
-            // Untrusted shape from a peer: skip the record, not the stream.
-            s.frames_dropped = s.frames_dropped.wrapping_add(1);
-            off += rec_len;
-            continue;
-        }
-        let wrote = if wire_channels::writable(sys, dest) {
-            (sys.channel_write)(dest, bytes.as_ptr().add(off), rec_len)
+    }
+}
+
+/// `inbound_gate` index of each consensus input.
+const DEST_RPC: usize = 0;
+const DEST_REPL: usize = 1;
+
+/// The inbound walk's view of this router: the graph's partition scope
+/// and the two consensus inputs.
+struct PeerSink<'a> {
+    sys: &'a SyscallTable,
+    partitions: u16,
+    raft_rpc: i32,
+    peer_rx: i32,
+}
+
+impl PeerSink<'_> {
+    fn chan(&self, dest: usize) -> i32 {
+        if dest == DEST_RPC {
+            self.raft_rpc
         } else {
-            0
-        };
-        if wrote != rec_len as i32 {
-            return Err(off);
+            self.peer_rx
         }
-        s.rx_by_replica[r] = s.rx_by_replica[r].wrapping_add(1);
-        off += rec_len;
     }
-    let rest = bytes.len() - off;
-    if rest > 0 {
-        s.peer_tail[r][..rest].copy_from_slice(&bytes[off..]);
-        s.peer_tail_len[r] = rest as u16;
+}
+
+impl inbound_gate::Sink for PeerSink<'_> {
+    fn admitted(&mut self, partition: u16) -> bool {
+        // Out of this graph's groups: not this peer's to speak for.
+        peer_policy::partition_admitted(self.partitions, partition)
     }
-    Ok(())
+
+    fn dest(&mut self, msg_type: u8) -> Option<usize> {
+        // An unknown type is an untrusted shape from a peer: the walk
+        // skips the record, not the stream.
+        match peer_dest(self.peer_rx, self.raft_rpc, msg_type) {
+            ch if ch < 0 => None,
+            ch if ch == self.raft_rpc => Some(DEST_RPC),
+            _ => Some(DEST_REPL),
+        }
+    }
+
+    fn write(&mut self, dest: usize, record: &[u8]) -> bool {
+        let ch = self.chan(dest);
+        // SAFETY: `sys` is the router's live syscall table and `record`
+        // a valid slice for the length passed.
+        unsafe {
+            wire_channels::writable(self.sys, ch)
+                && (self.sys.channel_write)(ch, record.as_ptr(), record.len())
+                    == record.len() as i32
+        }
+    }
 }
 
 // ── Outbound routing ────────────────────────────────────────
@@ -2870,12 +2964,12 @@ fn find_conn(s: &ModuleState, conn_id: u16) -> usize {
 /// -1 = untrusted shape from a peer, dropped by the caller. Single
 /// source for both the steady-state data path and the
 /// coalesced-identity tail path.
-fn peer_dest(s: &ModuleState, peer_msg_type: u8) -> i32 {
+fn peer_dest(peer_rx: i32, raft_rpc: i32, peer_msg_type: u8) -> i32 {
     match peer_msg_type {
         wire::MSG_APPEND_ENTRIES_RESP
         | wire::MSG_INSTALL_SNAPSHOT_RESP
         | wire::MSG_INSTALL_SNAPSHOT
-        | wire::MSG_SNAPSHOT_CHUNK => s.peer_rx,
+        | wire::MSG_SNAPSHOT_CHUNK => peer_rx,
         wire::MSG_APPEND_ENTRIES
         | wire::MSG_REQUEST_VOTE
         | wire::MSG_REQUEST_VOTE_RESP
@@ -2901,7 +2995,7 @@ fn peer_dest(s: &ModuleState, peer_msg_type: u8) -> i32 {
         // Response-owed relay and the leader's answer back to the
         // origin's proposer ring.
         | wire::MSG_PROPOSAL_FORWARD_TAGGED
-        | wire::MSG_PROPOSAL_ASSIGNED_REMOTE => s.raft_rpc,
+        | wire::MSG_PROPOSAL_ASSIGNED_REMOTE => raft_rpc,
         _ => -1,
     }
 }

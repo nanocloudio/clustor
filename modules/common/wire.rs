@@ -1739,6 +1739,14 @@ pub const MSG_CLIENT_FRAME: u8 = 0xEA;
 /// fixed here; a consumer that does not care ignores the msg_type (the
 /// gateway does).
 pub const MSG_CONN_CLOSED: u8 = 0xEB;
+/// The client at the far end of a connection, on the `cleartext` chain
+/// ahead of its first [`MSG_CLIENT_FRAME`]: `[conn_id:u16 LE][family:u8]
+/// [addr:16][port:u16 LE]` — the transport's `MSG_PEER`, relabelled with
+/// the router's client id. Emitted only under `peer_router`'s
+/// `forward_peer: 1`, for a consumer that names a connection by its
+/// client (Quantum's MQTT anchor, matching a connection the transport
+/// moved to it).
+pub const MSG_CLIENT_PEER: u8 = 0xED;
 
 /// Ask `peer_router` to CLOSE a client connection. Payload
 /// `[conn_id:u16 LE]`, on the same `client_resp` lane the codecs write
@@ -2367,12 +2375,17 @@ pub const MSG_SR_REPLY: u8 = 0x91;
 
 // The directory's other namespaces ride the same `requests` / `replies`
 // ports, told apart by message id; the module prefixes the replicated
-// body with the namespace magic (`"SR"`, `"TR"`, `"VB"`).
+// body with the namespace magic (`"SR"`, `"TR"`, `"VB"`, `"FO"`, `"RG"`,
+// `"OP"`, `"AT"`, `"RS"`).
 //
 // `MSG_TR_REQUEST`: `[request_id:u64 LE][transport_registry command body]`
 // (`TR_OP_*` layouts in `modules/common/transport_registry.rs`);
 // `MSG_TR_REPLY`: `[request_id:u64 LE][TransportReply (TR_REPLY_LEN
-// bytes)]`, the session reply's 38-byte shape.
+// bytes)][token trailer (TR_TOKEN_TRAILER_LEN bytes)]` — the session
+// reply's 38-byte shape, then `[token_present:1][reserved:3][FlowToken]`,
+// carrying the promoted emitter's per-flow emission token after a
+// committed MOVE_FENCED (zero otherwise). A reader of the first 38 bytes
+// alone reads the reply unchanged.
 pub const MSG_TR_REQUEST: u8 = 0x92;
 pub const MSG_TR_REPLY: u8 = 0x93;
 // `MSG_VB_REQUEST`: `[request_id:u64 LE][vip_registry command body]`
@@ -2382,6 +2395,53 @@ pub const MSG_TR_REPLY: u8 = 0x93;
 // re-derived one on a TOKEN_REISSUE.
 pub const MSG_VB_REQUEST: u8 = 0x94;
 pub const MSG_VB_REPLY: u8 = 0x95;
+// `MSG_FO_REQUEST`: `[request_id:u64 LE][failover_registry command body]`
+// (`FO_OP_*` layouts in `modules/common/failover_registry.rs`: a
+// compare-and-swap of one 264-byte `WHFO` FailoverOperation record, or a
+// REPLAY); `MSG_FO_REPLY`: `[request_id:u64 LE][FailoverReply
+// (FO_REPLY_LEN bytes)]` — the stored record after the swap, and after a
+// committed REPLAY one reply per live record (status REPLAY) in creation
+// order, then an end-of-replay reply (op REPLAY, status OK, the count).
+pub const MSG_FO_REQUEST: u8 = 0x96;
+pub const MSG_FO_REPLY: u8 = 0x97;
+// `MSG_RG_REQUEST`: `[request_id:u64 LE][region_registry command body]`
+// (every `VB_OP_*` command in its `vip/` layout, plus `RG_OP_INVALIDATE`,
+// in `modules/common/region_registry.rs`); `MSG_RG_REPLY`:
+// `[request_id:u64 LE][RgReply (RG_REPLY_LEN bytes)]` — the `VipReply`,
+// then the binding's DR generation and an invalidation readiness.
+pub const MSG_RG_REQUEST: u8 = 0x98;
+pub const MSG_RG_REPLY: u8 = 0x99;
+// `MSG_OP_REQUEST`: `[request_id:u64 LE][operation_registry command
+// body]` (`OP_OP_*` layouts in `modules/common/operation_registry.rs`: a
+// compare-and-swap of one 256-byte `CLOP` operation record, or a REPLAY
+// of one kind); `MSG_OP_REPLY`: `[request_id:u64 LE][OperationReply
+// (OP_REPLY_LEN bytes)]` — `fo/`'s replies and replay, for the takeover,
+// evacuation and DR operation kinds.
+pub const MSG_OP_REQUEST: u8 = 0x9A;
+pub const MSG_OP_REPLY: u8 = 0x9B;
+// `MSG_AT_REQUEST`: `[request_id:u64 LE][attachment_registry command
+// body]` (`AT_OP_*` layouts in `modules/common/attachment_registry.rs`:
+// COMMIT an attachment generation, REVOKE a service's boundary, READ);
+// `MSG_AT_REPLY`: `[request_id:u64 LE][AttachmentReply (AT_REPLY_LEN
+// bytes)]`, ending in the attachment's `AttachmentBoundary`.
+pub const MSG_AT_REQUEST: u8 = 0x9C;
+pub const MSG_AT_REPLY: u8 = 0x9D;
+// `MSG_RS_REQUEST`: `[request_id:u64 LE][reservation_registry command
+// body]` (`RS_OP_*` layouts in `modules/common/reservation_registry.rs`:
+// egress block RESERVE / RELEASE / RETIRE_BOOT / MOVE, address
+// ADDR_RESERVE / ADDR_RELEASE); `MSG_RS_REPLY`: `[request_id:u64 LE]
+// [ReservationReply (RS_REPLY_LEN bytes)]`.
+pub const MSG_RS_REQUEST: u8 = 0x9E;
+pub const MSG_RS_REPLY: u8 = 0x9F;
+// `MSG_DIR_OUT_OF_SCOPE`: `[request_id:u64 LE][request msg id:u8]
+// [reason:u8]` — a directory deployed for one tier (`scope`: a regional
+// cell or the multi-site global tier, docs/architecture/multi_site.md)
+// refuses a request in a namespace the other tier owns, before proposing
+// it, so a session's state never replicates across sites. Reason 1: the
+// namespace is the other tier's; 2: an operation record of a kind the
+// other tier owns.
+// (`directory_scope.rs` holds the rule and the reasons.)
+pub const MSG_DIR_OUT_OF_SCOPE: u8 = 0xA0;
 
 // Routing
 pub const MSG_PLACEMENT_UPDATE: u8 = 0x80;

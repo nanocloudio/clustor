@@ -230,9 +230,13 @@ per-module parser.
 `MSG_SR_REPLY` (0x91), the replicated session-registry boundary of
 `modules/app/session_directory` — a reply is sent only after the
 command is quorum-committed and applied; `MSG_TR_REQUEST` (0x92) /
-`MSG_TR_REPLY` (0x93) and `MSG_VB_REQUEST` (0x94) / `MSG_VB_REPLY`
-(0x95), the same boundary for the directory's transport and VIP
-namespaces (`[request_id:u64 LE][command body]` / `[request_id:u64
+`MSG_TR_REPLY` (0x93), `MSG_VB_REQUEST` (0x94) / `MSG_VB_REPLY`
+(0x95), `MSG_FO_REQUEST` (0x96) / `MSG_FO_REPLY` (0x97),
+`MSG_RG_REQUEST` (0x98) / `MSG_RG_REPLY` (0x99), `MSG_OP_REQUEST`
+(0x9A) / `MSG_OP_REPLY` (0x9B), `MSG_AT_REQUEST` (0x9C) / `MSG_AT_REPLY`
+(0x9D) and `MSG_RS_REQUEST` (0x9E) / `MSG_RS_REPLY` (0x9F), the same
+boundary for the directory's transport, VIP, failover-operation, region,
+operation, attachment and reservation namespaces (`[request_id:u64 LE][command body]` / `[request_id:u64
 LE][reply]`, see `architecture/session_directory.md`); `MSG_PLACEMENT_EPOCH_EVENT`
 (0xD5, `[kpg_id:u16][new_epoch:u32][reason:u8]`);
 `MSG_COMPACTION_FLOOR` (0xE1, `[kpg_id:u16][floor_revision:u64]`);

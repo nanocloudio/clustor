@@ -12,8 +12,11 @@ palette of seven substrate modules (`peer_router`, `consensus`,
 `durability`, `gateway`, `admission`, `control_plane`, `operations`)
 ships as position-independent `no_std` ELFs and runs cooperatively
 on a wired module graph. Alongside the palette sit the standalone
-`session_directory` and `partition_router` modules, two bench
-drivers, `example_consumer`, and the `clustor_cli` applet.
+`session_directory`, `directory_front` and `partition_router`
+modules, two bench drivers, `example_consumer`, and the
+`clustor_cli` applet. A group may span sites, its quorum a majority
+across a declared number of them
+([multi_site.md](docs/architecture/multi_site.md)).
 
 ## Quick start
 
@@ -97,7 +100,7 @@ prefix a replica would recover. Module source:
 
 | Path              | Contents |
 |-------------------|----------|
-| `modules/app/`    | `no_std` PIC modules: the seven substrate modules, `session_directory`, `partition_router`, the `consensus_bench` / `nvme_bench` drivers, `example_consumer`, and `clustor_cli`. `fluxor modules build` packs each into a `.fmod`, plus one per declared variant (`durability` has a `volatile` variant, `operations` a `headless` one). |
+| `modules/app/`    | `no_std` PIC modules: the seven substrate modules, `session_directory`, `directory_front`, `partition_router`, the `consensus_bench` / `nvme_bench` drivers, `example_consumer`, and `clustor_cli`. `fluxor modules build` packs each into a `.fmod`, plus one per declared variant (`durability` has a `volatile` variant, `operations` a `headless` one). |
 | `modules/common/` | Shared types, wire constants, the WAL frame contract, the consumer facade, and the HTTP admin mapping. Pulled into each app module via `#[path]`. |
 | `crates/`         | `clustor-common`, the publishable cargo crate re-exporting the pure `no_std` subset of `modules/common/` for host consumers. |
 | `packaging/`      | Distribution packaging; `packaging/applet/clustor/` holds the CLI applet's graph and workload manifest. |

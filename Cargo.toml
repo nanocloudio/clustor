@@ -245,6 +245,21 @@ path = "tests/keyed_routing.rs"
 name = "union_quorum"
 path = "tests/union_quorum.rs"
 
+# The multi-site group's quorum: a majority across min_sites sites.
+[[test]]
+name = "site_quorum"
+path = "tests/site_quorum.rs"
+
+# Which tier a directory serves: the cell / global split of requests.
+[[test]]
+name = "directory_scope"
+path = "tests/directory_scope.rs"
+
+# The broker and egress fronts against the real registries.
+[[test]]
+name = "directory_front"
+path = "tests/directory_front.rs"
+
 # Learner semantics: replicated to, counted nowhere.
 [[test]]
 name = "learner_semantics"
@@ -255,6 +270,14 @@ path = "tests/learner_semantics.rs"
 [[test]]
 name = "engine_scheduler"
 path = "tests/engine_scheduler.rs"
+
+# Slot routing in the multi-group engine: lookups ask only the hosted
+# slots, an unhosted partition's frames are misrouted and never held,
+# and duplicate activation is judged against hosted slots. Mounts
+# `modules/app/consensus/slot_route.rs` via `#[path]`; always runs.
+[[test]]
+name = "slot_route"
+path = "tests/slot_route.rs"
 
 # Migration state machine: the fence boundary, transition legality, and
 # the timeout policy either side of it.
@@ -293,12 +316,50 @@ name = "vip_token_reissue"
 path = "tests/vip_token_reissue.rs"
 
 [[test]]
+name = "failover_registry"
+path = "tests/failover_registry.rs"
+
+[[test]]
+name = "flow_token"
+path = "tests/flow_token.rs"
+
+[[test]]
+name = "vip_owner_width"
+path = "tests/vip_owner_width.rs"
+
+[[test]]
+name = "region_registry"
+path = "tests/region_registry.rs"
+
+[[test]]
+name = "operation_registry"
+path = "tests/operation_registry.rs"
+
+[[test]]
+name = "fenced_move"
+path = "tests/fenced_move.rs"
+
+[[test]]
+name = "attachment_registry"
+path = "tests/attachment_registry.rs"
+
+[[test]]
+name = "reservation_registry"
+path = "tests/reservation_registry.rs"
+
+[[test]]
 name = "timing_cluster_e2e"
 path = "tests/timing_cluster_e2e.rs"
 
 [[test]]
 name = "session_directory_e2e"
 path = "tests/session_directory_e2e.rs"
+
+# Site loss against a real multi-site group (5 voters / 3 sites, and
+# 3 voters / 2 sites at min_sites 2).
+[[test]]
+name = "site_loss_e2e"
+path = "tests/site_loss_e2e.rs"
 
 [[test]]
 name = "wal_group_fsync"
@@ -355,6 +416,15 @@ path = "tests/snap_pointer.rs"
 [[test]]
 name = "peer_policy"
 path = "tests/peer_policy.rs"
+
+# Host-side coverage for peer_router's inbound record walk: a slow
+# consensus input keeps ordered backpressure, a wedged one has its
+# records shed whole and counted while the other keeps receiving.
+# Mounts `modules/app/peer_router/inbound_gate.rs` via `#[path]`;
+# always runs.
+[[test]]
+name = "inbound_gate"
+path = "tests/inbound_gate.rs"
 
 # Host-side coverage for wire admin admission by peer identity: role by
 # pinned key, fail-closed when unbound, revoke, eviction on overflow.

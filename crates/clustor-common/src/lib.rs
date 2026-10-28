@@ -60,6 +60,21 @@ pub mod transport_registry;
 #[rustfmt::skip]
 #[path = "../common/vip_registry.rs"]
 pub mod vip_registry;
+#[rustfmt::skip]
+#[path = "../common/failover_registry.rs"]
+pub mod failover_registry;
+#[rustfmt::skip]
+#[path = "../common/region_registry.rs"]
+pub mod region_registry;
+#[rustfmt::skip]
+#[path = "../common/operation_registry.rs"]
+pub mod operation_registry;
+#[rustfmt::skip]
+#[path = "../common/attachment_registry.rs"]
+pub mod attachment_registry;
+#[rustfmt::skip]
+#[path = "../common/reservation_registry.rs"]
+pub mod reservation_registry;
 
 #[rustfmt::skip]
 #[path = "../common/wal_frame.rs"]

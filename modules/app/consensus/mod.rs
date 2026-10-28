@@ -102,6 +102,9 @@ mod inbox;
 mod raft;
 mod replicator;
 mod seam;
+mod slot_route;
+
+use slot_route::{Activation, Disposition, OnFull};
 
 use types::MAX_NODES;
 
@@ -214,6 +217,20 @@ define_params! {
     // where it does not — an observation posture, not a durability one.
     13, name_fence, u8, 1
         => |s, d, len| { s.slots[0].raft.name_fence = p_u8(d, len, 0, 1); };
+
+    // The multi-site group (docs/architecture/multi_site.md): each
+    // replica id's site, four bits per id (id 0 lowest), and the fewest
+    // distinct sites a quorum spans — for commit, elections (pre-vote and
+    // vote) and ReadIndex alike. `durability` takes the same pair. A
+    // group whose voters span fewer than `min_sites` sites is refused at
+    // construction (it could never commit); one that cannot survive the
+    // loss of one site whole boots and logs `[raft] sites: one site's
+    // loss stops this group` (a deliberate RPO-zero posture across two
+    // sites). Defaults: one site, a plain majority.
+    21, site_map, u32, 0
+        => |s, d, len| { s.site_map = p_u32(d, len, 0, 0); };
+    22, min_sites, u8, 1
+        => |s, d, len| { s.min_sites = p_u8(d, len, 0, 1); };
 }
 
 /// Compile-time ceiling on the Partition Raft Groups one `consensus`
@@ -297,6 +314,11 @@ struct ModuleState {
     // designed to demux by frame type / request-id namespace anyway).
     in_cp_state: i32,    // MSG_CACHE_STATE → commit, MSG_FALLBACK_SIGNAL → raft
     in_entry_reply: i32, // MSG_WAL_ENTRY_REPLY: id bit 31 set → apply, clear → replicator
+
+    /// The multi-site map (`site_map`, `min_sites`), fanned into every
+    /// slot's raft and commit.
+    site_map: u32,
+    min_sites: u8,
 
     /// The hosted groups. Shared plumbing lives outside; per-group state
     /// lives strictly inside a slot.
@@ -526,9 +548,32 @@ pub unsafe extern "C" fn module_new(
         s.comp_step = [step_accounting::CompStepHist::new(); 4];
         s.comp_step_last_ms = 0;
 
+        s.site_map = 0;
+        s.min_sites = 1;
         set_defaults(s);
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
+        }
+        // A declared multi-site group: refused if no quorum can ever form
+        // across its voters' sites, reported if one site's loss stops it.
+        let sites = types::SiteMap::new(s.site_map, s.min_sites);
+        if !sites.is_flat() {
+            let mut voters = types::NodeSet::empty();
+            for id in 0..s.slots[0].voter_count.min(MAX_NODES as u8) {
+                voters.insert(id);
+            }
+            match sites.check(voters) {
+                Ok(()) => {}
+                Err(types::SiteFault::TooFewSites { .. }) => {
+                    let m = b"[raft] sites: the voters span fewer sites than min_sites";
+                    dev_log(sys, 1, m.as_ptr(), m.len());
+                    return -22;
+                }
+                Err(types::SiteFault::LossOf { .. }) => {
+                    let m = b"[raft] sites: one site's loss stops this group";
+                    dev_log(sys, 2, m.as_ptr(), m.len());
+                }
+            }
         }
         // Slot 1..K-1 mirror slot 0's channel handles — every hosted
         // group shares this instance's ports, which is the entire point:
@@ -730,6 +775,10 @@ fn fan_slot_identity(s: &mut ModuleState, i: usize) {
     sl.commit.self_id = sl.self_id;
     sl.raft.voter_count = sl.voter_count;
     sl.commit.voter_count = sl.voter_count;
+    let sites = types::SiteMap::new(s.site_map, s.min_sites);
+    let sl = &mut s.slots[i];
+    sl.raft.sites = sites;
+    sl.commit.sites = sites;
     sl.raft.partition_id = sl.partition_id;
     sl.repl.partition_id = sl.partition_id;
     sl.commit.partition_id = sl.partition_id;
@@ -755,14 +804,20 @@ unsafe fn activate_slot(
     self_id: u8,
     voter_count: u8,
 ) {
-    if slot_for(s, partition_id).is_some() {
-        return;
-    }
-    let idx = s.active_slots as usize;
-    if idx == 0 || idx >= K_MAX {
-        s.slot_activations_refused = s.slot_activations_refused.wrapping_add(1);
-        return;
-    }
+    // Duplicate detection asks only the slots this engine runs. An
+    // unhosted slot reads `partition_id == 0`, so a scan over all of
+    // `K_MAX` answered "already hosted" for partition 0 on every engine
+    // whose base partition is not 0, and refused to bring it up.
+    let active = s.active_slots as usize;
+    let idx = match slot_route::activation_for(&s.slots, active, partition_id, |sl| sl.partition_id)
+    {
+        Activation::AlreadyHosted(_) => return,
+        Activation::Full => {
+            s.slot_activations_refused = s.slot_activations_refused.wrapping_add(1);
+            return;
+        }
+        Activation::Activate(idx) => idx,
+    };
     // `voter_count == 0` means "inherit this engine's existing
     // membership": the control plane does not yet own per-group
     // membership, so it cannot state one. Taking the 0 literally gives
@@ -791,15 +846,13 @@ unsafe fn activate_slot(
     dev_log(sys, 3, dbg.as_ptr(), 13);
 }
 
+/// The hosted slot for `partition_id`, or `None` when this engine does
+/// not host it. Bounded by `active_slots` (see `slot_route`): the slots
+/// past it are allocated but never stepped, and read as partition 0.
 fn slot_for(s: &ModuleState, partition_id: u16) -> Option<usize> {
-    let mut i = 0;
-    while i < K_MAX {
-        if s.slots[i].partition_id == partition_id {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+    slot_route::slot_for(&s.slots, s.active_slots as usize, partition_id, |sl| {
+        sl.partition_id
+    })
 }
 
 /// Route one shared partitioned channel's frames into the owning slots'
@@ -808,24 +861,6 @@ fn slot_for(s: &ModuleState, partition_id: u16) -> Option<usize> {
 /// # Safety
 ///
 /// Caller must supply a valid `&SyscallTable` per the module ABI.
-/// What to do with a frame whose group has no inbox room.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OnFull {
-    /// Keep it at the channel head until the group drains. Right for a
-    /// stream the group's LOG depends on — a proposal held is a
-    /// proposal delivered later; a proposal dropped is a write lost.
-    Hold,
-    /// Discard it and count. Right for Raft RPCs, which the protocol
-    /// retransmits: a heartbeat resends next interval, a vote request
-    /// re-campaigns, an AppendEntries is re-driven by the replicator.
-    /// Holding one instead parks the whole shared channel behind a
-    /// single group, and every OTHER group on the node then misses its
-    /// heartbeats — a per-group backlog becoming a node-wide election.
-    /// A forwarded PROPOSAL on the same channel is exempt: it is a
-    /// client's write with no retransmit behind it, so it is held.
-    Drop,
-}
-
 /// Forwarded proposals ride the rpc channel but are proposals, not RPCs.
 fn is_forward_type(msg_type: u8) -> bool {
     msg_type == wire::MSG_PROPOSAL_FORWARD || msg_type == wire::MSG_PROPOSAL_FORWARD_TAGGED
@@ -906,55 +941,66 @@ unsafe fn demux_partitioned(
             s.prop_demuxed = s.prop_demuxed.wrapping_add(1);
         }
         let len = (plen as usize).min(s.msg_buf.len()).min(CARRY_MAX);
-        let Some(slot) = slot_for(s, partition_id) else {
-            // No slot hosts this partition. Counted, not re-queued: a
-            // frame nobody owns would block the channel head forever.
-            s.frames_misrouted = s.frames_misrouted.wrapping_add(1);
-            continue;
-        };
-        let placed = if inbox_for(&mut s.slots[slot], carry_idx, msg_type, which).has_room() {
-            let (buf, slots) = (&s.msg_buf, &mut s.slots);
-            inbox_for(&mut slots[slot], carry_idx, msg_type, which).push(sys, msg_type, &buf[..len])
-        } else {
-            false
-        };
-        if !placed {
-            // A forwarded proposal is a client's WRITE, not a protocol
-            // RPC: nothing retransmits it, so it is held like a proposal
-            // even on a channel whose other traffic is dropped.
-            let is_forward = is_forward_type(msg_type);
-            if on_full == OnFull::Drop && !is_forward {
-                s.rpc_dropped_full = s.rpc_dropped_full.wrapping_add(1);
-                // Said once, then every 256th: a steady rate here means
-                // a group cannot keep up with its RPC intake, which is a
-                // step-budget problem, not a wire problem.
-                if s.rpc_dropped_full & 0xFF == 1 {
-                    let mut line = [0u8; 64];
-                    let mut pos = log_fmt::log_field(
-                        &mut line,
-                        0,
-                        b"[raft] rpc dropped n=",
-                        s.rpc_dropped_full,
-                    );
-                    pos = log_fmt::log_field(&mut line, pos, b" p=", u32::from(partition_id));
-                    pos = log_fmt::log_field(&mut line, pos, b" mt=", u32::from(msg_type));
-                    dev_log(sys, 2, line.as_ptr(), pos);
-                }
+        // A forwarded proposal is a client's WRITE, not a protocol RPC:
+        // nothing retransmits it, so it is held like a proposal even on
+        // a channel whose other traffic is dropped.
+        let is_forward = is_forward_type(msg_type);
+        let owner = slot_for(s, partition_id);
+        let mut fate = slot_route::dispose(
+            owner,
+            |slot| inbox_for(&mut s.slots[slot], carry_idx, msg_type, which).has_room(),
+            on_full,
+            is_forward,
+        );
+        if let Disposition::Place(slot) = fate {
+            let placed = {
+                let (buf, slots) = (&s.msg_buf, &mut s.slots);
+                inbox_for(&mut slots[slot], carry_idx, msg_type, which).push(
+                    sys,
+                    msg_type,
+                    &buf[..len],
+                )
+            };
+            if placed {
                 continue;
             }
-            // The owner is backed up (or the arena is) and the frame is
-            // already off the channel — hold it.
-            if carry_idx == 1 || carry_idx == 2 {
-                s.prop_held = s.prop_held.wrapping_add(1);
-            }
-            let c = &mut s.carry[carry_idx];
-            c.active = true;
-            c.partition_id = partition_id;
-            c.msg_type = msg_type;
-            c.len = len as u16;
-            c.buf[..len].copy_from_slice(&s.msg_buf[..len]);
-            break;
+            // Room, but the arena is exhausted: treat it as full.
+            fate = slot_route::dispose(owner, |_| false, on_full, is_forward);
         }
+        if fate == Disposition::Misrouted {
+            // No slot hosts this partition. Counted, not held: no step
+            // will ever make room for a frame nobody owns, so holding it
+            // would block the channel head for good.
+            s.frames_misrouted = s.frames_misrouted.wrapping_add(1);
+            continue;
+        }
+        if fate == Disposition::DropFull {
+            s.rpc_dropped_full = s.rpc_dropped_full.wrapping_add(1);
+            // Said once, then every 256th: a steady rate here means
+            // a group cannot keep up with its RPC intake, which is a
+            // step-budget problem, not a wire problem.
+            if s.rpc_dropped_full & 0xFF == 1 {
+                let mut line = [0u8; 64];
+                let mut pos =
+                    log_fmt::log_field(&mut line, 0, b"[raft] rpc dropped n=", s.rpc_dropped_full);
+                pos = log_fmt::log_field(&mut line, pos, b" p=", u32::from(partition_id));
+                pos = log_fmt::log_field(&mut line, pos, b" mt=", u32::from(msg_type));
+                dev_log(sys, 2, line.as_ptr(), pos);
+            }
+            continue;
+        }
+        // The owner is backed up (or the arena is) and the frame is
+        // already off the channel — hold it.
+        if carry_idx == 1 || carry_idx == 2 {
+            s.prop_held = s.prop_held.wrapping_add(1);
+        }
+        let c = &mut s.carry[carry_idx];
+        c.active = true;
+        c.partition_id = partition_id;
+        c.msg_type = msg_type;
+        c.len = len as u16;
+        c.buf[..len].copy_from_slice(&s.msg_buf[..len]);
+        break;
     }
 }
 
@@ -1140,6 +1186,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             // fail-closed override applies to every group this engine
             // hosts. Routing one to a single slot would leave the
             // others admitting work the control plane has disowned.
+            //
+            // These two loops span all of `K_MAX`, not `active_slots`, on
+            // purpose: they read no slot identity, and a slot activated
+            // later must already hold the current admission state, since
+            // `clone_slot_from_zero` copies plumbing, not these gates.
             match msg_type {
                 wire::MSG_CACHE_STATE => {
                     let mut i = 0;

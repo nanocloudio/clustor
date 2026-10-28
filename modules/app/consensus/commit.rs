@@ -45,6 +45,9 @@ pub struct Commit {
     pub durability_mode: u8, // DUR_STRICT / DUR_GROUP_FSYNC / DUR_RELAXED
     pub self_id: ReplicaId,
     pub partition_id: u16,
+    /// The voters' sites and the fewest a quorum spans (`site_map`,
+    /// `min_sites`): flat unless the graph declares a multi-site group.
+    pub sites: SiteMap,
 
     // Metrics
     commit_advances: u32,
@@ -111,6 +114,7 @@ pub fn init(s: &mut Commit) {
     s.durability_mode = DUR_GROUP_FSYNC;
     s.self_id = 0;
     s.partition_id = 0;
+    s.sites = SiteMap::flat();
     s.commit_advances = 0;
     s.last_metrics_ms = 0;
     s.current_voters = NodeSet::empty();
@@ -467,10 +471,12 @@ unsafe fn advance_commit(s: &mut Commit) {
     // must be replicated to a majority of BOTH sets before it counts as
     // committed. Otherwise we fall back to the legacy fixed-range
     // `voter_count` median.
+    // Under a multi-site map a quorum is also `min_sites` sites wide
+    // (`quorum_index_sited`; the plain median under a flat one).
     let quorum_match = if s.current_voters.count() > 0 {
-        let current_median = quorum_index_for_set(&s.match_indices, s.current_voters);
+        let current_median = quorum_index_sited(&s.match_indices, s.current_voters, s.sites);
         if s.joint_active && s.joint_voters.count() > 0 {
-            let joint_median = quorum_index_for_set(&s.match_indices, s.joint_voters);
+            let joint_median = quorum_index_sited(&s.match_indices, s.joint_voters, s.sites);
             if current_median < joint_median {
                 current_median
             } else {
@@ -480,7 +486,7 @@ unsafe fn advance_commit(s: &mut Commit) {
             current_median
         }
     } else {
-        quorum_index(&s.match_indices, s.voter_count)
+        quorum_index_count_sited(&s.match_indices, s.voter_count, s.sites)
     };
 
     // Apply durability mode

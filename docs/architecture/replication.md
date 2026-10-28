@@ -48,6 +48,11 @@ learner mode never grants. Real-vote responses count only when they
 echo the candidate's exact term, and only ballots from the active voter
 set (both sets while a joint configuration is active) move the tally.
 
+A group whose voters span sites counts every tally above — pre-vote,
+vote, ReadIndex and the commit tracker's — as a majority that also spans
+`min_sites` distinct sites ([multi_site.md](multi_site.md)); a flat
+group (one site, or `min_sites: 1`) is the plain majority described here.
+
 On winning, the leader appends a current-term no-op entry and arms a
 **term fence** in the commit tracker: until the no-op itself has
 quorum, the commit index may not advance by counting replicas —

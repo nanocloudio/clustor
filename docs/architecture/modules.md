@@ -64,6 +64,10 @@ in front of them while a TLS server fronts the listener, each module in
 the one role it holds; unwired, dials share `net_in` / `net_out`.
 `client_identity` re-keys each connection's identity to the id its
 client frames carry, for an admission stage that judges commands by key.
+With `forward_peer: 1` each client connection's peer (the transport's
+`MSG_PEER`) goes out on `cleartext` as `MSG_CLIENT_PEER` under the
+client id, ahead of its first frame — what Quantum's MQTT anchor matches
+a connection the transport moved to it by.
 
 A client response is only ever written to a client's connection. A
 response tagged with a slot holding a replica link is dropped and
@@ -76,7 +80,7 @@ connection number, or one already closed.
 |---|---|
 | Inputs | `net_in`, `peer_tx`, `repl_tx`, `client_resp`, `tls_identity`, `dial_in` |
 | Outputs | `net_out`, `cleartext`, `peer_rx`, `raft_rpc`, `metrics`, `dial_out`, `client_identity` |
-| Params | `self_id`, `peer_count`, `listen_port`, `peer{0..4}`, `peer{0..4}_key`, `require_identity`, `partitions`, `max_link_s` |
+| Params | `self_id`, `peer_count`, `listen_port`, `peer{0..4}`, `peer{0..4}_key`, `require_identity`, `partitions`, `max_link_s`, `forward_peer` |
 | Metrics | `bytes_in`, `bytes_out`, `connections.open`, `frames_dropped` |
 
 ### `consensus`
@@ -110,7 +114,7 @@ feedback, the same shape a channel edge has.
 |---|---|
 | Inputs | `rpc`, `proposals`, `admin_proposals`, `proposals_tagged`, `proposals_partitioned`, `proposals_partitioned_tagged`, `snapshot_installed`, `wal_flushed`, `wal_replay_complete`, `ack`, `snapshot_rx`, `durable`, `cp_state`, `read_permits`, `read`, `entry_reply` |
 | Outputs | `rpc_out`, `net_out`, `log_append`, `metrics`, `proposal_assigned`, `leader_state`, `admin_applied`, `log_maintenance`, `lag_signal`, `snapshot_import`, `snapshot_request`, `cross_durability_ack`, `committed_entries`, `applied`, `entry_request`, `durable_horizon` |
-| Params | `self_id`, `voter_count`, `election_timeout_ms`, `heartbeat_interval_ms`, `proposal_batch_max`, `proposal_batch_timeout_ms`, `partition_id`, `root_path`, `peer_count`, `pipeline_depth`, `durability_mode`, `persist_meta`, `name_fence` |
+| Params | `self_id`, `voter_count`, `election_timeout_ms`, `heartbeat_interval_ms`, `proposal_batch_max`, `proposal_batch_timeout_ms`, `partition_id`, `root_path`, `peer_count`, `pipeline_depth`, `durability_mode`, `persist_meta`, `name_fence`, `site_map`, `min_sites` |
 
 Two inputs and one output are shared handles with an in-module
 demux, because fluxor caps a module at 16 ports per direction:
@@ -158,7 +162,7 @@ themselves rather than behind channel capacity.
 |---|---|
 | Inputs | `entries`, `entry_request`, `compact_before`, `ack`, `import_chunks`, `trigger`, `install_request`, `retention_floor`, `app_snapshot_body` |
 | Outputs | `flushed`, `replay_complete`, `entry_reply`, `compaction_signal`, `metrics`, `quorum_durable`, `export_chunks`, `manifest_auth`, `installed_local`, `app_snapshot_ctl`, `cert_refresh` |
-| Params | `encoding`, `segment_bytes`, `aead`, `cluster`, `partition_id`, `self_id`, `fsync_mode`, `group_window_ms`, `group_max_pending`, `root_path`, `skip_replay`, `fixed_segment`, `preallocate_settle_ms`, `fence_depth`, `voter_count`, `name_fence` |
+| Params | `encoding`, `segment_bytes`, `aead`, `cluster`, `partition_id`, `self_id`, `fsync_mode`, `group_window_ms`, `group_max_pending`, `root_path`, `skip_replay`, `fixed_segment`, `preallocate_settle_ms`, `fence_depth`, `voter_count`, `name_fence`, `site_map`, `min_sites` |
 | Variants | `disk` (default), `volatile` |
 
 `disk` is the durable composition: FS-backed segments and
@@ -345,6 +349,7 @@ and the example consumer are driver-side.
 | Module | Description |
 |--------|-------------|
 | `session_directory` | Session directory / reservation authority: single-writer session bindings, quorum-committed counter-block grants, wrapped-key custody, fence ordering, and unsafe-recovery voiding, as a replicated consumer over `modules/common/session_registry.rs`. Replies only from the committed-entry stream. See [session_directory.md](session_directory.md). |
+| `directory_front` | One directory namespace behind a consumer's own port pair — the broker and egress surfaces: `rs/` egress block and address-range reservations, `att/` attachment boundaries, `op/` operation records (`op_kind: evacuation` for a failure-domain controller's). Tags each request with an id of its own, resends one unanswered after `retry_ms` (the command's operation id makes it a retry), streams an `op/` REPLAY, skips other requesters' replies and refuses what is not its namespace or kind. Logic in `modules/common/directory_front_core.rs`. See [session_directory.md](session_directory.md#fronts-the-broker-and-egress-surfaces). |
 | `partition_router` | Routes proposals to the correct per-partition `consensus` instance by partition id, preserving the correlation prefix on tagged proposals. |
 | `consensus_bench` | Load injector and scrape driver for the consensus path (bench graphs only). |
 | `nvme_bench` | Device-floor and WAL-path storage driver (bench graphs only). |

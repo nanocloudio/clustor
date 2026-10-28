@@ -207,6 +207,16 @@ define_params! {
     // one.
     15, name_fence, u8, 1
         => |s, d, len| { s.name_fence = p_u8(d, len, 0, 1); };
+
+    // The multi-site group (docs/architecture/multi_site.md): each
+    // replica id's site, four bits per id (id 0 lowest), and the fewest
+    // distinct sites a durable quorum spans. Must equal `consensus`'s
+    // pair, so both tallies count the same quorum. Defaults: one site, a
+    // plain majority.
+    18, site_map, u32, 0
+        => |s, d, len| { s.site_map = p_u32(d, len, 0, 0); };
+    19, min_sites, u8, 1
+        => |s, d, len| { s.min_sites = p_u8(d, len, 0, 1); };
 }
 
 /// Compile-time ceiling on the Partition Raft Groups one `durability`
@@ -284,6 +294,10 @@ struct ModuleState {
     /// stays shared rather than duplicated per slot.
     root_path: u8,
     name_fence: u8,
+    /// The multi-site group's map (`site_map`, `min_sites`), the one
+    /// `consensus` commits under; identical for every hosted group.
+    site_map: u32,
+    min_sites: u8,
 
     /// The hosted groups.
     slots: [DurSlot; K_MAX],
@@ -391,6 +405,8 @@ pub unsafe extern "C" fn module_new(
         }
         s.root_path = 0;
         s.name_fence = 0;
+        s.site_map = 0;
+        s.min_sites = 1;
         // EVERY slot, not just the hosted ones: `init` runs before the
         // params that say how many groups this instance hosts, and an
         // uninitialised slot is all-zeroes — which reads as channel
@@ -766,6 +782,7 @@ fn fan_slot_identity(s: &mut ModuleState, i: usize) {
         s.slots[i].ledger.self_id = s.slots[i].self_id;
         s.slots[i].ledger.partition_id = s.slots[i].partition_id;
         s.slots[i].ledger.voter_count = s.slots[i].voter_count;
+        s.slots[i].ledger.sites = types::SiteMap::new(s.site_map, s.min_sites);
         ledger::clamp_voters(&mut s.slots[i].ledger);
     }
     wal::arm(&mut s.slots[i].wal);

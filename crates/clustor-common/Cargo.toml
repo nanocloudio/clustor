@@ -28,8 +28,13 @@ categories             = ["no-std", "data-structures"]
 include = [
     "Cargo.toml",
     "src/lib.rs",
+    "common/attachment_registry.rs",
     "common/collections.rs",
+    "common/failover_registry.rs",
     "common/http_admin.rs",
+    "common/operation_registry.rs",
+    "common/region_registry.rs",
+    "common/reservation_registry.rs",
     "common/replica_facade.rs",
     "common/session_registry.rs",
     "common/slot_index.rs",

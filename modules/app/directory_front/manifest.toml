@@ -1,0 +1,61 @@
+version = "0.1.0"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712", "linux"]
+# timer_class: a request unanswered `retry_ms` of wall time is resent.
+timer_class = "wall_clock"
+
+# directory_front — one session-directory namespace behind a consumer's
+# own port pair: the broker and egress surfaces (docs/architecture/
+# session_directory.md §Fronts). `namespace` picks `rs/` (egress block and
+# address-range reservations), `att/` (attachment boundaries) or `op/`
+# (operation records; `op_kind: evacuation` for a failure-domain
+# controller's). The consumer writes the namespace's request frames under
+# its own request ids and reads the committed replies back under them;
+# the front tags, resends and filters (`modules/common/directory_front_core.rs`).
+
+# The consumer's requests: `[MSG_*_REQUEST][len u16][request id u64][body]`.
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+# The directory's `replies` (shared: other requesters' are skipped).
+[[ports]]
+name = "directory_in"
+direction = "input"
+content_type = "OctetStream"
+required = true
+
+# The committed replies under the consumer's ids, and
+# `MSG_DIR_OUT_OF_SCOPE` when the directory serves the other tier.
+[[ports]]
+name = "answer_out"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+# To the directory's `requests`.
+[[ports]]
+name = "directory_out"
+direction = "output"
+content_type = "OctetStream"
+required = true
+
+[[ports]]
+name = "metrics"
+direction = "output"
+content_type = "OctetStream"
+
+[observability]
+# Heartbeat on `metrics` (MSG_METRICS, ~1s cadence): the counters below
+# and the requests in flight.
+metrics = [
+  "admitted",
+  "refused",
+  "answered",
+  "resent",
+  "foreign",
+  "in_flight",
+]

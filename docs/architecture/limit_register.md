@@ -37,8 +37,8 @@ absent so that "absent here is a bug" stays a checkable claim:
   `METRICS_CACHE_SLACK` delta, kept so the cap has one source rather
   than a second literal), `RESP_BODY_MAX` from the exchange contract
   record's own bounds, `SEND_STAGE_MAX` from
-  `ROUTE_FRAME_MAX`, `SR_MAX_CMD` from `SR_MAX_WRAPPED_KEY`, `TR_MAX_CMD`
-  and `VB_MAX_CMD` from the transport and VIP command layouts, the session directory's `CMD_MAX`,
+  `ROUTE_FRAME_MAX`, `SR_MAX_CMD` from `SR_MAX_WRAPPED_KEY`, `TR_MAX_CMD`,
+  `VB_MAX_CMD`, `FO_MAX_CMD`, `RG_MAX_CMD`, `OP_MAX_CMD`, `AT_MAX_CMD` and `RS_MAX_CMD` from the transport, VIP, failover, region, operation, attachment and reservation command layouts (`TR_WIRE_REPLY_LEN` from the transport reply and its token trailer), the session directory's `CMD_MAX`,
   `SNAP_UNIT_MAX` and `REPLY_MAX` from the registries' own bounds,
   `SNAP_PTR_CANDIDATES` from `SNAP_PTR_SLOTS`, `FWD_FRAME_MAX` (one
   routed install frame the replicator holds) from `XFER_CHUNK_BODY`, and `EXPORT_TAIL_RECORDS`
@@ -148,12 +148,46 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Flow arena, RP2350 profile | `TR_PROFILE_RP2350` | modules/common/transport_registry.rs | 64 | Capacity: a BIND past the admitted count is refused `TR_ST_NO_CAPACITY`. |
 | Flow arena, Pi 5 profile | `TR_PROFILE_PI5` | modules/common/transport_registry.rs | 4096 | Capacity, as above. |
 | Flow arena, server profile | `TR_PROFILE_SERVER` | modules/common/transport_registry.rs | 65536 | Capacity, as above. |
-| Owners, prepared hosts and fences per VIP binding | `VB_MAX_OWNERS` | modules/common/vip_registry.rs | 8 | Semantic: an active/active claim past eight owners is refused `VB_ST_CAPACITY`; a ninth fence confirmation likewise. |
+| Owners, prepared hosts and fences per VIP binding, default width | `VB_MAX_OWNERS` | modules/common/vip_registry.rs | 8 | Semantic: the owner width `O` of `VipRegistry<N>` (the default of `VipRegistry<N, O>`): an active/active claim past `O` owners is refused `VB_ST_CAPACITY`; a fence confirmation past `O` likewise. The image records `O`, so a registry of another width refuses it. |
+| VIP owner width, RP2350 profile | `VB_OWNERS_RP2350` | modules/common/vip_registry.rs | 8 | Semantic, as above: the `rp2350` variant's `vip/` sets. Every binding reserves `O` host-table rows of `VB_SNAP_ROW_LEN` (100) bytes, so the width multiplies the arena. |
+| VIP owner width, Pi 5 profile | `VB_OWNERS_PI5` | modules/common/vip_registry.rs | 16 | Semantic, as above (1024 bindings × 16 rows ≈ 1.6 MiB of host tables). |
+| VIP owner width, server profile | `VB_OWNERS_SERVER` | modules/common/vip_registry.rs | 32 | Semantic, as above (16384 bindings × 32 rows ≈ 50 MiB of host tables, against 12.5 MiB at the default width: a server cell's ingress set, bought with memory, not a record change). |
+| Widest owner set any registry declares | `VB_OWNERS_MAX` | modules/common/vip_registry.rs | 64 | Build-time: a `VipRegistry<N, O>` with `O` above it does not compile (`PROFILE_OK`). Owner counts travel as one byte; the global tier's region sets are the widest consumer. |
 | VIP binding arena, RP2350 profile | `VB_PROFILE_RP2350` | modules/common/vip_registry.rs | 16 | Capacity: a claim for a new address past the admitted count is refused `VB_ST_CAPACITY`. VIP records are reserved independently of sessions, and a record lives as long as its group (a released binding keeps its epoch to refuse stale coordinators), so the arena bounds the distinct addresses a group ever claims. |
 | VIP binding arena, Pi 5 profile | `VB_PROFILE_PI5` | modules/common/vip_registry.rs | 1024 | Capacity, as above. |
 | VIP binding arena, server profile | `VB_PROFILE_SERVER` | modules/common/vip_registry.rs | 16384 | Capacity, as above. |
+| Failover-operation arena, RP2350 profile | `FO_PROFILE_RP2350` | modules/common/failover_registry.rs | 16 | Capacity: a new operation with every slot held by a live (non-terminal) record is refused `FO_ST_CAPACITY`; a terminal record is kept for retries until a new operation takes its slot, oldest first. |
+| Failover-operation arena, Pi 5 profile | `FO_PROFILE_PI5` | modules/common/failover_registry.rs | 256 | Capacity, as above. |
+| Failover-operation arena, server profile | `FO_PROFILE_SERVER` | modules/common/failover_registry.rs | 4096 | Capacity, as above. |
+| Global-tier service arena, RP2350 profile | `RG_PROFILE_RP2350` | modules/common/region_registry.rs | 4 | Capacity: a claim for a new service past the admitted count is refused `VB_ST_CAPACITY` (the VIP registry's arena under `rg/`); like `vip/` records, a service's binding lives as long as its group. |
+| Global-tier service arena, Pi 5 profile | `RG_PROFILE_PI5` | modules/common/region_registry.rs | 64 | Capacity, as above. |
+| Global-tier service arena, server profile | `RG_PROFILE_SERVER` | modules/common/region_registry.rs | 1024 | Capacity, as above. |
+| Regions per service owner set, RP2350 profile | `RG_OWNERS_RP2350` | modules/common/region_registry.rs | 8 | Semantic: the `rg/` registry's owner width; a region claim past it is refused `VB_ST_CAPACITY`. |
+| Regions per service owner set, Pi 5 profile | `RG_OWNERS_PI5` | modules/common/region_registry.rs | 16 | Semantic, as above. |
+| Regions per service owner set, server profile | `RG_OWNERS_SERVER` | modules/common/region_registry.rs | 64 | Semantic, as above (`VB_OWNERS_MAX`). |
+| Regions the invalidation table holds | `RG_MAX_REGIONS` | modules/common/region_registry.rs | 64 | Capacity: an INVALIDATE of a region not yet in a full table is refused `VB_ST_CAPACITY`; a later invalidation of a region already held advances its entry, so the table bounds a deployment's distinct regions, not its events. |
+| Operation-record arena, RP2350 profile | `OP_PROFILE_RP2350` | modules/common/operation_registry.rs | 16 | Capacity: a new takeover, evacuation or DR operation with every slot held by a live record is refused `OP_ST_CAPACITY`; terminal records are kept for retries until a new operation takes the oldest one's slot. |
+| Operation-record arena, Pi 5 profile | `OP_PROFILE_PI5` | modules/common/operation_registry.rs | 256 | Capacity, as above. |
+| Operation-record arena, server profile | `OP_PROFILE_SERVER` | modules/common/operation_registry.rs | 4096 | Capacity, as above. |
+| Attachment arena, RP2350 profile | `AT_PROFILE_RP2350` | modules/common/attachment_registry.rs | 32 | Capacity: a COMMIT of a new attachment past the admitted count is refused `AT_ST_CAPACITY`. A record lives as long as its group (a generation never restarts lower under a reused id), so the arena bounds the distinct attachments a group ever commits. |
+| Attachment arena, Pi 5 profile | `AT_PROFILE_PI5` | modules/common/attachment_registry.rs | 1024 | Capacity, as above. |
+| Attachment arena, server profile | `AT_PROFILE_SERVER` | modules/common/attachment_registry.rs | 16384 | Capacity, as above. |
+| Attached services, RP2350 profile | `AT_SERVICES_RP2350` | modules/common/attachment_registry.rs | 8 | Capacity: the first attachment of a new service past the admitted count is refused `AT_ST_CAPACITY`; services live as long as the group, as attachments do. |
+| Attached services, Pi 5 profile | `AT_SERVICES_PI5` | modules/common/attachment_registry.rs | 256 | Capacity, as above. |
+| Attached services, server profile | `AT_SERVICES_SERVER` | modules/common/attachment_registry.rs | 4096 | Capacity, as above. |
+| Egress block records, RP2350 profile | `RS_BLOCKS_RP2350` | modules/common/reservation_registry.rs | 64 | Capacity: a RESERVE that would create a block record past the admitted count is not granted one (`RS_ST_EXHAUSTED` when no existing record is grantable either). A block record lives as long as its pool (a released block keeps its generation), so the arena bounds the blocks of every pool the group serves. |
+| Egress block records, Pi 5 profile | `RS_BLOCKS_PI5` | modules/common/reservation_registry.rs | 4096 | Capacity, as above. |
+| Egress block records, server profile | `RS_BLOCKS_SERVER` | modules/common/reservation_registry.rs | 65536 | Capacity, as above. |
+| Address records, RP2350 profile | `RS_ADDRS_RP2350` | modules/common/reservation_registry.rs | 32 | Capacity: a new range past the admitted count takes the slot of a record whose quarantine has passed (its record id is forgotten), else is refused `RS_ST_CAPACITY`. |
+| Address records, Pi 5 profile | `RS_ADDRS_PI5` | modules/common/reservation_registry.rs | 1024 | Capacity, as above. |
+| Address records, server profile | `RS_ADDRS_SERVER` | modules/common/reservation_registry.rs | 4096 | Capacity, as above. |
+| Blocks one egress pool may declare | `RS_POOL_BLOCKS_MAX` | modules/common/reservation_registry.rs | 1024 | Semantic: a RESERVE naming a larger pool is refused `RS_ST_INVALID` at encode and apply; it bounds the blocks one RESERVE searches (65536 ports in blocks of 64). |
 | KEK-wrapped key blob | `SR_MAX_WRAPPED_KEY` | modules/common/session_registry.rs | 80 | A larger blob is refused at encode and at apply; the key is never stored. |
 | Pending session-directory proposals | `MAX_PENDING` | modules/app/session_directory/mod.rs | 16 | A full table leaves requests in the input channel. If the proposal channel fills after consumption, the request is dropped and the client must recover by reply-timeout retry; slots expire after 10 seconds. |
+| Requests in flight through one directory front | `FRONT_PENDING` | modules/common/directory_front_core.rs | 8 | Backpressure: a ninth consumer request stays in `request_in` until a reply frees a slot. |
+| Directory-front command body | `FRONT_CMD_MAX` | modules/common/directory_front_core.rs | 257 | Shape: the largest command the fronted namespaces carry (an `op/` CAS); a longer request is refused `Malformed`. |
+| Directory-front reply | `FRONT_REPLY_MAX` | modules/common/directory_front_core.rs | 264 | Shape: the largest reply the fronted namespaces send (an `op/` reply). |
+| Distinct sites a multi-site map names | `SITE_MAX` | modules/common/types.rs | 16 | Semantic: four bits of `site_map` per replica id; a seventeenth site cannot be named. |
 | Deterministic-timing owners | `TM_MAX_OWNERS` | modules/common/timing.rs | 4 | Rejects another independently drained timing owner. |
 | RBAC connection identities | `IDENTITY_SLOTS` | modules/app/operations/rbac.rs | 32 | Fail-closed capacity: a full table evicts its oldest binding, and with identity wired a connection with no binding is denied (never judged as `default_role`); the eviction is counted. Bindings die with their slot's revoke, so the table holds only connections that reported a verified identity and are still open. |
 | RBAC role keys | `ROLE_KEYS_MAX` | modules/app/operations/rbac.rs | 4 | Key fingerprints pinned per role (`operator_keyN`, `observer_keyN`); a fifth pins nothing. |
@@ -356,8 +390,42 @@ VB_MAX_OWNERS | modules/common/vip_registry.rs | 8
 VB_PROFILE_RP2350 | modules/common/vip_registry.rs | 16
 VB_PROFILE_PI5 | modules/common/vip_registry.rs | 1024
 VB_PROFILE_SERVER | modules/common/vip_registry.rs | 16384
+FO_PROFILE_RP2350 | modules/common/failover_registry.rs | 16
+FO_PROFILE_PI5 | modules/common/failover_registry.rs | 256
+FO_PROFILE_SERVER | modules/common/failover_registry.rs | 4096
+VB_OWNERS_RP2350 | modules/common/vip_registry.rs | 8
+VB_OWNERS_PI5 | modules/common/vip_registry.rs | 16
+VB_OWNERS_SERVER | modules/common/vip_registry.rs | 32
+VB_OWNERS_MAX | modules/common/vip_registry.rs | 64
+RG_PROFILE_RP2350 | modules/common/region_registry.rs | 4
+RG_PROFILE_PI5 | modules/common/region_registry.rs | 64
+RG_PROFILE_SERVER | modules/common/region_registry.rs | 1024
+RG_OWNERS_RP2350 | modules/common/region_registry.rs | 8
+RG_OWNERS_PI5 | modules/common/region_registry.rs | 16
+RG_OWNERS_SERVER | modules/common/region_registry.rs | 64
+RG_MAX_REGIONS | modules/common/region_registry.rs | 64
+OP_PROFILE_RP2350 | modules/common/operation_registry.rs | 16
+OP_PROFILE_PI5 | modules/common/operation_registry.rs | 256
+OP_PROFILE_SERVER | modules/common/operation_registry.rs | 4096
+AT_PROFILE_RP2350 | modules/common/attachment_registry.rs | 32
+AT_PROFILE_PI5 | modules/common/attachment_registry.rs | 1024
+AT_PROFILE_SERVER | modules/common/attachment_registry.rs | 16384
+AT_SERVICES_RP2350 | modules/common/attachment_registry.rs | 8
+AT_SERVICES_PI5 | modules/common/attachment_registry.rs | 256
+AT_SERVICES_SERVER | modules/common/attachment_registry.rs | 4096
+RS_BLOCKS_RP2350 | modules/common/reservation_registry.rs | 64
+RS_BLOCKS_PI5 | modules/common/reservation_registry.rs | 4096
+RS_BLOCKS_SERVER | modules/common/reservation_registry.rs | 65536
+RS_ADDRS_RP2350 | modules/common/reservation_registry.rs | 32
+RS_ADDRS_PI5 | modules/common/reservation_registry.rs | 1024
+RS_ADDRS_SERVER | modules/common/reservation_registry.rs | 4096
+RS_POOL_BLOCKS_MAX | modules/common/reservation_registry.rs | 1024
 SR_MAX_WRAPPED_KEY | modules/common/session_registry.rs | 80
 MAX_PENDING | modules/app/session_directory/mod.rs | 16
+FRONT_PENDING | modules/common/directory_front_core.rs | 8
+FRONT_CMD_MAX | modules/common/directory_front_core.rs | 257
+FRONT_REPLY_MAX | modules/common/directory_front_core.rs | 264
+SITE_MAX | modules/common/types.rs | 16
 TM_MAX_OWNERS | modules/common/timing.rs | 4
 IDENTITY_SLOTS | modules/app/operations/rbac.rs | 32
 ROLE_KEYS_MAX | modules/app/operations/rbac.rs | 4
@@ -426,6 +494,10 @@ FWD_FRAME_MAX | modules/app/consensus/replicator.rs | -
 CMD_MAX | modules/app/session_directory/mod.rs | -
 SNAP_UNIT_MAX | modules/app/session_directory/mod.rs | -
 REPLY_MAX | modules/app/session_directory/mod.rs | -
+RG_MAX_CMD | modules/common/region_registry.rs | -
+OP_MAX_CMD | modules/common/operation_registry.rs | -
+AT_MAX_CMD | modules/common/attachment_registry.rs | -
+RS_MAX_CMD | modules/common/reservation_registry.rs | -
 
 # Status codes. The convention keys on the NAME, and a reply status that
 # reports exhaustion reads as a capacity — these are values on the wire,
@@ -434,6 +506,10 @@ SR_ST_NO_CAPACITY | modules/common/session_registry.rs | -
 SR_ST_DEADLINE_CAPACITY | modules/common/session_registry.rs | -
 TR_ST_NO_CAPACITY | modules/common/transport_registry.rs | -
 VB_ST_CAPACITY | modules/common/vip_registry.rs | -
+FO_ST_CAPACITY | modules/common/failover_registry.rs | -
+OP_ST_CAPACITY | modules/common/operation_registry.rs | -
+AT_ST_CAPACITY | modules/common/attachment_registry.rs | -
+RS_ST_CAPACITY | modules/common/reservation_registry.rs | -
 
 # Snapshot-stream stage tags. The convention keys on the NAME, and a stage
 # named for the records it streams reads as a count — this is a cursor

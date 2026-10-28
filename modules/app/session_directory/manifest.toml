@@ -41,9 +41,13 @@ capabilities = [
 # qualification envelope. The `profile` parameter admits at most the
 # variant's arena; a graph asking a smaller variant for a larger profile
 # fails init rather than claim it.
-#   rp2350 — 64 sessions, 64 flows, 16 VIP bindings (the default)
-#   pi5    — 4096 / 4096 / 1024
-#   server — 65536 / 65536 / 16384
+#   rp2350 — 64 sessions, 64 flows, 16 VIP bindings of 8 owners, 4 global
+#            services of 8 regions, 16 operation records, 32 attachments
+#            of 8 services, 64 egress blocks, 32 address records (default)
+#   pi5    — 4096 / 4096 / 1024 × 16 / 64 × 16 / 256 / 1024 × 256 / 4096
+#            / 1024
+#   server — 65536 / 65536 / 16384 × 32 / 1024 × 64 / 4096 / 16384 × 4096
+#            / 65536 / 4096
 [[variant]]
 name = "rp2350"
 features = ["profile-rp2350"]
@@ -63,9 +67,12 @@ name = "committed_entries"
 direction = "input"
 content_type = "OctetStream"
 
-# MSG_SR_REQUEST / MSG_TR_REQUEST / MSG_VB_REQUEST from anchors /
-# orchestrators: [request_id:u64][command body] of the session, transport
-# or VIP namespace (the message id names the namespace).
+# MSG_SR_REQUEST / MSG_TR_REQUEST / MSG_VB_REQUEST / MSG_FO_REQUEST /
+# MSG_RG_REQUEST / MSG_OP_REQUEST / MSG_AT_REQUEST / MSG_RS_REQUEST from
+# anchors / orchestrators / coordinators / brokers / gateways:
+# [request_id:u64][command body] of the session, transport, VIP,
+# failover-operation, region, operation, attachment or reservation
+# namespace (the message id names the namespace).
 [[ports]]
 name = "requests"
 index = 1
@@ -122,9 +129,11 @@ name = "proposals"
 direction = "output"
 content_type = "OctetStream"
 
-# MSG_SR_REPLY / MSG_TR_REPLY / MSG_VB_REPLY back to the requester —
-# emitted ONLY after the command is quorum-committed and applied (the ack
-# boundary in docs/architecture/session_directory.md).
+# MSG_SR_REPLY / MSG_TR_REPLY / MSG_VB_REPLY / MSG_FO_REPLY / MSG_RG_REPLY
+# / MSG_OP_REPLY / MSG_AT_REPLY / MSG_RS_REPLY back to the requester — emitted ONLY after the command is
+# quorum-committed and applied (the ack boundary in
+# docs/architecture/session_directory.md); a committed failover or
+# operation REPLAY is followed by one reply per live record.
 [[ports]]
 name = "replies"
 index = 1

@@ -402,6 +402,10 @@ pub struct Raft {
     /// happens before this node can lead.
     learners: NodeSet,
     joint_voters: NodeSet,
+    /// The voters' sites and the fewest distinct sites a quorum spans
+    /// (`site_map`, `min_sites`): elections and ReadIndex probes need a
+    /// majority that is also that wide, as commit does. Flat by default.
+    pub sites: SiteMap,
     /// True iff `joint_voters` is the active overlay (so we don't
     /// have to encode "Some via a sentinel" inside a NodeSet bitmask).
     joint_active: bool,
@@ -921,6 +925,7 @@ pub fn init(s: &mut Raft) {
     s.learners = NodeSet::empty();
     s.joint_voters = NodeSet::empty();
     s.joint_active = false;
+    s.sites = SiteMap::flat();
     s.noop_pending = false;
     s.commit_fence_out = None;
     s.pending_new_voters = NodeSet::empty();
@@ -1627,6 +1632,7 @@ unsafe fn handle_read_index_probe_resp(s: &mut Raft, sys: &SyscallTable, plen: u
             s.current_voters,
             s.joint_voters,
             s.joint_active,
+            s.sites,
         ) {
             let corr = s.probes[i].correlation_id;
             let commit = s.probes[i].snapshot_commit;
@@ -1716,7 +1722,13 @@ unsafe fn start_probe(s: &mut Raft, sys: &SyscallTable, correlation_id: u64, now
     };
 
     // Single-node cluster: we already have majority (self).
-    if set_majority(votes, s.current_voters, s.joint_voters, s.joint_active) {
+    if set_majority(
+        votes,
+        s.current_voters,
+        s.joint_voters,
+        s.joint_active,
+        s.sites,
+    ) {
         emit_read_probe_reply(s, sys, correlation_id, s.commit_index, true);
         s.probes[slot_idx] = ProbeSlot::empty();
         return;
@@ -3197,16 +3209,22 @@ unsafe fn handle_vote_response(s: &mut Raft, sys: &SyscallTable, msg_type: u8, p
 /// voter set must reach a majority of it, and — while a joint config is
 /// active — a majority of the joint set too. Election-side mirror of
 /// commit's dual-median rule: a joint-phase leader must win both configs.
-fn set_majority(votes: NodeSet, current: NodeSet, joint: NodeSet, joint_active: bool) -> bool {
-    let cur_needed = (current.count() / 2) + 1;
-    if NodeSet(votes.0 & current.0).count() < cur_needed {
+///
+/// Under a multi-site map each majority must also span `min_sites`
+/// sites (`SiteMap::quorum`), so a leader is never elected, nor a read
+/// confirmed, by voters of fewer sites than a commit needs.
+fn set_majority(
+    votes: NodeSet,
+    current: NodeSet,
+    joint: NodeSet,
+    joint_active: bool,
+    sites: SiteMap,
+) -> bool {
+    if !sites.quorum(votes, current) {
         return false;
     }
-    if joint_active && joint.count() > 0 {
-        let joint_needed = (joint.count() / 2) + 1;
-        if NodeSet(votes.0 & joint.0).count() < joint_needed {
-            return false;
-        }
+    if joint_active && joint.count() > 0 && !sites.quorum(votes, joint) {
+        return false;
     }
     true
 }
@@ -3749,6 +3767,7 @@ unsafe fn step_candidate(s: &mut Raft, sys: &SyscallTable, now: u64) {
         s.current_voters,
         s.joint_voters,
         s.joint_active,
+        s.sites,
     ) {
         if s.pre_vote_active {
             // Pre-vote succeeded — start real election
@@ -6265,6 +6284,7 @@ unsafe fn begin_candidacy(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: 
         s.current_voters,
         s.joint_voters,
         s.joint_active,
+        s.sites,
     ) {
         if pre_vote {
             start_election(s, sys, now, false);

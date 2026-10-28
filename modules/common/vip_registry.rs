@@ -58,7 +58,8 @@
 //   claim made after it — or a capability that does not recompute.
 // - **active/active is an owner set.** Mode is fixed at the first claim.
 //   In active/active a claim adds the prepared host to the set (bounded by
-//   `VB_MAX_OWNERS`, `CAPACITY` beyond) without fencing the owners that
+//   the registry's owner width `O` — `VB_MAX_OWNERS` unless the profile
+//   names a wider one — `CAPACITY` beyond) without fencing the owners that
 //   stay; RELEASE naming a fenced owner removes just that host while the
 //   set is ACTIVE. A claim over an EMISSION_DISABLED set replaces it: the
 //   disabled owners acknowledged their cutoff and are not re-admitted by
@@ -95,8 +96,23 @@ use super::slot_index::{SlotIndex, SlotSet};
 
 // ── Capacity ────────────────────────────────────────────────────────
 
-/// Owners (active/active set), prepared hosts and fences one binding names.
+/// Owners (active/active set), prepared hosts and fences one binding names
+/// by default: the owner width of `VipRegistry<N>` and of the RP2350
+/// profile. A registry is `VipRegistry<N, O>`; the width is a compile-time
+/// size like the arena, and the image records it.
 pub const VB_MAX_OWNERS: usize = 8;
+
+/// Owner width per profile: hosts one active/active set admits. Every
+/// binding reserves `O` rows of host tables (`VB_SNAP_ROW_LEN` bytes
+/// each), so the width multiplies the arena: a wider set is bought with
+/// fewer bindings or more memory, never by changing the record format.
+pub const VB_OWNERS_RP2350: usize = 8;
+pub const VB_OWNERS_PI5: usize = 16;
+pub const VB_OWNERS_SERVER: usize = 32;
+/// The widest set any registry may declare: owner counts are carried as
+/// one byte, and the global tier's region sets (`region_registry.rs`) are
+/// the widest consumer.
+pub const VB_OWNERS_MAX: usize = 64;
 
 /// Profiles: bindings per group (one group's share of a profile's
 /// concurrent VIP/prefix intents; VIP records are low-volume and reserved
@@ -673,7 +689,7 @@ impl VipOpMemo {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(C)]
-pub struct VipSlot {
+pub struct VipSlot<const O: usize = VB_MAX_OWNERS> {
     pub used: bool,
     pub voided: bool,
     pub mode: u8,
@@ -696,18 +712,18 @@ pub struct VipSlot {
     pub unsafe_recovery_generation: u64,
     pub allowed_interfaces: u32,
     pub advertisement_policy_id: [u8; VB_POLICY_ID],
-    pub owners: [[u8; VB_HOST_ID]; VB_MAX_OWNERS],
-    pub owner_boot: [[u8; VB_BOOT_INCARNATION]; VB_MAX_OWNERS],
-    pub prepared: [[u8; VB_HOST_ID]; VB_MAX_OWNERS],
-    pub prepared_boot: [[u8; VB_BOOT_INCARNATION]; VB_MAX_OWNERS],
+    pub owners: [[u8; VB_HOST_ID]; O],
+    pub owner_boot: [[u8; VB_BOOT_INCARNATION]; O],
+    pub prepared: [[u8; VB_HOST_ID]; O],
+    pub prepared_boot: [[u8; VB_BOOT_INCARNATION]; O],
     /// Owners the in-flight claim replaces: each needs a confirmed fence.
-    pub previous_owners: [[u8; VB_HOST_ID]; VB_MAX_OWNERS],
-    pub fenced_hosts: [[u8; VB_HOST_ID]; VB_MAX_OWNERS],
-    pub fence_gens: [u32; VB_MAX_OWNERS],
+    pub previous_owners: [[u8; VB_HOST_ID]; O],
+    pub fenced_hosts: [[u8; VB_HOST_ID]; O],
+    pub fence_gens: [u32; O],
     pub last_op: VipOpMemo,
 }
 
-impl VipSlot {
+impl<const O: usize> VipSlot<O> {
     pub const fn empty() -> Self {
         VipSlot {
             used: false,
@@ -726,13 +742,13 @@ impl VipSlot {
             unsafe_recovery_generation: 0,
             allowed_interfaces: 0,
             advertisement_policy_id: [0; VB_POLICY_ID],
-            owners: [[0; VB_HOST_ID]; VB_MAX_OWNERS],
-            owner_boot: [[0; VB_BOOT_INCARNATION]; VB_MAX_OWNERS],
-            prepared: [[0; VB_HOST_ID]; VB_MAX_OWNERS],
-            prepared_boot: [[0; VB_BOOT_INCARNATION]; VB_MAX_OWNERS],
-            previous_owners: [[0; VB_HOST_ID]; VB_MAX_OWNERS],
-            fenced_hosts: [[0; VB_HOST_ID]; VB_MAX_OWNERS],
-            fence_gens: [0; VB_MAX_OWNERS],
+            owners: [[0; VB_HOST_ID]; O],
+            owner_boot: [[0; VB_BOOT_INCARNATION]; O],
+            prepared: [[0; VB_HOST_ID]; O],
+            prepared_boot: [[0; VB_BOOT_INCARNATION]; O],
+            previous_owners: [[0; VB_HOST_ID]; O],
+            fenced_hosts: [[0; VB_HOST_ID]; O],
+            fence_gens: [0; O],
             last_op: VipOpMemo::empty(),
         }
     }
@@ -768,17 +784,17 @@ impl VipSlot {
     }
 
     fn clear_claim(&mut self) {
-        self.prepared = [[0; VB_HOST_ID]; VB_MAX_OWNERS];
-        self.prepared_boot = [[0; VB_BOOT_INCARNATION]; VB_MAX_OWNERS];
+        self.prepared = [[0; VB_HOST_ID]; O];
+        self.prepared_boot = [[0; VB_BOOT_INCARNATION]; O];
         self.prepared_count = 0;
-        self.previous_owners = [[0; VB_HOST_ID]; VB_MAX_OWNERS];
+        self.previous_owners = [[0; VB_HOST_ID]; O];
         self.previous_count = 0;
         self.clear_fences();
     }
 
     fn clear_fences(&mut self) {
-        self.fenced_hosts = [[0; VB_HOST_ID]; VB_MAX_OWNERS];
-        self.fence_gens = [0; VB_MAX_OWNERS];
+        self.fenced_hosts = [[0; VB_HOST_ID]; O];
+        self.fence_gens = [0; O];
         self.fence_count = 0;
     }
 
@@ -795,9 +811,11 @@ impl VipSlot {
         self.owner_count -= 1;
     }
 
-    /// Snapshot record layout (fixed `VB_SLOT_SNAP_LEN`): the scalar
-    /// fields in declaration order, then the host tables, then the memo.
-    fn encode(&self, dst: &mut [u8]) {
+    /// Snapshot head unit (fixed `VB_SLOT_HEAD_LEN`, whatever the owner
+    /// width): the scalar fields in declaration order, then the memo. The
+    /// host tables follow as `O` row units (`encode_row`), so a unit's
+    /// size never depends on how wide a profile's owner sets are.
+    fn encode_head(&self, dst: &mut [u8]) {
         dst[0] = self.used as u8;
         dst[1] = self.voided as u8;
         dst[2] = self.mode;
@@ -816,36 +834,39 @@ impl VipSlot {
         dst[72..80].copy_from_slice(&self.unsafe_recovery_generation.to_le_bytes());
         dst[80..84].copy_from_slice(&self.allowed_interfaces.to_le_bytes());
         dst[84..100].copy_from_slice(&self.advertisement_policy_id);
-        let mut o = 100;
-        let tables: [&[[u8; 16]; VB_MAX_OWNERS]; 6] = [
-            &self.owners,
-            &self.owner_boot,
-            &self.prepared,
-            &self.prepared_boot,
-            &self.previous_owners,
-            &self.fenced_hosts,
-        ];
-        for t in tables {
-            for h in t {
-                dst[o..o + 16].copy_from_slice(h);
-                o += 16;
-            }
-        }
-        for g in &self.fence_gens {
-            dst[o..o + 4].copy_from_slice(&g.to_le_bytes());
-            o += 4;
-        }
-        self.last_op.encode(&mut dst[o..o + VipOpMemo::LEN]);
+        self.last_op.encode(&mut dst[100..100 + VipOpMemo::LEN]);
     }
 
-    fn decode(src: &[u8]) -> Option<VipSlot> {
+    /// Row `k` of the host tables (fixed `VB_SNAP_ROW_LEN`): `[owner:16]
+    /// [owner_boot:16][prepared:16][prepared_boot:16][previous:16]
+    /// [fenced:16][fence_gen:4]`.
+    fn encode_row(&self, k: usize, dst: &mut [u8]) {
+        let cols: [&[u8; 16]; 6] = [
+            &self.owners[k],
+            &self.owner_boot[k],
+            &self.prepared[k],
+            &self.prepared_boot[k],
+            &self.previous_owners[k],
+            &self.fenced_hosts[k],
+        ];
+        let mut o = 0;
+        for c in cols {
+            dst[o..o + 16].copy_from_slice(c);
+            o += 16;
+        }
+        dst[o..o + 4].copy_from_slice(&self.fence_gens[k].to_le_bytes());
+    }
+
+    fn decode_head(src: &[u8]) -> Option<VipSlot<O>> {
         let mut s = VipSlot::empty();
         if src[0] > 1
             || src[1] > 1
             || src[2] > VB_MODE_ACTIVE_ACTIVE
             || src[3] > VB_PHASE_RELEASED
             || src[4] > VB_PHASE_RELEASED
-            || src[5..9].iter().any(|&c| c as usize > VB_MAX_OWNERS)
+            || src[5..9].iter().any(|&c| c as usize > O)
+            || src[9..12] != [0; 3]
+            || src[46..48] != [0; 2]
         {
             return None;
         }
@@ -865,36 +886,32 @@ impl VipSlot {
         s.unsafe_recovery_generation = u64_at(src, 72);
         s.allowed_interfaces = u32_at(src, 80);
         s.advertisement_policy_id.copy_from_slice(&src[84..100]);
-        let mut o = 100;
-        {
-            let tables: [&mut [[u8; 16]; VB_MAX_OWNERS]; 6] = [
-                &mut s.owners,
-                &mut s.owner_boot,
-                &mut s.prepared,
-                &mut s.prepared_boot,
-                &mut s.previous_owners,
-                &mut s.fenced_hosts,
-            ];
-            for t in tables {
-                for h in t.iter_mut() {
-                    h.copy_from_slice(&src[o..o + 16]);
-                    o += 16;
-                }
-            }
-        }
-        for g in &mut s.fence_gens {
-            *g = u32_at(src, o);
-            o += 4;
-        }
-        s.last_op = VipOpMemo::decode(&src[o..o + VipOpMemo::LEN])?;
+        s.last_op = VipOpMemo::decode(&src[100..100 + VipOpMemo::LEN])?;
         Some(s)
+    }
+
+    fn decode_row(&mut self, k: usize, src: &[u8]) {
+        let cols: [&mut [u8; 16]; 6] = [
+            &mut self.owners[k],
+            &mut self.owner_boot[k],
+            &mut self.prepared[k],
+            &mut self.prepared_boot[k],
+            &mut self.previous_owners[k],
+            &mut self.fenced_hosts[k],
+        ];
+        let mut o = 0;
+        for c in cols {
+            c.copy_from_slice(&src[o..o + 16]);
+            o += 16;
+        }
+        self.fence_gens[k] = u32_at(src, o);
     }
 }
 
 /// The replicated state machine. `N` is the binding arena (a power of two).
 #[repr(C)]
-pub struct VipRegistry<const N: usize> {
-    pub slots: [VipSlot; N],
+pub struct VipRegistry<const N: usize, const O: usize = VB_MAX_OWNERS> {
+    pub slots: [VipSlot<O>; N],
     /// binding key → slot. Derived; rebuilt on restore.
     index: SlotIndex<N, VB_KEY>,
     /// Which slots hold a binding; a new key takes the lowest free one.
@@ -911,14 +928,17 @@ pub struct VipRegistry<const N: usize> {
     pub last_op: VipOpMemo,
 }
 
-impl<const N: usize> Default for VipRegistry<N> {
+impl<const N: usize, const O: usize> Default for VipRegistry<N, O> {
     fn default() -> Self {
         Self::new(&[0; VB_SEED])
     }
 }
 
-impl<const N: usize> VipRegistry<N> {
-    const PROFILE_OK: () = assert!(N.is_power_of_two(), "vip profile: N must be a power of two");
+impl<const N: usize, const O: usize> VipRegistry<N, O> {
+    const PROFILE_OK: () = assert!(
+        N.is_power_of_two() && O >= 1 && O <= VB_OWNERS_MAX,
+        "vip profile: N must be a power of two and O within 1..=VB_OWNERS_MAX"
+    );
 
     /// `seed` is the capability seed — in deployment the kernel CSPRNG's
     /// 32 bytes, replicated by the module through SEED so every replica
@@ -1002,11 +1022,23 @@ impl<const N: usize> VipRegistry<N> {
         self.occupied.lowest_free()
     }
 
-    pub fn lookup(&self, key: &[u8; VB_KEY]) -> Option<&VipSlot> {
+    pub fn lookup(&self, key: &[u8; VB_KEY]) -> Option<&VipSlot<O>> {
         self.find(key).map(|i| &self.slots[i])
     }
 
-    fn reply(&self, op: u8, status: u8, slot: &VipSlot) -> VipReply {
+    /// The slot `key`'s binding occupies: placement is replicated state,
+    /// so a namespace layered on this one (`region_registry.rs`) keys its
+    /// own per-binding state by it.
+    pub fn slot_of(&self, key: &[u8; VB_KEY]) -> Option<usize> {
+        self.find(key)
+    }
+
+    /// The first binding's slot at or after `at`, in slot order.
+    pub fn next_binding(&self, at: usize) -> Option<usize> {
+        self.occupied.next_used(at)
+    }
+
+    fn reply(&self, op: u8, status: u8, slot: &VipSlot<O>) -> VipReply {
         VipReply {
             op,
             status,
@@ -1037,7 +1069,7 @@ impl<const N: usize> VipRegistry<N> {
     /// it. A claim in flight over an owned record at a recovery is not
     /// voided (it re-fences instead), but its owners' authority predates
     /// the recovery all the same.
-    fn authority_current(&self, slot: &VipSlot) -> bool {
+    fn authority_current(&self, slot: &VipSlot<O>) -> bool {
         !slot.voided && slot.unsafe_recovery_generation == self.unsafe_recovery_generation
     }
 
@@ -1058,7 +1090,7 @@ impl<const N: usize> VipRegistry<N> {
         Some(self.mint(slot, i, digest))
     }
 
-    fn mint(&self, slot: &VipSlot, owner: usize, digest: DigestFn) -> EmissionToken {
+    fn mint(&self, slot: &VipSlot<O>, owner: usize, digest: DigestFn) -> EmissionToken {
         let mut t = EmissionToken {
             key: slot.key,
             owner_host: slot.owners[owner],
@@ -1073,6 +1105,43 @@ impl<const N: usize> VipRegistry<N> {
         t.encode_fields(&mut fields);
         t.capability = EmissionToken::capability_for(&self.seed, &fields, digest);
         t
+    }
+
+    /// An address provider's check before it arms under `arm_authority`,
+    /// as Fluxor's `ip` asks it on `auth_req` (`MSG_ARM_AUTH_CHECK` 0x7A:
+    /// `[addr:16][generation:u32 LE][boot_incarnation:16][auth_len:u16 LE]
+    /// [auth]`, the auth a VIP emission token), answered as
+    /// `ARM_AUTH_VERDICT` (0x7B) wants it: `[addr][generation]
+    /// [sha256(auth):32][verdict]` — 0 for a token that verifies and names
+    /// the asking boot, otherwise `0x80 |` the refusal. `None` for a check
+    /// that is not one.
+    pub fn answer_arm_check(
+        &self,
+        req: &[u8],
+        digest: DigestFn,
+        out: &mut [u8; 16 + 4 + 32 + 1],
+    ) -> Option<u8> {
+        if req.len() < 38 {
+            return None;
+        }
+        let auth_len = usize::from(u16::from_le_bytes([req[36], req[37]]));
+        if 38 + auth_len != req.len() {
+            return None;
+        }
+        let auth = &req[38..];
+        let verdict = match EmissionToken::decode(auth) {
+            Some(t) if t.boot_incarnation[..] == req[20..36] => {
+                match self.verify_emission_token(&t, digest) {
+                    Ok(()) => 0,
+                    Err(code) => 0x80 | code,
+                }
+            }
+            _ => 0x80 | VB_ST_UNAUTHORIZED,
+        };
+        out[..20].copy_from_slice(&req[..20]);
+        out[20..52].copy_from_slice(&digest(auth));
+        out[52] = verdict;
+        Some(verdict)
     }
 
     /// What a Fluxor `ip` / NIC provider or `route_announcer` asks before
@@ -1401,7 +1470,7 @@ impl<const N: usize> VipRegistry<N> {
         if adding && slot.owner_index(&host).is_some() {
             return Self::reply_of(recovery, VB_OP_CLAIM_PREPARE, VB_ST_INVALID, slot);
         }
-        if adding && slot.owner_count as usize + 1 > VB_MAX_OWNERS {
+        if adding && slot.owner_count as usize + 1 > O {
             return Self::reply_of(recovery, VB_OP_CLAIM_PREPARE, VB_ST_CAPACITY, slot);
         }
         slot.clear_claim();
@@ -1423,7 +1492,7 @@ impl<const N: usize> VipRegistry<N> {
         Self::reply_of(recovery, VB_OP_CLAIM_PREPARE, VB_ST_OK, slot)
     }
 
-    fn reply_of(recovery: u64, op: u8, status: u8, slot: &VipSlot) -> VipReply {
+    fn reply_of(recovery: u64, op: u8, status: u8, slot: &VipSlot<O>) -> VipReply {
         VipReply {
             op,
             status,
@@ -1497,7 +1566,7 @@ impl<const N: usize> VipRegistry<N> {
             slot.fence_gens[k] = fence_gen;
         } else {
             let k = slot.fence_count as usize;
-            if k >= VB_MAX_OWNERS {
+            if k >= O {
                 return Self::reply_of(recovery, VB_OP_FENCE_CONFIRM, VB_ST_CAPACITY, slot);
             }
             slot.fenced_hosts[k] = host;
@@ -1533,7 +1602,7 @@ impl<const N: usize> VipRegistry<N> {
             && slot.unsafe_recovery_generation == recovery;
         let owner = if keep_set {
             let k = slot.owner_count as usize;
-            if k >= VB_MAX_OWNERS {
+            if k >= O {
                 return Self::reply_of(recovery, VB_OP_ACTIVATE, VB_ST_CAPACITY, slot);
             }
             slot.owners[k] = slot.prepared[0];
@@ -1541,8 +1610,8 @@ impl<const N: usize> VipRegistry<N> {
             slot.owner_count += 1;
             k
         } else {
-            slot.owners = [[0; VB_HOST_ID]; VB_MAX_OWNERS];
-            slot.owner_boot = [[0; VB_BOOT_INCARNATION]; VB_MAX_OWNERS];
+            slot.owners = [[0; VB_HOST_ID]; O];
+            slot.owner_boot = [[0; VB_BOOT_INCARNATION]; O];
             slot.owners[0] = slot.prepared[0];
             slot.owner_boot[0] = slot.prepared_boot[0];
             slot.owner_count = 1;
@@ -1622,8 +1691,8 @@ impl<const N: usize> VipRegistry<N> {
         };
         slot.phase = to;
         if to == VB_PHASE_RELEASED {
-            slot.owners = [[0; VB_HOST_ID]; VB_MAX_OWNERS];
-            slot.owner_boot = [[0; VB_BOOT_INCARNATION]; VB_MAX_OWNERS];
+            slot.owners = [[0; VB_HOST_ID]; O];
+            slot.owner_boot = [[0; VB_BOOT_INCARNATION]; O];
             slot.owner_count = 0;
             slot.clear_fences();
         }
@@ -1632,15 +1701,21 @@ impl<const N: usize> VipRegistry<N> {
 
     // ── Snapshot (streamed, versioned) ──────────────────────────────
     //
-    //   header [version:u16 = 2][reserved:u16][arena N:u32][admitted:u32]
-    //          [record_count:u32][unsafe_recovery_generation:u64]
-    //          [applied:u64][seed:32][last_op: VipOpMemo::LEN]
-    //   record [slot:u32][VipSlot: VB_SLOT_SNAP_LEN] × record_count
+    //   header [version:u16 = 3][owner width O:u16][arena N:u32]
+    //          [admitted:u32][record_count:u32]
+    //          [unsafe_recovery_generation:u64][applied:u64][seed:32]
+    //          [last_op: VipOpMemo::LEN]
+    //   record [slot:u32][head: VB_SLOT_HEAD_LEN] then O × [row:
+    //          VB_SNAP_ROW_LEN], × record_count, in slot order
+    //
+    // Version 3 carries the owner width: an image is installed only by a
+    // registry of the same arena and the same width, so a profile whose
+    // owner sets are wider never reads a narrower one's records as its own.
 
-    pub const SNAPSHOT_VERSION: u16 = 2;
+    pub const SNAPSHOT_VERSION: u16 = 3;
 
     pub fn snapshot_len(&self) -> usize {
-        VB_SNAP_HDR_LEN + self.live as usize * VB_SNAP_RECORD_LEN
+        VB_SNAP_HDR_LEN + self.live as usize * vb_snap_record_len(O)
     }
 
     pub fn snapshot(&self, dst: &mut [u8]) -> i32 {
@@ -1672,7 +1747,7 @@ impl<const N: usize> VipRegistry<N> {
         match cur.stage {
             VB_EXPORT_HEADER => {
                 dst[0..2].copy_from_slice(&Self::SNAPSHOT_VERSION.to_le_bytes());
-                dst[2..4].copy_from_slice(&0u16.to_le_bytes());
+                dst[2..4].copy_from_slice(&(O as u16).to_le_bytes());
                 dst[4..8].copy_from_slice(&(N as u32).to_le_bytes());
                 dst[8..12].copy_from_slice(&self.admitted.to_le_bytes());
                 dst[12..16].copy_from_slice(&self.live.to_le_bytes());
@@ -1686,9 +1761,19 @@ impl<const N: usize> VipRegistry<N> {
             }
             VB_EXPORT_RECORDS => {
                 dst[0..4].copy_from_slice(&cur.pos.to_le_bytes());
-                self.slots[cur.pos as usize].encode(&mut dst[4..4 + VB_SLOT_SNAP_LEN]);
-                cur.pos += 1;
-                VB_SNAP_RECORD_LEN
+                self.slots[cur.pos as usize].encode_head(&mut dst[4..4 + VB_SLOT_HEAD_LEN]);
+                cur.stage = VB_EXPORT_ROWS;
+                cur.row = 0;
+                4 + VB_SLOT_HEAD_LEN
+            }
+            VB_EXPORT_ROWS => {
+                self.slots[cur.pos as usize].encode_row(cur.row as usize, dst);
+                cur.row += 1;
+                if cur.row as usize == O {
+                    cur.pos += 1;
+                    cur.stage = VB_EXPORT_RECORDS;
+                }
+                VB_SNAP_ROW_LEN
             }
             _ => 0,
         }
@@ -1750,6 +1835,7 @@ impl<const N: usize> VipRegistry<N> {
         match ins.stage {
             VB_EXPORT_HEADER => {
                 if u16::from_le_bytes([unit[0], unit[1]]) != Self::SNAPSHOT_VERSION
+                    || u16::from_le_bytes([unit[2], unit[3]]) as usize != O
                     || u32_at(&unit, 4) != N as u32
                 {
                     return false;
@@ -1776,7 +1862,7 @@ impl<const N: usize> VipRegistry<N> {
             }
             VB_EXPORT_RECORDS => {
                 let slot = u32_at(&unit, 0) as usize;
-                let Some(rec) = VipSlot::decode(&unit[4..4 + VB_SLOT_SNAP_LEN]) else {
+                let Some(rec) = VipSlot::<O>::decode_head(&unit[4..4 + VB_SLOT_HEAD_LEN]) else {
                     return false;
                 };
                 if slot >= N || !rec.used || self.occupied.is_used(slot) {
@@ -1788,10 +1874,23 @@ impl<const N: usize> VipRegistry<N> {
                 self.occupied.mark(slot);
                 self.slots[slot] = rec;
                 self.live += 1;
-                ins.seen += 1;
-                if ins.seen == ins.expected {
-                    ins.stage = VB_EXPORT_DONE;
+                ins.slot = slot as u32;
+                ins.row = 0;
+                ins.stage = VB_EXPORT_ROWS;
+                true
+            }
+            VB_EXPORT_ROWS => {
+                self.slots[ins.slot as usize].decode_row(ins.row as usize, &unit);
+                ins.row += 1;
+                if (ins.row as usize) < O {
+                    return true;
                 }
+                ins.seen += 1;
+                ins.stage = if ins.seen == ins.expected {
+                    VB_EXPORT_DONE
+                } else {
+                    VB_EXPORT_RECORDS
+                };
                 true
             }
             _ => false,
@@ -1808,17 +1907,33 @@ impl<const N: usize> VipRegistry<N> {
     }
 }
 
-/// Per-binding snapshot record (see `VipSlot::encode`): 100 scalar bytes,
-/// six 128-byte host tables, 32 bytes of fence generations, the memo.
-pub const VB_SLOT_SNAP_LEN: usize =
-    100 + 6 * 16 * VB_MAX_OWNERS + 4 * VB_MAX_OWNERS + VipOpMemo::LEN;
-pub const VB_SNAP_RECORD_LEN: usize = 4 + VB_SLOT_SNAP_LEN;
+/// Snapshot head unit (see `VipSlot::encode_head`): 100 scalar bytes, the
+/// memo.
+pub const VB_SLOT_HEAD_LEN: usize = 100 + VipOpMemo::LEN;
+/// One row of the host tables (see `VipSlot::encode_row`): six 16-byte
+/// identities and a fence generation.
+pub const VB_SNAP_ROW_LEN: usize = 6 * 16 + 4;
+
+/// Bytes one binding occupies in an image of owner width `owners`.
+pub const fn vb_snap_record_len(owners: usize) -> usize {
+    4 + VB_SLOT_HEAD_LEN + owners * VB_SNAP_ROW_LEN
+}
+
+/// One binding's record at the default width (`VB_MAX_OWNERS`).
+pub const VB_SLOT_SNAP_LEN: usize = VB_SLOT_HEAD_LEN + VB_MAX_OWNERS * VB_SNAP_ROW_LEN;
+pub const VB_SNAP_RECORD_LEN: usize = vb_snap_record_len(VB_MAX_OWNERS);
 pub const VB_SNAP_HDR_LEN: usize = 64 + VipOpMemo::LEN;
-pub const VB_SNAP_MAX_UNIT: usize = VB_SNAP_RECORD_LEN;
+/// Largest unit, whatever the owner width: the header or a record head.
+pub const VB_SNAP_MAX_UNIT: usize = if VB_SNAP_HDR_LEN > 4 + VB_SLOT_HEAD_LEN {
+    VB_SNAP_HDR_LEN
+} else {
+    4 + VB_SLOT_HEAD_LEN
+};
 
 pub const VB_EXPORT_HEADER: u8 = 0;
 pub const VB_EXPORT_RECORDS: u8 = 1;
 pub const VB_EXPORT_DONE: u8 = 2;
+pub const VB_EXPORT_ROWS: u8 = 3;
 
 /// A streamed install rejected the image; the registry is left cleared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1829,6 +1944,8 @@ pub struct InstallRejected;
 pub struct VbExportCursor {
     pub stage: u8,
     pub pos: u32,
+    /// The host-table row next streamed for the binding at `pos`.
+    pub row: u32,
 }
 
 impl Default for VbExportCursor {
@@ -1842,6 +1959,7 @@ impl VbExportCursor {
         VbExportCursor {
             stage: VB_EXPORT_HEADER,
             pos: 0,
+            row: 0,
         }
     }
 
@@ -1858,6 +1976,9 @@ pub struct VbInstaller {
     pub carry_len: u16,
     pub expected: u32,
     pub seen: u32,
+    /// The binding whose host-table rows are arriving, and the next row.
+    pub slot: u32,
+    pub row: u32,
     pub carry: [u8; VB_SNAP_MAX_UNIT],
 }
 
@@ -1875,6 +1996,8 @@ impl VbInstaller {
             carry_len: 0,
             expected: 0,
             seen: 0,
+            slot: 0,
+            row: 0,
             carry: [0; VB_SNAP_MAX_UNIT],
         }
     }
@@ -1886,7 +2009,8 @@ impl VbInstaller {
     pub fn stage_len(stage: u8) -> usize {
         match stage {
             VB_EXPORT_HEADER => VB_SNAP_HDR_LEN,
-            VB_EXPORT_RECORDS => VB_SNAP_RECORD_LEN,
+            VB_EXPORT_RECORDS => 4 + VB_SLOT_HEAD_LEN,
+            VB_EXPORT_ROWS => VB_SNAP_ROW_LEN,
             _ => 0,
         }
     }

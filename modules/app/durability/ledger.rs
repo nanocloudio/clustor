@@ -20,7 +20,8 @@
 
 use super::abi::SyscallTable;
 use super::types::{
-    quorum_index, quorum_index_for_set, Index, NodeSet, ReplicaId, Term, MAX_NODES,
+    quorum_index_count_sited, quorum_index_sited, Index, NodeSet, ReplicaId, SiteMap, Term,
+    MAX_NODES,
 };
 use super::{dev_log, wire, wire_channels};
 
@@ -36,6 +37,11 @@ pub struct Ledger {
     pub self_id: ReplicaId,
     pub voter_count: u8,
     pub partition_id: u16,
+    /// The voters' sites and the fewest a durable quorum spans — the map
+    /// `consensus` commits under (`site_map`, `min_sites`): the two
+    /// tallies must agree, or an entry could commit on fewer sites than
+    /// the group declares.
+    pub sites: SiteMap,
 
     /// Voter sets for the durability tally, mirrored from raft's
     /// voter-set latch via `MSG_VOTER_SET_UPDATE` on the entry stream.
@@ -84,6 +90,7 @@ pub unsafe fn init(l: &mut Ledger) {
     l.self_id = 0;
     l.voter_count = 1;
     l.partition_id = 0;
+    l.sites = SiteMap::flat();
     l.current_voters = NodeSet::empty();
     l.joint_voters = NodeSet::empty();
     l.joint_active = false;
@@ -125,11 +132,11 @@ fn durable_quorum(l: &Ledger) -> Index {
     if l.current_voters.count() == 0 {
         // No voter-set update yet — median over the fixed `0..voter_count`
         // range.
-        return quorum_index(&l.progress, l.voter_count);
+        return quorum_index_count_sited(&l.progress, l.voter_count, l.sites);
     }
-    let current = quorum_index_for_set(&l.progress, l.current_voters);
+    let current = quorum_index_sited(&l.progress, l.current_voters, l.sites);
     if l.joint_active && l.joint_voters.count() > 0 {
-        let joint = quorum_index_for_set(&l.progress, l.joint_voters);
+        let joint = quorum_index_sited(&l.progress, l.joint_voters, l.sites);
         if current < joint {
             current
         } else {

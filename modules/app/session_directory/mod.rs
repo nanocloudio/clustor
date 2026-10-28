@@ -26,8 +26,24 @@
 //!   `transport/<flow_id>` namespace (`MSG_TR_REQUEST` / `MSG_TR_REPLY`,
 //!   `modules/common/transport_registry.rs`, magic `"TR"`) and the
 //!   `vip/<service_address>` namespace (`MSG_VB_REQUEST` /
-//!   `MSG_VB_REPLY`, `modules/common/vip_registry.rs`, magic `"VB"`)
-//!   beside the session registry (`"SR"`); each is its own deterministic
+//!   `MSG_VB_REPLY`, `modules/common/vip_registry.rs`, magic `"VB"`) and
+//!   the `fo/<operation_id>` failover-operation store (`MSG_FO_REQUEST` /
+//!   `MSG_FO_REPLY`, `modules/common/failover_registry.rs`, magic `"FO"`:
+//!   a coordinator's compare-and-swap record, replayed to it on
+//!   reconnection), the `rg/<service>` global tier (`MSG_RG_REQUEST` /
+//!   `MSG_RG_REPLY`, `modules/common/region_registry.rs`, magic `"RG"`:
+//!   region owner sets, DR generations, regional invalidation) and the
+//!   `op/<operation_id>` operation store (`MSG_OP_REQUEST` /
+//!   `MSG_OP_REPLY`, `modules/common/operation_registry.rs`, magic `"OP"`:
+//!   takeover, evacuation and DR operation records), the
+//!   `att/<attachment_id>` boundaries (`MSG_AT_REQUEST` / `MSG_AT_REPLY`,
+//!   `modules/common/attachment_registry.rs`, magic `"AT"`: attachment
+//!   generations and service revocation boundaries) and the `rs/`
+//!   reservations (`MSG_RS_REQUEST` / `MSG_RS_REPLY`,
+//!   `modules/common/reservation_registry.rs`, magic `"RS"`: egress blocks
+//!   per gateway incarnation and address ranges, horizons in committed
+//!   time) beside the session registry (`"SR"`); each is its own
+//!   deterministic
 //!   state machine, proposed, committed, acknowledged and snapshotted on
 //!   exactly the same path.
 //! - **Profiles**: the arenas are static per
@@ -111,10 +127,22 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
 include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 
 use abi::contracts::net::session_ctrl;
+#[path = "../../common/attachment_registry.rs"]
+mod attachment_registry;
+#[path = "../../common/directory_scope.rs"]
+mod directory_scope;
 #[path = "../../common/session_directory_face.rs"]
 mod face;
+#[path = "../../common/failover_registry.rs"]
+mod failover_registry;
+#[path = "../../common/operation_registry.rs"]
+mod operation_registry;
+#[path = "../../common/region_registry.rs"]
+mod region_registry;
 #[path = "../../common/replica_facade.rs"]
 mod replica_facade;
+#[path = "../../common/reservation_registry.rs"]
+mod reservation_registry;
 #[path = "../../common/session_registry.rs"]
 mod session_registry;
 /// The SDK's SHA-256: the digest the VIP registry derives emission-token
@@ -141,17 +169,44 @@ mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
 
+use attachment_registry::{
+    AtExportCursor, AtInstaller, AttachmentRegistry, AttachmentReply, AT_MAX_CMD, AT_PROFILE_PI5,
+    AT_PROFILE_RP2350, AT_PROFILE_SERVER, AT_REPLY_LEN, AT_SERVICES_PI5, AT_SERVICES_RP2350,
+    AT_SERVICES_SERVER, AT_SNAP_MAX_UNIT, AT_ST_OK,
+};
+use failover_registry::{
+    FailoverRegistry, FailoverReply, FoExportCursor, FoInstaller, FO_MAX_CMD, FO_OP_REPLAY,
+    FO_PROFILE_PI5, FO_PROFILE_RP2350, FO_PROFILE_SERVER, FO_REPLY_LEN, FO_SNAP_MAX_UNIT, FO_ST_OK,
+    FO_ST_REPLAY,
+};
+use operation_registry::{
+    OpExportCursor, OpInstaller, OperationRegistry, OperationReply, OP_MAX_CMD, OP_OP_REPLAY,
+    OP_PROFILE_PI5, OP_PROFILE_RP2350, OP_PROFILE_SERVER, OP_REPLY_LEN, OP_SNAP_MAX_UNIT, OP_ST_OK,
+    OP_ST_REPLAY,
+};
+use region_registry::{
+    RegionRegistry, RgExportCursor, RgInstaller, RgReply, RG_INVALIDATE_LEN, RG_MAX_CMD,
+    RG_OP_INVALIDATE, RG_OWNERS_PI5, RG_OWNERS_RP2350, RG_OWNERS_SERVER, RG_PROFILE_PI5,
+    RG_PROFILE_RP2350, RG_PROFILE_SERVER, RG_REPLY_LEN, RG_SNAP_MAX_UNIT,
+};
 use replica_facade::{CommitOrderError, CommittedSubscriber, TAGGED_PROPOSAL_HDR};
+use reservation_registry::{
+    carries_horizon, ReservationRegistry, ReservationReply, RsExportCursor, RsInstaller,
+    RS_ADDRS_PI5, RS_ADDRS_RP2350, RS_ADDRS_SERVER, RS_BLOCKS_PI5, RS_BLOCKS_RP2350,
+    RS_BLOCKS_SERVER, RS_MAX_CMD, RS_REPLY_LEN, RS_SNAP_MAX_UNIT, RS_ST_OK,
+};
 use session_registry::*;
 use timing::{ClockGuard, ClockHealth};
 use transport_registry::{
-    TrExportCursor, TrInstaller, TransportRegistry, TransportReply, TR_MAX_CMD, TR_OP_MOVE,
-    TR_PROFILE_PI5, TR_PROFILE_RP2350, TR_PROFILE_SERVER, TR_REPLY_LEN, TR_SNAP_MAX_UNIT, TR_ST_OK,
+    encode_token_trailer, TrExportCursor, TrInstaller, TransportRegistry, TransportReply,
+    TR_MAX_CMD, TR_OP_MOVE, TR_OP_MOVE_FENCED, TR_PROFILE_PI5, TR_PROFILE_RP2350,
+    TR_PROFILE_SERVER, TR_REPLY_LEN, TR_SNAP_MAX_UNIT, TR_ST_OK, TR_TOKEN_LEN, TR_WIRE_REPLY_LEN,
 };
 use vip_registry::{
     build_seed, VbExportCursor, VbInstaller, VipRegistry, VipReply, VB_MAX_CMD, VB_OP_ACTIVATE,
-    VB_PROFILE_PI5, VB_PROFILE_RP2350, VB_PROFILE_SERVER, VB_REPLY_LEN, VB_SEED, VB_SNAP_MAX_UNIT,
-    VB_ST_OK,
+    VB_OP_SEED, VB_OWNERS_PI5, VB_OWNERS_RP2350, VB_OWNERS_SERVER, VB_PROFILE_PI5,
+    VB_PROFILE_RP2350, VB_PROFILE_SERVER, VB_REPLY_LEN, VB_SEED, VB_SNAP_MAX_UNIT, VB_ST_OK,
+    VB_TOKEN_LEN,
 };
 
 // ── Profile (variant-selected arenas) ───────────────────────────────
@@ -166,6 +221,15 @@ mod profile {
     pub const DEADLINES: usize = SR_DEADLINES_SERVER;
     pub const FLOWS: usize = TR_PROFILE_SERVER;
     pub const BINDINGS: usize = VB_PROFILE_SERVER;
+    pub const OWNERS: usize = VB_OWNERS_SERVER;
+    pub const OPERATIONS: usize = FO_PROFILE_SERVER;
+    pub const SERVICES: usize = RG_PROFILE_SERVER;
+    pub const REGIONS: usize = RG_OWNERS_SERVER;
+    pub const RECORDS: usize = OP_PROFILE_SERVER;
+    pub const ATTACHMENTS: usize = AT_PROFILE_SERVER;
+    pub const PRODUCERS: usize = AT_SERVICES_SERVER;
+    pub const BLOCKS: usize = RS_BLOCKS_SERVER;
+    pub const ADDRS: usize = RS_ADDRS_SERVER;
 }
 #[cfg(all(feature = "profile-pi5", not(feature = "profile-server")))]
 mod profile {
@@ -174,6 +238,15 @@ mod profile {
     pub const DEADLINES: usize = SR_DEADLINES_PI5;
     pub const FLOWS: usize = TR_PROFILE_PI5;
     pub const BINDINGS: usize = VB_PROFILE_PI5;
+    pub const OWNERS: usize = VB_OWNERS_PI5;
+    pub const OPERATIONS: usize = FO_PROFILE_PI5;
+    pub const SERVICES: usize = RG_PROFILE_PI5;
+    pub const REGIONS: usize = RG_OWNERS_PI5;
+    pub const RECORDS: usize = OP_PROFILE_PI5;
+    pub const ATTACHMENTS: usize = AT_PROFILE_PI5;
+    pub const PRODUCERS: usize = AT_SERVICES_PI5;
+    pub const BLOCKS: usize = RS_BLOCKS_PI5;
+    pub const ADDRS: usize = RS_ADDRS_PI5;
 }
 #[cfg(not(any(feature = "profile-pi5", feature = "profile-server")))]
 mod profile {
@@ -182,23 +255,85 @@ mod profile {
     pub const DEADLINES: usize = SR_DEADLINES_RP2350;
     pub const FLOWS: usize = TR_PROFILE_RP2350;
     pub const BINDINGS: usize = VB_PROFILE_RP2350;
+    pub const OWNERS: usize = VB_OWNERS_RP2350;
+    pub const OPERATIONS: usize = FO_PROFILE_RP2350;
+    pub const SERVICES: usize = RG_PROFILE_RP2350;
+    pub const REGIONS: usize = RG_OWNERS_RP2350;
+    pub const RECORDS: usize = OP_PROFILE_RP2350;
+    pub const ATTACHMENTS: usize = AT_PROFILE_RP2350;
+    pub const PRODUCERS: usize = AT_SERVICES_RP2350;
+    pub const BLOCKS: usize = RS_BLOCKS_RP2350;
+    pub const ADDRS: usize = RS_ADDRS_RP2350;
 }
 
 type Registry = SessionRegistry<{ profile::SESSIONS }, { profile::DEADLINES }>;
 type Transport = TransportRegistry<{ profile::FLOWS }>;
-type Vip = VipRegistry<{ profile::BINDINGS }>;
+type Vip = VipRegistry<{ profile::BINDINGS }, { profile::OWNERS }>;
+type Failover = FailoverRegistry<{ profile::OPERATIONS }>;
+type Region = RegionRegistry<{ profile::SERVICES }, { profile::REGIONS }>;
+type Operations = OperationRegistry<{ profile::RECORDS }>;
+type Attachments = AttachmentRegistry<{ profile::ATTACHMENTS }, { profile::PRODUCERS }>;
+type Reservations = ReservationRegistry<{ profile::BLOCKS }, { profile::ADDRS }>;
 
 /// `profile` parameter values.
 const PROFILE_RP2350: u8 = 0;
 const PROFILE_PI5: u8 = 1;
 const PROFILE_SERVER: u8 = 2;
 
-/// Admitted `(sessions, flows, bindings)` for a profile value.
-fn profile_admits(profile: u8) -> Option<(usize, usize, usize)> {
+/// What a profile value admits in each arena. Owner widths are not
+/// admitted counts: they are the variant's record shape, fixed at build.
+#[derive(Clone, Copy)]
+struct Admits {
+    sessions: usize,
+    flows: usize,
+    bindings: usize,
+    operations: usize,
+    services: usize,
+    records: usize,
+    attachments: usize,
+    producers: usize,
+    blocks: usize,
+    addrs: usize,
+}
+
+fn profile_admits(profile: u8) -> Option<Admits> {
     match profile {
-        PROFILE_RP2350 => Some((SR_PROFILE_RP2350, TR_PROFILE_RP2350, VB_PROFILE_RP2350)),
-        PROFILE_PI5 => Some((SR_PROFILE_PI5, TR_PROFILE_PI5, VB_PROFILE_PI5)),
-        PROFILE_SERVER => Some((SR_PROFILE_SERVER, TR_PROFILE_SERVER, VB_PROFILE_SERVER)),
+        PROFILE_RP2350 => Some(Admits {
+            sessions: SR_PROFILE_RP2350,
+            flows: TR_PROFILE_RP2350,
+            bindings: VB_PROFILE_RP2350,
+            operations: FO_PROFILE_RP2350,
+            services: RG_PROFILE_RP2350,
+            records: OP_PROFILE_RP2350,
+            attachments: AT_PROFILE_RP2350,
+            producers: AT_SERVICES_RP2350,
+            blocks: RS_BLOCKS_RP2350,
+            addrs: RS_ADDRS_RP2350,
+        }),
+        PROFILE_PI5 => Some(Admits {
+            sessions: SR_PROFILE_PI5,
+            flows: TR_PROFILE_PI5,
+            bindings: VB_PROFILE_PI5,
+            operations: FO_PROFILE_PI5,
+            services: RG_PROFILE_PI5,
+            records: OP_PROFILE_PI5,
+            attachments: AT_PROFILE_PI5,
+            producers: AT_SERVICES_PI5,
+            blocks: RS_BLOCKS_PI5,
+            addrs: RS_ADDRS_PI5,
+        }),
+        PROFILE_SERVER => Some(Admits {
+            sessions: SR_PROFILE_SERVER,
+            flows: TR_PROFILE_SERVER,
+            bindings: VB_PROFILE_SERVER,
+            operations: FO_PROFILE_SERVER,
+            services: RG_PROFILE_SERVER,
+            records: OP_PROFILE_SERVER,
+            attachments: AT_PROFILE_SERVER,
+            producers: AT_SERVICES_SERVER,
+            blocks: RS_BLOCKS_SERVER,
+            addrs: RS_ADDRS_SERVER,
+        }),
         _ => None,
     }
 }
@@ -206,6 +341,49 @@ fn profile_admits(profile: u8) -> Option<(usize, usize, usize)> {
 /// The digest every namespace derives with.
 fn digest(m: &[u8]) -> [u8; 32] {
     sha256::sha256(m)
+}
+
+/// Fluxor's continuity provider asks whether a per-flow emission token is
+/// the flow's current one (`[token:48]`, TRANSPORT_CONTINUITY's
+/// `MSG_TOKEN_CHECK`); answered `[token:48][verdict:u8]`.
+const MSG_FLOW_TOKEN_CHECK: u8 = 0xC2;
+const MSG_FLOW_TOKEN_VERDICT: u8 = 0xC3;
+/// Fluxor's `ip` asks before arming an address under `arm_authority`
+/// (`identity::MSG_ARM_AUTH_CHECK`): `[addr:16][generation:u32 LE]
+/// [boot_incarnation:16][auth_len:u16 LE][auth]`, the auth a VIP emission
+/// token; answered `[addr:16][generation:u32 LE][sha256(auth):32]
+/// [verdict:u8]`.
+const MSG_ARM_AUTH_CHECK: u8 = 0x7A;
+const MSG_ARM_AUTH_VERDICT: u8 = 0x7B;
+
+/// Answer a token check from this replica's committed registries: the
+/// verdict is 0 for a token that verifies, else the registry's refusal
+/// code (`0x80 |` it); an unseeded group or a malformed check refuses.
+unsafe fn answer_token_check(s: &mut ModuleState, msg_type: u8, req: &[u8]) {
+    let sys = &*s.syscalls;
+    s.token_checks = s.token_checks.saturating_add(1);
+    if msg_type == MSG_FLOW_TOKEN_CHECK {
+        let mut out = [0u8; TR_TOKEN_LEN + 1];
+        let Some(v) = s
+            .transport
+            .answer_token_check(req, &s.vip.seed, digest, &mut out)
+        else {
+            return;
+        };
+        if v != 0 {
+            s.token_refusals = s.token_refusals.saturating_add(1);
+        }
+        let _ = wire_channels::channel_write_msg(sys, s.out_replies, MSG_FLOW_TOKEN_VERDICT, &out);
+    } else {
+        let mut out = [0u8; 16 + 4 + 32 + 1];
+        let Some(v) = s.vip.answer_arm_check(req, digest, &mut out) else {
+            return;
+        };
+        if v != 0 {
+            s.token_refusals = s.token_refusals.saturating_add(1);
+        }
+        let _ = wire_channels::channel_write_msg(sys, s.out_replies, MSG_ARM_AUTH_VERDICT, &out);
+    }
 }
 
 /// Two-byte prefix on every replicated registry command so registry
@@ -217,11 +395,26 @@ const SR_CMD_MAGIC: [u8; 2] = *b"SR";
 const TR_CMD_MAGIC: [u8; 2] = *b"TR";
 /// The VIP namespace's prefix (`vip_registry.rs`).
 const VB_CMD_MAGIC: [u8; 2] = *b"VB";
+/// The failover-operation namespace's prefix (`failover_registry.rs`).
+const FO_CMD_MAGIC: [u8; 2] = *b"FO";
+/// The global tier's prefix (`region_registry.rs`).
+const RG_CMD_MAGIC: [u8; 2] = *b"RG";
+/// The operation store's prefix (`operation_registry.rs`).
+const OP_CMD_MAGIC: [u8; 2] = *b"OP";
+/// The attachment boundaries' prefix (`attachment_registry.rs`).
+const AT_CMD_MAGIC: [u8; 2] = *b"AT";
+/// The reservations' prefix (`reservation_registry.rs`).
+const RS_CMD_MAGIC: [u8; 2] = *b"RS";
 
 /// Which namespace a pending proposal answers on.
 const NS_SR: u8 = 0;
 const NS_TR: u8 = 1;
 const NS_VB: u8 = 2;
+const NS_FO: u8 = 3;
+const NS_RG: u8 = 4;
+const NS_OP: u8 = 5;
+const NS_AT: u8 = 6;
+const NS_RS: u8 = 7;
 
 const fn max_usize(a: usize, b: usize) -> usize {
     if a > b {
@@ -233,14 +426,46 @@ const fn max_usize(a: usize, b: usize) -> usize {
 
 /// Largest command body any namespace replicates (derived from the
 /// registries' own bounds).
-const CMD_MAX: usize = max_usize(max_usize(SR_MAX_CMD, TR_MAX_CMD), VB_MAX_CMD);
+const CMD_MAX: usize = max_usize(
+    max_usize(
+        max_usize(max_usize(SR_MAX_CMD, TR_MAX_CMD), VB_MAX_CMD),
+        FO_MAX_CMD,
+    ),
+    max_usize(
+        max_usize(RG_MAX_CMD, OP_MAX_CMD),
+        max_usize(AT_MAX_CMD, RS_MAX_CMD),
+    ),
+);
 /// Largest streamed-snapshot unit any registry exports (derived).
 const SNAP_UNIT_MAX: usize = max_usize(
-    max_usize(SR_SNAP_MAX_UNIT, TR_SNAP_MAX_UNIT),
-    VB_SNAP_MAX_UNIT,
+    max_usize(
+        max_usize(
+            max_usize(SR_SNAP_MAX_UNIT, TR_SNAP_MAX_UNIT),
+            VB_SNAP_MAX_UNIT,
+        ),
+        FO_SNAP_MAX_UNIT,
+    ),
+    max_usize(
+        max_usize(RG_SNAP_MAX_UNIT, OP_SNAP_MAX_UNIT),
+        max_usize(AT_SNAP_MAX_UNIT, RS_SNAP_MAX_UNIT),
+    ),
 );
-/// Largest reply any namespace encodes (derived).
-const REPLY_MAX: usize = max_usize(max_usize(SR_REPLY_LEN, TR_REPLY_LEN), VB_REPLY_LEN);
+/// Largest reply any namespace encodes (derived; the transport reply
+/// with its token trailer).
+const REPLY_MAX: usize = max_usize(
+    max_usize(
+        max_usize(max_usize(SR_REPLY_LEN, TR_WIRE_REPLY_LEN), VB_REPLY_LEN),
+        FO_REPLY_LEN,
+    ),
+    max_usize(
+        max_usize(RG_REPLY_LEN, OP_REPLY_LEN),
+        max_usize(AT_REPLY_LEN, RS_REPLY_LEN),
+    ),
+);
+const _: () = assert!(
+    CMD_MAX + 2 <= MSG_BUF && TR_WIRE_REPLY_LEN > TR_REPLY_LEN,
+    "every namespace's command fits the entry body"
+);
 
 /// Pending request table: correlation → request_id. Small — the
 /// directory is a control-plane service; a full table backpressures
@@ -267,11 +492,22 @@ const PENDING_TTL_MS: u64 = 10_000;
 const SNAP_CHUNK: usize = 1024;
 
 /// Snapshot section order within one image: the session registry, the
-/// transport registry, then the VIP registry.
+/// transport registry, the VIP registry, the failover-operation store, the
+/// global tier, the operation store, the attachment boundaries, then the
+/// reservations. The session registry's header leads the image, so its
+/// `SNAPSHOT_VERSION` is the image's: 3 when the failover section joined,
+/// 4 when the region and operation sections did (and the transport and VIP
+/// sections changed shape), 5 when the attachment and reservation sections
+/// did, and an image of any other shape is refused.
 const SNAP_SECTION_SR: u8 = 0;
 const SNAP_SECTION_TR: u8 = 1;
 const SNAP_SECTION_VB: u8 = 2;
-const SNAP_SECTION_DONE: u8 = 3;
+const SNAP_SECTION_FO: u8 = 3;
+const SNAP_SECTION_RG: u8 = 4;
+const SNAP_SECTION_OP: u8 = 5;
+const SNAP_SECTION_AT: u8 = 6;
+const SNAP_SECTION_RS: u8 = 7;
+const SNAP_SECTION_DONE: u8 = 8;
 
 /// Scratch buffer: committed entries carry the command body
 /// (SR_CMD_MAGIC + SR_MAX_CMD) under a 16-byte entry header; snapshot
@@ -288,6 +524,16 @@ const SMOKE_KEY_ARM: u8 = 4;
 const SMOKE_KEY_SENT: u8 = 5;
 const SMOKE_DONE: u8 = 6;
 const SMOKE_OFF: u8 = 0xFF;
+/// `smoke: 3`, the site-loss smoke: the leader commits a regional
+/// INVALIDATE of `SITE_SMOKE_REGION` one readiness higher every
+/// `SITE_SMOKE_PERIOD_MS`, and every replica logs each one it applies
+/// (`[sess_dir] site smoke applied readiness=N`) — a commit heartbeat a
+/// site-loss test counts across the loss.
+const SMOKE_SITE: u8 = 3;
+const SITE_SMOKE_PERIOD_MS: u64 = 300;
+const SITE_SMOKE_REGION: [u8; 16] = *b"SITE-LOSS-SMOKE1";
+
+use directory_scope::{scope_admits, SCOPE_ALL};
 
 /// TTL for the smoke KEY_PUT (smoke = 2): long enough to commit the
 /// put before expiry, short enough for an e2e to observe the fire.
@@ -319,7 +565,9 @@ struct ModuleState {
     replica_id: u8,
     smoke: u8,
     smoke_phase: u8,
-    _pad0: u8,
+    /// `scope`: which tier this directory serves (`SCOPE_*`); a request
+    /// in a namespace the other tier owns is refused before proposal.
+    scope: u8,
     /// The raft group this directory's log is: the committed stream
     /// carries every group's entries, each numbered from 1, and only
     /// this group's are applied here. A proposal the engine assigns to
@@ -335,10 +583,16 @@ struct ModuleState {
     forwarded_stream: u8,
     _pad4: u8,
 
-    /// The replicated state machines: sessions, flows and VIP bindings.
+    /// The replicated state machines: sessions, flows, VIP bindings,
+    /// failover operations, region owner sets and operation records.
     registry: Registry,
     transport: Transport,
     vip: Vip,
+    failover: Failover,
+    region: Region,
+    ops: Operations,
+    attachments: Attachments,
+    reservations: Reservations,
     /// Capacity profile parameter (tag 9).
     profile: u8,
 
@@ -372,6 +626,14 @@ struct ModuleState {
 
     // Counters (metrics)
     requests_in: u32,
+    /// Fluxor providers' token checks answered (flow and address), and
+    /// how many refused.
+    token_checks: u32,
+    token_refusals: u32,
+    /// Requests refused for this directory's tier (`MSG_DIR_OUT_OF_SCOPE`).
+    scope_refusals: u32,
+    /// The site-loss smoke (`smoke: 3`): when the leader last proposed.
+    site_smoke_ms: u64,
     proposals_out: u32,
     /// Pending slots reclaimed by the TTL (lost assignment/commit).
     proposals_expired: u32,
@@ -426,6 +688,11 @@ struct ModuleState {
     sr_installer: SrInstaller,
     tr_installer: TrInstaller,
     vb_installer: VbInstaller,
+    fo_installer: FoInstaller,
+    rg_installer: RgInstaller,
+    op_installer: OpInstaller,
+    at_installer: AtInstaller,
+    rs_installer: RsInstaller,
 
     /// Snapshot export: active while an image is being streamed across
     /// steps (committed applies hold so the image is one index's state).
@@ -438,6 +705,27 @@ struct ModuleState {
     sr_cursor: SrExportCursor,
     tr_cursor: TrExportCursor,
     vb_cursor: VbExportCursor,
+    fo_cursor: FoExportCursor,
+    rg_cursor: RgExportCursor,
+    op_cursor: OpExportCursor,
+    at_cursor: AtExportCursor,
+    rs_cursor: RsExportCursor,
+    /// Failover replay: after a committed REPLAY of ours, every live
+    /// record goes to `fo_replay_req` in creation order, one per
+    /// writable step slot, then the end-of-replay reply.
+    fo_replay_active: bool,
+    _pad7: [u8; 3],
+    fo_replay_sent: u32,
+    fo_replay_req: u64,
+    fo_replay_after: u64,
+    /// Operation replay: as the failover replay, for the live records of
+    /// `op_replay_kind` (0: every kind).
+    op_replay_active: bool,
+    op_replay_kind: u8,
+    _pad8: [u8; 2],
+    op_replay_sent: u32,
+    op_replay_req: u64,
+    op_replay_after: u64,
     /// A SEED proposal is in flight (do not propose another until it
     /// commits or the pending slot expires).
     seed_proposed_ms: u64,
@@ -491,6 +779,15 @@ mod params_def {
             => |s, d, len| { s.forwarded_stream = p_u8(d, len, 0, 0); };
         9, profile, u8, 0
             => |s, d, len| { s.profile = p_u8(d, len, 0, 0); };
+        // Which tier this directory serves (docs/architecture/multi_site.md):
+        // 0 both (one region, no global tier — the default), 1 a regional
+        // cell (sessions, flows, VIPs, failover records, attachments,
+        // reservations, takeover and evacuation records; never `rg/`), 2
+        // the multi-site global tier (`rg/` and REGION / EVACUATION
+        // operation records only). A request for the other tier is
+        // answered `MSG_DIR_OUT_OF_SCOPE`, never proposed.
+        10, scope, u8, 0, enum { all=0, cell=1, global=2 }
+            => |s, d, len| { s.scope = p_u8(d, len, 0, 0); };
     }
 }
 
@@ -536,6 +833,11 @@ unsafe fn propose_ns(s: &mut ModuleState, request_id: u64, body: &[u8], face: u8
     tagged[..2].copy_from_slice(match ns {
         NS_TR => &TR_CMD_MAGIC,
         NS_VB => &VB_CMD_MAGIC,
+        NS_FO => &FO_CMD_MAGIC,
+        NS_RG => &RG_CMD_MAGIC,
+        NS_OP => &OP_CMD_MAGIC,
+        NS_AT => &AT_CMD_MAGIC,
+        NS_RS => &RS_CMD_MAGIC,
         _ => &SR_CMD_MAGIC,
     });
     tagged[2..2 + body.len()].copy_from_slice(body);
@@ -853,7 +1155,9 @@ pub unsafe extern "C" fn module_new(
         s.replica_id = 0;
         s.smoke = 0;
         s.smoke_phase = SMOKE_IDLE;
-        s._pad0 = 0;
+        s.scope = SCOPE_ALL;
+        s.scope_refusals = 0;
+        s.site_smoke_ms = 0;
         s.profile = PROFILE_RP2350;
         s.subscriber = CommittedSubscriber::new(0);
         s.corr_counter = 0;
@@ -866,6 +1170,8 @@ pub unsafe extern "C" fn module_new(
         s.pending_part = [0; MAX_PENDING];
         s.pending_ns = [NS_SR; MAX_PENDING];
         s.requests_in = 0;
+        s.token_checks = 0;
+        s.token_refusals = 0;
         s.proposals_out = 0;
         s.proposals_expired = 0;
         s.replies_out = 0;
@@ -893,6 +1199,11 @@ pub unsafe extern "C" fn module_new(
         s.sr_installer = SrInstaller::new();
         s.tr_installer = TrInstaller::new();
         s.vb_installer = VbInstaller::new();
+        s.fo_installer = FoInstaller::new();
+        s.rg_installer = RgInstaller::new();
+        s.op_installer = OpInstaller::new();
+        s.at_installer = AtInstaller::new();
+        s.rs_installer = RsInstaller::new();
         s.export_active = false;
         s.export_section = SNAP_SECTION_SR;
         s._pad5 = [0; 2];
@@ -902,6 +1213,22 @@ pub unsafe extern "C" fn module_new(
         s.sr_cursor = SrExportCursor::new();
         s.tr_cursor = TrExportCursor::new();
         s.vb_cursor = VbExportCursor::new();
+        s.fo_cursor = FoExportCursor::new();
+        s.rg_cursor = RgExportCursor::new();
+        s.op_cursor = OpExportCursor::new();
+        s.at_cursor = AtExportCursor::new();
+        s.rs_cursor = RsExportCursor::new();
+        s.fo_replay_active = false;
+        s._pad7 = [0; 3];
+        s.fo_replay_sent = 0;
+        s.fo_replay_req = 0;
+        s.fo_replay_after = 0;
+        s.op_replay_active = false;
+        s.op_replay_kind = 0;
+        s._pad8 = [0; 2];
+        s.op_replay_sent = 0;
+        s.op_replay_req = 0;
+        s.op_replay_after = 0;
         s.seed_proposed_ms = 0;
         s.snap_staged = 0;
         s._pad6 = 0;
@@ -913,26 +1240,45 @@ pub unsafe extern "C" fn module_new(
         } else {
             params_def::set_defaults(s);
         }
-        if s.smoke == 0 {
+        if s.smoke == 0 || s.smoke == SMOKE_SITE {
             s.smoke_phase = SMOKE_OFF;
         }
         // The profile must fit this variant's arenas: a build admitting
         // less than the named profile cannot claim it.
-        let Some((sessions, flows, bindings)) = profile_admits(s.profile) else {
+        let Some(admits) = profile_admits(s.profile) else {
             dev_log(sys, 1, b"[sess_dir] unknown profile".as_ptr(), 26);
             return -3;
         };
-        if sessions > profile::SESSIONS || flows > profile::FLOWS || bindings > profile::BINDINGS {
+        if admits.sessions > profile::SESSIONS
+            || admits.flows > profile::FLOWS
+            || admits.bindings > profile::BINDINGS
+            || admits.operations > profile::OPERATIONS
+            || admits.services > profile::SERVICES
+            || admits.records > profile::RECORDS
+            || admits.attachments > profile::ATTACHMENTS
+            || admits.producers > profile::PRODUCERS
+            || admits.blocks > profile::BLOCKS
+            || admits.addrs > profile::ADDRS
+        {
             dev_log(sys, 1, b"[sess_dir] profile exceeds arena".as_ptr(), 32);
             return -3;
         }
         // In place: a profile-sized registry does not fit on the stack.
-        s.registry.reset(sessions as u32);
-        s.transport.reset(flows as u32);
+        s.registry.reset(admits.sessions as u32);
+        s.transport.reset(admits.flows as u32);
         // Unseeded: the leader proposes the group's capability seed from
         // the kernel CSPRNG once (step 5.7); until it commits, ACTIVATE
         // answers NOT_READY on every replica.
-        s.vip.reset(bindings as u32);
+        s.vip.reset(admits.bindings as u32);
+        s.failover.reset(admits.operations as u32);
+        // The global tier is seeded by the same SEED, under its derived
+        // seed (`apply_committed_vip`).
+        s.region.reset(admits.services as u32);
+        s.ops.reset(admits.records as u32);
+        s.attachments
+            .reset(admits.attachments as u32, admits.producers as u32);
+        s.reservations
+            .reset(admits.blocks as u32, admits.addrs as u32);
         s.clock_guard = ClockGuard::new(
             s.logical_max_step_ms as u64,
             s.clock_slew_tolerance_ms as u64,
@@ -966,6 +1312,26 @@ unsafe fn apply_committed(s: &mut ModuleState, index: u64, command: &[u8]) {
     }
     if command[..2] == VB_CMD_MAGIC {
         apply_committed_vip(s, index, &command[2..]);
+        return;
+    }
+    if command[..2] == FO_CMD_MAGIC {
+        apply_committed_failover(s, index, &command[2..]);
+        return;
+    }
+    if command[..2] == RG_CMD_MAGIC {
+        apply_committed_region(s, index, &command[2..]);
+        return;
+    }
+    if command[..2] == OP_CMD_MAGIC {
+        apply_committed_operation(s, index, &command[2..]);
+        return;
+    }
+    if command[..2] == AT_CMD_MAGIC {
+        apply_committed_attachment(s, index, &command[2..]);
+        return;
+    }
+    if command[..2] == RS_CMD_MAGIC {
+        apply_committed_reservation(s, index, &command[2..]);
         return;
     }
     if command[..2] != SR_CMD_MAGIC {
@@ -1039,13 +1405,21 @@ fn take_pending(s: &mut ModuleState, index: u64, ns: u8) -> Option<usize> {
 }
 
 /// A committed `"TR"` entry: apply to the transport registry on every
-/// replica; relay the reply as `MSG_TR_REPLY` when it was ours.
+/// replica; relay the reply as `MSG_TR_REPLY` when it was ours, with the
+/// token trailer (the promoted emitter's `FlowToken` after a committed
+/// MOVE_FENCED, minted under the group's capability seed).
 unsafe fn apply_committed_transport(s: &mut ModuleState, index: u64, body: &[u8]) {
     let sys = &*s.syscalls;
-    let reply: TransportReply = s.transport.apply(body);
+    // A fenced move needs the session namespace's confirmed fence on the
+    // emitter it replaces (session id = flow id): read from replicated
+    // state at this log position, so every replica decides alike.
+    let registry = &s.registry;
+    let fenced =
+        |flow: &[u8; 16], old: &[u8; 8], gen: u32| registry.fence_confirmed_on(flow, old, gen);
+    let reply: TransportReply = s.transport.apply_fenced(body, &fenced);
     if reply.status == TR_ST_OK {
         s.applied_ok = s.applied_ok.saturating_add(1);
-        if reply.op == TR_OP_MOVE {
+        if reply.op == TR_OP_MOVE || reply.op == TR_OP_MOVE_FENCED {
             dev_log(sys, 3, b"[sess_dir] flow moved".as_ptr(), 21);
         }
     } else {
@@ -1056,9 +1430,11 @@ unsafe fn apply_committed_transport(s: &mut ModuleState, index: u64, body: &[u8]
     };
     let request_id = s.pending_req[slot];
     if s.out_replies >= 0 && request_id != 0 {
-        let mut out = [0u8; 8 + TR_REPLY_LEN];
+        let token = s.transport.reply_token(&reply, &s.vip.seed, digest);
+        let mut out = [0u8; 8 + TR_WIRE_REPLY_LEN];
         out[..8].copy_from_slice(&request_id.to_le_bytes());
-        let _ = reply.encode(&mut out[8..]);
+        let _ = reply.encode(&mut out[8..8 + TR_REPLY_LEN]);
+        let _ = encode_token_trailer(token.as_ref(), &mut out[8 + TR_REPLY_LEN..]);
         let wrote = wire_channels::channel_write_msg(sys, s.out_replies, wire::MSG_TR_REPLY, &out);
         if wrote > 0 {
             s.replies_out = s.replies_out.saturating_add(1);
@@ -1073,6 +1449,11 @@ unsafe fn apply_committed_transport(s: &mut ModuleState, index: u64, body: &[u8]
 unsafe fn apply_committed_vip(s: &mut ModuleState, index: u64, body: &[u8]) {
     let sys = &*s.syscalls;
     let reply: VipReply = s.vip.apply(body, digest);
+    // The group's capability seed is one SEED: the global tier adopts it
+    // (under its derived seed) on the same committed entry, every replica.
+    if reply.status == VB_ST_OK && reply.op == VB_OP_SEED {
+        s.region.adopt_seed(body, digest);
+    }
     if reply.status == VB_ST_OK {
         s.applied_ok = s.applied_ok.saturating_add(1);
         if reply.op == VB_OP_ACTIVATE {
@@ -1093,6 +1474,276 @@ unsafe fn apply_committed_vip(s: &mut ModuleState, index: u64, body: &[u8]) {
         if wrote > 0 {
             s.replies_out = s.replies_out.saturating_add(1);
         }
+    }
+}
+
+/// A committed `"FO"` entry: apply to the failover-operation store on
+/// every replica; relay the reply as `MSG_FO_REPLY` when it was ours. A
+/// committed REPLAY of ours starts the replay pump (`pump_fo_replay`):
+/// it is a read through the log, so every record a coordinator could have
+/// been answered with is in the state it streams.
+unsafe fn apply_committed_failover(s: &mut ModuleState, index: u64, body: &[u8]) {
+    let reply: FailoverReply = s.failover.apply(body, digest);
+    if reply.status == FO_ST_OK {
+        s.applied_ok = s.applied_ok.saturating_add(1);
+    } else {
+        s.applied_rejected = s.applied_rejected.saturating_add(1);
+    }
+    let Some(slot) = take_pending(s, index, NS_FO) else {
+        return;
+    };
+    let request_id = s.pending_req[slot];
+    if request_id == 0 || s.out_replies < 0 {
+        return;
+    }
+    if reply.op == FO_OP_REPLAY && reply.status == FO_ST_OK {
+        // A later replay supersedes one still streaming: its requester is
+        // the coordinator that reconnected last.
+        s.fo_replay_active = true;
+        s.fo_replay_req = request_id;
+        s.fo_replay_after = 0;
+        s.fo_replay_sent = 0;
+        return;
+    }
+    send_fo_reply(s, request_id, &reply);
+}
+
+unsafe fn send_fo_reply(s: &mut ModuleState, request_id: u64, reply: &FailoverReply) -> bool {
+    let sys = &*s.syscalls;
+    let mut out = [0u8; 8 + FO_REPLY_LEN];
+    out[..8].copy_from_slice(&request_id.to_le_bytes());
+    let _ = reply.encode(&mut out[8..]);
+    let wrote = wire_channels::channel_write_msg(sys, s.out_replies, wire::MSG_FO_REPLY, &out);
+    if wrote > 0 {
+        s.replies_out = s.replies_out.saturating_add(1);
+        true
+    } else {
+        false
+    }
+}
+
+/// Stream the replay a committed REPLAY started: each live record as a
+/// `REPLAY` reply in creation order, then the end-of-replay reply (op
+/// REPLAY, status OK, the count sent). Paced by `replies` being writable;
+/// the cursor is a creation sequence, so a record created during the
+/// replay is streamed too and one finished during it is not.
+unsafe fn pump_fo_replay(s: &mut ModuleState) {
+    let sys = &*s.syscalls;
+    let mut budget = 8;
+    while s.fo_replay_active && budget > 0 {
+        budget -= 1;
+        if !wire_channels::writable(sys, s.out_replies) {
+            return;
+        }
+        let next = s
+            .failover
+            .replay_next(s.fo_replay_after)
+            .map(|(seq, rec)| (seq, *rec));
+        let req = s.fo_replay_req;
+        match next {
+            Some((seq, record)) => {
+                let reply = FailoverReply {
+                    op: FO_OP_REPLAY,
+                    status: FO_ST_REPLAY,
+                    present: true,
+                    live: s.failover.live,
+                    record,
+                };
+                if !send_fo_reply(s, req, &reply) {
+                    return;
+                }
+                s.fo_replay_after = seq;
+                s.fo_replay_sent = s.fo_replay_sent.saturating_add(1);
+            }
+            None => {
+                let mut end = FailoverReply::zero();
+                end.op = FO_OP_REPLAY;
+                end.status = FO_ST_OK;
+                end.live = s.fo_replay_sent;
+                if !send_fo_reply(s, req, &end) {
+                    return;
+                }
+                s.fo_replay_active = false;
+            }
+        }
+    }
+}
+
+/// A committed `"RG"` entry: apply to the global tier on every replica;
+/// relay the reply as `MSG_RG_REPLY` when it was ours.
+unsafe fn apply_committed_region(s: &mut ModuleState, index: u64, body: &[u8]) {
+    let sys = &*s.syscalls;
+    let reply: RgReply = s.region.apply(body, digest);
+    if s.smoke == SMOKE_SITE
+        && reply.vip.status == VB_ST_OK
+        && body.len() == RG_INVALIDATE_LEN
+        && body[0] == RG_OP_INVALIDATE
+        && body[17..33] == SITE_SMOKE_REGION
+    {
+        let mut line = [0u8; 64];
+        let head = b"[sess_dir] site smoke applied readiness=";
+        line[..head.len()].copy_from_slice(head);
+        let n = fmt_u32_raw(
+            line.as_mut_ptr().add(head.len()),
+            reply.invalidated_readiness as u32,
+        );
+        dev_log(sys, 3, line.as_ptr(), head.len() + n);
+    }
+    if reply.vip.status == VB_ST_OK {
+        s.applied_ok = s.applied_ok.saturating_add(1);
+    } else {
+        s.applied_rejected = s.applied_rejected.saturating_add(1);
+    }
+    let Some(slot) = take_pending(s, index, NS_RG) else {
+        return;
+    };
+    let request_id = s.pending_req[slot];
+    if s.out_replies >= 0 && request_id != 0 {
+        let mut out = [0u8; 8 + RG_REPLY_LEN];
+        out[..8].copy_from_slice(&request_id.to_le_bytes());
+        let _ = reply.encode(&mut out[8..]);
+        let wrote = wire_channels::channel_write_msg(sys, s.out_replies, wire::MSG_RG_REPLY, &out);
+        if wrote > 0 {
+            s.replies_out = s.replies_out.saturating_add(1);
+        }
+    }
+}
+
+/// A committed `"OP"` entry: apply to the operation store on every
+/// replica; relay the reply as `MSG_OP_REPLY` when it was ours. A
+/// committed REPLAY of ours starts the replay pump (`pump_op_replay`)
+/// for the kind it named, exactly as `fo/`'s does.
+unsafe fn apply_committed_operation(s: &mut ModuleState, index: u64, body: &[u8]) {
+    let reply: OperationReply = s.ops.apply(body, digest);
+    if reply.status == OP_ST_OK {
+        s.applied_ok = s.applied_ok.saturating_add(1);
+    } else {
+        s.applied_rejected = s.applied_rejected.saturating_add(1);
+    }
+    let Some(slot) = take_pending(s, index, NS_OP) else {
+        return;
+    };
+    let request_id = s.pending_req[slot];
+    if request_id == 0 || s.out_replies < 0 {
+        return;
+    }
+    if reply.op == OP_OP_REPLAY && reply.status == OP_ST_OK {
+        s.op_replay_active = true;
+        s.op_replay_kind = reply.kind;
+        s.op_replay_req = request_id;
+        s.op_replay_after = 0;
+        s.op_replay_sent = 0;
+        return;
+    }
+    send_op_reply(s, request_id, &reply);
+}
+
+unsafe fn send_op_reply(s: &mut ModuleState, request_id: u64, reply: &OperationReply) -> bool {
+    let sys = &*s.syscalls;
+    let mut out = [0u8; 8 + OP_REPLY_LEN];
+    out[..8].copy_from_slice(&request_id.to_le_bytes());
+    let _ = reply.encode(&mut out[8..]);
+    let wrote = wire_channels::channel_write_msg(sys, s.out_replies, wire::MSG_OP_REPLY, &out);
+    if wrote > 0 {
+        s.replies_out = s.replies_out.saturating_add(1);
+        true
+    } else {
+        false
+    }
+}
+
+/// Stream the replay a committed operation REPLAY started: each live
+/// record of the kind as a `REPLAY` reply in creation order, then the
+/// end-of-replay reply (op REPLAY, status OK, the kind, the count sent).
+unsafe fn pump_op_replay(s: &mut ModuleState) {
+    let sys = &*s.syscalls;
+    let mut budget = 8;
+    while s.op_replay_active && budget > 0 {
+        budget -= 1;
+        if !wire_channels::writable(sys, s.out_replies) {
+            return;
+        }
+        let next = s
+            .ops
+            .replay_next(s.op_replay_after, s.op_replay_kind)
+            .map(|(seq, rec)| (seq, *rec));
+        let req = s.op_replay_req;
+        match next {
+            Some((seq, record)) => {
+                let reply = OperationReply {
+                    op: OP_OP_REPLAY,
+                    status: OP_ST_REPLAY,
+                    present: true,
+                    kind: record[operation_registry::OP_AT_KIND],
+                    live: s.ops.live,
+                    record,
+                };
+                if !send_op_reply(s, req, &reply) {
+                    return;
+                }
+                s.op_replay_after = seq;
+                s.op_replay_sent = s.op_replay_sent.saturating_add(1);
+            }
+            None => {
+                let mut end = OperationReply::zero();
+                end.op = OP_OP_REPLAY;
+                end.status = OP_ST_OK;
+                end.kind = s.op_replay_kind;
+                end.live = s.op_replay_sent;
+                if !send_op_reply(s, req, &end) {
+                    return;
+                }
+                s.op_replay_active = false;
+            }
+        }
+    }
+}
+
+/// A committed `"AT"` entry: apply to the attachment boundaries on every
+/// replica; relay the reply as `MSG_AT_REPLY` when it was ours.
+unsafe fn apply_committed_attachment(s: &mut ModuleState, index: u64, body: &[u8]) {
+    let reply: AttachmentReply = s.attachments.apply(body);
+    if reply.status == AT_ST_OK {
+        s.applied_ok = s.applied_ok.saturating_add(1);
+    } else {
+        s.applied_rejected = s.applied_rejected.saturating_add(1);
+    }
+    let mut out = [0u8; 8 + AT_REPLY_LEN];
+    let _ = reply.encode(&mut out[8..]);
+    relay_reply(s, index, NS_AT, wire::MSG_AT_REPLY, &mut out);
+}
+
+/// A committed `"RS"` entry: apply to the reservations at the committed
+/// logical time of this log position (the timing state's, replicated, so
+/// every replica decides a horizon alike); relay the reply as
+/// `MSG_RS_REPLY` when it was ours.
+unsafe fn apply_committed_reservation(s: &mut ModuleState, index: u64, body: &[u8]) {
+    let now = s.registry.timing.logical_now_ms();
+    let reply: ReservationReply = s.reservations.apply(body, now);
+    if reply.status == RS_ST_OK {
+        s.applied_ok = s.applied_ok.saturating_add(1);
+    } else {
+        s.applied_rejected = s.applied_rejected.saturating_add(1);
+    }
+    let mut out = [0u8; 8 + RS_REPLY_LEN];
+    let _ = reply.encode(&mut out[8..]);
+    relay_reply(s, index, NS_RS, wire::MSG_RS_REPLY, &mut out);
+}
+
+/// Send `out` (`[request_id:8]` then the encoded reply) as `msg` when the
+/// entry at `index` was this replica's proposal in namespace `ns`.
+unsafe fn relay_reply(s: &mut ModuleState, index: u64, ns: u8, msg: u8, out: &mut [u8]) {
+    let Some(slot) = take_pending(s, index, ns) else {
+        return;
+    };
+    let request_id = s.pending_req[slot];
+    if s.out_replies < 0 || request_id == 0 {
+        return;
+    }
+    out[..8].copy_from_slice(&request_id.to_le_bytes());
+    let sys = &*s.syscalls;
+    if wire_channels::channel_write_msg(sys, s.out_replies, msg, out) > 0 {
+        s.replies_out = s.replies_out.saturating_add(1);
     }
 }
 
@@ -1179,6 +1830,11 @@ fn install_begin(s: &mut ModuleState) {
     s.sr_installer = s.registry.install_begin();
     s.tr_installer = s.transport.install_begin();
     s.vb_installer = s.vip.install_begin();
+    s.fo_installer = s.failover.install_begin();
+    s.rg_installer = s.region.install_begin();
+    s.op_installer = s.ops.install_begin();
+    s.at_installer = s.attachments.install_begin();
+    s.rs_installer = s.reservations.install_begin();
     s.install_section = SNAP_SECTION_SR;
     s.install_active = true;
     s.hold_applies = true;
@@ -1225,6 +1881,61 @@ fn install_feed(s: &mut ModuleState, mut bytes: &[u8]) -> bool {
                 };
                 bytes = &bytes[n..];
                 if s.vb_installer.done() {
+                    s.install_section = SNAP_SECTION_FO;
+                } else if n == 0 {
+                    return false;
+                }
+            }
+            SNAP_SECTION_FO => {
+                let Ok(n) = s.failover.install_feed(&mut s.fo_installer, bytes, digest) else {
+                    return false;
+                };
+                bytes = &bytes[n..];
+                if s.fo_installer.done() {
+                    s.install_section = SNAP_SECTION_RG;
+                } else if n == 0 {
+                    return false;
+                }
+            }
+            SNAP_SECTION_RG => {
+                let Ok(n) = s.region.install_feed(&mut s.rg_installer, bytes) else {
+                    return false;
+                };
+                bytes = &bytes[n..];
+                if s.rg_installer.done() {
+                    s.install_section = SNAP_SECTION_OP;
+                } else if n == 0 {
+                    return false;
+                }
+            }
+            SNAP_SECTION_OP => {
+                let Ok(n) = s.ops.install_feed(&mut s.op_installer, bytes, digest) else {
+                    return false;
+                };
+                bytes = &bytes[n..];
+                if s.op_installer.done() {
+                    s.install_section = SNAP_SECTION_AT;
+                } else if n == 0 {
+                    return false;
+                }
+            }
+            SNAP_SECTION_AT => {
+                let Ok(n) = s.attachments.install_feed(&mut s.at_installer, bytes) else {
+                    return false;
+                };
+                bytes = &bytes[n..];
+                if s.at_installer.done() {
+                    s.install_section = SNAP_SECTION_RS;
+                } else if n == 0 {
+                    return false;
+                }
+            }
+            SNAP_SECTION_RS => {
+                let Ok(n) = s.reservations.install_feed(&mut s.rs_installer, bytes) else {
+                    return false;
+                };
+                bytes = &bytes[n..];
+                if s.rs_installer.done() {
                     s.install_section = SNAP_SECTION_DONE;
                 } else if n == 0 {
                     return false;
@@ -1241,7 +1952,12 @@ fn install_finish(s: &mut ModuleState) -> bool {
     let sr = s.registry.install_finish(&mut s.sr_installer);
     let tr = s.transport.install_finish(&mut s.tr_installer);
     let vb = s.vip.install_finish(&mut s.vb_installer);
-    sr && tr && vb && s.install_section == SNAP_SECTION_DONE
+    let fo = s.failover.install_finish(&mut s.fo_installer);
+    let rg = s.region.install_finish(&mut s.rg_installer);
+    let op = s.ops.install_finish(&mut s.op_installer);
+    let at = s.attachments.install_finish(&mut s.at_installer);
+    let rs = s.reservations.install_finish(&mut s.rs_installer);
+    sr && tr && vb && fo && rg && op && at && rs && s.install_section == SNAP_SECTION_DONE
 }
 
 /// Stage export units until a chunk is ready or the image ends.
@@ -1255,7 +1971,20 @@ fn export_stage(s: &mut ModuleState) {
             SNAP_SECTION_TR => s
                 .transport
                 .export_next(&mut s.tr_cursor, &mut s.snap_buf[at..]),
-            _ => s.vip.export_next(&mut s.vb_cursor, &mut s.snap_buf[at..]),
+            SNAP_SECTION_VB => s.vip.export_next(&mut s.vb_cursor, &mut s.snap_buf[at..]),
+            SNAP_SECTION_FO => s
+                .failover
+                .export_next(&mut s.fo_cursor, &mut s.snap_buf[at..]),
+            SNAP_SECTION_RG => s
+                .region
+                .export_next(&mut s.rg_cursor, &mut s.snap_buf[at..]),
+            SNAP_SECTION_OP => s.ops.export_next(&mut s.op_cursor, &mut s.snap_buf[at..]),
+            SNAP_SECTION_AT => s
+                .attachments
+                .export_next(&mut s.at_cursor, &mut s.snap_buf[at..]),
+            _ => s
+                .reservations
+                .export_next(&mut s.rs_cursor, &mut s.snap_buf[at..]),
         };
         if n == 0 {
             s.export_section += 1;
@@ -1417,10 +2146,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 else {
                     break;
                 };
+                // A continuity provider's or an address provider's check
+                // (Fluxor's `auth_req`): answered here from this replica's
+                // committed state, not proposed — a read, failing closed.
+                if msg_type == MSG_FLOW_TOKEN_CHECK || msg_type == MSG_ARM_AUTH_CHECK {
+                    let plen = plen as usize;
+                    let mut req = [0u8; 16 + 4 + 16 + 2 + VB_TOKEN_LEN + 8];
+                    let n = plen.min(req.len()).min(s.msg_buf.len());
+                    req[..n].copy_from_slice(&s.msg_buf[..n]);
+                    answer_token_check(s, msg_type, &req[..n]);
+                    continue;
+                }
                 let (ns, cmd_max) = match msg_type {
                     wire::MSG_SR_REQUEST => (NS_SR, SR_MAX_CMD),
                     wire::MSG_TR_REQUEST => (NS_TR, TR_MAX_CMD),
                     wire::MSG_VB_REQUEST => (NS_VB, VB_MAX_CMD),
+                    wire::MSG_FO_REQUEST => (NS_FO, FO_MAX_CMD),
+                    wire::MSG_RG_REQUEST => (NS_RG, RG_MAX_CMD),
+                    wire::MSG_OP_REQUEST => (NS_OP, OP_MAX_CMD),
+                    wire::MSG_AT_REQUEST => (NS_AT, AT_MAX_CMD),
+                    wire::MSG_RS_REQUEST => (NS_RS, RS_MAX_CMD),
                     _ => continue,
                 };
                 let plen = plen as usize;
@@ -1428,6 +2173,20 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     continue;
                 }
                 s.requests_in = s.requests_in.saturating_add(1);
+                if let Err(why) = scope_admits(s.scope, msg_type, &s.msg_buf[8..plen]) {
+                    s.scope_refusals = s.scope_refusals.saturating_add(1);
+                    let mut out = [0u8; 10];
+                    out[..8].copy_from_slice(&s.msg_buf[..8]);
+                    out[8] = msg_type;
+                    out[9] = why;
+                    let _ = wire_channels::channel_write_msg(
+                        sys,
+                        s.out_replies,
+                        wire::MSG_DIR_OUT_OF_SCOPE,
+                        &out,
+                    );
+                    continue;
+                }
                 let request_id = u64::from_le_bytes([
                     s.msg_buf[0],
                     s.msg_buf[1],
@@ -1441,6 +2200,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 let mut body = [0u8; CMD_MAX];
                 let blen = plen - 8;
                 body[..blen].copy_from_slice(&s.msg_buf[8..plen]);
+                // A horizon is counted from committed time, so a command
+                // carrying one is admitted only behind the time-freshness
+                // barrier (as a duration is): stale time would end the
+                // horizon early in wall terms. Not admitted now, it is
+                // dropped and the requester's retry finds time fresh.
+                if ns == NS_RS && carries_horizon(&body[..blen]) && !ensure_time_fresh(s) {
+                    continue;
+                }
                 // A request that cannot be proposed right now is
                 // DROPPED here (we already consumed the frame) — the
                 // requester retries on reply timeout. Dropping beats
@@ -1598,6 +2365,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 s.sr_cursor = SrExportCursor::new();
                 s.tr_cursor = TrExportCursor::new();
                 s.vb_cursor = VbExportCursor::new();
+                s.fo_cursor = FoExportCursor::new();
+                s.rg_cursor = RgExportCursor::new();
+                s.op_cursor = OpExportCursor::new();
+                s.at_cursor = AtExportCursor::new();
+                s.rs_cursor = RsExportCursor::new();
                 s.snap_staged = 0;
             }
         }
@@ -1688,7 +2460,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.last_drain_propose_ms = mono;
                     }
                 }
-            } else if s.registry.timing.live > 0 {
+            } else if s.registry.timing.live > 0 || s.reservations.horizon_pending(logical) {
+                // Live deadlines, or a reservation horizon still to pass:
+                // committed time must keep moving for either to end.
                 s.pause_reason = wire::TIMING_PAUSE_NONE;
                 if mono.wrapping_sub(s.last_advance_propose_ms) >= s.time_advance_period_ms as u64 {
                     if let Some(t) = s.clock_guard.propose_time(logical, unix) {
@@ -1702,6 +2476,30 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             } else {
                 // No live deadlines: idle tick coalescing.
                 s.pause_reason = wire::TIMING_PAUSE_IDLE;
+            }
+        }
+
+        // 5.6) The site-loss smoke: the leader commits the smoke region's
+        //      next INVALIDATE every period. The command is a function of
+        //      the readiness alone, so two leaders proposing the same one
+        //      commit one invalidation and a retry is answered from it.
+        if s.smoke == SMOKE_SITE && is_leader(s) && !s.hold_applies {
+            let now = dev_millis(sys);
+            if now.wrapping_sub(s.site_smoke_ms) >= SITE_SMOKE_PERIOD_MS {
+                let readiness = s.region.invalidated_at(&SITE_SMOKE_REGION) + 1;
+                let mut op_id = [0u8; 16];
+                op_id[..8].copy_from_slice(&readiness.to_le_bytes());
+                op_id[8..].copy_from_slice(b"SITESMKE");
+                let mut cmd = [0u8; RG_INVALIDATE_LEN];
+                let n = region_registry::build_invalidate(
+                    &mut cmd,
+                    &op_id,
+                    &SITE_SMOKE_REGION,
+                    readiness,
+                );
+                if n > 0 && propose_ns(s, 0, &cmd[..n], FACE_NONE, NS_RG) {
+                    s.site_smoke_ms = now;
+                }
             }
         }
 
@@ -1728,6 +2526,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 }
             }
         }
+
+        // 5.8) Failover replay: stream the live records a committed
+        //      REPLAY asked for, as `replies` has room.
+        pump_fo_replay(s);
+        pump_op_replay(s);
 
         // 6) Heartbeat metrics.
         let now = dev_millis(sys);
