@@ -10,17 +10,20 @@
 //!
 //! But a held chunk blocks every event behind it, for every peer:
 //! accepts, dial completions, closes, and the other input's records. An
-//! input that has stopped reading for good therefore takes the whole
-//! node's peer plane with it. Measured on Nanocloud: an engine wedged on
-//! its own rpc input, the shared buffer behind it full, `peer_router`
-//! holding the same chunk for ever, every link closed as stale after
-//! 15 s, and every redial queued behind the stall.
+//! input that has stopped reading for good would therefore take the whole
+//! node's peer plane with it: the chunk held for ever, every link closed
+//! as stale once its 15 s liveness lapses, every redial queued behind the
+//! stall.
 //!
-//! So a hold is bounded. An input that has accepted nothing for
-//! `SHED_AFTER_MS` is wedged, and while it stays wedged its records are
-//! dropped whole and counted, so the walk goes on delivering the other
+//! So a hold is bounded. An input that has refused every record offered
+//! it for `SHED_AFTER_MS` is wedged, and while it stays wedged its records
+//! are dropped whole and counted, so the walk goes on delivering the other
 //! input's records and the event drain goes on. The first record it
-//! accepts again ends the episode, and holding resumes. A shed record is
+//! accepts again ends the episode, and holding resumes. An episode is a
+//! wedge only while the input stays full: a refusal from an input with
+//! room is a reader that is alive but behind (the record outgrew the room
+//! left), so it starts a fresh episode, held again — however long ago the
+//! last one began. A shed record is
 //! a whole record, so no consumer's framing is touched: what the Raft
 //! peer sees is loss, which it tolerates (RPCs retransmit, a snapshot
 //! transfer whose offsets skip is refused and restarted), never
@@ -36,10 +39,12 @@ pub const HDR: usize = 5;
 /// Inputs the walk delivers to: `raft_rpc` and `peer_rx`.
 pub const DESTS: usize = 2;
 
-/// How long an input may accept nothing before its records are shed.
-/// Above an election timeout, so an input that is only slow keeps
-/// backpressure, and well inside the 15 s a silent link survives, so a
-/// wedged one is shed before its peers are closed as stale.
+/// How long an input may refuse every record before its records are
+/// shed: twice consensus's default election timeout, so an input that is
+/// only slow keeps backpressure, and well inside the 15 s a silent link
+/// survives, so a wedged one is shed before its peers are closed as stale.
+/// A deployment that raises `election_timeout_ms` past it sheds an input
+/// still that slow — losses Raft tolerates, but a cost it pays.
 pub const SHED_AFTER_MS: u64 = 2000;
 
 /// Per-input refusal tracking.
@@ -83,11 +88,13 @@ impl Gate {
         self.shedding[dest] = false;
     }
 
-    /// The input refused a record at `now`.
-    pub fn refused(&mut self, dest: usize, now: u64) -> Verdict {
-        if !self.refusing[dest] {
+    /// The input refused a record at `now`; `full` says it has no room at
+    /// all. Only a full input continues an episode.
+    pub fn refused(&mut self, dest: usize, now: u64, full: bool) -> Verdict {
+        if !self.refusing[dest] || !full {
             self.refusing[dest] = true;
             self.since[dest] = now;
+            self.shedding[dest] = false;
         }
         if now.wrapping_sub(self.since[dest]) < SHED_AFTER_MS {
             return Verdict::Hold;
@@ -115,6 +122,9 @@ pub trait Sink {
     fn dest(&mut self, msg_type: u8) -> Option<usize>;
     /// Hand one whole record to an input; false when it refused.
     fn write(&mut self, dest: usize, record: &[u8]) -> bool;
+    /// Whether an input has no room at all: its reader has stopped, or
+    /// has not caught up since the last refusal.
+    fn full(&mut self, dest: usize) -> bool;
 }
 
 /// How a walk ended.
@@ -177,7 +187,8 @@ pub fn walk(
             gate.accepted(dest);
             w.delivered += 1;
         } else {
-            match gate.refused(dest, now) {
+            let full = sink.full(dest);
+            match gate.refused(dest, now, full) {
                 Verdict::Hold => return (End::Held(off), w),
                 Verdict::Shed => w.shed += 1,
             }

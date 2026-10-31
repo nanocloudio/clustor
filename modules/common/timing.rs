@@ -212,7 +212,7 @@ pub struct TimingState<const N: usize> {
 }
 
 impl<const N: usize> TimingState<N> {
-    pub const SNAPSHOT_VERSION: u16 = 3;
+    pub const SNAPSHOT_VERSION: u16 = 1;
     pub const SLOT_LEN: usize = TM_SNAPSHOT_ENTRY_LEN;
     pub const SNAPSHOT_HDR_LEN: usize = TM_SNAPSHOT_HDR_LEN;
 

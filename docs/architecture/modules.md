@@ -67,7 +67,13 @@ client frames carry, for an admission stage that judges commands by key.
 With `forward_peer: 1` each client connection's peer (the transport's
 `MSG_PEER`) goes out on `cleartext` as `MSG_CLIENT_PEER` under the
 client id, ahead of its first frame — what Quantum's MQTT anchor matches
-a connection the transport moved to it by.
+a connection the transport moved to it by — its mirrored output horizon
+(the transport's `MSG_HORIZON`) as `MSG_CLIENT_HORIZON`, and, for a
+connection a takeover resumed here, its predecessor's position (the
+transport's `MSG_RESUMED`) as `MSG_CLIENT_RESUMED`. The consumer's
+`MSG_CLIENT_DELIVERED` on `client_resp` goes to the transport as
+`CMD_DELIVERED`, in order with the client's responses, so the cursor it
+carries is the one a successor resumes from.
 
 A client response is only ever written to a client's connection. A
 response tagged with a slot holding a replica link is dropped and
@@ -162,7 +168,7 @@ themselves rather than behind channel capacity.
 |---|---|
 | Inputs | `entries`, `entry_request`, `compact_before`, `ack`, `import_chunks`, `trigger`, `install_request`, `retention_floor`, `app_snapshot_body` |
 | Outputs | `flushed`, `replay_complete`, `entry_reply`, `compaction_signal`, `metrics`, `quorum_durable`, `export_chunks`, `manifest_auth`, `installed_local`, `app_snapshot_ctl`, `cert_refresh` |
-| Params | `encoding`, `segment_bytes`, `aead`, `cluster`, `partition_id`, `self_id`, `fsync_mode`, `group_window_ms`, `group_max_pending`, `root_path`, `skip_replay`, `fixed_segment`, `preallocate_settle_ms`, `fence_depth`, `voter_count`, `name_fence`, `site_map`, `min_sites` |
+| Params | `encoding`, `segment_bytes`, `aead`, `cluster`, `partition_id`, `self_id`, `fsync_mode`, `group_window_ms`, `group_max_pending`, `root_path`, `skip_replay`, `fixed_segment`, `preallocate_settle_ms`, `fence_depth`, `voter_count`, `name_fence` |
 | Variants | `disk` (default), `volatile` |
 
 `disk` is the durable composition: FS-backed segments and

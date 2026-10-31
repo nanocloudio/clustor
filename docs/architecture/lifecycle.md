@@ -316,12 +316,15 @@ Union quorum holds on both sides of the substrate. The joint state
 machine lives in `consensus`'s raft component
 (`CONFIG_CHANGE_OP_JOINT`/`_NEW`, voter-set overlay, auto-`C_new` on
 commit), and the voter-set update reaches its commit component in the
-same step raft applies the configuration change. `durability`'s ledger
-takes the same update as `MSG_VOTER_SET_UPDATE` on the entry stream and
-applies the same rule — the minimum of the two medians while the joint
-config is active — so an index counts as durable only once a majority
-of EACH configuration has fsynced it. The two must stay in step; the
-gate on this is `tests/union_quorum.rs`.
+step raft publishes the configuration. `durability`'s ledger has no
+configuration of its own: raft hands it the same voter sets, with the
+site map, as `MSG_QUORUM_CONFIG` on the entry stream, ahead of any entry
+written after the change, and the ledger applies the same rule — the
+minimum of the two medians while the joint config is active — so an
+index counts as durable only once a majority of EACH configuration has
+fsynced it. Raft publishes its configuration at boot and after loading
+its metadata as well, and until the ledger has one nothing is durable.
+The gates are `tests/union_quorum.rs` and `tests/raft_fault_matrix.rs`.
 
 What the implemented state machine does when a configuration entry
 commits (`modules/app/consensus/raft.rs`):
@@ -359,7 +362,10 @@ same way.
 
 Vote responses and probe confirmations from nodes outside the active
 voter set(s) never move a tally — the guard against an ex-voter's
-ballot electing a second leader after a downsize. There is no
-preflight validation, learner catch-up protocol, finalise window, or
-rollback entry; the admin gate stays closed until the durability
-ledger is joint-aware.
+ballot electing a second leader after a downsize. A voter joins only
+as a learner that has caught up to within `catchup_lag_max` of the
+leader's tip; one change is in flight at a time; and under a multi-site
+map a change whose new voters span fewer than `min_sites` sites is
+refused ([multi_site.md](multi_site.md)). There is no finalise window
+or rollback entry: the joint entry commits under both configurations
+and C_new follows it.

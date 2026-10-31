@@ -194,6 +194,13 @@ define_params! {
     13, fence_depth, u16, 1
         => |s, d, len| { s.slots[0].wal.fence_depth = p_u16(d, len, 0, 1); };
 
+    // The group's configuration before any config entry: its first
+    // `voter_count` replica ids. The WAL's configuration history starts
+    // from it, so a snapshot records the configuration as of its index.
+    // Must equal `consensus`'s `voter_count`: the ledger refuses a quorum
+    // configuration naming another initial set, and with none adopted
+    // nothing is durable. The quorum itself — voter sets, site map — is
+    // consensus's alone (`MSG_QUORUM_CONFIG`).
     14, voter_count, u8, 1
         => |s, d, len| { s.slots[0].voter_count = p_u8(d, len, 0, 1); };
 
@@ -207,16 +214,6 @@ define_params! {
     // one.
     15, name_fence, u8, 1
         => |s, d, len| { s.name_fence = p_u8(d, len, 0, 1); };
-
-    // The multi-site group (docs/architecture/multi_site.md): each
-    // replica id's site, four bits per id (id 0 lowest), and the fewest
-    // distinct sites a durable quorum spans. Must equal `consensus`'s
-    // pair, so both tallies count the same quorum. Defaults: one site, a
-    // plain majority.
-    18, site_map, u32, 0
-        => |s, d, len| { s.site_map = p_u32(d, len, 0, 0); };
-    19, min_sites, u8, 1
-        => |s, d, len| { s.min_sites = p_u8(d, len, 0, 1); };
 }
 
 /// Compile-time ceiling on the Partition Raft Groups one `durability`
@@ -294,10 +291,6 @@ struct ModuleState {
     /// stays shared rather than duplicated per slot.
     root_path: u8,
     name_fence: u8,
-    /// The multi-site group's map (`site_map`, `min_sites`), the one
-    /// `consensus` commits under; identical for every hosted group.
-    site_map: u32,
-    min_sites: u8,
 
     /// The hosted groups.
     slots: [DurSlot; K_MAX],
@@ -405,8 +398,6 @@ pub unsafe extern "C" fn module_new(
         }
         s.root_path = 0;
         s.name_fence = 0;
-        s.site_map = 0;
-        s.min_sites = 1;
         // EVERY slot, not just the hosted ones: `init` runs before the
         // params that say how many groups this instance hosts, and an
         // uninitialised slot is all-zeroes — which reads as channel
@@ -777,13 +768,13 @@ fn fan_slot_identity(s: &mut ModuleState, i: usize) {
     s.slots[i].snapshot.partition_id = s.slots[i].partition_id;
     s.slots[i].snapshot.root_path = s.root_path;
     s.slots[i].snapshot.name_fence = s.name_fence;
+    // Clamped as raft clamps its own, so equal params name equal sets.
+    s.slots[i].voter_count = s.slots[i].voter_count.clamp(1, types::MAX_NODES as u8);
     #[cfg(not(feature = "volatile"))]
     {
         s.slots[i].ledger.self_id = s.slots[i].self_id;
         s.slots[i].ledger.partition_id = s.slots[i].partition_id;
-        s.slots[i].ledger.voter_count = s.slots[i].voter_count;
-        s.slots[i].ledger.sites = types::SiteMap::new(s.site_map, s.min_sites);
-        ledger::clamp_voters(&mut s.slots[i].ledger);
+        s.slots[i].ledger.initial_voters = s.slots[i].voter_count;
     }
     wal::arm(&mut s.slots[i].wal);
     // The group's configuration before any config entry: its first
@@ -886,15 +877,16 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             #[cfg(not(feature = "volatile"))]
             {
                 let t0 = dev_micros(sys);
-                // Voter-set update first, so a quorum recomputed this step
-                // is tallied against the configuration that arrived with
-                // (or before) the acks driving it.
-                // Learners are deliberately dropped here: the durability
-                // tally counts voters only, exactly as the commit tally does.
-                if let Some((current, joint, joint_active, _learners)) =
-                    s.slots[i].wal.voter_out.take()
-                {
-                    ledger::on_voter_set(&mut s.slots[i].ledger, current, joint, joint_active);
+                // Quorum configuration first, so a quorum recomputed this
+                // step is tallied against the configuration that arrived
+                // with (or before) the acks driving it. Its learners count
+                // toward no quorum, here as in commit.
+                if let Some(c) = s.slots[i].wal.quorum_out.take() {
+                    if !ledger::on_quorum_config(&mut s.slots[i].ledger, &c) {
+                        let m =
+                            b"[dur] quorum config refused: initial voters differ from voter_count";
+                        dev_log(sys, 1, m.as_ptr(), m.len());
+                    }
                 }
                 let local_advanced = if s.slots[i].wal.ledger_dirty {
                     s.slots[i].wal.ledger_dirty = false;
@@ -906,11 +898,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 ledger::step(&mut s.slots[i].ledger, sys, local_advanced);
                 s.comp_step[2].record(dev_micros(sys).wrapping_sub(t0));
             }
-            // The volatile variant has no ledger; still clear the latch so a
-            // config change can't leave a stale Some() behind.
+            // The volatile variant has no ledger: its quorum configuration
+            // is consumed and dropped.
             #[cfg(feature = "volatile")]
             {
-                let _ = s.slots[i].wal.voter_out.take();
+                let _ = s.slots[i].wal.quorum_out.take();
             }
 
             // The configuration as the log has it, for the snapshot a

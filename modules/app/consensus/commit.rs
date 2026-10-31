@@ -41,7 +41,6 @@ pub struct Commit {
     pub match_changed: bool,
 
     // Configuration
-    pub voter_count: u8,
     pub durability_mode: u8, // DUR_STRICT / DUR_GROUP_FSYNC / DUR_RELAXED
     pub self_id: ReplicaId,
     pub partition_id: u16,
@@ -53,9 +52,10 @@ pub struct Commit {
     commit_advances: u32,
     last_metrics_ms: u64,
 
-    /// Current and joint voter NodeSet bitmasks. Until raft pushes the first
-    /// voter-set update, the commit tracker falls back to `voter_count` for
-    /// the median — preserving the existing single-config behaviour.
+    /// Current and joint voter NodeSet bitmasks, from raft's voter-set
+    /// updates: raft publishes its configuration at `arm`, so the first
+    /// step already has one. With none, nothing commits — as with
+    /// durability's ledger, which tallies under the same configuration.
     current_voters: NodeSet,
     joint_voters: NodeSet,
     joint_active: bool,
@@ -110,7 +110,6 @@ pub fn init(s: &mut Commit) {
     s.horizon_out = HorizonLatch::new();
     s.raft_commit_out = HorizonLatch::new();
     s.match_changed = false;
-    s.voter_count = 1;
     s.durability_mode = DUR_GROUP_FSYNC;
     s.self_id = 0;
     s.partition_id = 0;
@@ -133,22 +132,14 @@ pub fn init(s: &mut Commit) {
     s.msg_buf = [0u8; 32];
 }
 
-/// Post-param boot logic: voter-count clamp + init log. Called by
-/// `mod.rs` after channel handles and params are in place.
+/// Post-param boot logic: the init log. Called by `mod.rs` after
+/// channel handles and params are in place.
 ///
 /// # Safety
 ///
 /// Caller must supply a valid `&SyscallTable` per the module ABI in
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
-pub unsafe fn arm(s: &mut Commit, sys: &SyscallTable) {
-    // `voter_count` is operator-supplied; clamp here so the
-    // downstream `quorum_index` slice access can never panic on
-    // a typo'd cluster config. `NodeSet`-side mutators have a
-    // matching guard for completeness.
-    if (s.voter_count as usize) > MAX_NODES {
-        s.voter_count = MAX_NODES as u8;
-    }
-
+pub unsafe fn arm(_s: &mut Commit, sys: &SyscallTable) {
     super::dev_log(sys, 3, b"[commit] init".as_ptr(), 13);
 }
 
@@ -206,7 +197,6 @@ pub fn on_voter_set(s: &mut Commit, current: u8, joint: u8, joint_active: bool) 
     s.current_voters = NodeSet(current);
     s.joint_voters = NodeSet(joint);
     s.joint_active = joint_active;
-    s.voter_count = s.current_voters.count();
     s.match_changed = true;
 }
 
@@ -282,14 +272,7 @@ unsafe fn emit_retention_floor(s: &mut Commit, sys: &SyscallTable) {
     let mut floor = Index::MAX;
     let mut any = false;
     for id in 0..MAX_NODES as u8 {
-        let in_set = if s.current_voters.count() > 0 {
-            s.current_voters.contains(id) || (s.joint_active && s.joint_voters.contains(id))
-        } else {
-            // Pre-voter-set fallback: ids 0..voter_count (mirrors the
-            // quorum computation's fallback).
-            id < s.voter_count
-        };
-        if in_set {
+        if s.current_voters.contains(id) || (s.joint_active && s.joint_voters.contains(id)) {
             any = true;
             if s.match_indices[id as usize] < floor {
                 floor = s.match_indices[id as usize];
@@ -465,28 +448,22 @@ pub fn on_cache_state(s: &mut Commit, msg: &[u8], plen: u16) {
 /// Caller must hold an exclusive `&mut Commit` per the module ABI in
 /// `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn advance_commit(s: &mut Commit) {
-    // Compute quorum match index. If a voter-set update has populated
-    // `current_voters` we use the joint-aware path; during joint mode the
-    // effective commit index is the minimum of the two medians so an entry
-    // must be replicated to a majority of BOTH sets before it counts as
-    // committed. Otherwise we fall back to the legacy fixed-range
-    // `voter_count` median.
+    // Compute quorum match index. During joint mode the effective commit
+    // index is the minimum of the two medians, so an entry must be
+    // replicated to a majority of BOTH sets before it counts as committed.
     // Under a multi-site map a quorum is also `min_sites` sites wide
-    // (`quorum_index_sited`; the plain median under a flat one).
-    let quorum_match = if s.current_voters.count() > 0 {
+    // (`quorum_index_sited`; the plain median under a flat one). No voter
+    // set yet: nothing has a quorum.
+    let quorum_match = if s.current_voters.count() == 0 {
+        0
+    } else {
         let current_median = quorum_index_sited(&s.match_indices, s.current_voters, s.sites);
         if s.joint_active && s.joint_voters.count() > 0 {
             let joint_median = quorum_index_sited(&s.match_indices, s.joint_voters, s.sites);
-            if current_median < joint_median {
-                current_median
-            } else {
-                joint_median
-            }
+            current_median.min(joint_median)
         } else {
             current_median
         }
-    } else {
-        quorum_index_count_sited(&s.match_indices, s.voter_count, s.sites)
     };
 
     // Apply durability mode

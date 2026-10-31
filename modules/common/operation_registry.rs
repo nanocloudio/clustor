@@ -1,9 +1,9 @@
 // Operation registry — the `op/<operation_id>` namespace of the session
 // directory: the replicated compare-and-swap store the coordinators that
-// have no VIP-shaped record keep their restart-safe operations in (rfc_lb_vip
-// §13.5: "every drain, ownership transfer, VIP move and transport migration
-// has one bounded FailoverOperation record"). `fo/` holds Wormhole's `WHFO`
-// VIP moves; this namespace holds the other kinds under one envelope:
+// have no VIP-shaped record keep their restart-safe operations in, so every
+// drain, ownership transfer and transport migration has one bounded
+// operation record. `fo/` holds Wormhole's `WHFO` VIP moves; this
+// namespace holds the other kinds under one envelope:
 //
 //   TAKEOVER    a transport-continuity takeover of one protected flow
 //               (Wormhole's `takeover_core::Takeover`: pair, planned or
@@ -58,10 +58,11 @@
 //   clear: once the higher flow epoch has committed there is no declared
 //   fallback, only completion. The fence generation and the committed flow
 //   epoch in its progress are fixed once set, and a committed record must
-//   name both. An evacuation is never ABORTED with an authority move in
-//   flight (MOVING) or after it (DRAINING, EVACUATED), and reaches
-//   BLOCKED_FENCE only from a move phase; a DR operation's steps only
-//   increase.
+//   name both. An evacuation is never ABORTED from MOVING, DRAINING or
+//   EVACUATED (an authority move in flight, or done); from RESTORING it
+//   may be, which is Wormhole's restart rolling a ramp in flight back. It
+//   reaches BLOCKED_FENCE only from a phase that moves authority, MOVING
+//   or RESTORING. A DR operation's steps only increase.
 // - **a frame is checked whole.** Magic, version, reserved bytes, kind,
 //   step and variant ranges, flags, and the digest trailer; a malformed
 //   record is `INVALID` and nothing is stored.
@@ -71,7 +72,14 @@
 // - **bounded retention.** A terminal record stays, answering retries,
 //   until the arena is full; then the oldest terminal record gives its
 //   slot to a new operation. A full arena of live operations refuses a new
-//   one `CAPACITY`.
+//   one `CAPACITY`. Retention is what bounds idempotence: once a terminal
+//   record has given its slot away, a late duplicate of its intent is a
+//   new operation; the epochs a record carries keep such a re-run from
+//   acting on authority that has since moved.
+// - **bounded work.** Replay and eviction each walk the arena once per
+//   record they find (at most 4096 on the server profile, tens of
+//   microseconds); the module paces replay at eight records a step. A
+//   creation sequence that would pass `u64::MAX` is refused `CAPACITY`.
 
 use super::slot_index::{SlotIndex, SlotSet};
 
@@ -676,6 +684,19 @@ impl<const N: usize> OperationRegistry<N> {
 
     /// The slot a new operation takes: the lowest free one while the
     /// admitted count has room, else the oldest terminal record's.
+    /// Whether some record already carries creation sequence `seq`: no
+    /// two may, or replay, which orders by it, would skip one.
+    fn holds_seq(&self, seq: u64) -> bool {
+        let mut at = 0;
+        while let Some(i) = self.occupied.next_used(at) {
+            if self.slots[i].seq == seq {
+                return true;
+            }
+            at = i + 1;
+        }
+        false
+    }
+
     fn take_slot(&mut self) -> Option<usize> {
         if self.count < self.admitted {
             return self.occupied.lowest_free();
@@ -749,18 +770,21 @@ impl<const N: usize> OperationRegistry<N> {
             if generation != 1 || step != first_step(kind, variant) || proposed[OP_AT_FLAGS] != 0 {
                 return self.reply(OP_OP_CAS, OP_ST_CONFLICT, None);
             }
+            let Some(next_seq) = self.next_seq.checked_add(1) else {
+                return self.reply(OP_OP_CAS, OP_ST_CAPACITY, None);
+            };
             let Some(i) = self.take_slot() else {
                 return self.reply(OP_OP_CAS, OP_ST_CAPACITY, None);
             };
-            if !self.index.insert(&op_id, i as u32) {
-                return self.reply(OP_OP_CAS, OP_ST_CAPACITY, None);
-            }
+            // `take_slot` answers a slot inside the arena, which the index
+            // always takes.
+            let _ = self.index.insert(&op_id, i as u32);
             self.occupied.mark(i);
             self.slots[i] = OpSlot {
                 seq: self.next_seq,
                 record: proposed,
             };
-            self.next_seq += 1;
+            self.next_seq = next_seq;
             self.count += 1;
             self.live += 1;
             return self.reply(OP_OP_CAS, OP_ST_OK, Some(&proposed));
@@ -944,6 +968,7 @@ impl<const N: usize> OperationRegistry<N> {
                     || self.occupied.is_used(slot)
                     || seq == 0
                     || seq >= self.next_seq
+                    || self.holds_seq(seq)
                     || !record_valid(rec, digest)
                 {
                     return false;

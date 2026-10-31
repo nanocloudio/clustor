@@ -39,7 +39,10 @@ absent so that "absent here is a bug" stays a checkable claim:
   record's own bounds, `SEND_STAGE_MAX` from
   `ROUTE_FRAME_MAX`, `SR_MAX_CMD` from `SR_MAX_WRAPPED_KEY`, `TR_MAX_CMD`,
   `VB_MAX_CMD`, `FO_MAX_CMD`, `RG_MAX_CMD`, `OP_MAX_CMD`, `AT_MAX_CMD` and `RS_MAX_CMD` from the transport, VIP, failover, region, operation, attachment and reservation command layouts (`TR_WIRE_REPLY_LEN` from the transport reply and its token trailer), the session directory's `CMD_MAX`,
-  `SNAP_UNIT_MAX` and `REPLY_MAX` from the registries' own bounds,
+  `SNAP_UNIT_MAX` and `REPLY_MAX` from the registries' own bounds, its
+  `CHECK_REQ_MAX` from the arm check's layout carrying `ARM_AUTH_MAX` of
+  auth (which mirrors Fluxor's identity contract, so a check Fluxor may
+  send is never cut),
   `SNAP_PTR_CANDIDATES` from `SNAP_PTR_SLOTS`, `FWD_FRAME_MAX` (one
   routed install frame the replicator holds) from `XFER_CHUNK_BODY`, and `EXPORT_TAIL_RECORDS`
   and `COMP_STEP_BUCKETS` from histogram bucket counts.
@@ -182,8 +185,10 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Address records, Pi 5 profile | `RS_ADDRS_PI5` | modules/common/reservation_registry.rs | 1024 | Capacity, as above. |
 | Address records, server profile | `RS_ADDRS_SERVER` | modules/common/reservation_registry.rs | 4096 | Capacity, as above. |
 | Blocks one egress pool may declare | `RS_POOL_BLOCKS_MAX` | modules/common/reservation_registry.rs | 1024 | Semantic: a RESERVE naming a larger pool is refused `RS_ST_INVALID` at encode and apply; it bounds the blocks one RESERVE searches (65536 ports in blocks of 64). |
+| Address record nesting depth | `RS_ADDR_DEPTH_MAX` | modules/common/reservation_registry.rs | 4 | Semantic: an `ADDR_RESERVE` carved from a parent whose ancestor chain (the parent and its own ancestors) would be longer is refused `RS_ST_INVALID`, and a restored image with a deeper chain fails closed. It bounds one reserve's ancestor walk and its overlap exemptions (a BYOIP import, then the VIPs and sub-prefixes carved from it). |
 | KEK-wrapped key blob | `SR_MAX_WRAPPED_KEY` | modules/common/session_registry.rs | 80 | A larger blob is refused at encode and at apply; the key is never stored. |
 | Pending session-directory proposals | `MAX_PENDING` | modules/app/session_directory/mod.rs | 16 | A full table leaves requests in the input channel. If the proposal channel fills after consumption, the request is dropped and the client must recover by reply-timeout retry; slots expire after 10 seconds. |
+| Token checks awaiting their barrier | `MAX_CHECKS` | modules/common/check_barrier.rs | 8 | Backpressure: a ninth check stays in the `checks` channel until a barrier applies and frees a slot. A held check is dropped unanswered (a refusal to the provider) once `CHECK_TTL_MS`, 5 seconds — the longest a Fluxor provider waits on a verdict — passes without its barrier applying here. |
 | Requests in flight through one directory front | `FRONT_PENDING` | modules/common/directory_front_core.rs | 8 | Backpressure: a ninth consumer request stays in `request_in` until a reply frees a slot. |
 | Directory-front command body | `FRONT_CMD_MAX` | modules/common/directory_front_core.rs | 257 | Shape: the largest command the fronted namespaces carry (an `op/` CAS); a longer request is refused `Malformed`. |
 | Directory-front reply | `FRONT_REPLY_MAX` | modules/common/directory_front_core.rs | 264 | Shape: the largest reply the fronted namespaces send (an `op/` reply). |
@@ -420,8 +425,10 @@ RS_ADDRS_RP2350 | modules/common/reservation_registry.rs | 32
 RS_ADDRS_PI5 | modules/common/reservation_registry.rs | 1024
 RS_ADDRS_SERVER | modules/common/reservation_registry.rs | 4096
 RS_POOL_BLOCKS_MAX | modules/common/reservation_registry.rs | 1024
+RS_ADDR_DEPTH_MAX | modules/common/reservation_registry.rs | 4
 SR_MAX_WRAPPED_KEY | modules/common/session_registry.rs | 80
 MAX_PENDING | modules/app/session_directory/mod.rs | 16
+MAX_CHECKS | modules/common/check_barrier.rs | 8
 FRONT_PENDING | modules/common/directory_front_core.rs | 8
 FRONT_CMD_MAX | modules/common/directory_front_core.rs | 257
 FRONT_REPLY_MAX | modules/common/directory_front_core.rs | 264
@@ -494,6 +501,8 @@ FWD_FRAME_MAX | modules/app/consensus/replicator.rs | -
 CMD_MAX | modules/app/session_directory/mod.rs | -
 SNAP_UNIT_MAX | modules/app/session_directory/mod.rs | -
 REPLY_MAX | modules/app/session_directory/mod.rs | -
+ARM_AUTH_MAX | modules/app/session_directory/mod.rs | -
+CHECK_REQ_MAX | modules/app/session_directory/mod.rs | -
 RG_MAX_CMD | modules/common/region_registry.rs | -
 OP_MAX_CMD | modules/common/operation_registry.rs | -
 AT_MAX_CMD | modules/common/attachment_registry.rs | -

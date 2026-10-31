@@ -990,13 +990,12 @@ impl<const N: usize, const D: usize> SessionRegistry<N, D> {
         self.find(sid).map(|i| &self.slots[i])
     }
 
-    /// Mutable read accessor for host tests that stage a slot's fields
-    /// (generation sentinels); production state moves only through
-    /// `apply`.
     /// Whether `sid` holds a confirmed fence of exactly `fence_gen` on its
     /// current anchor `anchor`, not yet consumed by an ACTIVATE: what a
     /// fenced transport move of the same flow (session id = flow id) needs
-    /// before it may mint the promoted emitter's token.
+    /// before it may mint the promoted emitter's token. A RECOVERY_MARK
+    /// clears every unconsumed fence, so only a fence confirmed after the
+    /// last recovery answers true.
     pub fn fence_confirmed_on(
         &self,
         sid: &[u8; SR_SESSION_ID],
@@ -1012,6 +1011,9 @@ impl<const N: usize, const D: usize> SessionRegistry<N, D> {
         })
     }
 
+    /// Mutable read accessor for host tests that stage a slot's fields
+    /// (generation sentinels); production state moves only through
+    /// `apply`.
     pub fn lookup_mut(&mut self, sid: &[u8; SR_SESSION_ID]) -> Option<&mut SessionSlot> {
         match self.find(sid) {
             Some(i) => Some(&mut self.slots[i]),
@@ -1551,11 +1553,17 @@ impl<const N: usize, const D: usize> SessionRegistry<N, D> {
         // outstanding transfer grant: a recovery that lost the log tail
         // must force reconnect, never risk a duplicate key use. Emission
         // for each session stays blocked until ITS epoch advances
-        // (EPOCH_BUMP, an epoch-advancing BIND, or ACTIVATE).
+        // (EPOCH_BUMP, an epoch-advancing BIND, or ACTIVATE). A fence in
+        // flight is evidence gathered before the recovery and is cleared
+        // with the rest: a takeover after it fences afresh, as the VIP
+        // namespace's re-admission does.
         let mut voided = 0u64;
         let mut at = 0;
         while let Some(i) = self.occupied.next_used(at) {
             self.slots[i].voided = true;
+            self.slots[i].fence_state = SR_FENCE_NONE;
+            self.slots[i].fence_target = [0; SR_PEER_ID];
+            self.slots[i].fence_gen = 0;
             voided += 1;
             if self.slots[i].grant_live {
                 let sid = self.slots[i].session_id;
@@ -1756,7 +1764,7 @@ impl<const N: usize, const D: usize> SessionRegistry<N, D> {
     // match, a record for a slot already filled or a session already
     // indexed, or a deadline without its consumer object fails the
     // install closed. Layout (all LE):
-    //   header [version:u16 = 5][reserved:u16][arena N:u32][deadlines D:u32]
+    //   header [version:u16 = 1][reserved:u16][arena N:u32][deadlines D:u32]
     //          [admitted:u32][record_count:u32][recovery_epoch:u32]
     //          [applied:u64][deadlines_fired:u32][deadline_noop:u32]
     //          [next_grant_id:u64]
@@ -1769,13 +1777,10 @@ impl<const N: usize, const D: usize> SessionRegistry<N, D> {
     // occupied, so every replica places sessions alike and the image is
     // byte-identical across replicas.
 
-    /// The session registry's header leads the session directory's
-    /// image, so this versions the image: 3 since the failover-operation
-    /// section followed the VIP one; 4 since the region and operation
-    /// sections followed it, the transport records carried token fields
-    /// and the VIP records their owner width; 5 since the attachment and
-    /// reservation sections followed the operation one.
-    pub const SNAPSHOT_VERSION: u16 = 5;
+    /// The session registry's header leads the session directory's image,
+    /// so this marks the whole image as this build's format. An image of
+    /// another version is refused.
+    pub const SNAPSHOT_VERSION: u16 = 1;
 
     /// Snapshot of the whole state into `dst` (host convenience over the
     /// streamed form). Returns the length, or -1 when `dst` is short.

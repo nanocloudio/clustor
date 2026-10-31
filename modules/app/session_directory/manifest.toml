@@ -41,13 +41,17 @@ capabilities = [
 # qualification envelope. The `profile` parameter admits at most the
 # variant's arena; a graph asking a smaller variant for a larger profile
 # fails init rather than claim it.
-#   rp2350 — 64 sessions, 64 flows, 16 VIP bindings of 8 owners, 4 global
-#            services of 8 regions, 16 operation records, 32 attachments
-#            of 8 services, 64 egress blocks, 32 address records (default)
-#   pi5    — 4096 / 4096 / 1024 × 16 / 64 × 16 / 256 / 1024 × 256 / 4096
-#            / 1024
-#   server — 65536 / 65536 / 16384 × 32 / 1024 × 64 / 4096 / 16384 × 4096
-#            / 65536 / 4096
+#
+#                         rp2350 (default)   pi5       server
+#   sessions                    64           4096      65536
+#   flows                       64           4096      65536
+#   VIP bindings × owners       16 × 8       1024 × 16 16384 × 32
+#   failover operations         16           256       4096
+#   global services × regions   4 × 8        64 × 16   1024 × 64
+#   operation records           16           256       4096
+#   attachments / services      32 / 8       1024/256  16384 / 4096
+#   egress blocks               64           4096      65536
+#   address records             32           1024      4096
 [[variant]]
 name = "rp2350"
 features = ["profile-rp2350"]
@@ -123,6 +127,18 @@ index = 6
 direction = "input"
 content_type = "OctetStream"
 
+# Token checks: a continuity provider's MSG_TOKEN_CHECK (0xC2) and an
+# address provider's MSG_ARM_AUTH_CHECK (0x7A), Fluxor's `auth_req`.
+# Each is held behind a barrier entry (magic "CK") and answered on
+# `replies` once this replica has applied it, so the verdict reflects
+# every command committed before the check. Checks hold slots of their
+# own, so a busy request port never delays one. Optional.
+[[ports]]
+name = "checks"
+index = 7
+direction = "input"
+content_type = "OctetStream"
+
 # Tagged proposals (MSG_CLIENT_PROPOSAL) to consensus.proposals_tagged.
 [[ports]]
 name = "proposals"
@@ -130,10 +146,14 @@ direction = "output"
 content_type = "OctetStream"
 
 # MSG_SR_REPLY / MSG_TR_REPLY / MSG_VB_REPLY / MSG_FO_REPLY / MSG_RG_REPLY
-# / MSG_OP_REPLY / MSG_AT_REPLY / MSG_RS_REPLY back to the requester — emitted ONLY after the command is
-# quorum-committed and applied (the ack boundary in
-# docs/architecture/session_directory.md); a committed failover or
-# operation REPLAY is followed by one reply per live record.
+# / MSG_OP_REPLY / MSG_AT_REPLY / MSG_RS_REPLY back to the requester —
+# emitted ONLY after the command is quorum-committed and applied (the ack
+# boundary in docs/architecture/session_directory.md); a committed failover
+# or operation REPLAY is followed by one reply per live record. Also on
+# this port: MSG_DIR_OUT_OF_SCOPE (0xA0), a request this directory's tier
+# refuses before proposing it, sent at once; and a token check's verdict
+# (MSG_TOKEN_VERDICT 0xC3, ARM_AUTH_VERDICT 0x7B), sent once the check's
+# barrier has applied.
 [[ports]]
 name = "replies"
 index = 1

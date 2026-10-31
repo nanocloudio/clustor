@@ -43,9 +43,8 @@
 //!   `modules/common/reservation_registry.rs`, magic `"RS"`: egress blocks
 //!   per gateway incarnation and address ranges, horizons in committed
 //!   time) beside the session registry (`"SR"`); each is its own
-//!   deterministic
-//!   state machine, proposed, committed, acknowledged and snapshotted on
-//!   exactly the same path.
+//!   deterministic state machine, proposed, committed, acknowledged and
+//!   snapshotted on exactly the same path.
 //! - **Profiles**: the arenas are static per
 //!   `[[variant]]` (`rp2350` 64 sessions, `pi5` 4096, `server` 65536)
 //!   and the `profile` parameter names the capacity a deployment admits
@@ -77,6 +76,11 @@
 //! fabric port. FENCE_CONFIRM must be proposed only from the agent's own
 //! `MSG_ADDR_FENCED`, carrying the custody generation it reports.
 //!
+//! - **Token checks** (`MSG_TOKEN_CHECK`, `MSG_ARM_AUTH_CHECK`) arrive on
+//!   `checks` and are linearizable: each is held behind a barrier entry
+//!   (magic `"CK"`, no body, no state) and answered on `replies` once
+//!   this replica's applied state has reached it, so a verdict reflects
+//!   every command committed before the check arrived.
 //! - **Deterministic timing**: this module hosts the leader-fenced time
 //!   producer for its state machine. When (and only when) this node is
 //!   the PRG leader per
@@ -129,6 +133,9 @@ include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
 use abi::contracts::net::session_ctrl;
 #[path = "../../common/attachment_registry.rs"]
 mod attachment_registry;
+#[path = "../../common/check_barrier.rs"]
+mod check_barrier;
+use check_barrier::{Assigned, CheckBarrier, MAX_CHECKS};
 #[path = "../../common/directory_scope.rs"]
 mod directory_scope;
 #[path = "../../common/session_directory_face.rs"]
@@ -206,7 +213,7 @@ use vip_registry::{
     build_seed, VbExportCursor, VbInstaller, VipRegistry, VipReply, VB_MAX_CMD, VB_OP_ACTIVATE,
     VB_OP_SEED, VB_OWNERS_PI5, VB_OWNERS_RP2350, VB_OWNERS_SERVER, VB_PROFILE_PI5,
     VB_PROFILE_RP2350, VB_PROFILE_SERVER, VB_REPLY_LEN, VB_SEED, VB_SNAP_MAX_UNIT, VB_ST_OK,
-    VB_TOKEN_LEN,
+    VB_ST_UNAUTHORIZED, VB_TOKEN_LEN,
 };
 
 // ── Profile (variant-selected arenas) ───────────────────────────────
@@ -355,10 +362,40 @@ const MSG_FLOW_TOKEN_VERDICT: u8 = 0xC3;
 /// [verdict:u8]`.
 const MSG_ARM_AUTH_CHECK: u8 = 0x7A;
 const MSG_ARM_AUTH_VERDICT: u8 = 0x7B;
+/// The largest auth an arm check carries (Fluxor's `ARM_AUTH_MAX`).
+const ARM_AUTH_MAX: usize = 160;
+/// The largest check either provider sends: an arm check carrying
+/// `ARM_AUTH_MAX` bytes of auth.
+const CHECK_REQ_MAX: usize = 16 + 4 + 16 + 2 + ARM_AUTH_MAX;
 
-/// Answer a token check from this replica's committed registries: the
-/// verdict is 0 for a token that verifies, else the registry's refusal
-/// code (`0x80 |` it); an unseeded group or a malformed check refuses.
+/// A token check's log barrier: an entry of this prefix alone, changing
+/// no state. Its commit orders the check after every command committed
+/// before the check arrived (raft appends it behind them all), so a
+/// replica whose applied state has reached it answers as the group's
+/// committed state then stood, never from a lagging view.
+const CK_CMD_MAGIC: [u8; 2] = *b"CK";
+
+/// An arm check whose auth is longer than any Fluxor sends is refused, not
+/// dropped: the verdict names the digest of the whole auth, so the
+/// provider matches it to its request rather than waiting out its timeout.
+unsafe fn refuse_oversized_arm_check(s: &mut ModuleState, plen: usize) {
+    let sys = &*s.syscalls;
+    s.token_checks = s.token_checks.saturating_add(1);
+    s.token_refusals = s.token_refusals.saturating_add(1);
+    if plen < 38 {
+        return;
+    }
+    let mut out = [0u8; 16 + 4 + 32 + 1];
+    out[..20].copy_from_slice(&s.msg_buf[..20]);
+    out[20..52].copy_from_slice(&digest(&s.msg_buf[38..plen]));
+    out[52] = 0x80 | VB_ST_UNAUTHORIZED;
+    let _ = wire_channels::channel_write_msg(sys, s.out_replies, MSG_ARM_AUTH_VERDICT, &out);
+}
+
+/// Answer a token check from this replica's applied registries — called
+/// once they have reached the check's barrier: the verdict is 0 for a
+/// token that verifies, else the registry's refusal code (`0x80 |` it);
+/// an unseeded group or a malformed check refuses.
 unsafe fn answer_token_check(s: &mut ModuleState, msg_type: u8, req: &[u8]) {
     let sys = &*s.syscalls;
     s.token_checks = s.token_checks.saturating_add(1);
@@ -495,10 +532,8 @@ const SNAP_CHUNK: usize = 1024;
 /// transport registry, the VIP registry, the failover-operation store, the
 /// global tier, the operation store, the attachment boundaries, then the
 /// reservations. The session registry's header leads the image, so its
-/// `SNAPSHOT_VERSION` is the image's: 3 when the failover section joined,
-/// 4 when the region and operation sections did (and the transport and VIP
-/// sections changed shape), 5 when the attachment and reservation sections
-/// did, and an image of any other shape is refused.
+/// `SNAPSHOT_VERSION` marks the whole image, and an image of any other
+/// shape is refused.
 const SNAP_SECTION_SR: u8 = 0;
 const SNAP_SECTION_TR: u8 = 1;
 const SNAP_SECTION_VB: u8 = 2;
@@ -555,8 +590,9 @@ struct ModuleState {
     in_proposal_assigned: i32, // in[4]: MSG_PROPOSAL_ASSIGNED from consensus
     in_leader_state: i32,      // in[5]: MSG_LEADER_HINT from consensus
     in_ctrl: i32,              // in[6]: SessionCtrlV1 commands from anchors
+    in_checks: i32,            // in[7]: token checks from continuity / address providers
     out_proposals: i32,        // out[0]: MSG_CLIENT_PROPOSAL to consensus.proposals_tagged
-    out_replies: i32,          // out[1]: MSG_SR_REPLY to requester
+    out_replies: i32,          // out[1]: every namespace's replies, verdicts, out-of-scope answers
     out_metrics: i32,          // out[2]: MSG_METRICS to operations
     out_snapshot_export: i32,  // out[3]: MSG_APP_SNAPSHOT_CHUNK to durability
     out_ctrl: i32,             // out[4]: SessionCtrlV1 replies and grants to anchors
@@ -584,7 +620,8 @@ struct ModuleState {
     _pad4: u8,
 
     /// The replicated state machines: sessions, flows, VIP bindings,
-    /// failover operations, region owner sets and operation records.
+    /// failover operations, region owner sets, operation records,
+    /// attachment boundaries and reservations.
     registry: Registry,
     transport: Transport,
     vip: Vip,
@@ -624,6 +661,11 @@ struct ModuleState {
     /// The namespace (`NS_*`) a pending proposal answers on.
     pending_ns: [u8; MAX_PENDING],
 
+    /// Token checks awaiting their barrier (`CK_CMD_MAGIC`): a table of
+    /// their own, so checks and registry commands never wait on each
+    /// other's slots.
+    checks: CheckBarrier<CHECK_REQ_MAX>,
+
     // Counters (metrics)
     requests_in: u32,
     /// Fluxor providers' token checks answered (flow and address), and
@@ -637,6 +679,9 @@ struct ModuleState {
     proposals_out: u32,
     /// Pending slots reclaimed by the TTL (lost assignment/commit).
     proposals_expired: u32,
+    /// Token checks dropped unanswered: their barrier was lost, or raft
+    /// assigned it to another group.
+    checks_expired: u32,
     replies_out: u32,
     applied_ok: u32,
     applied_rejected: u32,
@@ -718,6 +763,10 @@ struct ModuleState {
     fo_replay_sent: u32,
     fo_replay_req: u64,
     fo_replay_after: u64,
+    /// A replay committed while one streams waits here, then starts when
+    /// the stream ends (0: none). A later one takes the place; its
+    /// predecessor's requester, unanswered, resends.
+    fo_replay_queued: u64,
     /// Operation replay: as the failover replay, for the live records of
     /// `op_replay_kind` (0: every kind).
     op_replay_active: bool,
@@ -726,6 +775,10 @@ struct ModuleState {
     op_replay_sent: u32,
     op_replay_req: u64,
     op_replay_after: u64,
+    /// As `fo_replay_queued`, with the kind it asks for.
+    op_replay_queued: u64,
+    op_replay_queued_kind: u8,
+    _pad9: [u8; 7],
     /// A SEED proposal is in flight (do not propose another until it
     /// commits or the pending slot expires).
     seed_proposed_ms: u64,
@@ -867,32 +920,67 @@ unsafe fn propose_ns(s: &mut ModuleState, request_id: u64, body: &[u8], face: u8
     true
 }
 
-/// Propose an untracked internal entry (timing). No pending-table
-/// registration: time entries need no reply routing — the committed
-/// entry itself is the effect. Returns false when the proposal ring
+/// Propose an internal entry (timing, a check's barrier) outside the
+/// pending table: the committed entry itself is the effect, or its
+/// caller tracks the returned correlation. `None` when the proposal ring
 /// has no space (retry next step).
-unsafe fn propose_raw(s: &mut ModuleState, body: &[u8]) -> bool {
+unsafe fn propose_raw(s: &mut ModuleState, body: &[u8]) -> Option<u64> {
     let sys = &*s.syscalls;
     if !wire_channels::writable(sys, s.out_proposals) {
-        return false;
+        return None;
     }
     let corr = next_correlation(s);
-    let mut prop = [0u8; TAGGED_PROPOSAL_HDR + wire::TIMING_ENTRY_LEN];
-    let n = match replica_facade::build_tagged_proposal(&mut prop, corr, body) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
+    let mut prop = [0u8; TAGGED_PROPOSAL_HDR + max_usize(wire::TIMING_ENTRY_LEN, 2)];
+    let n = replica_facade::build_tagged_proposal(&mut prop, corr, body).ok()?;
     let wrote = wire_channels::channel_write_msg(
         sys,
         s.out_proposals,
         wire::MSG_CLIENT_PROPOSAL,
         &prop[..n],
     );
-    if wrote > 0 {
-        s.proposals_out = s.proposals_out.saturating_add(1);
-        true
-    } else {
-        false
+    if wrote <= 0 {
+        return None;
+    }
+    s.proposals_out = s.proposals_out.saturating_add(1);
+    Some(corr)
+}
+
+/// Hold the check in `msg_buf[..plen]` behind a barrier: propose the
+/// barrier and keep the check until this replica's applied state has
+/// reached it. False when no check slot is free or the proposal ring
+/// refuses the barrier.
+unsafe fn take_check(s: &mut ModuleState, msg_type: u8, plen: usize) -> bool {
+    if !s.checks.has_room() {
+        return false;
+    }
+    let Some(corr) = propose_raw(s, &CK_CMD_MAGIC) else {
+        return false;
+    };
+    let sys = &*s.syscalls;
+    let n = plen.min(CHECK_REQ_MAX);
+    s.checks.hold(
+        corr,
+        s.partition_id,
+        dev_millis(sys),
+        msg_type,
+        &s.msg_buf[..n],
+    )
+}
+
+/// Answer every held check whose barrier this replica's applied state
+/// (`applied`, the committed cursor) has reached. Never over a partial
+/// install; a check stays held while `replies` has no room.
+unsafe fn answer_checks_through(s: &mut ModuleState, applied: u64) {
+    if s.hold_applies || s.install_active {
+        return;
+    }
+    let sys = &*s.syscalls;
+    let mut req = [0u8; CHECK_REQ_MAX];
+    while wire_channels::writable(sys, s.out_replies) {
+        let Some((msg, n)) = s.checks.take_ready(applied, &mut req) else {
+            return;
+        };
+        answer_token_check(s, msg, &req[..n]);
     }
 }
 
@@ -932,7 +1020,7 @@ unsafe fn ensure_time_fresh(s: &mut ModuleState) -> bool {
     };
     let mut body = [0u8; wire::TIMING_ENTRY_LEN];
     let n = wire::encode_time_entry(&mut body, wire::TIMING_OP_ADVANCE, t);
-    if n == 0 || !propose_raw(s, &body[..n]) {
+    if n == 0 || propose_raw(s, &body[..n]).is_none() {
         return false;
     }
     // The barrier is in the log ahead of the command; whether it made
@@ -1146,6 +1234,7 @@ pub unsafe extern "C" fn module_new(
         s.in_proposal_assigned = dev_channel_port(sys, 0, 4);
         s.in_leader_state = dev_channel_port(sys, 0, 5);
         s.in_ctrl = dev_channel_port(sys, 0, 6);
+        s.in_checks = dev_channel_port(sys, 0, 7);
         s.out_proposals = out_chan;
         s.out_replies = dev_channel_port(sys, 1, 1);
         s.out_metrics = dev_channel_port(sys, 1, 2);
@@ -1169,6 +1258,8 @@ pub unsafe extern "C" fn module_new(
         s.pending_face = [FACE_NONE; MAX_PENDING];
         s.pending_part = [0; MAX_PENDING];
         s.pending_ns = [NS_SR; MAX_PENDING];
+        s.checks = CheckBarrier::new();
+        s.checks_expired = 0;
         s.requests_in = 0;
         s.token_checks = 0;
         s.token_refusals = 0;
@@ -1223,12 +1314,16 @@ pub unsafe extern "C" fn module_new(
         s.fo_replay_sent = 0;
         s.fo_replay_req = 0;
         s.fo_replay_after = 0;
+        s.fo_replay_queued = 0;
         s.op_replay_active = false;
         s.op_replay_kind = 0;
         s._pad8 = [0; 2];
         s.op_replay_sent = 0;
         s.op_replay_req = 0;
         s.op_replay_after = 0;
+        s.op_replay_queued = 0;
+        s.op_replay_queued_kind = 0;
+        s._pad9 = [0; 7];
         s.seed_proposed_ms = 0;
         s.snap_staged = 0;
         s._pad6 = 0;
@@ -1262,6 +1357,11 @@ pub unsafe extern "C" fn module_new(
         {
             dev_log(sys, 1, b"[sess_dir] profile exceeds arena".as_ptr(), 32);
             return -3;
+        }
+        if s.scope > directory_scope::SCOPE_GLOBAL {
+            let m = b"[sess_dir] unknown scope";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return -22;
         }
         // In place: a profile-sized registry does not fit on the stack.
         s.registry.reset(admits.sessions as u32);
@@ -1303,7 +1403,9 @@ unsafe fn apply_committed(s: &mut ModuleState, index: u64, command: &[u8]) {
         apply_timing_entry(s, command);
         return;
     }
-    if command.len() <= 2 {
+    // A check's barrier changes no state on any replica; its commit is
+    // the whole of its effect (`answer_checks_through`).
+    if command == CK_CMD_MAGIC || command.len() <= 2 {
         return;
     }
     if command[..2] == TR_CMD_MAGIC {
@@ -1497,15 +1599,23 @@ unsafe fn apply_committed_failover(s: &mut ModuleState, index: u64, body: &[u8])
         return;
     }
     if reply.op == FO_OP_REPLAY && reply.status == FO_ST_OK {
-        // A later replay supersedes one still streaming: its requester is
-        // the coordinator that reconnected last.
-        s.fo_replay_active = true;
-        s.fo_replay_req = request_id;
-        s.fo_replay_after = 0;
-        s.fo_replay_sent = 0;
+        // One stream at a time, run to its end: a replay committed while
+        // one streams waits its turn rather than cutting it off.
+        if s.fo_replay_active {
+            s.fo_replay_queued = request_id;
+        } else {
+            start_fo_replay(s, request_id);
+        }
         return;
     }
     send_fo_reply(s, request_id, &reply);
+}
+
+fn start_fo_replay(s: &mut ModuleState, request_id: u64) {
+    s.fo_replay_active = true;
+    s.fo_replay_req = request_id;
+    s.fo_replay_after = 0;
+    s.fo_replay_sent = 0;
 }
 
 unsafe fn send_fo_reply(s: &mut ModuleState, request_id: u64, reply: &FailoverReply) -> bool {
@@ -1564,6 +1674,11 @@ unsafe fn pump_fo_replay(s: &mut ModuleState) {
                     return;
                 }
                 s.fo_replay_active = false;
+                if s.fo_replay_queued != 0 {
+                    let next = s.fo_replay_queued;
+                    s.fo_replay_queued = 0;
+                    start_fo_replay(s, next);
+                }
             }
         }
     }
@@ -1628,14 +1743,23 @@ unsafe fn apply_committed_operation(s: &mut ModuleState, index: u64, body: &[u8]
         return;
     }
     if reply.op == OP_OP_REPLAY && reply.status == OP_ST_OK {
-        s.op_replay_active = true;
-        s.op_replay_kind = reply.kind;
-        s.op_replay_req = request_id;
-        s.op_replay_after = 0;
-        s.op_replay_sent = 0;
+        if s.op_replay_active {
+            s.op_replay_queued = request_id;
+            s.op_replay_queued_kind = reply.kind;
+        } else {
+            start_op_replay(s, request_id, reply.kind);
+        }
         return;
     }
     send_op_reply(s, request_id, &reply);
+}
+
+fn start_op_replay(s: &mut ModuleState, request_id: u64, kind: u8) {
+    s.op_replay_active = true;
+    s.op_replay_kind = kind;
+    s.op_replay_req = request_id;
+    s.op_replay_after = 0;
+    s.op_replay_sent = 0;
 }
 
 unsafe fn send_op_reply(s: &mut ModuleState, request_id: u64, reply: &OperationReply) -> bool {
@@ -1694,6 +1818,11 @@ unsafe fn pump_op_replay(s: &mut ModuleState) {
                     return;
                 }
                 s.op_replay_active = false;
+                if s.op_replay_queued != 0 {
+                    let (next, kind) = (s.op_replay_queued, s.op_replay_queued_kind);
+                    s.op_replay_queued = 0;
+                    start_op_replay(s, next, kind);
+                }
             }
         }
     }
@@ -1827,6 +1956,13 @@ unsafe fn smoke_advance(s: &mut ModuleState, reply: &SessionReply) {
 /// Begin an install: clear the registries and hold applies until an
 /// image installs.
 fn install_begin(s: &mut ModuleState) {
+    // A replay streams committed state, which an install replaces: every
+    // stream stops unended, and its requester resends once the install
+    // has the group's state again.
+    s.fo_replay_active = false;
+    s.fo_replay_queued = 0;
+    s.op_replay_active = false;
+    s.op_replay_queued = 0;
     s.sr_installer = s.registry.install_begin();
     s.tr_installer = s.transport.install_begin();
     s.vb_installer = s.vip.install_begin();
@@ -2051,6 +2187,12 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         break;
                     }
                 }
+                // A barrier in another group's log orders nothing in
+                // this one: its check is dropped unanswered.
+                if s.checks.assign(corr, partition, wal_index) == Assigned::Foreign {
+                    s.misrouted = s.misrouted.saturating_add(1);
+                    s.checks_expired = s.checks_expired.saturating_add(1);
+                }
             }
         }
 
@@ -2068,6 +2210,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     dev_log(sys, 2, b"[sess_dir] pending expired".as_ptr(), 26);
                 }
             }
+            let dropped = s.checks.expire(now);
+            s.checks_expired = s.checks_expired.saturating_add(dropped);
         }
 
         // 1) Committed entries — apply in strict order, reply on match.
@@ -2131,6 +2275,44 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
+        // 1.5) Token checks (Fluxor's `auth_req`), on their own port and
+        //      their own slot table, so registry commands and checks never
+        //      wait on each other. Each is held behind a barrier entry and
+        //      answered once applied state reaches it; a check no slot or
+        //      proposal could take stays in the channel. Then every held
+        //      check whose barrier the entries above applied is answered.
+        if s.in_checks >= 0 {
+            for _ in 0..MAX_CHECKS {
+                if !s.checks.has_room()
+                    || !wire_channels::writable(sys, s.out_proposals)
+                    || !wire_channels::writable(sys, s.out_replies)
+                {
+                    break;
+                }
+                let Some((msg_type, plen)) =
+                    wire_channels::next_msg(sys, s.in_checks, &mut s.msg_buf)
+                else {
+                    break;
+                };
+                let plen = (plen as usize).min(s.msg_buf.len());
+                if msg_type == MSG_ARM_AUTH_CHECK && plen > CHECK_REQ_MAX {
+                    // Refused whatever the state: no barrier needed.
+                    refuse_oversized_arm_check(s, plen);
+                    continue;
+                }
+                if msg_type != MSG_FLOW_TOKEN_CHECK && msg_type != MSG_ARM_AUTH_CHECK {
+                    continue;
+                }
+                // Both gates were open above, so only a ring that filled
+                // between the check and the write loses the frame — and
+                // an unanswered check is a refusal.
+                if !take_check(s, msg_type, plen) {
+                    s.checks_expired = s.checks_expired.saturating_add(1);
+                }
+            }
+        }
+        answer_checks_through(s, s.subscriber.cursor());
+
         // 2) Requests — propose each as a tagged raft entry. When the
         //    pending table is full the frame stays in the channel for
         //    the next step; a full proposal ring drops the consumed
@@ -2146,17 +2328,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 else {
                     break;
                 };
-                // A continuity provider's or an address provider's check
-                // (Fluxor's `auth_req`): answered here from this replica's
-                // committed state, not proposed — a read, failing closed.
-                if msg_type == MSG_FLOW_TOKEN_CHECK || msg_type == MSG_ARM_AUTH_CHECK {
-                    let plen = plen as usize;
-                    let mut req = [0u8; 16 + 4 + 16 + 2 + VB_TOKEN_LEN + 8];
-                    let n = plen.min(req.len()).min(s.msg_buf.len());
-                    req[..n].copy_from_slice(&s.msg_buf[..n]);
-                    answer_token_check(s, msg_type, &req[..n]);
-                    continue;
-                }
                 let (ns, cmd_max) = match msg_type {
                     wire::MSG_SR_REQUEST => (NS_SR, SR_MAX_CMD),
                     wire::MSG_TR_REQUEST => (NS_TR, TR_MAX_CMD),
@@ -2456,7 +2627,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 if mono.wrapping_sub(s.last_drain_propose_ms) >= 50 {
                     let mut body = [0u8; wire::TIMING_ENTRY_LEN];
                     let n = wire::encode_time_entry(&mut body, wire::TIMING_OP_DRAIN, logical);
-                    if n > 0 && propose_raw(s, &body[..n]) {
+                    if n > 0 && propose_raw(s, &body[..n]).is_some() {
                         s.last_drain_propose_ms = mono;
                     }
                 }
@@ -2468,7 +2639,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if let Some(t) = s.clock_guard.propose_time(logical, unix) {
                         let mut body = [0u8; wire::TIMING_ENTRY_LEN];
                         let n = wire::encode_time_entry(&mut body, wire::TIMING_OP_ADVANCE, t);
-                        if n > 0 && propose_raw(s, &body[..n]) {
+                        if n > 0 && propose_raw(s, &body[..n]).is_some() {
                             s.last_advance_propose_ms = mono;
                         }
                     }

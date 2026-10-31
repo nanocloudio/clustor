@@ -6,8 +6,9 @@
 #
 # Sites (`site_map`, four bits per replica id): A {0,1}, B {2,3}, C {4};
 # `min_sites: 2`. Any one site's loss leaves three voters in two sites, a
-# quorum; a second site's loss leaves none. `consensus` and `durability`
-# take the same map, so commit and the durable tally count one quorum.
+# quorum; a second site's loss leaves none. The map is `consensus`'s;
+# durability tallies under it as consensus hands it over, so commit and
+# the durable tally count one quorum.
 # The directory serves the global tier (`scope: global`) and runs the
 # site-loss smoke (`smoke: 3`). Used by `tests/site_loss_e2e.rs`.
 #
@@ -63,8 +64,6 @@ modules:
       self_id: __SELF_ID__
       voter_count: 5
       partition_id: 0
-      site_map: 135424
-      min_sites: 2
   - name: control_plane
   - name: admission
   - name: operations

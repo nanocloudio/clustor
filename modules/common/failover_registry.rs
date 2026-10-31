@@ -12,9 +12,9 @@
 // `clustor-common` mounts it for host tests and for Wormhole, whose store
 // adapter builds these commands and reads these replies.
 //
-// The record is Wormhole's §13.5 `FailoverOperation`, the fixed 264-byte
-// `WHFO` frame (`wormhole/modules/common/traffic/failover_core.rs`), held
-// as its bytes. The registry does not interpret what a record asks for —
+// The record is Wormhole's `FailoverOperation`, the fixed 264-byte `WHFO`
+// frame (`modules/common/traffic/failover_core.rs` in Wormhole), held as
+// its bytes. The registry does not interpret what a record asks for —
 // that is the coordinator's — but it owns the rule a record may change by,
 // which is the rule `fo_cas_check` states there:
 //
@@ -32,8 +32,10 @@
 //   `fo_transition_legal`). Anything else is `CONFLICT`, and the reply
 //   carries the stored record so the writer follows it.
 // - **a frame is checked whole.** Magic, version, reserved bytes, enum
-//   ranges and the record's own SHA-256 trailer; a malformed record is
-//   `INVALID` and nothing is stored.
+//   ranges, the target as Wormhole's `VipTarget::decode` checks it (a
+//   known family, reserved bytes zero, a canonical IPv4 prefix, a length
+//   within the family), and the record's own SHA-256 trailer; a malformed
+//   record is `INVALID` and nothing is stored.
 // - **replay.** REPLAY changes no record: it is a read through the log, so
 //   once it commits, every record a coordinator could have been told about
 //   is in this state. The module then streams every live (non-terminal)
@@ -45,6 +47,14 @@
 //   oldest terminal record gives its slot to a new operation. A full arena
 //   of live operations refuses a new one `CAPACITY`, which the store
 //   adapter leaves unanswered for the coordinator's own retry.
+//   Retention is what bounds idempotence: once a terminal record has given
+//   its slot away, a late duplicate of its intent is a new operation. The
+//   records' own epochs (a VIP move's expected epoch) keep such a re-run
+//   from acting on authority that has since moved.
+// - **bounded work.** Replay and eviction each walk the arena once per
+//   record they find (at most 4096 on the server profile, tens of
+//   microseconds); the module paces replay at eight records a step. A
+//   creation sequence that would pass `u64::MAX` is refused `CAPACITY`.
 //
 // A proposer routes an operation to its group like any directory key; the
 // module's `partition_id` names the group this registry holds.
@@ -74,6 +84,8 @@ const AT_OP_ID: usize = 8;
 const AT_KIND: usize = 24;
 const AT_FENCE: usize = 25;
 const AT_PHASE: usize = 26;
+const AT_TARGET: usize = 48;
+const FO_TARGET_LEN: usize = 36;
 const AT_PHASE_GEN: usize = 104;
 const AT_READY: usize = 148;
 
@@ -237,11 +249,26 @@ pub fn record_valid(rec: &[u8], digest: DigestFn) -> bool {
         && u16_at(rec, 4) == FO_VERSION
         && u16_at(rec, 6) == 0
         && rec[149..152] == [0, 0, 0]
+        && target_valid(&rec[AT_TARGET..AT_TARGET + FO_TARGET_LEN])
         && (FO_KIND_VIP_MOVE..=FO_KIND_RECOVERY_MARK).contains(&rec[AT_KIND])
         && rec[AT_FENCE] <= FO_FENCE_EXTERNAL
         && rec[AT_PHASE] <= FO_PH_BLOCKED
         && rec[AT_READY] <= 1
         && digest(&rec[..FO_BODY_LEN])[..] == rec[FO_BODY_LEN..]
+}
+
+/// The record's target, `[service_id:16][family:1][prefix_len:1]
+/// [reserved:2][prefix:16]`, checked as Wormhole's `VipTarget::decode`
+/// checks it: reserved bytes zero, family 4 or 6, an IPv4 prefix
+/// canonical (its first twelve bytes zero), and a length within the
+/// family.
+fn target_valid(t: &[u8]) -> bool {
+    let width = match t[16] {
+        4 if t[20..32].iter().all(|&b| b == 0) => 32,
+        6 => 128,
+        _ => return false,
+    };
+    t[18] == 0 && t[19] == 0 && t[17] <= width
 }
 
 /// Whether `b` is the same operation as `a`: every field fixed at intent
@@ -509,6 +536,19 @@ impl<const N: usize> FailoverRegistry<N> {
         best.map(|i| (self.slots[i].seq, &self.slots[i].record))
     }
 
+    /// Whether some record already carries creation sequence `seq`: no
+    /// two may, or replay, which orders by it, would skip one.
+    fn holds_seq(&self, seq: u64) -> bool {
+        let mut at = 0;
+        while let Some(i) = self.occupied.next_used(at) {
+            if self.slots[i].seq == seq {
+                return true;
+            }
+            at = i + 1;
+        }
+        false
+    }
+
     /// The slot a new operation takes: the lowest free one while the
     /// admitted count has room, else the oldest terminal record's.
     fn take_slot(&mut self) -> Option<usize> {
@@ -577,18 +617,21 @@ impl<const N: usize> FailoverRegistry<N> {
             if phase != FO_PH_INTENT || generation != 1 {
                 return self.reply(FO_OP_CAS, FO_ST_CONFLICT, None);
             }
+            let Some(next_seq) = self.next_seq.checked_add(1) else {
+                return self.reply(FO_OP_CAS, FO_ST_CAPACITY, None);
+            };
             let Some(i) = self.take_slot() else {
                 return self.reply(FO_OP_CAS, FO_ST_CAPACITY, None);
             };
-            if !self.index.insert(&op_id, i as u32) {
-                return self.reply(FO_OP_CAS, FO_ST_CAPACITY, None);
-            }
+            // `take_slot` answers a slot inside the arena, which the index
+            // always takes.
+            let _ = self.index.insert(&op_id, i as u32);
             self.occupied.mark(i);
             self.slots[i] = FoSlot {
                 seq: self.next_seq,
                 record: proposed,
             };
-            self.next_seq += 1;
+            self.next_seq = next_seq;
             self.count += 1;
             self.live += 1;
             return self.reply(FO_OP_CAS, FO_ST_OK, Some(&proposed));
@@ -765,6 +808,7 @@ impl<const N: usize> FailoverRegistry<N> {
                     || self.occupied.is_used(slot)
                     || seq == 0
                     || seq >= self.next_seq
+                    || self.holds_seq(seq)
                     || !record_valid(rec, digest)
                 {
                     return false;

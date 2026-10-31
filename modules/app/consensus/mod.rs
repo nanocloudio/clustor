@@ -221,9 +221,10 @@ define_params! {
     // The multi-site group (docs/architecture/multi_site.md): each
     // replica id's site, four bits per id (id 0 lowest), and the fewest
     // distinct sites a quorum spans — for commit, elections (pre-vote and
-    // vote) and ReadIndex alike. `durability` takes the same pair. A
-    // group whose voters span fewer than `min_sites` sites is refused at
-    // construction (it could never commit); one that cannot survive the
+    // vote) and ReadIndex alike. `durability` must take the same pair. A
+    // voter set spanning fewer than `min_sites` sites could never commit,
+    // so it is refused at construction, at a runtime activation and as a
+    // voter change; one that cannot survive the
     // loss of one site whole boots and logs `[raft] sites: one site's
     // loss stops this group` (a deliberate RPO-zero posture across two
     // sites). Defaults: one site, a plain majority.
@@ -774,7 +775,6 @@ fn fan_slot_identity(s: &mut ModuleState, i: usize) {
     sl.repl.self_id = sl.self_id;
     sl.commit.self_id = sl.self_id;
     sl.raft.voter_count = sl.voter_count;
-    sl.commit.voter_count = sl.voter_count;
     let sites = types::SiteMap::new(s.site_map, s.min_sites);
     let sl = &mut s.slots[i];
     sl.raft.sites = sites;
@@ -804,10 +804,9 @@ unsafe fn activate_slot(
     self_id: u8,
     voter_count: u8,
 ) {
-    // Duplicate detection asks only the slots this engine runs. An
-    // unhosted slot reads `partition_id == 0`, so a scan over all of
-    // `K_MAX` answered "already hosted" for partition 0 on every engine
-    // whose base partition is not 0, and refused to bring it up.
+    // Duplicate detection asks only the slots this engine runs: an
+    // unhosted slot reads `partition_id == 0`, which is not a hosted
+    // partition 0.
     let active = s.active_slots as usize;
     let idx = match slot_route::activation_for(&s.slots, active, partition_id, |sl| sl.partition_id)
     {
@@ -830,12 +829,29 @@ unsafe fn activate_slot(
     } else {
         voter_count
     };
+    // A group whose voters span too few sites to form a quorum would
+    // campaign forever for the same reason: refused, as at construction.
+    let mut voters = types::NodeSet::empty();
+    for id in 0..voter_count.min(MAX_NODES as u8) {
+        voters.insert(id);
+    }
+    if !types::SiteMap::new(s.site_map, s.min_sites).can_commit(voters) {
+        s.slot_activations_refused = s.slot_activations_refused.wrapping_add(1);
+        let m = b"[raft] sites: activation spans fewer sites than min_sites";
+        dev_log(sys, 2, m.as_ptr(), m.len());
+        return;
+    }
 
     // Components for every slot were initialised at construction — an
     // all-zero slot would read channel handle 0 as a real handle — so
     // activation is purely giving this one its plumbing and identity.
     clone_slot_from_zero(s, idx, partition_id, self_id, voter_count);
     fan_slot_identity(s, idx);
+    let sl = &mut s.slots[idx];
+    raft::arm(&mut sl.raft, sys);
+    replicator::arm(&mut sl.repl, sys);
+    commit::arm(&mut sl.commit, sys);
+    apply::arm(&mut sl.apply, sys);
     // Publish the slot LAST. The per-slot dispatch loop runs
     // `0..active_slots`, so bumping the count only after the slot is
     // fully wired means a step can never reach a half-built group.
@@ -855,12 +871,6 @@ fn slot_for(s: &ModuleState, partition_id: u16) -> Option<usize> {
     })
 }
 
-/// Route one shared partitioned channel's frames into the owning slots'
-/// inboxes.
-///
-/// # Safety
-///
-/// Caller must supply a valid `&SyscallTable` per the module ABI.
 /// Forwarded proposals ride the rpc channel but are proposals, not RPCs.
 fn is_forward_type(msg_type: u8) -> bool {
     msg_type == wire::MSG_PROPOSAL_FORWARD || msg_type == wire::MSG_PROPOSAL_FORWARD_TAGGED
@@ -882,6 +892,12 @@ fn inbox_for(
     }
 }
 
+/// Route one shared partitioned channel's frames into the owning slots'
+/// inboxes.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
 unsafe fn demux_partitioned(
     s: &mut ModuleState,
     sys: &SyscallTable,
@@ -1290,8 +1306,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 replicator::on_leader_state(&mut s.slots[i].repl, lead, term, commit);
             }
 
-            // 2. E10 voter-set latch → commit + replicator, in the same
-            //    step raft applied the config change.
+            // 2. E10 voter-set latch → commit + replicator, in the step
+            //    raft published the configuration (the first step, for the
+            //    one seeded at `arm`). Durability takes the same
+            //    configuration from raft as `MSG_QUORUM_CONFIG` on the
+            //    WAL-entry channel.
             if let Some((current, joint, joint_active, learners)) = s.slots[i].raft.voter_out.take()
             {
                 // Learners reach only the replicator: it must keep shipping
@@ -1306,38 +1325,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     joint_active != 0,
                     learners,
                 );
-
-                // The durability ledger runs the same union-quorum tally on
-                // fsync acks that `commit` runs on match indices, so it needs
-                // the same voter sets — but it lives in the `durability`
-                // module, across a channel.
-                //
-                // The update rides raft's WAL-entry channel rather than a
-                // port of its own: `durability` is already at its input-port
-                // budget, and message-type multiplexing on a shared channel
-                // is the established way modules here stay under it. Riding
-                // the entry stream also puts the update in FIFO order with
-                // the entries whose acks it governs, which a side channel
-                // could not guarantee — the ledger sees the new
-                // configuration before any ack that must be judged against
-                // it.
-                if s.slots[i].raft.out_log >= 0 {
-                    let mut vbuf = [0u8; wire::VOTER_SET_UPDATE_LEN];
-                    wire::encode_voter_set_update(
-                        &mut vbuf,
-                        current,
-                        joint,
-                        joint_active != 0,
-                        learners,
-                    );
-                    wire_channels::channel_write_partitioned(
-                        sys,
-                        s.slots[i].raft.out_log,
-                        s.slots[i].partition_id,
-                        wire::MSG_VOTER_SET_UPDATE,
-                        &vbuf,
-                    );
-                }
             }
 
             // 2b. E12 term-fence latch → commit (§5.4.2 gate), raised when a

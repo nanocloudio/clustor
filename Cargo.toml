@@ -260,6 +260,11 @@ path = "tests/directory_scope.rs"
 name = "directory_front"
 path = "tests/directory_front.rs"
 
+# Token checks held behind a log barrier until applied state reaches it.
+[[test]]
+name = "check_barrier"
+path = "tests/check_barrier.rs"
+
 # Learner semantics: replicated to, counted nowhere.
 [[test]]
 name = "learner_semantics"
@@ -425,6 +430,13 @@ path = "tests/peer_policy.rs"
 [[test]]
 name = "inbound_gate"
 path = "tests/inbound_gate.rs"
+
+# peer_router's answers to the transport's closes: every reported close
+# gets its CMD_CLOSE, at once or later in order, and none past the grace.
+# Mounts `modules/app/peer_router/close_owed.rs` via `#[path]`; always runs.
+[[test]]
+name = "close_owed"
+path = "tests/close_owed.rs"
 
 # Host-side coverage for wire admin admission by peer identity: role by
 # pinned key, fail-closed when unbound, revoke, eviction on overflow.

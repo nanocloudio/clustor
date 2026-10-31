@@ -3,19 +3,15 @@
 //!
 //! The engine allocates `K_MAX` slots and hosts only `active` of them.
 //! The rest are initialised but never stepped, and an initialised slot
-//! reads `partition_id == 0`, which is a real partition. So a lookup that
-//! scans every allocated slot answers "hosted" for partition 0 on any
-//! engine whose base partition is not 0. Every lookup is therefore
-//! bounded by `active`, and that bound lives here, once, so the demux,
-//! the durability-proof route, the WAL read-back route and runtime
-//! activation cannot each get it wrong separately.
-//!
-//! Measured on Nanocloud's `consensus_vip`, an engine hosting partition 1
-//! alone: partition-0 frames on the shared peer channel were filed into
-//! slot 1, which nothing drains. A forwarded proposal for it was then held
-//! at the channel head, the engine stopped reading its rpc input, the
-//! shared buffer behind it filled, and `peer_router` stopped draining the
-//! node's inbound bytes. The node lost its link to every worker.
+//! reads `partition_id == 0`, which is a real partition. A lookup that
+//! scanned every allocated slot would answer "hosted" for partition 0 on
+//! any engine whose base partition is not 0, and file its frames into a
+//! slot nothing drains: a forwarded proposal held there stops the engine
+//! reading its rpc input, the shared buffer behind it fills, and the peer
+//! router stops draining the node's inbound bytes. Every lookup is
+//! therefore bounded by `active`, and that bound lives here, once, so the
+//! demux, the durability-proof route, the WAL read-back route and runtime
+//! activation share it.
 //!
 //! Pure: no syscalls, so the host tests mount this file as the engine
 //! does.

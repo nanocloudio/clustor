@@ -29,7 +29,10 @@ content_type = "OctetStream"
 required = true
 
 # The committed replies under the consumer's ids, and
-# `MSG_DIR_OUT_OF_SCOPE` when the directory serves the other tier.
+# `MSG_DIR_OUT_OF_SCOPE` `[consumer id][request msg][reason]`: from the
+# directory when it serves the other tier, and from this front at once for
+# a request it refuses (1 another namespace, 2 another `op/` kind, 3 a
+# malformed command).
 [[ports]]
 name = "answer_out"
 direction = "output"

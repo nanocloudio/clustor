@@ -41,6 +41,9 @@ operation records; `att/<attachment_id>` (`MSG_AT_REQUEST` /
 `MSG_AT_REPLY`, magic `"AT"`), private attachments' generations and their
 services' revocation boundaries; and `rs/` (`MSG_RS_REQUEST` /
 `MSG_RS_REPLY`, magic `"RS"`), egress block and address reservations.
+Token checks add one more magic, `"CK"`: a barrier entry with no body
+that changes no state (see the flow token below). A forwarder passes
+these on with the directory's other entries.
 
 The log reaches the module on `committed_entries` in one of two
 shapes, declared by `forwarded_stream`. Wired straight from consensus
@@ -121,7 +124,9 @@ numbered from 1, and only this group's entries apply here.
   invalidates every outstanding transfer grant: `RESERVE` and
   `GRANT_TRANSFER` answer `recovery_void` until that session's epoch
   advances. A recovery that lost the grant-log tail can therefore
-  never lead to a re-emitted `(key, nonce)` or a duplicate key use.
+  never lead to a re-emitted `(key, nonce)` or a duplicate key use. It
+  also clears every fence in flight: a takeover after a recovery fences
+  afresh, and a fenced transport move needs a fence confirmed since.
 - **Mirror horizon.** `MIRROR_MARK` records the committed
   `(mirror_epoch, mirror_generation)` a session's standby has
   acknowledged, monotone in lexicographic order; its reply exposes the
@@ -170,11 +175,13 @@ same block, which is precisely the catastrophe the authority exists to
 prevent.
 
 Registry commands are namespaced in the shared raft log by a 2-byte
-magic prefix — `"SR"` sessions, `"TR"` flows, `"VB"` VIP bindings,
-`"FO"` failover operations — so
-admin ops and other consumers' entries are ignored structurally rather
-than by lucky opcode disjointness, and each namespace's reply goes out
-as its own message id from the same pending table.
+magic prefix — `"SR"` sessions, `"TR"` flows, `"VB"` VIP bindings, `"FO"`
+failover operations, `"RG"` region owner sets, `"OP"` operation records,
+`"AT"` attachment boundaries, `"RS"` reservations, and `"CK"` for a
+token check's barrier — so admin ops and other consumers' entries are
+ignored structurally rather than by lucky opcode disjointness, and each
+namespace's reply goes out as its own message id from the same pending
+table (a check's verdict from a table of its own).
 
 ## Profiles
 
@@ -201,8 +208,8 @@ unit and `O` fixed-size rows, and the header records `O`. Its
 consequences for compatibility:
 
 - **The width is part of the image.** A replica refuses an image of
-  another width, exactly as it refuses one of another arena; a group's
-  replicas must run the same variant, as they already must for the arena.
+  another width, exactly as it refuses one of another arena, so a group's
+  replicas run one variant.
   Changing a deployment's variant is a re-image (a fresh group, or every
   replica restarted from a log replay), never a rolling restart.
 - **Epochs are unaffected.** `vip_epoch`, the authority generation and
@@ -261,7 +268,8 @@ Replies are the session reply's 38-byte shape:
 `[op][status][flow:16][epoch:4][mirror_epoch:8][mirror_generation:8]`,
 and on the wire every one is followed by a token trailer
 `[token_present:1][reserved:3][FlowToken:48]` (`TR_WIRE_REPLY_LEN` = 90
-bytes), so a reader of the 38-byte reply alone reads it unchanged.
+bytes), so a reader of the 38-byte reply alone reads its first 38 bytes
+as that reply.
 A byte-identical retry of a record's last operation repeats its recorded
 reply; a different command under the same id is `conflict`. The record
 keeps that last command whole and compares bytes, so no other command can
@@ -270,8 +278,8 @@ construction.
 
 ### Per-flow emission tokens
 
-rfc_lb_vip §11.6 has the authority, not the coordinator, mint the token a
-promoted standby presents before it may emit. `MOVE_FENCED` commits
+The authority, not the coordinator, mints the token a promoted standby
+presents before it may emit. `MOVE_FENCED` commits
 `MOVE`'s promotion and records the fence generation it names (the
 custody generation the session namespace's `FENCE_CONFIRM` carried); the
 `FlowToken` is then derived from replicated state:
@@ -286,18 +294,30 @@ nothing). The module puts the token in the `MOVE_FENCED` reply's trailer;
 any replica re-derives it (`flow_token`) and a provider asks
 `verify_flow_token` before enabling emission.
 
-That question is a directory request. A Fluxor continuity provider's token
+That question goes to the directory. A Fluxor continuity provider's token
 check (`MSG_TOKEN_CHECK` 0xC2, `[token:48]`, on its `auth_req`) and an
 address provider's check before it arms under `arm_authority`
 (`MSG_ARM_AUTH_CHECK` 0x7A, the VIP emission token as its auth) arrive on
-the module's `requests` port and are answered on `replies` — `[token]
-[verdict]` (0xC3) and `[addr][generation][sha256(auth)][verdict]` (0x7B),
-the verdict 0 or `0x80 |` the registry's refusal — from this replica's
-committed registries, without a proposal: a read, failing closed (an
-unseeded group, another anchor, epoch or fence generation, another boot's
-arm). `TransportRegistry::answer_token_check` and
-`VipRegistry::answer_arm_check` are the answers (`tests/flow_token.rs`,
-`tests/vip_registry.rs`); `token_checks` / `token_refusals` count them.
+the module's `checks` port and are answered on `replies`:
+`[token][verdict]` (0xC3) and `[addr][generation][sha256(auth)][verdict]`
+(0x7B), the verdict 0 or `0x80 |` the registry's refusal. A check is
+linearizable. The replica that takes one proposes a barrier, a `"CK"`
+entry, and holds the check until its applied state reaches that entry.
+Raft appends the barrier behind every entry committed before the check
+arrived, so the answer reflects each of them: a token that a committed
+move has ended never verifies, on any replica, however far behind it
+ran. A check costs one commit of latency. Checks wait in a table of
+their own (`MAX_CHECKS`), never behind registry commands; a check no
+slot can take stays in the channel, and one whose barrier has not
+applied within 5 seconds (the longest a Fluxor provider waits) is dropped
+unanswered, which the provider reads as a refusal. The check refuses an
+unseeded group, another anchor, epoch or fence generation, another
+boot's arm, an address outside the token's prefix (the provider does
+not parse the token, so this is the only place the address is checked
+against it), and an auth longer than Fluxor's `ARM_AUTH_MAX` — that one
+at once, with no barrier, since no state could admit it.
+`TransportRegistry::answer_token_check` and `VipRegistry::answer_arm_check`
+are the answers (`tests/flow_token.rs`, `tests/vip_registry.rs`).
 
 The fence generation is not taken on trust. The module applies transport
 commands through `apply_fenced`, and a new `MOVE_FENCED` commits only if
@@ -319,7 +339,9 @@ standby set keeps it (the emitter did not change); a later `MOVE`,
 `TOMBSTONE` or `RECOVERY_MARK` ends it for good, and a re-admission after
 recovery needs a new fenced move. A retried `MOVE_FENCED` repeats its
 recorded reply and carries the token only while the flow is still at the
-epoch it committed. Plain `MOVE` mints nothing and stays as it was.
+epoch it committed. A plain `MOVE` mints nothing. A fence confirmed before
+an unsafe-recovery mark admits no `MOVE_FENCED` after it: the session
+namespace's `RECOVERY_MARK` clears every fence in flight.
 
 ## VIP namespace and emission tokens
 
@@ -402,14 +424,14 @@ it, so a disabled owner is never re-admitted by another host's commit.
 
 `fo/<operation_id>` (`modules/common/failover_registry.rs`) holds one
 Wormhole `FailoverOperation` per operation id: the fixed 264-byte `WHFO`
-record (`wormhole/modules/common/traffic/failover_core.rs`, rfc_lb_vip
-§13.5), kept as its bytes. Clustor does not act on what a record asks
+record (Wormhole's `modules/common/traffic/failover_core.rs`), kept as its
+bytes. Clustor does not act on what a record asks
 for; it owns the rule a record may change by, which is the rule
 Wormhole's `fo_cas_check` states:
 
 | Command | Body | Effect |
 |---|---|---|
-| `CAS` (1) | `[record:264]` | A new operation id is stored only as INTENT at phase generation 1. A byte-identical write of the stored record is `OK`. Otherwise the write must leave every field fixed at intent unchanged, advance the phase generation by exactly one, and make a legal transition of the record's kind under its fence requirement (the forward path, ABORTING inside a claim window, FAILED before the unsafe boundary, BLOCKED past it); anything else is `CONFLICT` carrying the stored record. A malformed frame (magic, version, reserved bytes, enum ranges, its own SHA-256 trailer) is `INVALID`. |
+| `CAS` (1) | `[record:264]` | A new operation id is stored only as INTENT at phase generation 1. A byte-identical write of the stored record is `OK`. Otherwise the write must leave every field fixed at intent unchanged, advance the phase generation by exactly one, and make a legal transition of the record's kind under its fence requirement (the forward path, ABORTING inside a claim window, FAILED before the unsafe boundary, BLOCKED past it); anything else is `CONFLICT` carrying the stored record. A malformed frame (magic, version, reserved bytes, enum ranges, a target Wormhole's `VipTarget::decode` would refuse, its own SHA-256 trailer) is `INVALID`. |
 | `REPLAY` (2) | — | A read through the log: changes nothing. Once it commits, the replica that proposed it streams every live (non-terminal) record to the requester, in creation order, as `REPLAY` replies, then an end-of-replay reply (op `REPLAY`, status `OK`, the count). |
 
 The reply is `[op:1][status:1][present:1][reserved:1][live:4][record:264]`;
@@ -418,13 +440,17 @@ Wormhole's store answers, and `CAPACITY` (4) refuses a new operation
 when every slot holds a live one. A terminal record stays, so a late
 retry or a re-sent request with the same operation id is answered from
 it, until a new operation needs its slot (the oldest terminal record
-gives way first).
+gives way first). Retention is what bounds that idempotence: a duplicate
+of an evicted operation's intent is a new operation, and the epochs the
+record carries keep it from acting on authority that has since moved. A
+replay committed while another streams waits for it to end; a snapshot
+install stops both unended, and the requester resends.
 
 ## Region namespace (the global tier)
 
-`rg/<service>` (`modules/common/region_registry.rs`) is rfc_lb_vip
-§13.6's low-rate global group: each service's region owner set, its DR
-generation and regional invalidation. The owner set is the `vip/` state
+`rg/<service>` (`modules/common/region_registry.rs`) is the low-rate
+global group's state ([multi_site.md](multi_site.md)): each service's
+region owner set, its DR generation and regional invalidation. The owner set is the `vip/` state
 machine, regions as owners, so every `VB_OP_*` command is accepted in its
 `vip/` layout (a region controller built on the VIP builders drives `rg/`
 unchanged), keyed by the service's global key, and answered with the
@@ -434,9 +460,13 @@ incarnation is `[tag:8][readiness_generation:u64 LE]`.
 
 - **DR generation.** Each binding counts its committed owner-set changes
   — an `ACTIVATE`, a `RELEASE` that removes a region or ends the set, a
-  `RECOVERY_MARK`, an `INVALIDATE` that voids one of its regions. A
-  retry, a refusal, a claim or a phase step counts nothing. It is
-  replicated state: a restarted controller reads the group's count.
+  `RECOVERY_MARK` that voids it, an `ABORT` that leaves a recovered
+  claim's record void, an `INVALIDATE` that newly voids one of its
+  regions' owners. A retry, a refusal, a claim, a phase step, a mark that
+  finds the binding void already and an invalidation that reaches no owner
+  not already void count nothing. It is replicated state: a restarted
+  controller reads the group's count, and every reply carries the
+  binding's current one.
 - **`INVALIDATE` (32)** `[op_id:16][region:16][readiness:8]`: the
   region's authority is void at or below `readiness` across every binding
   — its tokens stop verifying (`RG_ST_INVALIDATED`, 32), `TOKEN_REISSUE`
@@ -452,9 +482,9 @@ incarnation is `[tag:8][readiness_generation:u64 LE]`.
 
 ## Operation namespace
 
-`op/<operation_id>` (`modules/common/operation_registry.rs`) is
-rfc_lb_vip §13.5's restart-safe operation record for the coordinators
-that have no VIP-shaped one: a transport-continuity takeover (Wormhole's
+`op/<operation_id>` (`modules/common/operation_registry.rs`) is the
+restart-safe operation record for the coordinators that have no
+VIP-shaped one: a transport-continuity takeover (Wormhole's
 `takeover_core`), a failure-domain evacuation (`failure_domain_core`) and
 a region controller's DR operation (`dr_core`). One 256-byte `CLOP`
 record per operation id, sealed by its own SHA-256 trailer:
@@ -538,19 +568,39 @@ are declared with that margin.
 
 | Command | Body after `[op][op_id:16]` | Effect |
 |---|---|---|
-| `RESERVE` (1) | `[identity:16][protocol:1][gateway:16][boot:8][pool_blocks:4]` | The lowest block of the pool that is free, released, or retired past its horizon, to `(gateway, boot)`; `exhausted` when none is. A retry is recognised by the grant it made, while held. Wormhole's `BlockAuthority::reserve`. |
+| `RESERVE` (1) | `[identity:16][protocol:1][gateway:16][boot:8][pool_blocks:4]` | The lowest block of the pool that is free, released, or retired past its horizon, to `(gateway, boot)`; `exhausted` when none is, `retired` when the incarnation was. A block keeps the operation id and pool size of the grant that took it, so a retry is that grant: repeated while it stands, `conflict` (nothing granted) once the block was released, moved or retired. A zero operation id is `invalid`. Wormhole's `BlockAuthority::reserve`. |
 | `RELEASE` (2) | `[identity:16][protocol:1][block:4][gateway:16][boot:8]` | Frees the block; only its holder may (`not_holder`). |
-| `RETIRE_BOOT` (3) | `[gateway:16][boot:8][horizon_ms:8]` | The incarnation is gone: each block it holds is grantable once `horizon_ms` of committed time has passed. |
-| `MOVE` (4) | `[identity:16][protocol:1][block:4][from_gateway:16][from_boot:8][to_gateway:16][to_boot:8]` | Hands a block to another incarnation for continuity; `until` in the reply is the previous holder's horizon, the quarantine `adopt_block` honours. |
-| `ADDR_RESERVE` (5) | `[record_id:16][tenant:16][family:1][len:1][prefix:16]` | Holds a canonical range for a tenant unless a held range, or a quarantined one inside its horizon, of the family overlaps it (`overlap`, with `until`; never whose). |
-| `ADDR_RELEASE` (6) | `[record_id:16][horizon_ms:8]` | Quarantines the range for `horizon_ms`; reusable after. |
+| `RETIRE_BOOT` (3) | `[gateway:16][boot:8][horizon_ms:8]` | The incarnation is gone: each block it holds is grantable once `horizon_ms` of committed time has passed, and the incarnation is remembered as retired (the last as many as the block arena holds), granted nothing again. The one block command that walks the arena. |
+| `MOVE` (4) | `[identity:16][protocol:1][block:4][from_gateway:16][from_boot:8][to_gateway:16][to_boot:8]` | Hands a block to another incarnation for continuity (`retired` if that one was); `until` in the reply is the previous holder's horizon, the quarantine `adopt_block` honours. |
+| `ADDR_RESERVE` (5) | `[record_id:16][tenant:16][family:1][len:1][prefix:16][parent:16]` | Holds a canonical range for a tenant unless a held range, or a quarantined one inside its horizon, of the family overlaps it (`overlap`, with `until`; never whose) — its own ancestors excepted. `parent` all zero: a top-level range (a BYOIP import). Otherwise the range is carved from that record (a VIP or sub-prefix of the import): see below. A record's parent is fixed for its life; re-reserving it under another is `conflict`. |
+| `ADDR_RELEASE` (6) | `[record_id:16][horizon_ms:8]` | Quarantines the range for `horizon_ms`; reusable after. A record with a held child is not released (`conflict`): children first. |
+
+An address manager holds each tenant's whole imported prefix as a
+top-level record, so two managers of the group never admit overlapping
+imports, and holds what it carves from one as a child naming that
+record. A child's parent must be a record of the registry (`unknown`
+otherwise) that is held, of the same family, containing the child
+(`len` no shorter, prefix within), with an ancestor chain no longer
+than `RS_ADDR_DEPTH_MAX` (4) — otherwise `invalid`. A child may overlap
+its ancestor chain and nothing else live: a sibling, another import, a
+quarantined range inside its horizon are `overlap` as for any range, and
+a top-level range overlapping anything live, someone's child included,
+is `overlap`. A child may be held for any tenant: `rs/` is not the
+authorization layer — the manager that holds the parent carves it. These
+parent refusals, and `ADDR_RELEASE`'s `conflict` under a held child,
+leave the record's operation memo as it was, so the same operation
+succeeds once the parent or children are in place; a quarantined child
+does not hold its parent. A record some other record names as parent
+never gives its slot away (its children go first), so a parent
+reference always names a record.
 
 The reply (`RS_REPLY_LEN` = 72) is `[op][status][kind][state][block:4]
 [count:4][reserved:4][generation:8][until:8][holder:16][holder_boot:8]
 [subject:16]`. Statuses: `ok` (0), `invalid` (1), `conflict` (2),
 `exhausted` (3), `not_holder` (4), `overlap` (5), `capacity` (6),
-`unknown` (7). Every grant, move and re-reservation advances the record's
-generation. A block record lives as long as its pool; an address record
+`unknown` (7), `retired` (8). Every grant, move and re-reservation
+advances the record's generation, which never wraps (`invalid` at
+`u64::MAX`). A block record lives as long as its pool; an address record
 whose quarantine has passed gives its slot to a new one when the arena is
 full.
 
@@ -563,7 +613,9 @@ slot number (placement is replicated state, so images are byte-identical
 across replicas), then — for the session registry — the timing
 section's header and live entries. Restore validates the version, the
 profile, every count and every cross-reference (a deadline without its
-consumer object, two records for one slot or one identity) and fails
+consumer object, two records for one slot or one identity, an address
+record whose parent is not a record of the image, does not contain it,
+is quarantined under a held child or sits past `RS_ADDR_DEPTH_MAX`) and fails
 closed, leaving the registry empty. The module stages one chunk plus one
 unit (`SNAP_CHUNK` + the largest record), independent of the profile;
 the timing section streams the deadline heap position by position, and a
@@ -578,16 +630,12 @@ restored replica replays in the exporter's order), then the region
 registry (its header, its VIP image, a DR generation per binding, the
 invalidation table), then the operation store (with creation sequences,
 as `fo/`), then the attachment boundaries (services, then attachments),
-then the reservations (blocks, then address records). The session
-registry's header leads the image and versions it: version 3 since the
-failover section joined; version 5 since the attachment and reservation
-sections followed the operation one; version 4 between, since the region
-and operation sections followed it, transport records gained their token
-fields (transport section version 3) and VIP records their owner width
-(VIP section version 3, head and row units). An image of any other
-version is refused, so a replica built before this change cannot install
-one built after it, nor the reverse: upgrade a group's replicas together
-(or re-image), as for any section change.
+then the reservations (blocks, then address records, then the retired
+incarnations). The session registry's header leads the image, and
+each section's header carries version 1; an image of any other version
+is refused. The format has one version: a layout change rewrites it in
+place, so a group's replicas run one build and are upgraded together
+(or re-imaged).
 
 ## Deterministic timing
 
@@ -711,7 +759,7 @@ msg:1][reason:1]` — reason 1 the namespace, 2 an `op/` record of a kind the
 other tier owns — so a session's state never enters a log whose voters
 span sites (`modules/common/directory_scope.rs`). The global tier runs on a
 multi-site group, its quorum a majority across `min_sites` sites
-(`consensus` / `durability` `site_map`, `min_sites`); `smoke: 3` is the
+(`consensus` `site_map`, `min_sites`); `smoke: 3` is the
 site-loss smoke, a regional INVALIDATE committed one readiness higher
 every 300 ms by the leader and logged by every replica that applies it
 (`tests/site_loss_e2e.rs`).
@@ -738,9 +786,12 @@ writes the namespace's request frames under its own request ids on
   registry answers from the grant or record it made;
 - an `op/` REPLAY's streamed records pass through as they arrive (each
   restarting its retry clock) and the REPLAY completes on its own reply;
-- a request of another namespace, or an `op/` record or REPLAY of another
-  kind, is refused there and counted; `MSG_DIR_OUT_OF_SCOPE` from a
-  directory of the other tier is the consumer's answer;
+- a request of another namespace, an `op/` record or REPLAY of another
+  kind, or a malformed one is refused there, counted, and answered at once
+  as `MSG_DIR_OUT_OF_SCOPE` `[consumer id][request msg][reason]` (1
+  another namespace, 2 another kind, 3 malformed), as a directory of the
+  other tier answers; `retry_ms` 0 is refused at init, since every resend
+  is a log entry;
 - at most eight requests are in flight; a ninth waits in `request_in`.
 
 It answers nothing from state of its own and holds no record past its
@@ -752,12 +803,13 @@ and `op/` registries.
 
 `packaging/stack/clustor-directory.yaml` publishes the directory as the
 `clustor-directory` stack (Fluxor's `docs/architecture/stacks.md`: a
-published stack is included by name once pinned, or by path): `peer_router`, `gateway`,
+published stack is included by name once pinned, or by path):
+`peer_router`, `gateway`,
 `consensus`, `durability`, `control_plane`, `admission` and `operations`
 as a one-voter group whose peer router names itself, and this module as
 its consumer, wired exactly as `configs/session-directory.yaml` wires
 them (without the diagnostic HTTP surface). Its exports are the
-directory's `requests` and `replies` and the peer router's `net_in` /
+directory's `requests`, `replies` and `checks` and the peer router's `net_in` /
 `net_out`, which the includer wires to the platform's `linux_net`; its
 params are `self_id`, `listen_port` (required) and the boot `smoke`. A
 graph that needs a directory beside its own modules — Wormhole's

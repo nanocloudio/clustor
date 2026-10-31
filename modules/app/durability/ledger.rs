@@ -19,10 +19,7 @@
 //! structurally incapable of emitting a durability proof.
 
 use super::abi::SyscallTable;
-use super::types::{
-    quorum_index_count_sited, quorum_index_sited, Index, NodeSet, ReplicaId, SiteMap, Term,
-    MAX_NODES,
-};
+use super::types::{quorum_index_sited, Index, NodeSet, ReplicaId, SiteMap, Term, MAX_NODES};
 use super::{dev_log, wire, wire_channels};
 
 #[repr(C)]
@@ -35,31 +32,41 @@ pub struct Ledger {
 
     // Configuration
     pub self_id: ReplicaId,
-    pub voter_count: u8,
     pub partition_id: u16,
-    /// The voters' sites and the fewest a durable quorum spans — the map
-    /// `consensus` commits under (`site_map`, `min_sites`): the two
-    /// tallies must agree, or an entry could commit on fewer sites than
-    /// the group declares.
-    pub sites: SiteMap,
+    /// The group's configuration before any config entry, its first
+    /// `initial_voters` ids: this durability instance's own `voter_count`,
+    /// which its WAL's configuration history starts from. A quorum
+    /// configuration that names a different initial set comes from a
+    /// consensus configured for another group, and is refused.
+    pub initial_voters: u8,
 
-    /// Voter sets for the durability tally, mirrored from raft's
-    /// voter-set latch via `MSG_VOTER_SET_UPDATE` on the entry stream.
+    /// The quorum configuration `consensus` commits under, from raft's
+    /// `MSG_QUORUM_CONFIG` on the entry stream: the voter sets and the
+    /// site map. The ledger has no configuration of its own, so the two
+    /// tallies cannot disagree.
     ///
-    /// The ledger must run the SAME union quorum `commit` runs. During
-    /// joint consensus an entry is durable only when a majority of BOTH
+    /// The ledger must run the SAME quorum `commit` runs. During joint
+    /// consensus an entry is durable only when a majority of BOTH
     /// `C_old` and `C_new` have fsynced it: `commit` takes
     /// `min(quorum_match, durable_index)`, so a durable_index computed
     /// over `C_old` alone would let an entry commit that survives only
-    /// on the old configuration — exactly the committed-entry loss a
-    /// membership change must not permit.
+    /// on the old configuration. Under a site map each majority must
+    /// also span `min_sites` sites, or an entry could commit while
+    /// durable in fewer sites than the group requires.
     ///
-    /// Empty until the first update lands, which is why the tally falls
-    /// back to the `voter_count` median: a graph that never changes
-    /// membership behaves exactly as before.
+    /// Until `configured`, nothing is durable: no proof is emitted, and
+    /// so nothing commits.
+    configured: bool,
     current_voters: NodeSet,
     joint_voters: NodeSet,
     joint_active: bool,
+    sites: SiteMap,
+    /// Quorum configurations refused for a mismatched initial set.
+    pub configs_refused: u32,
+    /// Set by a newly adopted configuration: the quorum is recomputed
+    /// on the next step even if no ack advances, since an index already
+    /// fsynced by the new configuration's quorum is durable now.
+    reconfigured: bool,
 
     // Per-replica durable index tracking
     progress: [Index; MAX_NODES],
@@ -88,12 +95,15 @@ pub unsafe fn init(l: &mut Ledger) {
     l.in_ack = -1;
     l.out_quorum = -1;
     l.self_id = 0;
-    l.voter_count = 1;
     l.partition_id = 0;
-    l.sites = SiteMap::flat();
+    l.initial_voters = 1;
+    l.configured = false;
     l.current_voters = NodeSet::empty();
     l.joint_voters = NodeSet::empty();
     l.joint_active = false;
+    l.sites = SiteMap::flat();
+    l.configs_refused = 0;
+    l.reconfigured = false;
     l.progress = [0; MAX_NODES];
     l.term_at = [0; MAX_NODES];
     l.committed_index = 0;
@@ -101,47 +111,37 @@ pub unsafe fn init(l: &mut Ledger) {
     l.proof_pending = false;
 }
 
-/// Clamp `voter_count` after params land so the downstream
-/// `quorum_index` slice access can never panic on a typo'd cluster
-/// config.
-pub fn clamp_voters(l: &mut Ledger) {
-    if (l.voter_count as usize) > MAX_NODES {
-        l.voter_count = MAX_NODES as u8;
+/// Adopt consensus's quorum configuration. Mirrors what
+/// `consensus::commit` tallies under; false (and nothing adopted) when
+/// `c` names an initial set other than this group's.
+pub fn on_quorum_config(l: &mut Ledger, c: &wire::QuorumConfig) -> bool {
+    if c.initial != l.initial_voters {
+        l.configs_refused = l.configs_refused.wrapping_add(1);
+        return false;
     }
+    l.current_voters = NodeSet(c.current);
+    l.joint_voters = NodeSet(c.joint);
+    l.joint_active = c.joint_active;
+    l.sites = SiteMap::new(c.site_map, c.min_sites);
+    l.configured = true;
+    l.reconfigured = true;
+    true
 }
 
-/// Adopt a new voter configuration for the durability tally. Mirrors
-/// `consensus::commit::on_voter_set`; the two must stay in step or the
-/// union-quorum guarantee is only half-enforced.
-pub fn on_voter_set(l: &mut Ledger, current: u8, joint: u8, joint_active: bool) {
-    l.current_voters = NodeSet(current);
-    l.joint_voters = NodeSet(joint);
-    l.joint_active = joint_active;
-    let n = l.current_voters.count();
-    if n > 0 {
-        l.voter_count = n;
-    }
-}
-
-/// The durable high-water across the effective configuration.
+/// The durable high-water across the effective configuration: 0 until
+/// one is adopted.
 ///
 /// Single config: the median over `current_voters`. Joint consensus:
 /// the MINIMUM of the two medians, so an index counts as durable only
-/// once a majority of each configuration has fsynced it.
+/// once a majority of each configuration has fsynced it. Each median is
+/// site-aware under a multi-site map.
 fn durable_quorum(l: &Ledger) -> Index {
-    if l.current_voters.count() == 0 {
-        // No voter-set update yet — median over the fixed `0..voter_count`
-        // range.
-        return quorum_index_count_sited(&l.progress, l.voter_count, l.sites);
+    if !l.configured {
+        return 0;
     }
     let current = quorum_index_sited(&l.progress, l.current_voters, l.sites);
     if l.joint_active && l.joint_voters.count() > 0 {
-        let joint = quorum_index_sited(&l.progress, l.joint_voters, l.sites);
-        if current < joint {
-            current
-        } else {
-            joint
-        }
+        current.min(quorum_index_sited(&l.progress, l.joint_voters, l.sites))
     } else {
         current
     }
@@ -170,7 +170,8 @@ pub fn on_ack(l: &mut Ledger, term: Term, index: Index, replica: ReplicaId) -> b
 /// Caller must hold an exclusive `&mut Ledger` and supply a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
-    let mut advanced = local_advanced;
+    let mut advanced = local_advanced || l.reconfigured;
+    l.reconfigured = false;
 
     // Drain cross-node acks
     if l.in_ack >= 0 {
@@ -197,7 +198,7 @@ pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
         }
     }
 
-    // If any progress changed, recompute quorum
+    // Progress or the configuration changed: recompute the quorum.
     if advanced {
         let new_quorum = durable_quorum(l);
 

@@ -434,6 +434,44 @@ fn u64_at(src: &[u8], o: usize) -> u64 {
 
 // ── Command builders (proposer side) ────────────────────────────────
 
+/// Address families a binding key names. A key's prefix is in the
+/// canonical 16-byte form its producer (Wormhole's `VipTarget`) keys by:
+/// IPv4 in bytes 12..16 with the first twelve zero, IPv6 in all sixteen.
+pub const VB_FAMILY_V4: u8 = 4;
+pub const VB_FAMILY_V6: u8 = 6;
+
+/// Whether `addr` — a Fluxor address slot, IPv4 in bytes 0..4 with the
+/// rest zero, IPv6 in all sixteen — lies inside the prefix a binding key
+/// names. An unknown family, a length past the family's width, a
+/// non-canonical IPv4 key, or an IPv4 slot with bytes past its fourth set
+/// is outside every prefix.
+pub fn key_covers(key: &[u8; VB_KEY], addr: &[u8; 16]) -> bool {
+    let len = key[17] as usize;
+    let canonical = &key[18..34];
+    let (prefix, bits, width): (&[u8], &[u8], usize) = match key[16] {
+        VB_FAMILY_V4
+            if canonical[..12].iter().all(|&b| b == 0) && addr[4..].iter().all(|&b| b == 0) =>
+        {
+            (&canonical[12..], &addr[..4], 32)
+        }
+        VB_FAMILY_V6 => (canonical, &addr[..], 128),
+        _ => return false,
+    };
+    if len > width {
+        return false;
+    }
+    let whole = len / 8;
+    if bits[..whole] != prefix[..whole] {
+        return false;
+    }
+    let rest = len % 8;
+    if rest == 0 {
+        return true;
+    }
+    let mask = 0xFFu8 << (8 - rest);
+    bits[whole] & mask == prefix[whole] & mask
+}
+
 /// The binding key for `(service_id, family, prefix, prefix_len)`.
 pub fn vip_key(
     service_id: &[u8; 16],
@@ -906,6 +944,24 @@ impl<const O: usize> VipSlot<O> {
         }
         self.fence_gens[k] = u32_at(src, o);
     }
+
+    /// Whether the host tables are what apply could have left: every row
+    /// past a table's count empty (a free row is the empty record, which
+    /// whole-table copies rely on), every counted owner, prepared host and
+    /// previous owner named, and every counted fence a named host with a
+    /// custody generation.
+    fn rows_valid(&self) -> bool {
+        let tails_zero = |t: &[[u8; 16]; O], n: u8| (n as usize..O).all(|k| t[k] == [0; 16]);
+        let named =
+            |t: &[[u8; 16]; O], n: u8| (0..n as usize).all(|k| t[k] != [0; 16]) && tails_zero(t, n);
+        named(&self.owners, self.owner_count)
+            && tails_zero(&self.owner_boot, self.owner_count)
+            && named(&self.prepared, self.prepared_count)
+            && tails_zero(&self.prepared_boot, self.prepared_count)
+            && named(&self.previous_owners, self.previous_count)
+            && named(&self.fenced_hosts, self.fence_count)
+            && (0..O).all(|k| (self.fence_gens[k] != 0) == (k < self.fence_count as usize))
+    }
 }
 
 /// The replicated state machine. `N` is the binding arena (a power of two).
@@ -1112,9 +1168,12 @@ impl<const N: usize, const O: usize> VipRegistry<N, O> {
     /// `[addr:16][generation:u32 LE][boot_incarnation:16][auth_len:u16 LE]
     /// [auth]`, the auth a VIP emission token), answered as
     /// `ARM_AUTH_VERDICT` (0x7B) wants it: `[addr][generation]
-    /// [sha256(auth):32][verdict]` — 0 for a token that verifies and names
-    /// the asking boot, otherwise `0x80 |` the refusal. `None` for a check
-    /// that is not one.
+    /// [sha256(auth):32][verdict]` — 0 for a token that verifies, names the
+    /// asking boot, and covers the address being armed; otherwise `0x80 |`
+    /// the refusal. The provider does not parse the token, so this is the
+    /// only place the address is checked against the authority it carries:
+    /// a token for one address arms no other. `None` for a check that is
+    /// not one.
     pub fn answer_arm_check(
         &self,
         req: &[u8],
@@ -1129,8 +1188,14 @@ impl<const N: usize, const O: usize> VipRegistry<N, O> {
             return None;
         }
         let auth = &req[38..];
+        let mut addr = [0u8; 16];
+        addr.copy_from_slice(&req[..16]);
         let verdict = match EmissionToken::decode(auth) {
-            Some(t) if t.boot_incarnation[..] == req[20..36] => {
+            Some(t)
+                if auth.len() == VB_TOKEN_LEN
+                    && t.boot_incarnation[..] == req[20..36]
+                    && key_covers(&t.key, &addr) =>
+            {
                 match self.verify_emission_token(&t, digest) {
                     Ok(()) => 0,
                     Err(code) => 0x80 | code,
@@ -1701,18 +1766,18 @@ impl<const N: usize, const O: usize> VipRegistry<N, O> {
 
     // ── Snapshot (streamed, versioned) ──────────────────────────────
     //
-    //   header [version:u16 = 3][owner width O:u16][arena N:u32]
+    //   header [version:u16 = 1][owner width O:u16][arena N:u32]
     //          [admitted:u32][record_count:u32]
     //          [unsafe_recovery_generation:u64][applied:u64][seed:32]
     //          [last_op: VipOpMemo::LEN]
     //   record [slot:u32][head: VB_SLOT_HEAD_LEN] then O × [row:
     //          VB_SNAP_ROW_LEN], × record_count, in slot order
     //
-    // Version 3 carries the owner width: an image is installed only by a
-    // registry of the same arena and the same width, so a profile whose
+    // The header carries the owner width `O`: an image is installed only by
+    // a registry of the same arena and the same width, so a profile whose
     // owner sets are wider never reads a narrower one's records as its own.
 
-    pub const SNAPSHOT_VERSION: u16 = 3;
+    pub const SNAPSHOT_VERSION: u16 = 1;
 
     pub fn snapshot_len(&self) -> usize {
         VB_SNAP_HDR_LEN + self.live as usize * vb_snap_record_len(O)
@@ -1884,6 +1949,9 @@ impl<const N: usize, const O: usize> VipRegistry<N, O> {
                 ins.row += 1;
                 if (ins.row as usize) < O {
                     return true;
+                }
+                if !self.slots[ins.slot as usize].rows_valid() {
+                    return false;
                 }
                 ins.seen += 1;
                 ins.stage = if ins.seen == ins.expected {

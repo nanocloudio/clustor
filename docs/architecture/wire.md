@@ -215,8 +215,16 @@ management. The telemetry family:
   not clustor's: the `operations` `request_in` / `response_out` ports
   carry the fluxor SDK exchange contract's records, described in
   [../guides/net_http.md](../guides/net_http.md).
-- `MSG_VOTER_SET_UPDATE` (0x76):
-  `[current_set:u8][joint_set:u8][joint_active:u8]` bitmasks.
+- `MSG_QUORUM_CONFIG` (0x76), raft → durability on the WAL-entry
+  channel, 10 bytes:
+  `[current:u8][joint:u8][joint_active:u8][learners:u8][initial:u8][site_map:u32][min_sites:u8]`.
+  The voter sets are bitmasks and `current` is never empty; `initial` is
+  the group's first `initial` ids, its configuration before any config
+  entry. Raft owes one at boot, after loading its metadata and on every
+  configuration change, and writes no WAL entry while one is owed, so
+  the durability ledger tallies each entry's acks under the
+  configuration ahead of it. The ledger refuses one whose `initial`
+  differs from durability's own `voter_count`.
 
 The `GET /metrics` export payload is a self-describing blob:
 `[magic:u8 = 0xC7][version:u8 = 1][record_count:u16 LE]` followed by
@@ -236,15 +244,35 @@ command is quorum-committed and applied; `MSG_TR_REQUEST` (0x92) /
 (0x9A) / `MSG_OP_REPLY` (0x9B), `MSG_AT_REQUEST` (0x9C) / `MSG_AT_REPLY`
 (0x9D) and `MSG_RS_REQUEST` (0x9E) / `MSG_RS_REPLY` (0x9F), the same
 boundary for the directory's transport, VIP, failover-operation, region,
-operation, attachment and reservation namespaces (`[request_id:u64 LE][command body]` / `[request_id:u64
-LE][reply]`, see `architecture/session_directory.md`); `MSG_PLACEMENT_EPOCH_EVENT`
+operation, attachment and reservation namespaces (`[request_id:u64
+LE][command body]` / `[request_id:u64 LE][reply]`, see
+`architecture/session_directory.md`); `MSG_DIR_OUT_OF_SCOPE` (0xA0,
+`[request_id:u64 LE][request msg:u8][reason:u8]`), a request refused
+before it is proposed — by a directory of the other tier, or by a
+`directory_front` — and sent at once; `MSG_PLACEMENT_EPOCH_EVENT`
 (0xD5, `[kpg_id:u16][new_epoch:u32][reason:u8]`);
 `MSG_COMPACTION_FLOOR` (0xE1, `[kpg_id:u16][floor_revision:u64]`);
 `MSG_CLIENT_FRAME` (0xEA, `[conn_id:u16 LE][raw client bytes]`, the
 multiplexed cleartext client lane — the conn id is peer_router's
 slot index, `wire::ConnId`); `MSG_CONN_CLOSED` (0xEB,
 `[conn_id:u16 LE]`); `MSG_CONN_CLOSE_REQUEST` (0xEC,
-`[conn_id:u16 LE]`).
+`[conn_id:u16 LE]`); `MSG_CLIENT_PEER` (0xED, `[conn_id:u16 LE]
+[family:u8][addr:16][port:u16 LE]`, a client connection's peer ahead of
+its first client frame, under `peer_router`'s `forward_peer: 1`; never
+for a replica link); `MSG_CLIENT_HORIZON` (0xEE, `[conn_id:u16 LE]
+[bytes_through:u64 LE]`, how much of a client connection's output the
+transport's standby holds, under the same param and rule);
+`MSG_CLIENT_DELIVERED` (0xEF, `[conn_id:u16 LE][consumer_cursor:u64 LE]
+[in_bytes:u64 LE]`, on `client_resp` in order with the client's
+responses: its deliveries through `in_bytes` are consumed, relayed
+unchanged to the transport as `CMD_DELIVERED`, under the same param and
+rule); `MSG_CLIENT_RESUMED`
+(0xF0, `[conn_id:u16 LE][consumer_cursor:u64 LE][in_bytes:u64 LE]
+[out_bytes:u64 LE]`, a connection a takeover resumed here — the last
+cursor and consumed count its predecessor's `MSG_CLIENT_DELIVERED`
+carried, and its output horizon — after its
+`MSG_CLIENT_PEER` and ahead of its frames, under the same param and
+rule).
 
 ## Log-entry body magics
 

@@ -1,7 +1,7 @@
 // Reservation registry — the `rs/` namespace of the session directory: the
-// strict reservations rfc_lb_vip §22 asks of Clustor for what must never be
-// issued twice, without putting per-flow churn through consensus. Two
-// record kinds, each in its own arena:
+// strict reservations of what must never be issued twice, without putting
+// per-flow churn through consensus. Two record kinds, each in its own
+// arena:
 //
 // - **egress blocks** `egress/<identity>/<protocol>/<block>`: a block of an
 //   egress identity's ports, reserved to one gateway boot incarnation —
@@ -26,7 +26,10 @@
 //   that was retired and whose horizon has passed; a block held by a live
 //   incarnation, or a retired one inside its horizon, is never granted
 //   (`EXHAUSTED` when none is). The holder's next boot is another
-//   incarnation: it cannot have its predecessor's blocks either.
+//   incarnation: it cannot have its predecessor's blocks either. A retired
+//   incarnation is remembered (the last as many as the block arena holds),
+//   and RESERVE and MOVE grant it nothing (`RETIRED`): a gateway that is
+//   gone, or a late duplicate of its request, cannot strand a block on it.
 // - **release by the holder, or after its horizon.** RELEASE frees a
 //   block, and only its holder may. RETIRE_BOOT declares an incarnation
 //   gone: each of its blocks becomes grantable once `horizon_ms` of
@@ -41,15 +44,37 @@
 //   if no other held range, and no quarantined one inside its horizon, of
 //   the same family overlaps it. ADDR_RELEASE quarantines the range for
 //   `horizon_ms` (the longest flow, DNS, neighbour and abuse-attribution
-//   horizon); a range is reusable only after it.
+//   horizon); a range is reusable only after it. The overlap check
+//   compares the range with every address record, a 16-byte comparison
+//   each — at most 4096 on the server profile.
+// - **children carve their parent.** An ADDR_RESERVE naming a parent
+//   record (a tenant's imported prefix) holds a range wholly inside that
+//   parent, which must be held, of the same family, and at most
+//   `RS_ADDR_DEPTH_MAX` levels deep. The child may overlap its ancestor
+//   chain and nothing else live: siblings, other parents and quarantined
+//   ranges inside their horizon still refuse it `OVERLAP`. A top-level
+//   range (zero parent) overlapping anything live, someone else's child
+//   included, is `OVERLAP`. The child may be held for any tenant: `rs/`
+//   is not the authorization layer — the manager that holds the parent
+//   carves it. A record's parent is fixed for its life (a re-reservation
+//   naming another is `CONFLICT`), a parent with a held child is not
+//   released (`CONFLICT`: children first), and a record some other
+//   record names as parent never gives its slot away, so a parent
+//   reference always names a record of the registry.
 // - **generations.** Every grant, move and re-reservation advances the
 //   record's generation, which the reply carries.
-// - **idempotent operations.** Every command carries `operation_id[16]`. A
-//   record remembers its last command whole, so a byte-identical retry of
-//   RELEASE, MOVE or an address command repeats its recorded reply and
-//   another command under the same id is `CONFLICT`; a RESERVE is
-//   recognised by the block whose grant it was, while that grant is held;
-//   RETIRE_BOOT by the registry's own memo.
+// - **idempotent operations.** Every command carries `operation_id[16]`,
+//   never zero. A record remembers its last command whole, so a
+//   byte-identical retry of RELEASE, MOVE or an address command repeats its
+//   recorded reply and another command under the same id is `CONFLICT`;
+//   RETIRE_BOOT is remembered by the registry's own memo. A RESERVE is
+//   recognised by the block it granted, which keeps the grant's operation
+//   id and pool size — with the block's key and holder, the whole
+//   command: while that grant stands its retry repeats it, and once the
+//   block has been released, moved or retired a retry is `CONFLICT` and
+//   grants nothing.
+// - **generations never wrap.** A grant, move or re-reservation that would
+//   carry a generation past `u64::MAX` is refused `INVALID`.
 //
 // Committed time may lag wall time by the module's admission staleness
 // bound when a horizon is set (the module's freshness barrier proposes a
@@ -83,6 +108,15 @@ pub const RS_RECORD_ID: usize = 16;
 pub const RS_TENANT: usize = 16;
 /// Block key: `[identity:16][protocol:1][block:4]`.
 pub const RS_BLOCK_KEY: usize = RS_IDENTITY + 1 + 4;
+/// An incarnation: `[gateway:16][boot:u64 LE]`.
+pub const RS_INCARNATION: usize = RS_GATEWAY + 8;
+
+fn incarnation(gateway: &[u8; RS_GATEWAY], boot: u64) -> [u8; RS_INCARNATION] {
+    let mut k = [0u8; RS_INCARNATION];
+    k[..16].copy_from_slice(gateway);
+    k[16..].copy_from_slice(&boot.to_le_bytes());
+    k
+}
 
 /// `[op_id:16][identity:16][protocol:1][gateway:16][boot:8][pool_blocks:4]`.
 pub const RS_OP_RESERVE: u8 = 1;
@@ -93,7 +127,8 @@ pub const RS_OP_RETIRE_BOOT: u8 = 3;
 /// `[op_id:16][identity:16][protocol:1][block:4][from_gateway:16]
 /// [from_boot:8][to_gateway:16][to_boot:8]`.
 pub const RS_OP_MOVE: u8 = 4;
-/// `[op_id:16][record_id:16][tenant:16][family:1][len:1][prefix:16]`.
+/// `[op_id:16][record_id:16][tenant:16][family:1][len:1][prefix:16]
+/// [parent:16]` — `parent` all zero for a top-level range.
 pub const RS_OP_ADDR_RESERVE: u8 = 5;
 /// `[op_id:16][record_id:16][horizon_ms:8]`.
 pub const RS_OP_ADDR_RELEASE: u8 = 6;
@@ -102,10 +137,24 @@ pub const RS_RESERVE_LEN: usize = 1 + RS_OP_ID + RS_IDENTITY + 1 + RS_GATEWAY + 
 pub const RS_RELEASE_LEN: usize = 1 + RS_OP_ID + RS_BLOCK_KEY + RS_GATEWAY + 8;
 pub const RS_RETIRE_BOOT_LEN: usize = 1 + RS_OP_ID + RS_GATEWAY + 8 + 8;
 pub const RS_MOVE_LEN: usize = 1 + RS_OP_ID + RS_BLOCK_KEY + 2 * (RS_GATEWAY + 8);
-pub const RS_ADDR_RESERVE_LEN: usize = 1 + RS_OP_ID + RS_RECORD_ID + RS_TENANT + 2 + 16;
+pub const RS_ADDR_RESERVE_LEN: usize =
+    1 + RS_OP_ID + RS_RECORD_ID + RS_TENANT + 2 + 16 + RS_RECORD_ID;
 pub const RS_ADDR_RELEASE_LEN: usize = 1 + RS_OP_ID + RS_RECORD_ID + 8;
 /// Largest command body (MOVE).
 pub const RS_MAX_CMD: usize = RS_MOVE_LEN;
+const _: () = assert!(
+    RS_ADDR_RESERVE_LEN <= RS_MAX_CMD
+        && RS_RESERVE_LEN <= RS_MAX_CMD
+        && RS_RELEASE_LEN <= RS_MAX_CMD
+        && RS_RETIRE_BOOT_LEN <= RS_MAX_CMD
+        && RS_ADDR_RELEASE_LEN <= RS_MAX_CMD,
+    "RS_MAX_CMD must hold every command body"
+);
+
+/// Deepest an address record may sit under top-level ranges: a child
+/// whose ancestor chain would be longer is refused `INVALID`. It bounds
+/// the ancestor walk (and the overlap exemptions) of one ADDR_RESERVE.
+pub const RS_ADDR_DEPTH_MAX: usize = 4;
 
 /// Whether a command carries a horizon counted from committed time (the
 /// module admits these behind its time-freshness barrier).
@@ -124,11 +173,15 @@ pub const RS_ST_EXHAUSTED: u8 = 3;
 /// The command names a holder the block does not have.
 pub const RS_ST_NOT_HOLDER: u8 = 4;
 /// The range overlaps a held range, or a quarantined one inside its
-/// horizon (`until` names when that one ends).
+/// horizon (`until` names when that one ends), that is not its ancestor.
 pub const RS_ST_OVERLAP: u8 = 5;
 /// A new record past the admitted count.
 pub const RS_ST_CAPACITY: u8 = 6;
+/// The record (ADDR_RELEASE), or the parent an ADDR_RESERVE names, is not
+/// a record of the registry.
 pub const RS_ST_UNKNOWN: u8 = 7;
+/// The incarnation named to hold a block was retired.
+pub const RS_ST_RETIRED: u8 = 8;
 
 /// Record kinds, as the reply names them.
 pub const RS_KIND_BLOCK: u8 = 1;
@@ -239,6 +292,9 @@ pub fn build_move(
     RS_MOVE_LEN
 }
 
+/// `parent` is the record the range is carved from (all zero for a
+/// top-level range); 0 when the range is not canonical or names itself.
+#[expect(clippy::too_many_arguments, reason = "one ADDR_RESERVE body's fields")]
 pub fn build_addr_reserve(
     dst: &mut [u8],
     op_id: &[u8; RS_OP_ID],
@@ -247,8 +303,9 @@ pub fn build_addr_reserve(
     family: u8,
     len: u8,
     prefix: &[u8; 16],
+    parent: &[u8; RS_RECORD_ID],
 ) -> usize {
-    if dst.len() < RS_ADDR_RESERVE_LEN || !range_valid(family, len, prefix) {
+    if dst.len() < RS_ADDR_RESERVE_LEN || !range_valid(family, len, prefix) || parent == record_id {
         return 0;
     }
     dst[0] = RS_OP_ADDR_RESERVE;
@@ -258,6 +315,7 @@ pub fn build_addr_reserve(
     dst[49] = family;
     dst[50] = len;
     dst[51..67].copy_from_slice(prefix);
+    dst[67..83].copy_from_slice(parent);
     RS_ADDR_RESERVE_LEN
 }
 
@@ -300,18 +358,19 @@ pub fn range_valid(family: u8, len: u8, prefix: &[u8; 16]) -> bool {
 }
 
 /// Whether two ranges of one family overlap: one contains the other, so
-/// they agree on the shorter one's leading bits.
+/// they agree on the shorter one's leading bits. Compared a byte at a time.
 pub fn ranges_overlap(a: &[u8; 16], a_len: u8, b: &[u8; 16], b_len: u8) -> bool {
-    let n = a_len.min(b_len) as usize;
-    let mut bit = 0;
-    while bit < n {
-        let m = 0x80 >> (bit % 8);
-        if a[bit / 8] & m != b[bit / 8] & m {
-            return false;
-        }
-        bit += 1;
+    let n = (a_len.min(b_len) as usize).min(128);
+    let whole = n / 8;
+    if a[..whole] != b[..whole] {
+        return false;
     }
-    true
+    let rest = n % 8;
+    if rest == 0 {
+        return true;
+    }
+    let mask = 0xFFu8 << (8 - rest);
+    a[whole] & mask == b[whole] & mask
 }
 
 fn u32_at(src: &[u8], o: usize) -> u32 {
@@ -472,8 +531,10 @@ impl RsOpMemo {
         let _ = self.reply.encode(&mut dst[2 + RS_MAX_CMD..Self::LEN]);
     }
 
+    /// A memo `record` could have written: absent and all zero, or one
+    /// command of its opcode's exact length with nothing past it.
     fn decode(src: &[u8]) -> Option<RsOpMemo> {
-        if src[0] > 1 || src[1] as usize > RS_MAX_CMD || (src[0] == 0) != (src[1] == 0) {
+        if src[0] > 1 {
             return None;
         }
         let mut m = RsOpMemo::empty();
@@ -481,7 +542,20 @@ impl RsOpMemo {
         m.cmd_len = src[1];
         m.cmd.copy_from_slice(&src[2..2 + RS_MAX_CMD]);
         m.reply = ReservationReply::decode(&src[2 + RS_MAX_CMD..Self::LEN])?;
-        Some(m)
+        if !m.present {
+            return (m == Self::empty()).then_some(m);
+        }
+        let want = match m.cmd[0] {
+            RS_OP_RESERVE => RS_RESERVE_LEN,
+            RS_OP_RELEASE => RS_RELEASE_LEN,
+            RS_OP_RETIRE_BOOT => RS_RETIRE_BOOT_LEN,
+            RS_OP_MOVE => RS_MOVE_LEN,
+            RS_OP_ADDR_RESERVE => RS_ADDR_RESERVE_LEN,
+            RS_OP_ADDR_RELEASE => RS_ADDR_RELEASE_LEN,
+            _ => return None,
+        };
+        let n = m.cmd_len as usize;
+        (n == want && m.cmd[n..].iter().all(|&b| b == 0) && m.reply.op == m.cmd[0]).then_some(m)
     }
 }
 
@@ -496,8 +570,12 @@ pub struct BlockSlot {
     /// MOVE out of RETIRING it stays the quarantine the new holder honours.
     pub free_at: u64,
     pub generation: u64,
-    /// The RESERVE that granted it to its holder (its retry is that grant).
+    /// The RESERVE that last granted it, and the pool size it asked from:
+    /// with the key and the holder it was granted to, that command whole.
+    /// Kept through release, move and retirement, so a retry of it is
+    /// recognised until another grant takes the block.
     pub grant_op: [u8; RS_OP_ID],
+    pub grant_pool: u32,
     pub last_op: RsOpMemo,
 }
 
@@ -511,6 +589,7 @@ impl BlockSlot {
             free_at: 0,
             generation: 0,
             grant_op: [0; RS_OP_ID],
+            grant_pool: 0,
             last_op: RsOpMemo::empty(),
         }
     }
@@ -529,6 +608,9 @@ pub struct AddrSlot {
     pub len: u8,
     pub state: u8,
     pub prefix: [u8; 16],
+    /// The record this range is carved from; zero for a top-level range.
+    /// Fixed for the record's life.
+    pub parent: [u8; RS_RECORD_ID],
     pub quarantine_until: u64,
     pub generation: u64,
     pub last_op: RsOpMemo,
@@ -543,6 +625,7 @@ impl AddrSlot {
             len: 0,
             state: 0,
             prefix: [0; 16],
+            parent: [0; RS_RECORD_ID],
             quarantine_until: 0,
             generation: 0,
             last_op: RsOpMemo::empty(),
@@ -567,13 +650,27 @@ pub struct ReservationRegistry<const B: usize, const A: usize> {
     bk_used: SlotSet<B>,
     ad_index: SlotIndex<A, RS_RECORD_ID>,
     ad_used: SlotSet<A>,
+    /// Derived, by slot: how many address records (held or quarantined)
+    /// name this slot's record as parent. A record with any is never
+    /// given away by `addr_slot`. Rebuilt on restore.
+    ad_children: [u32; A],
+    /// Retired incarnations, oldest first: a ring of `B`
+    /// (`retired[(retired_head + i) % B]` for `i < retired_len`), found
+    /// through `rt_index` (derived). A RETIRE_BOOT past `B` forgets the
+    /// oldest.
+    retired: [[u8; RS_INCARNATION]; B],
+    retired_head: u32,
+    pub retired_len: u32,
+    rt_index: SlotIndex<B, RS_INCARNATION>,
     pub admitted_blocks: u32,
     pub admitted_addrs: u32,
     pub block_count: u32,
     pub addr_count: u32,
-    /// The latest horizon any record was given (derived): while committed
-    /// time is short of it a horizon is pending, and the module keeps time
-    /// moving.
+    /// The latest horizon any record was given: while committed time is
+    /// short of it a horizon is pending, and the module keeps time moving.
+    /// Replicated in the snapshot header — a record's own horizon can end
+    /// early (a retiring block released), so it is not derivable from the
+    /// records.
     pub latest_horizon: u64,
     pub applied: u64,
     /// RETIRE_BOOT's memo.
@@ -601,6 +698,11 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
             bk_used: SlotSet::new(),
             ad_index: SlotIndex::new(),
             ad_used: SlotSet::new(),
+            ad_children: [0; A],
+            retired: [[0; RS_INCARNATION]; B],
+            retired_head: 0,
+            retired_len: 0,
+            rt_index: SlotIndex::new(),
             admitted_blocks: B as u32,
             admitted_addrs: A as u32,
             block_count: 0,
@@ -623,12 +725,21 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
         i = 0;
         while i < A {
             self.addrs[i] = AddrSlot::empty();
+            self.ad_children[i] = 0;
+            i += 1;
+        }
+        i = 0;
+        while i < B {
+            self.retired[i] = [0; RS_INCARNATION];
             i += 1;
         }
         self.bk_index.reset();
         self.bk_used.reset();
         self.ad_index.reset();
         self.ad_used.reset();
+        self.rt_index.reset();
+        self.retired_head = 0;
+        self.retired_len = 0;
         self.admitted_blocks = blocks.min(B as u32);
         self.admitted_addrs = addrs.min(A as u32);
         self.clear_counters();
@@ -644,13 +755,46 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
         at = 0;
         while let Some(i) = self.ad_used.next_used(at) {
             self.addrs[i] = AddrSlot::empty();
+            self.ad_children[i] = 0;
             at = i + 1;
+        }
+        let mut r = 0;
+        while r < self.retired_len as usize {
+            self.retired[(self.retired_head as usize + r) % B] = [0; RS_INCARNATION];
+            r += 1;
         }
         self.bk_index.reset();
         self.bk_used.reset();
         self.ad_index.reset();
         self.ad_used.reset();
+        self.rt_index.reset();
+        self.retired_head = 0;
+        self.retired_len = 0;
         self.clear_counters();
+    }
+
+    /// Whether `(gateway, boot)` was retired.
+    pub fn is_retired(&self, gateway: &[u8; RS_GATEWAY], boot: u64) -> bool {
+        self.rt_index.find(&incarnation(gateway, boot)).is_some()
+    }
+
+    /// Remember a retired incarnation, forgetting the oldest at `B`.
+    fn remember_retired(&mut self, inc: [u8; RS_INCARNATION]) {
+        if self.rt_index.find(&inc).is_some() {
+            return;
+        }
+        if self.retired_len as usize == B {
+            let oldest = self.retired_head as usize;
+            let gone = self.retired[oldest];
+            let _ = self.rt_index.remove(&gone);
+            self.retired[oldest] = [0; RS_INCARNATION];
+            self.retired_head = ((oldest + 1) % B) as u32;
+            self.retired_len -= 1;
+        }
+        let at = (self.retired_head as usize + self.retired_len as usize) % B;
+        self.retired[at] = inc;
+        let _ = self.rt_index.insert(&inc, at as u32);
+        self.retired_len += 1;
     }
 
     fn clear_counters(&mut self) {
@@ -762,11 +906,18 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
         let gateway = id16(body, 34);
         let boot = u64_at(body, 50);
         let pool = u32_at(body, 58);
-        if boot == 0 || gateway == [0; 16] || pool == 0 || pool as usize > RS_POOL_BLOCKS_MAX {
+        if op_id == [0; RS_OP_ID]
+            || boot == 0
+            || gateway == [0; 16]
+            || pool == 0
+            || pool as usize > RS_POOL_BLOCKS_MAX
+        {
             return ReservationReply::fail(op, RS_ST_INVALID);
         }
         let mut key = [0u8; RS_BLOCK_KEY];
-        // A retry is the grant it made, while that grant is held.
+        // A retry is the grant it made: repeated while that grant stands,
+        // refused once it has ended. Recognised before the retirement
+        // check, so a retired holder's retry is answered as what it was.
         let mut pick: Option<(u32, Option<usize>)> = None;
         let mut b = 0;
         while b < pool {
@@ -774,12 +925,13 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
             match self.bk_index.find(&key).map(|i| i as usize) {
                 Some(i) => {
                     let s = &self.blocks[i];
-                    if s.state == RS_BLOCK_HELD
-                        && s.grant_op == op_id
-                        && s.holder == gateway
-                        && s.holder_boot == boot
-                    {
-                        return Self::block_reply(op, RS_ST_OK, s);
+                    if s.grant_op == op_id {
+                        let stands = s.state == RS_BLOCK_HELD
+                            && s.holder == gateway
+                            && s.holder_boot == boot
+                            && s.grant_pool == pool;
+                        let status = if stands { RS_ST_OK } else { RS_ST_CONFLICT };
+                        return Self::block_reply(op, status, s);
                     }
                     let grantable = s.state == RS_BLOCK_FREE
                         || (s.state == RS_BLOCK_RETIRING && now >= s.free_at);
@@ -795,12 +947,25 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
             }
             b += 1;
         }
+        if self.is_retired(&gateway, boot) {
+            let mut r = ReservationReply::fail(op, RS_ST_RETIRED);
+            r.kind = RS_KIND_BLOCK;
+            r.holder = gateway;
+            r.holder_boot = boot;
+            r.subject = identity;
+            return r;
+        }
         let Some((b, at)) = pick else {
             let mut r = ReservationReply::fail(op, RS_ST_EXHAUSTED);
             r.kind = RS_KIND_BLOCK;
             r.subject = identity;
             return r;
         };
+        if let Some(i) = at {
+            if self.blocks[i].generation == u64::MAX {
+                return Self::block_reply(op, RS_ST_INVALID, &self.blocks[i]);
+            }
+        }
         let i = match at {
             Some(i) => i,
             None => {
@@ -825,6 +990,7 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
         s.free_at = 0;
         s.generation += 1;
         s.grant_op = op_id;
+        s.grant_pool = pool;
         Self::block_reply(op, RS_ST_OK, s)
     }
 
@@ -845,6 +1011,7 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
             Ok(None) => {}
             Err(()) => return Self::block_reply(op, RS_ST_CONFLICT, &self.blocks[i]),
         }
+        let to_retired = op == RS_OP_MOVE && self.is_retired(&id16(body, 62), u64_at(body, 78));
         let s = &mut self.blocks[i];
         let reply = if s.state == RS_BLOCK_FREE || s.holder != from || s.holder_boot != from_boot {
             Self::block_reply(op, RS_ST_NOT_HOLDER, s)
@@ -853,13 +1020,18 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
             s.holder = [0; RS_GATEWAY];
             s.holder_boot = 0;
             s.free_at = 0;
-            s.grant_op = [0; RS_OP_ID];
             Self::block_reply(op, RS_ST_OK, s)
         } else {
             let to = id16(body, 62);
             let to_boot = u64_at(body, 78);
-            if to == [0; 16] || to_boot == 0 || (to == from && to_boot == from_boot) {
+            if to == [0; 16]
+                || to_boot == 0
+                || (to == from && to_boot == from_boot)
+                || s.generation == u64::MAX
+            {
                 Self::block_reply(op, RS_ST_INVALID, s)
+            } else if to_retired {
+                Self::block_reply(op, RS_ST_RETIRED, s)
             } else {
                 // The new holder honours the old one's horizon, if it had
                 // one: `free_at` stays as the quarantine it adopts under.
@@ -867,7 +1039,6 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
                 s.holder = to;
                 s.holder_boot = to_boot;
                 s.generation += 1;
-                s.grant_op = [0; RS_OP_ID];
                 Self::block_reply(op, RS_ST_OK, s)
             }
         };
@@ -892,8 +1063,12 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
         if boot == 0 || gateway == [0; 16] {
             reply.status = RS_ST_INVALID;
         } else {
+            self.remember_retired(incarnation(&gateway, boot));
             let until = now.saturating_add(horizon);
             reply.until = until;
+            // The one block command that walks the arena: a retirement is
+            // once per gateway incarnation, and it ends every block the
+            // incarnation holds.
             let mut at = 0;
             while let Some(i) = self.bk_used.next_used(at) {
                 let s = &mut self.blocks[i];
@@ -919,7 +1094,12 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
         let family = body[49];
         let len = body[50];
         let prefix = id16(body, 51);
-        if record_id == [0; 16] || tenant == [0; 16] || !range_valid(family, len, &prefix) {
+        let parent = id16(body, 67);
+        if record_id == [0; 16]
+            || tenant == [0; 16]
+            || parent == record_id
+            || !range_valid(family, len, &prefix)
+        {
             return ReservationReply::fail(op, RS_ST_INVALID);
         }
         let found = self.ad_index.find(&record_id).map(|i| i as usize);
@@ -929,18 +1109,75 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
                 Ok(None) => {}
                 Err(()) => return Self::addr_reply(op, RS_ST_CONFLICT, &self.addrs[i]),
             }
-            if self.addrs[i].state == RS_ADDR_HELD {
+            // Held, or carved from another parent than it was: not this
+            // record's re-reservation.
+            if self.addrs[i].state == RS_ADDR_HELD || self.addrs[i].parent != parent {
                 let r = Self::addr_reply(op, RS_ST_CONFLICT, &self.addrs[i]);
                 self.addrs[i].last_op.record(body, r);
                 return r;
             }
         }
-        // No other live range of the family may overlap, its own
-        // quarantined predecessor included.
+        // The ancestor chain a child may overlap: its parent, held, of the
+        // family, containing it, and the parent's own ancestors, at most
+        // `RS_ADDR_DEPTH_MAX`. A fault here leaves the record's memo as it
+        // was, so the same operation succeeds once the parent is in place.
+        let mut ancestors = [usize::MAX; RS_ADDR_DEPTH_MAX];
+        let mut depth = 0;
+        if parent != [0; 16] {
+            let Some(p) = self.ad_index.find(&parent).map(|p| p as usize) else {
+                let mut r = ReservationReply::fail(op, RS_ST_UNKNOWN);
+                r.kind = RS_KIND_ADDR;
+                r.subject = record_id;
+                return r;
+            };
+            let pa = &self.addrs[p];
+            if pa.family != family
+                || pa.len > len
+                || !ranges_overlap(&pa.prefix, pa.len, &prefix, len)
+            {
+                let mut r = ReservationReply::fail(op, RS_ST_INVALID);
+                r.kind = RS_KIND_ADDR;
+                r.subject = record_id;
+                return r;
+            }
+            let mut cur = p;
+            loop {
+                if depth == RS_ADDR_DEPTH_MAX
+                    || self.addrs[cur].state != RS_ADDR_HELD
+                    || cur == found.unwrap_or(usize::MAX)
+                {
+                    let mut r = ReservationReply::fail(op, RS_ST_INVALID);
+                    r.kind = RS_KIND_ADDR;
+                    r.subject = record_id;
+                    return r;
+                }
+                ancestors[depth] = cur;
+                depth += 1;
+                let up = self.addrs[cur].parent;
+                if up == [0; 16] {
+                    break;
+                }
+                match self.ad_index.find(&up) {
+                    Some(u) => cur = u as usize,
+                    None => {
+                        let mut r = ReservationReply::fail(op, RS_ST_INVALID);
+                        r.kind = RS_KIND_ADDR;
+                        r.subject = record_id;
+                        return r;
+                    }
+                }
+            }
+        }
+        // No other live range of the family may overlap — its own
+        // quarantined predecessor included — but its ancestors.
         let mut at = 0;
         while let Some(j) = self.ad_used.next_used(at) {
             let a = &self.addrs[j];
-            if a.live(now) && a.family == family && ranges_overlap(&a.prefix, a.len, &prefix, len) {
+            if a.live(now)
+                && a.family == family
+                && !ancestors[..depth].contains(&j)
+                && ranges_overlap(&a.prefix, a.len, &prefix, len)
+            {
                 // Which range is in the way, and until when; never whose.
                 let mut r = Self::addr_reply(op, RS_ST_OVERLAP, a);
                 r.subject = record_id;
@@ -965,10 +1202,19 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
                 self.ad_used.mark(i);
                 self.addrs[i] = AddrSlot::empty();
                 self.addrs[i].record_id = record_id;
+                self.addrs[i].parent = parent;
                 self.addr_count += 1;
+                // `addr_slot` gives away no parent, so the ancestors' slots
+                // still hold them.
+                if depth > 0 {
+                    self.ad_children[ancestors[0]] += 1;
+                }
                 i
             }
         };
+        if self.addrs[i].generation == u64::MAX {
+            return Self::addr_reply(op, RS_ST_INVALID, &self.addrs[i]);
+        }
         let a = &mut self.addrs[i];
         a.tenant = tenant;
         a.family = family;
@@ -984,15 +1230,25 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
 
     /// The slot a new address record takes: the lowest free one while the
     /// admitted count has room, else the lowest whose quarantine has
-    /// passed (its record id is forgotten with it).
+    /// passed and that no record names as parent (its record id is
+    /// forgotten with it). A held child keeps its parent held (a parent is
+    /// not released under one), and a quarantined child is given away
+    /// before its parent, so a parent reference never dangles.
     fn addr_slot(&mut self, now: u64) -> Option<usize> {
         if self.addr_count < self.admitted_addrs {
             return self.ad_used.lowest_free();
         }
         let mut at = 0;
         while let Some(i) = self.ad_used.next_used(at) {
-            if !self.addrs[i].live(now) {
+            if !self.addrs[i].live(now) && self.ad_children[i] == 0 {
                 let id = self.addrs[i].record_id;
+                let parent = self.addrs[i].parent;
+                if parent != [0; 16] {
+                    if let Some(p) = self.ad_index.find(&parent) {
+                        let p = p as usize;
+                        self.ad_children[p] = self.ad_children[p].saturating_sub(1);
+                    }
+                }
                 let _ = self.ad_index.remove(&id);
                 self.ad_used.free(i);
                 self.addrs[i] = AddrSlot::empty();
@@ -1002,6 +1258,23 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
             at = i + 1;
         }
         None
+    }
+
+    /// Whether some record carved from slot `i`'s record is held.
+    fn has_held_child(&self, i: usize) -> bool {
+        if self.ad_children[i] == 0 {
+            return false;
+        }
+        let id = self.addrs[i].record_id;
+        let mut at = 0;
+        while let Some(j) = self.ad_used.next_used(at) {
+            let a = &self.addrs[j];
+            if a.state == RS_ADDR_HELD && a.parent == id {
+                return true;
+            }
+            at = j + 1;
+        }
+        false
     }
 
     fn apply_addr_release(&mut self, body: &[u8], now: u64) -> ReservationReply {
@@ -1018,6 +1291,12 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
             Ok(Some(r)) => return r,
             Ok(None) => {}
             Err(()) => return Self::addr_reply(op, RS_ST_CONFLICT, &self.addrs[i]),
+        }
+        if self.addrs[i].state == RS_ADDR_HELD && self.has_held_child(i) {
+            // Children first: a parent is not quarantined under a held
+            // child. Not remembered, so the same operation releases once
+            // the children are gone.
+            return Self::addr_reply(op, RS_ST_CONFLICT, &self.addrs[i]);
         }
         let r = if self.addrs[i].state != RS_ADDR_HELD {
             Self::addr_reply(op, RS_ST_NOT_HOLDER, &self.addrs[i])
@@ -1037,17 +1316,20 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
 
     // ── Snapshot (streamed, versioned) ──────────────────────────────
     //
-    //   header [version:u16 = 1][reserved:u16][arena B:u32][arena A:u32]
-    //          [admitted_blocks:u32][admitted_addrs:u32][block_count:u32]
-    //          [addr_count:u32][applied:u64][last_op: RsOpMemo::LEN]
-    //   block  [slot:u32][key:21][state:1][reserved:2][holder:16]
-    //          [holder_boot:8][free_at:8][generation:8][grant_op:16]
-    //          [last_op: RsOpMemo::LEN] × block_count, slot order
-    //   addr   [slot:u32][record_id:16][tenant:16][family:1][len:1]
-    //          [state:1][reserved:1][prefix:16][quarantine_until:8]
-    //          [generation:8][last_op: RsOpMemo::LEN] × addr_count, slot order
-    //
-    // `latest_horizon` is derived, rebuilt from the records.
+    //   header  [version:u16 = 1][reserved:u16][arena B:u32][arena A:u32]
+    //           [admitted_blocks:u32][admitted_addrs:u32][block_count:u32]
+    //           [addr_count:u32][applied:u64][latest_horizon:u64]
+    //           [retired_len:u32][reserved:u32][last_op: RsOpMemo::LEN]
+    //   block   [slot:u32][key:21][state:1][reserved:2][holder:16]
+    //           [holder_boot:8][free_at:8][generation:8][grant_op:16]
+    //           [grant_pool:u32][last_op: RsOpMemo::LEN] × block_count, slot
+    //           order
+    //   addr    [slot:u32][record_id:16][tenant:16][family:1][len:1]
+    //           [state:1][reserved:1][prefix:16][parent:16]
+    //           [quarantine_until:8][generation:8][last_op: RsOpMemo::LEN]
+    //           × addr_count, slot order; every non-zero parent names
+    //           another record of the image
+    //   retired [gateway:16][boot:u64] × retired_len, oldest first
 
     pub const SNAPSHOT_VERSION: u16 = 1;
 
@@ -1055,6 +1337,7 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
         RS_SNAP_HDR_LEN
             + self.block_count as usize * RS_SNAP_BLOCK_LEN
             + self.addr_count as usize * RS_SNAP_ADDR_LEN
+            + self.retired_len as usize * RS_INCARNATION
     }
 
     pub fn snapshot(&self, dst: &mut [u8]) -> i32 {
@@ -1091,7 +1374,10 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
                     dst[20..24].copy_from_slice(&self.block_count.to_le_bytes());
                     dst[24..28].copy_from_slice(&self.addr_count.to_le_bytes());
                     dst[28..36].copy_from_slice(&self.applied.to_le_bytes());
-                    self.last_op.encode(&mut dst[36..36 + RsOpMemo::LEN]);
+                    dst[36..44].copy_from_slice(&self.latest_horizon.to_le_bytes());
+                    dst[44..48].copy_from_slice(&self.retired_len.to_le_bytes());
+                    dst[48..52].copy_from_slice(&[0; 4]);
+                    self.last_op.encode(&mut dst[52..52 + RsOpMemo::LEN]);
                     cur.stage = RS_EXPORT_BLOCKS;
                     cur.pos = 0;
                     return RS_SNAP_HDR_LEN;
@@ -1111,7 +1397,8 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
                         dst[52..60].copy_from_slice(&b.free_at.to_le_bytes());
                         dst[60..68].copy_from_slice(&b.generation.to_le_bytes());
                         dst[68..84].copy_from_slice(&b.grant_op);
-                        b.last_op.encode(&mut dst[84..84 + RsOpMemo::LEN]);
+                        dst[84..88].copy_from_slice(&b.grant_pool.to_le_bytes());
+                        b.last_op.encode(&mut dst[88..88 + RsOpMemo::LEN]);
                         cur.pos = i as u32 + 1;
                         return RS_SNAP_BLOCK_LEN;
                     }
@@ -1134,17 +1421,31 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
                         dst[38] = a.state;
                         dst[39] = 0;
                         dst[40..56].copy_from_slice(&a.prefix);
-                        dst[56..64].copy_from_slice(&a.quarantine_until.to_le_bytes());
-                        dst[64..72].copy_from_slice(&a.generation.to_le_bytes());
-                        a.last_op.encode(&mut dst[72..72 + RsOpMemo::LEN]);
+                        dst[56..72].copy_from_slice(&a.parent);
+                        dst[72..80].copy_from_slice(&a.quarantine_until.to_le_bytes());
+                        dst[80..88].copy_from_slice(&a.generation.to_le_bytes());
+                        a.last_op.encode(&mut dst[88..88 + RsOpMemo::LEN]);
                         cur.pos = i as u32 + 1;
                         return RS_SNAP_ADDR_LEN;
                     }
                     None => {
+                        cur.stage = RS_EXPORT_RETIRED;
+                        cur.pos = 0;
+                    }
+                },
+                RS_EXPORT_RETIRED => {
+                    if cur.pos >= self.retired_len {
                         cur.stage = RS_EXPORT_DONE;
                         return 0;
                     }
-                },
+                    if dst.len() < RS_INCARNATION {
+                        return 0;
+                    }
+                    let at = (self.retired_head as usize + cur.pos as usize) % B;
+                    dst[..RS_INCARNATION].copy_from_slice(&self.retired[at]);
+                    cur.pos += 1;
+                    return RS_INCARNATION;
+                }
                 _ => return 0,
             }
         }
@@ -1208,6 +1509,8 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
             RS_EXPORT_BLOCKS
         } else if ins.seen < ins.blocks + ins.addrs {
             RS_EXPORT_ADDRS
+        } else if ins.seen < ins.blocks + ins.addrs + ins.retired {
+            RS_EXPORT_RETIRED
         } else {
             RS_EXPORT_DONE
         }
@@ -1228,13 +1531,19 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
                 }
                 ins.blocks = u32_at(&unit, 20);
                 ins.addrs = u32_at(&unit, 24);
-                if ins.blocks > self.admitted_blocks || ins.addrs > self.admitted_addrs {
+                ins.retired = u32_at(&unit, 44);
+                if ins.blocks > self.admitted_blocks
+                    || ins.addrs > self.admitted_addrs
+                    || ins.retired as usize > B
+                    || unit[48..52] != [0; 4]
+                {
                     return false;
                 }
-                let Some(last_op) = RsOpMemo::decode(&unit[36..36 + RsOpMemo::LEN]) else {
+                let Some(last_op) = RsOpMemo::decode(&unit[52..52 + RsOpMemo::LEN]) else {
                     return false;
                 };
                 self.applied = u64_at(&unit, 28);
+                self.latest_horizon = u64_at(&unit, 36);
                 self.last_op = last_op;
                 ins.stage = Self::next_stage(ins);
                 true
@@ -1249,25 +1558,31 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
                 b.free_at = u64_at(&unit, 52);
                 b.generation = u64_at(&unit, 60);
                 b.grant_op = id16(&unit, 68);
-                let Some(last_op) = RsOpMemo::decode(&unit[84..84 + RsOpMemo::LEN]) else {
+                b.grant_pool = u32_at(&unit, 84);
+                let Some(last_op) = RsOpMemo::decode(&unit[88..88 + RsOpMemo::LEN]) else {
                     return false;
                 };
                 b.last_op = last_op;
                 let held = b.state != RS_BLOCK_FREE;
+                // Every block record was made by a grant: a generation, the
+                // grant's id and a pool that covers the block. A free one
+                // holds nothing else.
                 if slot >= B
                     || self.bk_used.is_used(slot)
                     || b.state > RS_BLOCK_RETIRING
                     || unit[26..28] != [0; 2]
-                    || b.block() as usize >= RS_POOL_BLOCKS_MAX
+                    || b.generation == 0
+                    || b.grant_op == [0; RS_OP_ID]
+                    || b.grant_pool as usize > RS_POOL_BLOCKS_MAX
+                    || b.block() >= b.grant_pool
                     || held != (b.holder != [0; 16] && b.holder_boot != 0)
+                    || (!held && b.free_at != 0)
                     || (b.state == RS_BLOCK_RETIRING && b.free_at == 0)
+                    || b.free_at > self.latest_horizon
                     || self.bk_index.find(&b.key).is_some()
                     || !self.bk_index.insert(&b.key, slot as u32)
                 {
                     return false;
-                }
-                if b.free_at > self.latest_horizon {
-                    self.latest_horizon = b.free_at;
                 }
                 self.bk_used.mark(slot);
                 self.blocks[slot] = b;
@@ -1285,16 +1600,22 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
                 a.len = unit[37];
                 a.state = unit[38];
                 a.prefix = id16(&unit, 40);
-                a.quarantine_until = u64_at(&unit, 56);
-                a.generation = u64_at(&unit, 64);
-                let Some(last_op) = RsOpMemo::decode(&unit[72..72 + RsOpMemo::LEN]) else {
+                a.parent = id16(&unit, 56);
+                a.quarantine_until = u64_at(&unit, 72);
+                a.generation = u64_at(&unit, 80);
+                let Some(last_op) = RsOpMemo::decode(&unit[88..88 + RsOpMemo::LEN]) else {
                     return false;
                 };
                 a.last_op = last_op;
                 if slot >= A
                     || self.ad_used.is_used(slot)
                     || unit[39] != 0
+                    || a.record_id == [0; RS_RECORD_ID]
+                    || a.parent == a.record_id
+                    || a.tenant == [0; RS_TENANT]
                     || !(a.state == RS_ADDR_HELD || a.state == RS_ADDR_QUARANTINED)
+                    || (a.state == RS_ADDR_HELD && a.quarantine_until != 0)
+                    || a.quarantine_until > self.latest_horizon
                     || !range_valid(a.family, a.len, &a.prefix)
                     || a.generation == 0
                     || self.ad_index.find(&a.record_id).is_some()
@@ -1302,18 +1623,72 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
                 {
                     return false;
                 }
-                if a.quarantine_until > self.latest_horizon {
-                    self.latest_horizon = a.quarantine_until;
-                }
                 self.ad_used.mark(slot);
                 self.addrs[slot] = a;
                 self.addr_count += 1;
+                ins.seen += 1;
+                ins.stage = Self::next_stage(ins);
+                // The section is whole: its parent references resolve.
+                ins.stage == RS_EXPORT_ADDRS || self.link_parents()
+            }
+            RS_EXPORT_RETIRED => {
+                let mut inc = [0u8; RS_INCARNATION];
+                inc.copy_from_slice(&unit[..RS_INCARNATION]);
+                if inc[..16] == [0; 16] || inc[16..] == [0; 8] || self.rt_index.find(&inc).is_some()
+                {
+                    return false;
+                }
+                let at = self.retired_len as usize;
+                self.retired[at] = inc;
+                let _ = self.rt_index.insert(&inc, at as u32);
+                self.retired_len += 1;
                 ins.seen += 1;
                 ins.stage = Self::next_stage(ins);
                 true
             }
             _ => false,
         }
+    }
+
+    /// Once every address record is installed: each non-zero parent names
+    /// another record of the image, of the family, containing the child,
+    /// held while the child is, within `RS_ADDR_DEPTH_MAX`; and the
+    /// derived child counts are rebuilt. False fails the install closed.
+    fn link_parents(&mut self) -> bool {
+        let mut at = 0;
+        while let Some(i) = self.ad_used.next_used(at) {
+            let a = self.addrs[i];
+            at = i + 1;
+            if a.parent == [0; 16] {
+                continue;
+            }
+            let Some(p) = self.ad_index.find(&a.parent).map(|p| p as usize) else {
+                return false;
+            };
+            let pa = &self.addrs[p];
+            if pa.family != a.family
+                || pa.len > a.len
+                || !ranges_overlap(&pa.prefix, pa.len, &a.prefix, a.len)
+                || (a.state == RS_ADDR_HELD && pa.state != RS_ADDR_HELD)
+            {
+                return false;
+            }
+            // Bounded depth, and so no cycle.
+            let mut cur = p;
+            let mut depth = 1;
+            while self.addrs[cur].parent != [0; 16] {
+                depth += 1;
+                if depth > RS_ADDR_DEPTH_MAX {
+                    return false;
+                }
+                match self.ad_index.find(&self.addrs[cur].parent) {
+                    Some(u) => cur = u as usize,
+                    None => return false,
+                }
+            }
+            self.ad_children[p] += 1;
+        }
+        true
     }
 
     pub fn install_finish(&mut self, ins: &mut RsInstaller) -> bool {
@@ -1326,15 +1701,20 @@ impl<const B: usize, const A: usize> ReservationRegistry<B, A> {
     }
 }
 
-pub const RS_SNAP_HDR_LEN: usize = 36 + RsOpMemo::LEN;
-pub const RS_SNAP_BLOCK_LEN: usize = 84 + RsOpMemo::LEN;
-pub const RS_SNAP_ADDR_LEN: usize = 72 + RsOpMemo::LEN;
-pub const RS_SNAP_MAX_UNIT: usize = RS_SNAP_BLOCK_LEN;
+pub const RS_SNAP_HDR_LEN: usize = 52 + RsOpMemo::LEN;
+pub const RS_SNAP_BLOCK_LEN: usize = 88 + RsOpMemo::LEN;
+pub const RS_SNAP_ADDR_LEN: usize = 88 + RsOpMemo::LEN;
+pub const RS_SNAP_MAX_UNIT: usize = if RS_SNAP_BLOCK_LEN > RS_SNAP_ADDR_LEN {
+    RS_SNAP_BLOCK_LEN
+} else {
+    RS_SNAP_ADDR_LEN
+};
 
 pub const RS_EXPORT_HEADER: u8 = 0;
 pub const RS_EXPORT_BLOCKS: u8 = 1;
 pub const RS_EXPORT_ADDRS: u8 = 2;
-pub const RS_EXPORT_DONE: u8 = 3;
+pub const RS_EXPORT_RETIRED: u8 = 3;
+pub const RS_EXPORT_DONE: u8 = 4;
 
 /// A streamed install rejected the image; the registry is left cleared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1374,6 +1754,7 @@ pub struct RsInstaller {
     pub carry_len: u16,
     pub blocks: u32,
     pub addrs: u32,
+    pub retired: u32,
     pub seen: u32,
     pub carry: [u8; RS_SNAP_MAX_UNIT],
 }
@@ -1392,6 +1773,7 @@ impl RsInstaller {
             carry_len: 0,
             blocks: 0,
             addrs: 0,
+            retired: 0,
             seen: 0,
             carry: [0; RS_SNAP_MAX_UNIT],
         }
@@ -1407,6 +1789,7 @@ impl RsInstaller {
             RS_EXPORT_HEADER => RS_SNAP_HDR_LEN,
             RS_EXPORT_BLOCKS => RS_SNAP_BLOCK_LEN,
             RS_EXPORT_ADDRS => RS_SNAP_ADDR_LEN,
+            RS_EXPORT_RETIRED => RS_INCARNATION,
             _ => 0,
         }
     }

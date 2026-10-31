@@ -27,7 +27,7 @@
 #![allow(
     unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset"
 )]
 
 use core::ffi::c_void;
@@ -51,7 +51,9 @@ mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
 
-use core_front::{FrontCore, FRONT_CMD_MAX, FRONT_REPLY_MAX, NS_AT, NS_OP, NS_RS};
+use core_front::{
+    refusal_answer, FrontCore, FrontRefusal, FRONT_CMD_MAX, FRONT_REPLY_MAX, NS_AT, NS_OP, NS_RS,
+};
 
 define_params! {
     ModuleState;
@@ -67,7 +69,8 @@ define_params! {
         => |s, d, len| { s.op_kind = p_u8(d, len, 0, 0); };
 
     // A request unanswered this long is sent again (the same command:
-    // its operation id makes the resend a retry).
+    // its operation id makes the resend a retry). Zero is refused: every
+    // resend is a log entry.
     3, retry_ms, u32, 2000
         => |s, d, len| { s.retry_ms = p_u32(d, len, 0, 2000); };
 }
@@ -154,6 +157,11 @@ pub unsafe extern "C" fn module_new(
             dev_log(sys, 1, m.as_ptr(), m.len());
             return -22;
         }
+        if s.retry_ms == 0 {
+            let m = b"[dir_front] retry_ms must be non-zero";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return -22;
+        }
         if s.in_request < 0 || s.in_directory < 0 || s.out_answer < 0 || s.out_directory < 0 {
             let m =
                 b"[dir_front] request_in, directory_in, answer_out and directory_out must be wired";
@@ -219,12 +227,32 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 break;
             };
             let plen = usize::from(plen);
-            if !(8..=8 + FRONT_CMD_MAX).contains(&plen) {
+            if plen < 8 {
+                // No request id to answer under.
+                s.front.refused = s.front.refused.wrapping_add(1);
                 continue;
             }
             let mut id = [0u8; 8];
             id.copy_from_slice(&s.buf[..8]);
-            let _ = s.front.admit(msg, u64::from_le_bytes(id), &s.buf[8..plen]);
+            let consumer_id = u64::from_le_bytes(id);
+            let verdict = if plen > 8 + FRONT_CMD_MAX {
+                s.front.refused = s.front.refused.wrapping_add(1);
+                Err(FrontRefusal::Malformed)
+            } else {
+                s.front.admit(msg, consumer_id, &s.buf[8..plen])
+            };
+            // A refusal is answered now, so the consumer does not wait out
+            // its own timeout for a request that will never be sent.
+            if let Err(why) = verdict {
+                if let Some(a) = refusal_answer(consumer_id, msg, why) {
+                    let _ = wire_channels::channel_write_msg(
+                        sys,
+                        s.out_answer,
+                        core_front::MSG_DIR_OUT_OF_SCOPE,
+                        &a,
+                    );
+                }
+            }
         }
 
         // 3) What is due on the directory's port: new requests and

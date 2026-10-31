@@ -69,6 +69,7 @@ mod wire;
 #[path = "../../common/wire_channels.rs"]
 mod wire_channels;
 
+mod close_owed;
 mod inbound_gate;
 
 // The walk's header is the wire's partitioned envelope.
@@ -245,7 +246,11 @@ define_params! {
     // 1: relay each client connection's peer (`MSG_PEER` from the
     // transport) on `cleartext` as `MSG_CLIENT_PEER` under the client id,
     // ahead of its first frame — for a consumer that names a connection
-    // by its client. 0 (default): nothing but frames and closes.
+    // by its client — its mirrored output horizon (`MSG_HORIZON`) as
+    // `MSG_CLIENT_HORIZON`, and a takeover's resume point (`MSG_RESUMED`)
+    // as `MSG_CLIENT_RESUMED`; and relay `MSG_CLIENT_DELIVERED` from
+    // `client_resp` to the transport as `CMD_DELIVERED`. 0 (default):
+    // nothing but frames and closes.
     29, forward_peer, u8, 0
         => |s, d, len| { s.forward_peer = p_u8(d, len, 0, 0); };
 
@@ -300,12 +305,15 @@ const NMSG_ACCEPT: u8 = net_proto::MSG_ACCEPTED;
 const NMSG_DATA: u8 = net_proto::MSG_DATA;
 const NMSG_CLOSED: u8 = net_proto::MSG_CLOSED;
 const NMSG_PEER: u8 = net_proto::MSG_PEER;
+const NMSG_HORIZON: u8 = net_proto::MSG_HORIZON;
+const NMSG_RESUMED: u8 = net_proto::MSG_RESUMED;
 const NMSG_BOUND: u8 = net_proto::MSG_BOUND;
 const NMSG_CONNOK: u8 = net_proto::MSG_CONNECTED;
 
 const NCMD_BIND: u8 = net_proto::CMD_BIND;
 const NCMD_SEND: u8 = net_proto::CMD_SEND;
 const NCMD_CLOSE: u8 = net_proto::CMD_CLOSE;
+const NCMD_DELIVERED: u8 = net_proto::CMD_DELIVERED;
 const NCMD_CONNECT_TO: u8 = net_proto::CMD_CONNECT_TO;
 const NSOCK_STREAM: u8 = net_proto::SOCK_TYPE_STREAM;
 
@@ -592,11 +600,14 @@ struct ModuleState {
     /// landed on the wrong input, where the consumer dropped them as
     /// not its type. Measured: 300 frames/s sent, 90/s arriving.
     peer_tail_len: [u16; MAX_NODES],
-    /// Retained client-response CMD_SEND payload awaiting net_out
+    /// Retained client-response command payload awaiting net_out
     /// space (length 0 = empty). Also the staging buffer for every
     /// response frame, so the hot path never re-zeroes an 8 KiB stack
     /// buffer per iteration.
     resp_stash_len: u16,
+    /// The retained payload's command: `CMD_SEND`, or `CMD_DELIVERED`
+    /// for a relayed `MSG_CLIENT_DELIVERED`.
+    resp_stash_cmd: u8,
     /// Frames dropped on this module's routing paths (oversize inbound
     /// chunk, oversize route frame, oversize response). Exported each
     /// metrics interval so the loss is never silent.
@@ -621,6 +632,10 @@ struct ModuleState {
     /// Set while a frame is retained, so the stall is logged once per
     /// episode rather than once per step.
     tx_stalled: bool,
+    /// `CMD_CLOSE`s the transport is owed for connections it reported
+    /// closed (`close_owed`): its answer releases the connection id, which
+    /// a transport otherwise holds through a grace sweep.
+    closes: close_owed::CloseOwed,
     /// Peer frames received / sent per replica id since the last
     /// accounting line, and inbound chunks retained because their
     /// destination was full. Printed once a second: the only way to see
@@ -700,6 +715,7 @@ pub unsafe extern "C" fn module_new(
         s.out_metrics = dev_channel_port(sys, 1, 4);
         s.dial_in = dev_channel_port(sys, 0, 5);
         s.dial_out = dev_channel_port(sys, 1, 5);
+        s.closes = close_owed::CloseOwed::new();
         s.client_identity = dev_channel_port(sys, 1, 6);
         s.learner_admin = dev_channel_port(sys, 1, 7);
 
@@ -737,6 +753,7 @@ pub unsafe extern "C" fn module_new(
         s.client_refused = 0;
         s.peer_tail_len = [0; MAX_NODES];
         s.resp_stash_len = 0;
+        s.resp_stash_cmd = NCMD_SEND;
         s.out_stash_len = 0;
         s.out_stash_next = 0;
         s.out_stash_target = 0;
@@ -811,10 +828,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
 /// One accounting line per second, unconditionally — this is a
 /// diagnostic of the LINK, and it must not depend on a metrics port
-/// being wired: `[pr] hb rx=a/b/c tx=a/b/c ev=N stall=N refused=N`,
-/// per-replica frame counts since the last line, net events taken off
-/// `net_in`, inbound chunks retained for a full destination, outbound
-/// writes refused.
+/// being wired: `[pr] hb rx=a/b/c tx=a/b/c ev=N stall=N refused=N ...
+/// closes=sent_late/dropped/owed`, per-replica frame counts since the last
+/// line, net events taken off `net_in`, inbound chunks retained for a full
+/// destination, outbound writes refused, and the transport closes answered
+/// late, dropped unsent, and still owed (`close_owed`).
 ///
 /// # Safety
 ///
@@ -842,6 +860,9 @@ unsafe fn account(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
     pos = log_fmt::log_field(&mut line, pos, b" cref=", s.client_refused);
     pos = log_fmt::log_field(&mut line, pos, b" shed=", s.inb_gate.shed[DEST_RPC]);
     pos = log_fmt::log_field(&mut line, pos, b"/", s.inb_gate.shed[DEST_REPL]);
+    pos = log_fmt::log_field(&mut line, pos, b" closes=", s.closes.deferred);
+    pos = log_fmt::log_field(&mut line, pos, b"/", s.closes.dropped);
+    pos = log_fmt::log_field(&mut line, pos, b"/", s.closes.len() as u32);
     dev_log(sys, 3, line.as_ptr(), pos);
     let mut line = [0u8; 96];
     let mut pos = log_fmt::log_field(&mut line, 0, b"[pr] id claims_refused=", s.claims_refused);
@@ -1510,6 +1531,41 @@ unsafe fn close_conn(s: &mut ModuleState, sys: &SyscallTable, conn_id: u16) {
     );
 }
 
+/// Write one `CMD_CLOSE` for `conn_id` on `chan`, whole, or nothing.
+unsafe fn write_close(sys: &SyscallTable, scratch: &mut [u8], chan: i32, conn_id: u16) -> bool {
+    if !wire_channels::writable(sys, chan) {
+        return false;
+    }
+    let payload = conn_id.to_le_bytes();
+    net_write_frame(
+        sys,
+        chan,
+        NCMD_CLOSE,
+        payload.as_ptr(),
+        2,
+        scratch.as_mut_ptr(),
+        scratch.len(),
+    ) != 0
+}
+
+/// Answer the transport's close of `conn_id` (on the transport `chan`)
+/// with `CMD_CLOSE`, at once or kept for a later step (`close_owed`).
+unsafe fn answer_close(s: &mut ModuleState, sys: &SyscallTable, chan: i32, conn_id: u16, now: u64) {
+    let ModuleState { closes, buf, .. } = s;
+    closes.close(conn_id, chan, now, &mut |ch, id| {
+        write_close(sys, &mut buf[..], ch, id)
+    });
+}
+
+/// Send the closes kept for want of room.
+unsafe fn flush_closes(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
+    if s.closes.is_empty() {
+        return;
+    }
+    let ModuleState { closes, buf, .. } = s;
+    closes.flush(now, &mut |ch, id| write_close(sys, &mut buf[..], ch, id));
+}
+
 /// Tear down peer links that are `connected` but have received no traffic for
 /// `PEER_LIVENESS_MS` — a half-open / silently-dead connection the transport
 /// never reported closed (no `NMSG_CLOSED`). Closing the conn slot(s) and
@@ -1571,6 +1627,8 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
     if s.net_in < 0 {
         return;
     }
+    // Closes owed from earlier steps go first; they hold nothing else up.
+    flush_closes(s, sys, now);
 
     // A retained chunk goes out FIRST, and no further inbound events
     // are drained until it does: consumers parse a continuous framed
@@ -1583,7 +1641,10 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
     }
 
     // The listener's transport, then the dials' when they have their own.
-    for chan in [s.net_in, s.dial_in] {
+    // Every stash holds one frame, so an event that has to be held stops
+    // the drain of BOTH channels (`break 'drain`): the next one could be
+    // held too, and would overwrite it.
+    'drain: for chan in [s.net_in, s.dial_in] {
         if chan < 0 {
             continue;
         }
@@ -1657,15 +1718,72 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                     if s.forward_peer == 0 || payload_len < net_proto::PEER_LEN {
                         continue;
                     }
+                    // A connection this router dialled, or one a peer
+                    // replica identified on, is a replica link, not a
+                    // client: its peer is no client's.
                     let slot = find_conn(s, conn_id);
-                    if slot >= MAX_CONNS || s.cleartext < 0 {
+                    if slot >= MAX_CONNS
+                        || s.cleartext < 0
+                        || s.conns[slot].outbound
+                        || s.conns[slot].replica_id >= 0
+                    {
                         continue;
                     }
                     let mut rec = [0u8; net_proto::PEER_LEN];
                     rec.copy_from_slice(&s.buf[NET_FRAME_HDR..NET_FRAME_HDR + net_proto::PEER_LEN]);
                     rec[..2].copy_from_slice(&(slot as u16).to_le_bytes());
                     if !deliver_client_frame(s, sys, wire::MSG_CLIENT_PEER, &rec, now) {
-                        break;
+                        break 'drain;
+                    }
+                }
+                NMSG_HORIZON => {
+                    // `[conn_id][bytes_through:u64]`: how much of a client
+                    // connection's output the transport's standby holds,
+                    // under its client id, in order with its frames.
+                    if s.forward_peer == 0 || payload_len < net_proto::HORIZON_LEN {
+                        continue;
+                    }
+                    let slot = find_conn(s, conn_id);
+                    if slot >= MAX_CONNS
+                        || s.cleartext < 0
+                        || s.conns[slot].outbound
+                        || s.conns[slot].replica_id >= 0
+                    {
+                        continue;
+                    }
+                    let mut rec = [0u8; net_proto::HORIZON_LEN];
+                    rec.copy_from_slice(
+                        &s.buf[NET_FRAME_HDR..NET_FRAME_HDR + net_proto::HORIZON_LEN],
+                    );
+                    rec[..2].copy_from_slice(&(slot as u16).to_le_bytes());
+                    if !deliver_client_frame(s, sys, wire::MSG_CLIENT_HORIZON, &rec, now) {
+                        break 'drain;
+                    }
+                }
+                NMSG_RESUMED => {
+                    // `[conn_id][consumer_cursor:u64][in_bytes:u64]
+                    // [out_bytes:u64]`: where
+                    // a client connection's predecessor stood when a
+                    // takeover resumed it here, under its client id, ahead
+                    // of its frames.
+                    if s.forward_peer == 0 || payload_len < net_proto::RESUMED_LEN {
+                        continue;
+                    }
+                    let slot = find_conn(s, conn_id);
+                    if slot >= MAX_CONNS
+                        || s.cleartext < 0
+                        || s.conns[slot].outbound
+                        || s.conns[slot].replica_id >= 0
+                    {
+                        continue;
+                    }
+                    let mut rec = [0u8; net_proto::RESUMED_LEN];
+                    rec.copy_from_slice(
+                        &s.buf[NET_FRAME_HDR..NET_FRAME_HDR + net_proto::RESUMED_LEN],
+                    );
+                    rec[..2].copy_from_slice(&(slot as u16).to_le_bytes());
+                    if !deliver_client_frame(s, sys, wire::MSG_CLIENT_RESUMED, &rec, now) {
+                        break 'drain;
                     }
                 }
                 NMSG_CONNOK => {
@@ -1729,7 +1847,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                         // destination: stop draining so the stream stays
                         // continuous (same rule as the stash below).
                         if handle_identity(s, sys, slot, &local[..cl], now) {
-                            break;
+                            break 'drain;
                         }
                     } else {
                         // Peer traffic: a byte stream of 5-byte partitioned
@@ -1747,7 +1865,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                                 // retained at a record boundary, and no further
                                 // event is drained until it goes — order on
                                 // this link is what the consumers parse by.
-                                break;
+                                break 'drain;
                             }
                         } else {
                             // Client traffic → gateway. Frame each record as
@@ -1777,7 +1895,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                                     &tagged[..2 + cl],
                                     now,
                                 ) {
-                                    break;
+                                    break 'drain;
                                 }
                             }
                         }
@@ -1820,6 +1938,14 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                                     &(slot as u16).to_le_bytes(),
                                     now,
                                 );
+                            // The transport keeps a closed connection's
+                            // id (and a FIN'd socket) until its consumer
+                            // answers with CMD_CLOSE: a client's or a
+                            // peer link's alike, so dropped clients never
+                            // run the node out of connections and a peer's
+                            // redial is not held behind the sweep.
+                            let close_chan = out_for(s, slot);
+                            answer_close(s, sys, close_chan, conn_id, now);
                             clear_slot(s, slot);
                             // Only mark the peer disconnected if NO other
                             // identified link to it survives. `handle_identity`'s
@@ -2303,6 +2429,11 @@ impl inbound_gate::Sink for PeerSink<'_> {
                     == record.len() as i32
         }
     }
+
+    fn full(&mut self, dest: usize) -> bool {
+        // SAFETY: as `write`.
+        unsafe { !wire_channels::writable(self.sys, self.chan(dest)) }
+    }
 }
 
 // ── Outbound routing ────────────────────────────────────────
@@ -2607,6 +2738,35 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
             }
             continue;
         }
+        // `[conn_id][consumer_cursor:u64][in_bytes:u64]`: the client's
+        // deliveries through `in_bytes` are consumed. Relayed in order
+        // with its responses through the same stash, so the transport
+        // never counts a delivery consumed ahead of the response written
+        // for it.
+        if msg_type == wire::MSG_CLIENT_DELIVERED {
+            let n = net_proto::DELIVERED_LEN;
+            if len != n {
+                continue;
+            }
+            let slot = u16::from_le_bytes([s.buf[0], s.buf[1]]) as usize;
+            if s.forward_peer == 0
+                || slot >= MAX_CONNS
+                || !s.conns[slot].active
+                || s.conns[slot].outbound
+                || s.conns[slot].replica_id >= 0
+            {
+                continue;
+            }
+            let conn_id = s.conns[slot].conn_id;
+            s.resp_stash[..2].copy_from_slice(&conn_id.to_le_bytes());
+            s.resp_stash[2..n].copy_from_slice(&s.buf[2..n]);
+            s.resp_stash_len = n as u16;
+            s.resp_stash_cmd = NCMD_DELIVERED;
+            if !flush_resp_stash(s, sys) {
+                break;
+            }
+            continue;
+        }
         if len < 3 {
             continue;
         }
@@ -2649,6 +2809,7 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         s.resp_stash[..2].copy_from_slice(&conn_id.to_le_bytes());
         s.resp_stash[2..payload_len].copy_from_slice(&s.buf[2..len]);
         s.resp_stash_len = payload_len as u16;
+        s.resp_stash_cmd = NCMD_SEND;
         if !flush_resp_stash(s, sys) {
             // net_out refused the atomic write after all; the ack is
             // retained for next step instead of vanishing.
@@ -2657,7 +2818,7 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
     }
 }
 
-/// Try to send the retained client-response CMD_SEND payload. Returns
+/// Try to send the retained client-response command payload. Returns
 /// true when the stash is empty afterwards (nothing retained, or the
 /// send just succeeded).
 ///
@@ -2674,7 +2835,7 @@ unsafe fn flush_resp_stash(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     let n = net_write_frame(
         sys,
         s.net_out,
-        NCMD_SEND,
+        s.resp_stash_cmd,
         s.resp_stash.as_ptr(),
         len,
         s.buf.as_mut_ptr(),
@@ -2688,17 +2849,6 @@ unsafe fn flush_resp_stash(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     }
 }
 
-/// Try to deliver the retained inbound peer chunk. Returns true when
-/// the stash is empty afterwards. `process_net_events` refuses to
-/// drain further net events while a chunk is retained, so the
-/// destination channel's framed byte stream keeps both order and
-/// integrity under backpressure.
-///
-/// # Safety
-///
-/// Caller must hold an exclusive `&mut ModuleState` and supply a
-/// `&SyscallTable` whose function pointers reach live kernel routines
-/// per `target/fluxor/fluxor-abi/sdk/abi.rs`.
 /// Write one client frame to `cleartext`, retaining it when the
 /// consumer refuses. `false` means the frame is held: the caller must
 /// stop draining inbound events so nothing overtakes it. Only one
@@ -2782,6 +2932,17 @@ unsafe fn flush_client_stash(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
     false
 }
 
+/// Try to deliver the retained inbound peer chunk. Returns true when
+/// the stash is empty afterwards. `process_net_events` refuses to
+/// drain further net events while a chunk is retained, so the
+/// destination channel's framed byte stream keeps both order and
+/// integrity under backpressure.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut ModuleState` and supply a
+/// `&SyscallTable` whose function pointers reach live kernel routines
+/// per `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn flush_inbound_stash(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     let cl = s.inb_stash_len as usize;
     if cl == 0 {

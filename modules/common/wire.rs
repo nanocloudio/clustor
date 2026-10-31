@@ -840,45 +840,71 @@ pub fn decode_time_entry(buf: &[u8]) -> Option<(u8, u64)> {
     Some((op, r.u64()))
 }
 
-/// `consensus` → `consensus` / `durability` voter-set
-/// update. Sent every time the current or joint voter set changes so
-/// the downstream quorum tracker can adjust. Payload (3 bytes):
-///   `[current_set:u8][joint_set:u8][joint_active:u8][learner_set:u8]`
-/// Each `u8` is a [`super::types::NodeSet`] bitmask. `joint_active = 0`
-/// means single-config; otherwise both sets must be considered for
-/// quorum.
+/// `consensus` → `durability` quorum configuration, on raft's WAL-entry
+/// channel. The durability ledger keeps no configuration of its own: it
+/// tallies fsync acks under exactly the voter sets and site map that
+/// consensus commits under, as this message states them.
 ///
-/// `learner_set` names replicas that receive the log but count toward
-/// no quorum. It is carried here so the replicator knows to keep
-/// shipping AppendEntries to them; every quorum tally derives from
-/// `current_set` / `joint_set` alone and must ignore it.
-pub const MSG_VOTER_SET_UPDATE: u8 = 0x76;
+/// Raft owes one at boot, after loading persisted metadata, and on every
+/// configuration change (a committed config entry or a snapshot's), and
+/// writes no further WAL entry until the one owed is on the channel. The
+/// configuration therefore sits in FIFO order with the entries whose acks
+/// it governs.
+///
+/// Payload ([`QUORUM_CONFIG_LEN`] bytes):
+///   `[current:u8][joint:u8][joint_active:u8][learners:u8][initial:u8]`
+///   `[site_map:u32 LE][min_sites:u8]`
+///
+/// The sets are [`super::types::NodeSet`] bitmasks; `current` is never
+/// empty. `learners` receive the log but count toward no quorum.
+/// `initial` is the group's configuration before any config entry, its
+/// first `initial` replica ids. `site_map` packs `SITE_BITS` per replica
+/// id; `min_sites` is the fewest distinct sites a quorum spans.
+pub const MSG_QUORUM_CONFIG: u8 = 0x76;
 
-/// Payload length of [`MSG_VOTER_SET_UPDATE`].
-pub const VOTER_SET_UPDATE_LEN: usize = 4;
+/// Payload length of [`MSG_QUORUM_CONFIG`].
+pub const QUORUM_CONFIG_LEN: usize = 10;
 
-#[inline]
-pub fn encode_voter_set_update(
-    buf: &mut [u8; VOTER_SET_UPDATE_LEN],
-    current_set: u8,
-    joint_set: u8,
-    joint_active: bool,
-    learner_set: u8,
-) {
-    Writer::new(buf)
-        .u8(current_set)
-        .u8(joint_set)
-        .bool(joint_active)
-        .u8(learner_set);
+/// A group's quorum configuration, as [`MSG_QUORUM_CONFIG`] carries it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct QuorumConfig {
+    pub current: u8,
+    pub joint: u8,
+    pub joint_active: bool,
+    pub learners: u8,
+    pub initial: u8,
+    pub site_map: u32,
+    pub min_sites: u8,
 }
 
-/// Returns `(current, joint, joint_active, learners)`.
 #[inline]
-pub fn decode_voter_set_update(buf: &[u8]) -> Option<(u8, u8, bool, u8)> {
-    if buf.len() < VOTER_SET_UPDATE_LEN {
+pub fn encode_quorum_config(buf: &mut [u8; QUORUM_CONFIG_LEN], c: &QuorumConfig) {
+    Writer::new(buf)
+        .u8(c.current)
+        .u8(c.joint)
+        .bool(c.joint_active)
+        .u8(c.learners)
+        .u8(c.initial)
+        .u32(c.site_map)
+        .u8(c.min_sites);
+}
+
+/// `None` for a short payload or one naming no current voter: no quorum
+/// can be tallied over an empty set.
+#[inline]
+pub fn decode_quorum_config(buf: &[u8]) -> Option<QuorumConfig> {
+    if buf.len() < QUORUM_CONFIG_LEN || buf[0] == 0 {
         return None;
     }
-    Some((buf[0], buf[1], buf[2] != 0, buf[3]))
+    Some(QuorumConfig {
+        current: buf[0],
+        joint: buf[1],
+        joint_active: buf[2] != 0,
+        learners: buf[3],
+        initial: buf[4],
+        site_map: u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]),
+        min_sites: buf[9],
+    })
 }
 
 /// `MSG_CLIENT_REJECT` status codes (status byte, after the conn_id /
@@ -1745,8 +1771,41 @@ pub const MSG_CONN_CLOSED: u8 = 0xEB;
 /// the router's client id. Emitted only under `peer_router`'s
 /// `forward_peer: 1`, for a consumer that names a connection by its
 /// client (Quantum's MQTT anchor, matching a connection the transport
-/// moved to it).
+/// moved to it); never for a link the router dialled or a peer replica
+/// identified on.
 pub const MSG_CLIENT_PEER: u8 = 0xED;
+/// A client connection's mirrored output horizon, on the `cleartext`
+/// chain in order with its frames: `[conn_id:u16 LE][bytes_through:u64
+/// LE]` — the transport's `MSG_HORIZON` (how many of the bytes written to
+/// the connection its standby holds), relabelled with the router's client
+/// id. Emitted only under `peer_router`'s `forward_peer: 1`; never for a
+/// replica link.
+pub const MSG_CLIENT_HORIZON: u8 = 0xEE;
+/// A client connection's deliveries are consumed, on the `client_resp`
+/// lane in order with its responses: `[conn_id:u16 LE][consumer_cursor:
+/// u64 LE][in_bytes:u64 LE]` — relayed unchanged to the transport as its
+/// `CMD_DELIVERED`, under the transport's conn id. `in_bytes` is how many
+/// of the connection's clear bytes, from its start, the consumer has
+/// consumed (it may fall inside a record), so nothing still in flight is
+/// acknowledged with them; the cursor is the consumer's own position
+/// there, opaque to the transport, which mirrors both and hands them to
+/// the consumer that resumes the stream after a takeover
+/// ([`MSG_CLIENT_RESUMED`]). Any other length is
+/// dropped. Honoured only under `peer_router`'s `forward_peer: 1`; never
+/// for a replica link.
+pub const MSG_CLIENT_DELIVERED: u8 = 0xEF;
+/// A client connection resumed here by a transport-continuity takeover,
+/// on the `cleartext` chain after its [`MSG_CLIENT_PEER`] and ahead of
+/// its first [`MSG_CLIENT_FRAME`] or [`MSG_CLIENT_HORIZON`]:
+/// `[conn_id:u16 LE][consumer_cursor:u64 LE][in_bytes:u64 LE][out_bytes:
+/// u64 LE]` — the transport's `MSG_RESUMED`, relabelled with the router's
+/// client id. `consumer_cursor` and `in_bytes` are the last ones the
+/// predecessor's [`MSG_CLIENT_DELIVERED`] carried (both 0 if none), and
+/// redelivery starts at exactly byte `in_bytes`, which this consumer's
+/// own `MSG_CLIENT_DELIVERED`s count on from;
+/// `out_bytes` is in `MSG_CLIENT_HORIZON`'s `bytes_through` numbering. Emitted only under
+/// `peer_router`'s `forward_peer: 1`; never for a replica link.
+pub const MSG_CLIENT_RESUMED: u8 = 0xF0;
 
 /// Ask `peer_router` to CLOSE a client connection. Payload
 /// `[conn_id:u16 LE]`, on the same `client_resp` lane the codecs write
@@ -2384,8 +2443,8 @@ pub const MSG_SR_REPLY: u8 = 0x91;
 // bytes)][token trailer (TR_TOKEN_TRAILER_LEN bytes)]` — the session
 // reply's 38-byte shape, then `[token_present:1][reserved:3][FlowToken]`,
 // carrying the promoted emitter's per-flow emission token after a
-// committed MOVE_FENCED (zero otherwise). A reader of the first 38 bytes
-// alone reads the reply unchanged.
+// committed MOVE_FENCED (zero otherwise). The first 38 bytes are the
+// whole TransportReply, so a reader of the reply alone needs no more.
 pub const MSG_TR_REQUEST: u8 = 0x92;
 pub const MSG_TR_REPLY: u8 = 0x93;
 // `MSG_VB_REQUEST`: `[request_id:u64 LE][vip_registry command body]`
@@ -2439,8 +2498,9 @@ pub const MSG_RS_REPLY: u8 = 0x9F;
 // refuses a request in a namespace the other tier owns, before proposing
 // it, so a session's state never replicates across sites. Reason 1: the
 // namespace is the other tier's; 2: an operation record of a kind the
-// other tier owns.
-// (`directory_scope.rs` holds the rule and the reasons.)
+// other tier owns. A `directory_front` answers its own refusals in the
+// same shape (reason 3: a malformed command). (`directory_scope.rs` holds
+// the tier rule and its reasons.)
 pub const MSG_DIR_OUT_OF_SCOPE: u8 = 0xA0;
 
 // Routing

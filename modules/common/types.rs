@@ -176,13 +176,13 @@ pub fn quorum_index_for_set(progress: &[Index; MAX_NODES], voters: NodeSet) -> I
 // A group whose voters span sites (failure domains a whole power, network
 // or building loss takes out together) counts a quorum as a majority of
 // the voter set that ALSO spans at least `min_sites` distinct sites. The
-// majority half is Raft's: any two quorums share a voter, so safety is
-// unchanged; the site half only removes quorums, so an entry is committed,
+// majority half is Raft's: any two quorums share a voter, so Raft's safety
+// holds; the site half only removes quorums, so an entry is committed,
 // a leader elected and a ReadIndex confirmed only with copies in
 // `min_sites` sites — a committed entry survives the loss of any
 // `min_sites - 1` sites whole. `SiteMap::flat()` (every replica in site 0,
 // `min_sites` 1) is plain majority, so a graph that declares no sites is
-// the group it always was. docs/architecture/multi_site.md is the design.
+// Raft's group exactly. docs/architecture/multi_site.md is the design.
 
 /// Bits of `SiteMap::sites` per replica: up to 16 sites.
 pub const SITE_BITS: u32 = 4;
@@ -255,6 +255,13 @@ impl SiteMap {
     pub fn quorum(self, votes: NodeSet, voters: NodeSet) -> bool {
         let inside = NodeSet(votes.0 & voters.0);
         inside.count() > voters.count() / 2 && self.spanned(inside) >= self.min_sites
+    }
+
+    /// Whether a quorum of `voters` can form at all: they span at least
+    /// `min_sites` sites. A voter set that fails this can never commit, so
+    /// no group is built, activated or reconfigured onto one.
+    pub fn can_commit(self, voters: NodeSet) -> bool {
+        self.spanned(voters) >= self.min_sites
     }
 
     /// Whether the group stays live with any one site gone whole: the
@@ -332,21 +339,4 @@ pub fn quorum_index_sited(progress: &[Index; MAX_NODES], voters: NodeSet, map: S
         }
     }
     best
-}
-
-/// `quorum_index_sited` over the first `voter_count` ids (a group that has
-/// seen no voter-set update yet).
-pub fn quorum_index_count_sited(
-    progress: &[Index; MAX_NODES],
-    voter_count: u8,
-    map: SiteMap,
-) -> Index {
-    if map.is_flat() {
-        return quorum_index(progress, voter_count);
-    }
-    let mut voters = NodeSet::empty();
-    for id in 0..(voter_count as usize).min(MAX_NODES) {
-        voters.insert(id as u8);
-    }
-    quorum_index_sited(progress, voters, map)
 }

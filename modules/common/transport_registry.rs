@@ -1350,15 +1350,13 @@ impl<const N: usize> TransportRegistry<N> {
 
     // ── Snapshot (streamed, versioned) ──────────────────────────────
     //
-    //   header [version:u16 = 3][reserved:u16][arena N:u32][admitted:u32]
+    //   header [version:u16 = 1][reserved:u16][arena N:u32][admitted:u32]
     //          [record_count:u32][recovery_epoch:u32][applied:u64]
     //          [last_op: OpMemo::LEN]
     //   record [slot:u32][FlowSlot: TR_SLOT_SNAP_LEN] × record_count, in
-    //          slot order
-    //
-    // Version 3 appended each flow's token fields to its record.
+    //          slot order; each record ends with the flow's token fields
 
-    pub const SNAPSHOT_VERSION: u16 = 3;
+    pub const SNAPSHOT_VERSION: u16 = 1;
 
     pub fn snapshot_len(&self) -> usize {
         TR_SNAP_HDR_LEN + self.live as usize * TR_SNAP_RECORD_LEN

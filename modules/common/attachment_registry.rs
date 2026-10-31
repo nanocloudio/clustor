@@ -1,8 +1,8 @@
 // Attachment registry — the `att/<attachment_id>` namespace of the session
-// directory: the boundaries a private service attachment is admitted under
-// (rfc_lb_vip §11.12, §22), each attachment's committed generation and
-// each service's revocation generation. Wormhole's broker
-// (`wormhole/modules/common/traffic/attachment_core.rs`) admits a
+// directory: the boundaries a private service attachment is admitted under,
+// each attachment's committed generation and each service's revocation
+// generation. Wormhole's broker
+// (`modules/common/traffic/attachment_core.rs` in Wormhole) admits a
 // connection only when the Kagi-verified grant names exactly these two
 // generations (`AttachmentBoundary`), and stops new connections the moment
 // a service's revocation boundary moves past the grant.
@@ -153,8 +153,8 @@ fn u64_at(src: &[u8], o: usize) -> u64 {
 /// Encoded reply: `[op:1][status:1][reserved:2][covered:4]
 /// [attachment_id:16][producer_tenant:16][service_id:16]
 /// [attachment_generation:8][revocation_generation:8]` — Wormhole's
-/// `AttachmentBoundary` in its last 16 bytes. `covered` is, for REVOKE,
-/// the attachments the service's boundary covers.
+/// `AttachmentBoundary` in its last 16 bytes. `covered` is the attachments
+/// the service's boundary covers: what a REVOKE ends, on every reply.
 pub const AT_REPLY_LEN: usize = 8 + AT_ID + AT_SERVICE_KEY + 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,8 +276,11 @@ impl AtOpMemo {
         let _ = self.reply.encode(&mut dst[2 + AT_MAX_CMD..Self::LEN]);
     }
 
-    fn decode(src: &[u8]) -> Option<AtOpMemo> {
-        if src[0] > 1 || src[1] as usize > AT_MAX_CMD || (src[0] == 0) != (src[1] == 0) {
+    /// A memo `record` could have written for a record whose commands are
+    /// `op` (`want` bytes long): absent and all zero, or one such command
+    /// with nothing past it.
+    fn decode(src: &[u8], op: u8, want: usize) -> Option<AtOpMemo> {
+        if src[0] > 1 || src[1] as usize > AT_MAX_CMD {
             return None;
         }
         let mut m = AtOpMemo::empty();
@@ -285,7 +288,11 @@ impl AtOpMemo {
         m.cmd_len = src[1];
         m.cmd.copy_from_slice(&src[2..2 + AT_MAX_CMD]);
         m.reply = AttachmentReply::decode(&src[2 + AT_MAX_CMD..Self::LEN])?;
-        Some(m)
+        if !m.present {
+            return (m == Self::empty()).then_some(m);
+        }
+        let n = m.cmd_len as usize;
+        (n == want && m.cmd[0] == op && m.cmd[n..].iter().all(|&b| b == 0)).then_some(m)
     }
 }
 
@@ -446,11 +453,9 @@ impl<const N: usize, const S: usize> AttachmentRegistry<N, S> {
 
     fn reply_for(&self, op: u8, status: u8, a: usize) -> AttachmentReply {
         let at = &self.attachments[a];
-        let sv = &self.services[at.service as usize];
         let mut r = self.reply_service(op, status, at.service as usize);
         r.attachment_id = at.attachment_id;
         r.attachment_generation = at.generation;
-        r.covered = sv.attachments;
         r
     }
 
@@ -788,12 +793,18 @@ impl<const N: usize, const S: usize> AttachmentRegistry<N, S> {
                 let mut key = [0u8; AT_SERVICE_KEY];
                 key.copy_from_slice(&unit[4..36]);
                 let rev = u64_at(&unit, 36);
-                let Some(last_op) = AtOpMemo::decode(&unit[48..48 + AtOpMemo::LEN]) else {
+                let Some(last_op) =
+                    AtOpMemo::decode(&unit[48..48 + AtOpMemo::LEN], AT_OP_REVOKE, AT_REVOKE_LEN)
+                else {
                     return false;
                 };
+                // A service is made with its first attachment, under a
+                // named tenant and service.
                 if slot >= S
                     || self.sv_used.is_used(slot)
                     || rev == 0
+                    || key[..16] == [0; 16]
+                    || key[16..] == [0; 16]
                     || unit[44..48] != [0; 4]
                     || self.sv_index.find(&key).is_some()
                     || !self.sv_index.insert(&key, slot as u32)
@@ -819,7 +830,9 @@ impl<const N: usize, const S: usize> AttachmentRegistry<N, S> {
                 id.copy_from_slice(&unit[4..20]);
                 let sv = u32_at(&unit, 20) as usize;
                 let generation = u64_at(&unit, 24);
-                let Some(last_op) = AtOpMemo::decode(&unit[32..32 + AtOpMemo::LEN]) else {
+                let Some(last_op) =
+                    AtOpMemo::decode(&unit[32..32 + AtOpMemo::LEN], AT_OP_COMMIT, AT_COMMIT_LEN)
+                else {
                     return false;
                 };
                 if slot >= N
@@ -851,7 +864,14 @@ impl<const N: usize, const S: usize> AttachmentRegistry<N, S> {
     }
 
     pub fn install_finish(&mut self, ins: &mut AtInstaller) -> bool {
-        let complete = !ins.failed && ins.stage == AT_EXPORT_DONE && ins.carry_len == 0;
+        let mut complete = !ins.failed && ins.stage == AT_EXPORT_DONE && ins.carry_len == 0;
+        // Every service a commit made holds at least the attachment that
+        // made it.
+        let mut at = 0;
+        while let Some(i) = self.sv_used.next_used(at) {
+            complete &= self.services[i].attachments > 0;
+            at = i + 1;
+        }
         if !complete {
             ins.failed = true;
             self.clear();

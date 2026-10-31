@@ -1,6 +1,6 @@
 # The Multi-Site Group
 
-Wormhole's traffic fabric (rfc_lb_vip Phase 9, §13.6) puts authority in
+Wormhole's traffic fabric puts authority in
 three tiers — a cell, a region, the world — and asks two things of Clustor
 that a group inside one site cannot give: a group whose committed state
 outlives the loss of a whole site, and a rule for which state may live in
@@ -36,7 +36,7 @@ map onto groups like this:
 | Global | one low-rate multi-site group | spread over sites in several regions | `rg/`: each service's region owner set, its DR generation and regional invalidation; REGION and EVACUATION operation records |
 
 Ordinary connection churn stays in the cell; only rare, site-level
-ownership changes go to the global group, globally ordered (§13.6). A
+ownership changes go to the global group, globally ordered. A
 deployment confined to one region omits the global tier rather than
 emulate it: its directory serves both namespaces (`scope: all`, the
 default).
@@ -53,7 +53,7 @@ The same rule decides everything quorum decides:
 | Decision | Where | Rule |
 |---|---|---|
 | Commit index | `consensus::commit` (`quorum_index_sited`) | the highest index held by a quorum of match indices |
-| Durable index | `durability::ledger` (same function) | the highest index held by a quorum of fsync acks; commit takes the minimum of the two, so both must count the same quorum |
+| Durable index | `durability::ledger` (same function) | the highest index held by a quorum of fsync acks; under the strict and group-fsync durability modes commit takes the minimum of the two, so both must count the same quorum. The ledger holds no map of its own: raft hands it the voter sets and the map (`MSG_QUORUM_CONFIG`) ahead of the entries they govern, and until it has them nothing is durable. The relaxed mode commits on the match quorum alone, and with it an entry is in `min_sites` sites' memory, not yet their disks. |
 | Election, pre-vote and vote | `raft::set_majority` (`SiteMap::quorum`) | the granted ballots form a quorum |
 | ReadIndex confirmation | `raft::set_majority` | the confirming replies form a quorum |
 | Joint consensus | all of the above | a quorum of each configuration, site rule included |
@@ -71,9 +71,9 @@ Why this is safe and what it buys:
   never commit, elect or confirm a read by themselves, even if they are a
   majority — a site cut off from the rest cannot run ahead
   (`a_majority_inside_one_site_commits_nothing`).
-- **Flat is unchanged.** One site (`site_map: 0`) or `min_sites: 1` is the
-  plain majority, bit for bit (`a_flat_map_is_a_plain_majority`): every
-  existing graph is the group it was.
+- **Flat is Raft.** One site (`site_map: 0`) or `min_sites: 1` is the
+  plain majority, bit for bit (`a_flat_map_is_a_plain_majority`), so a
+  graph that declares no sites gets Raft's group exactly.
 
 ## Membership and placement
 
@@ -84,7 +84,7 @@ site:
 |---|---|---|
 | any one site's loss leaves a quorum (5 voters A{0,1} B{2,3} C{4}, `min_sites: 2`) | survives one site | boots |
 | one site's loss leaves no majority, or fewer than `min_sites` sites (A{0,1,2} B{3} C{4}; two sites at `min_sites: 2`) | stops on that loss | boots, logs `[raft] sites: one site's loss stops this group` |
-| the voters span fewer than `min_sites` sites | can never commit | refused at construction |
+| the voters span fewer than `min_sites` sites | can never commit | refused at construction, at a runtime slot activation, and as a voter change |
 
 The middle row is a posture, not a fault: two sites at `min_sites: 2`
 commit every entry in both (a recovery point of zero across the pair) and
@@ -93,13 +93,16 @@ tier should be placed as the first row — at least three sites, no site
 holding enough voters that its loss leaves less than a majority — so a
 site's loss needs no human at all.
 
-Membership changes keep the rule: the joint configuration's two quorums
-are each site-aware, and a change that would leave the new set unable to
-survive a site is the operator's to avoid (the admin gate stays closed for
-voter changes until joint consensus is opened to operators; see
-[lifecycle.md](lifecycle.md)). Sites are named per replica id in the
-graph (`site_map`), the same map in `consensus` and `durability`, so a
-replica's site is configuration, not something a peer can claim.
+Membership changes keep the rule. The joint configuration's two quorums
+are each site-aware, and raft refuses a voter change whose new set spans
+fewer than `min_sites` sites: the joint configuration would commit under
+the old set, after which nothing — not even a corrective change — could
+commit under the new one. A change that leaves the new set unable to
+survive a site's loss is accepted, as the same placement is at boot; that
+posture is the operator's to choose (see [lifecycle.md](lifecycle.md) for
+the change itself). Sites are named per replica id in the graph
+(`site_map`), so a replica's site is configuration, not something a peer
+can claim.
 
 ## What a site loss does
 
@@ -116,18 +119,18 @@ Take the global tier as five voters over three sites, A{0,1} B{2,3} C{4},
   generation; the lost region's tokens stop verifying.
 - **C is lost too.** B's two voters are neither a majority of five nor two
   sites. Nothing more commits: no new DR generation, no new owner set, no
-  INVALIDATE. The current owners and their route generations continue
-  (rfc_lb_vip §16: "Clustor quorum lost — existing owners continue; no new
-  committed epoch, emitter or VIP takeover"). Loss of global quorum never
-  lets two regions invent conflicting generations, because neither half
-  can commit at all.
+  INVALIDATE. The current owners and their route generations continue:
+  with the quorum lost there is no new committed epoch, emitter or VIP
+  takeover, and nothing that was committed is taken back. Loss of global
+  quorum never lets two regions invent conflicting generations, because
+  neither half can commit at all.
 - **A returns.** Its replicas rejoin as followers, catch up by log or
   snapshot, and count toward quorum again; no reconfiguration is needed.
 
 A cell group inside the lost site is simply gone with it: its sessions
 and flows are the lost region's, and their fate is the declared
-per-protocol outcome (reconnect, resume, or continuity only where transport
-state was mirrored across sites — rfc_lb_vip §16's whole-site row).
+per-protocol outcome: reconnect, resume, or continuity only where
+transport state was mirrored across sites.
 
 ## Partitions, time and leases
 
@@ -162,7 +165,7 @@ namespace the other tier owns (`directory_scope::scope_admits`), answering
 | `scope` | Admits | Refuses |
 |---|---|---|
 | `all` (0, default) | everything — one region, no global tier | nothing |
-| `cell` (1) | `session/`, `transport/`, `vip/`, `fo/`, `att/`, `rs/`, `op/` | `rg/` (reason 1) |
+| `cell` (1) | `session/`, `transport/`, `vip/`, `fo/`, `att/`, `rs/`; `op/` TAKEOVER and EVACUATION records | `rg/` (reason 1); `op/` REGION (reason 2) |
 | `global` (2) | `rg/`; `op/` REGION and EVACUATION records, and REPLAY of those | every other namespace (reason 1); `op/` TAKEOVER (reason 2) |
 
 A session's binding, a flow's emitter and mirror horizon, a VIP's owner
@@ -190,8 +193,8 @@ namespace) is the global tier's state machine. Under a multi-site group:
   cell's or region's evacuation) live beside it, so the operation and the
   ownership it moves are ordered in one log.
 
-The cell's directory keeps `vip/`, `transport/` and `session/` exactly as
-before, under its own (single-site or zone-spread) group.
+The cell's directory keeps `vip/`, `transport/` and `session/` under its
+own (single-site or zone-spread) group.
 
 ## Configuration
 
@@ -199,7 +202,6 @@ before, under its own (single-site or zone-spread) group.
 |---|---|---|
 | `consensus` | `site_map` (u32) | each replica id's site, four bits per id, id 0 lowest (A{0,1} B{2,3} C{4} is `0x21100`) |
 | `consensus` | `min_sites` (u8, default 1) | the fewest distinct sites a quorum spans |
-| `durability` | `site_map`, `min_sites` | the same pair: the durable tally must count the same quorum |
 | `session_directory` | `scope` (`all` / `cell` / `global`) | which tier this directory serves |
 | `session_directory` | `smoke: 3` | the site-loss smoke: the leader commits a regional INVALIDATE one readiness higher every 300 ms; every replica logs `[sess_dir] site smoke applied readiness=N` |
 
@@ -215,6 +217,11 @@ two-site, RPO-zero posture.
   same quorum; two quorums always share a voter; placement checks; every
   placement `check` accepts keeps a quorum after any one loss (exhaustive
   over five voters and three sites).
+- `tests/raft_fault_matrix.rs` — with a site's only replica appending
+  every entry but fsyncing none, nothing commits under the two-site map
+  though one site's majority has fsynced it all, and it all commits once
+  that site fsyncs; a ledger offered a configuration for another initial
+  voter set adopts none and nothing commits.
 - `tests/directory_scope.rs` — the cell / global split of requests.
 - `tests/site_loss_e2e.rs` — five real replicas over three sites commit
   through the loss of a whole site (the leader's or not) and stop at the

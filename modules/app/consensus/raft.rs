@@ -363,10 +363,18 @@ pub struct Raft {
     /// drops the reply — the client retry path re-covers it.
     pub probe_reply_out: [(u64, u64, u8); PROBE_QUEUE_SLOTS],
     pub probe_reply_count: u8,
-    /// E10: voter-set update → commit + replicator (was
-    /// `out_voter_set`). `(current, joint, joint_active)` bitmasks,
-    /// delivered in the same step the config change applies.
+    /// E10: voter-set update → commit + replicator.
+    /// `(current, joint, joint_active, learners)` bitmasks, delivered in
+    /// the same step the configuration changes.
     pub voter_out: Option<(u8, u8, u8, u8)>,
+    /// A `MSG_QUORUM_CONFIG` owed to durability on `out_log`. Delivered
+    /// ahead of the next WAL entry: no entry write proceeds while one is
+    /// owed (see `deliver_quorum_config`).
+    quorum_owed: bool,
+    /// The group's configuration before any config entry: its first
+    /// `initial_voters` ids. Fixed at `arm`, unlike `voter_count`, which
+    /// follows the current set.
+    initial_voters: u8,
 
     // ── Partition slot (multi-Raft) ─────────────────────────
     // 0 for single-partition graphs. Drives META path and is exposed
@@ -912,6 +920,8 @@ pub fn init(s: &mut Raft) {
     s.probe_reply_out = [(0u64, 0u64, 0u8); PROBE_QUEUE_SLOTS];
     s.probe_reply_count = 0;
     s.voter_out = None;
+    s.quorum_owed = false;
+    s.initial_voters = 1;
 
     s.partition_id = 0;
     s.current_term = 0;
@@ -1121,6 +1131,7 @@ pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
     for i in 0..s.voter_count {
         s.current_voters.insert(i);
     }
+    s.initial_voters = s.voter_count;
     // A replica outside the initial voter set is joining: it boots as a
     // learner — it neither campaigns nor votes — until the group's
     // configuration, from its log or a snapshot, says what it is.
@@ -1128,8 +1139,10 @@ pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
         s.learner_mode = true;
         dev_log(sys, 3, b"[raft] joining as learner".as_ptr(), 25);
     }
-    // Broadcast initial voter set once everything is wired.
-    // The emission itself happens in the first step() call.
+    // Publish the seeded configuration: commit and the replicator take
+    // it in the first step, durability ahead of the first WAL entry. A
+    // persisted configuration, once loaded, is published over it.
+    publish_configuration(s, sys);
 
     // Hold proposal intake from boot whenever the recovery edge is wired,
     // so raft never appends before the WAL hands over its authoritative
@@ -1277,6 +1290,10 @@ pub unsafe fn step(
             return;
         }
     }
+
+    // 0b. An owed quorum configuration goes out now, not only ahead of
+    //     the next entry: durability proves nothing until it has one.
+    deliver_quorum_config(s, sys);
 
     // 0. Recovery seeding: fast-forward apply to the recovery BASE so it
     //    resumes applying post-recovery commits instead of gapping from
@@ -2642,12 +2659,12 @@ unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
         }
         _ => return,
     }
-    // Push new voter_count to local quorum logic plus downstream
-    // (commit + replicator via the voter-set latch) so AE-quorum
-    // tracking uses the right denominator.
+    // Publish the new configuration: commit and the replicator take it
+    // through the voter-set latch, durability's ledger as the quorum
+    // configuration ahead of the next WAL entry.
     s.voter_count = s.current_voters.count();
     save_metadata(s, sys);
-    emit_voter_set_update(s, sys);
+    publish_configuration(s, sys);
     dev_log(sys, 3, b"[raft] config applied".as_ptr(), 21);
 }
 
@@ -2671,24 +2688,71 @@ unsafe fn adopt_membership(s: &mut Raft, sys: &SyscallTable, m: wire::Membership
     let voter = s.current_voters.contains(s.self_id)
         || (s.joint_active && s.joint_voters.contains(s.self_id));
     s.learner_mode = !voter;
-    emit_voter_set_update(s, sys);
+    publish_configuration(s, sys);
     dev_log(sys, 3, b"[raft] config from snapshot".as_ptr(), 27);
 }
 
-/// E10 seam: latch the voter-set update for same-step delivery to
-/// commit + replicator by the dispatch table — every consumer sees
-/// the update on the same tick.
+/// Publish the configuration: latch the E10 voter-set update for
+/// same-step delivery to commit + replicator by the dispatch table, and
+/// owe durability its `MSG_QUORUM_CONFIG`.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Raft` per the module ABI.
-unsafe fn emit_voter_set_update(s: &mut Raft, _sys: &SyscallTable) {
+unsafe fn publish_configuration(s: &mut Raft, sys: &SyscallTable) {
     s.voter_out = Some((
         s.current_voters.0,
         s.joint_voters.0,
         s.joint_active as u8,
         s.learners.0,
     ));
+    s.quorum_owed = true;
+    deliver_quorum_config(s, sys);
+}
+
+/// Write the owed `MSG_QUORUM_CONFIG` to `out_log`. True when nothing is
+/// owed any more; false while the channel refuses it, in which case the
+/// caller must not write a WAL entry either: durability tallies an
+/// entry's acks under the configuration ahead of it in the stream, so an
+/// entry may never overtake the configuration it follows. A graph with
+/// no WAL edge owes nothing.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn deliver_quorum_config(s: &mut Raft, sys: &SyscallTable) -> bool {
+    if !s.quorum_owed {
+        return true;
+    }
+    if s.out_log < 0 {
+        s.quorum_owed = false;
+        return true;
+    }
+    let mut buf = [0u8; wire::QUORUM_CONFIG_LEN];
+    wire::encode_quorum_config(
+        &mut buf,
+        &wire::QuorumConfig {
+            current: s.current_voters.0,
+            joint: s.joint_voters.0,
+            joint_active: s.joint_active,
+            learners: s.learners.0,
+            initial: s.initial_voters,
+            site_map: s.sites.sites,
+            min_sites: s.sites.min_sites,
+        },
+    );
+    if wire_channels::channel_write_partitioned(
+        sys,
+        s.out_log,
+        s.partition_id,
+        wire::MSG_QUORUM_CONFIG,
+        &buf,
+    ) > 0
+    {
+        s.quorum_owed = false;
+    }
+    !s.quorum_owed
 }
 
 /// # Safety
@@ -2826,6 +2890,13 @@ unsafe fn apply_admin_op(s: &mut Raft, op_code: u8, buf_ptr: *const u8, plen: us
                     return wire::ADMIN_STATUS_REJECTED;
                 }
                 next.remove(target);
+            }
+            // Never onto a set that spans fewer sites than the map asks a
+            // quorum to: the joint configuration would commit under the
+            // old set, and then nothing could ever commit under the new
+            // one — not even a change to correct it.
+            if !s.sites.can_commit(next) {
+                return wire::ADMIN_STATUS_REJECTED;
             }
             s.pending_joint_voters = next;
             s.pending_joint_set = true;
@@ -3467,13 +3538,17 @@ unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now
         // and diverge). Respond with failure so the leader retries this AE
         // once our WAL drains; normal Raft log-repair, driven by local
         // durability backpressure instead of a log mismatch.
-        let written = wire_channels::channel_write_partitioned(
-            sys,
-            s.out_log,
-            s.partition_id,
-            wire::MSG_WAL_ENTRY,
-            &wal_buf[..16 + copy_len],
-        );
+        let written = if deliver_quorum_config(s, sys) {
+            wire_channels::channel_write_partitioned(
+                sys,
+                s.out_log,
+                s.partition_id,
+                wire::MSG_WAL_ENTRY,
+                &wal_buf[..16 + copy_len],
+            )
+        } else {
+            0
+        };
         if written <= 0 {
             s.flushes_deferred = s.flushes_deferred.saturating_add(1);
             // Local WAL backpressure, NOT a log mismatch: signal `busy` so the
@@ -4650,13 +4725,17 @@ unsafe fn append_noop(s: &mut Raft, sys: &SyscallTable) {
 
     let mut wal_buf = [0u8; 16];
     wire::encode_term_index(&mut wal_buf, s.current_term, new_index);
-    let written = wire_channels::channel_write_partitioned(
-        sys,
-        s.out_log,
-        s.partition_id,
-        wire::MSG_WAL_ENTRY,
-        &wal_buf,
-    );
+    let written = if deliver_quorum_config(s, sys) {
+        wire_channels::channel_write_partitioned(
+            sys,
+            s.out_log,
+            s.partition_id,
+            wire::MSG_WAL_ENTRY,
+            &wal_buf,
+        )
+    } else {
+        0
+    };
     if written <= 0 {
         return; // WAL busy — `noop_pending` stays set, retry next tick
     }
@@ -4730,13 +4809,17 @@ unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
     wire::encode_term_index(&mut wal_buf, s.current_term, new_index);
     wal_buf[16..16 + batch_len].copy_from_slice(&s.proposal_batch[..batch_len]);
 
-    let written = wire_channels::channel_write_partitioned(
-        sys,
-        s.out_log,
-        s.partition_id,
-        wire::MSG_WAL_ENTRY,
-        &wal_buf[..16 + batch_len],
-    );
+    let written = if deliver_quorum_config(s, sys) {
+        wire_channels::channel_write_partitioned(
+            sys,
+            s.out_log,
+            s.partition_id,
+            wire::MSG_WAL_ENTRY,
+            &wal_buf[..16 + batch_len],
+        )
+    } else {
+        0
+    };
     if written <= 0 {
         if !s.flush_deferred {
             s.flush_deferred = true;
@@ -5240,8 +5323,10 @@ unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
             s.current_voters = NodeSet(rec.current_voters);
             s.joint_voters = NodeSet(rec.joint_voters);
             s.joint_active = rec.joint_active;
+            s.voter_count = s.current_voters.count();
             s.learner_mode = !(s.current_voters.contains(s.self_id)
                 || (s.joint_active && s.joint_voters.contains(s.self_id)));
+            publish_configuration(s, sys);
         }
     }
     false // resolved (loaded or empty) — no retry needed

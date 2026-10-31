@@ -1,7 +1,7 @@
 // Region registry — the `rg/<service>` namespace of the session directory:
-// the global tier of rfc_lb_vip §13.6, where a low-rate global group
-// commits each service's region owner set, its disaster-recovery
-// generation and regional invalidation.
+// the global tier, where a low-rate global group commits each service's
+// region owner set, its disaster-recovery generation and regional
+// invalidation (docs/architecture/multi_site.md).
 //
 // Pure no_std, zero-alloc, DETERMINISTIC: `RegionRegistry::apply` is a pure
 // function of (state, committed command body, digest fn); every replica
@@ -27,19 +27,23 @@
 //
 // - **the DR generation.** Each binding counts its committed owner-set
 //   changes: an ACTIVATE that commits a region, a RELEASE that removes one
-//   or ends the set, a RECOVERY_MARK that voids it, an INVALIDATE that
-//   voids one of its regions. A retry changes nothing and counts nothing.
-//   The count is replicated state, so a restarted controller, or the
-//   other region's, reads the generation the group committed rather than
-//   re-counting, and every reply carries it (`RgReply::dr_generation`).
+//   or ends the set, a RECOVERY_MARK that voids it (only a binding the mark
+//   actually voids), an ABORT that leaves a recovered claim's record void,
+//   an INVALIDATE that voids one of its regions' owners (only owners not
+//   already void under an earlier INVALIDATE). A retry changes nothing and
+//   counts nothing. The count is replicated state, so a restarted
+//   controller, or the other region's, reads the generation the group
+//   committed rather than re-counting; every reply carries the binding's
+//   current one (`RgReply::dr_generation`), a retry's included. It
+//   saturates at `u64::MAX`.
 // - **regional invalidation.** INVALIDATE `[op_id:16][region:16]
 //   [readiness:8]` records that `region`'s authority ends at readiness
 //   generation `readiness`, across every binding of the group: an owner
-//   of that region admitted at or below it no longer verifies a token or
-//   reissues one, an ACTIVATE that would commit it is refused, and a claim
+//   of that region admitted at or below it does not verify a token or
+//   reissue one, an ACTIVATE that would commit it is refused, and a claim
 //   naming it at or below it is refused — the region comes back only
 //   through a claim under a newer readiness generation (a fresh boot and
-//   readiness, §14.5). Per region the readiness only advances. The owner
+//   readiness). Per region the readiness only advances. The owner
 //   stays in the set until a RELEASE or a replacing claim removes it under
 //   the VIP rules (a confirmed regional fence), so invalidation never
 //   stands in for a fence; it is the committed, group-wide statement that
@@ -230,6 +234,8 @@ impl RgOpMemo {
             .encode(&mut dst[1 + RG_INVALIDATE_LEN..Self::LEN]);
     }
 
+    /// A memo the registry could have written: absent and all zero, or
+    /// an INVALIDATE naming a region and a readiness.
     fn decode(src: &[u8]) -> Option<RgOpMemo> {
         if src[0] > 1 {
             return None;
@@ -238,7 +244,11 @@ impl RgOpMemo {
         m.present = src[0] != 0;
         m.cmd.copy_from_slice(&src[1..1 + RG_INVALIDATE_LEN]);
         m.reply = RgReply::decode(&src[1 + RG_INVALIDATE_LEN..Self::LEN])?;
-        Some(m)
+        if !m.present {
+            return (m == Self::empty()).then_some(m);
+        }
+        let named = m.cmd[17..33] != [0; 16] && m.cmd[33..41] != [0; 8];
+        (m.cmd[0] == RG_OP_INVALIDATE && named).then_some(m)
     }
 }
 
@@ -254,6 +264,9 @@ pub struct RegionRegistry<const N: usize, const O: usize> {
     pub invalidation_count: u32,
     pub applied: u64,
     pub last_op: RgOpMemo,
+    /// Transient, within one RECOVERY_MARK: the bindings not yet void
+    /// before it. Zero between commands; never serialized.
+    unvoided: [bool; N],
 }
 
 impl<const N: usize, const O: usize> RegionRegistry<N, O> {
@@ -267,6 +280,7 @@ impl<const N: usize, const O: usize> RegionRegistry<N, O> {
             invalidation_count: 0,
             applied: 0,
             last_op: RgOpMemo::empty(),
+            unvoided: [false; N],
         };
         if *seed != [0; VB_SEED] {
             r.vip.seed = Self::derive_seed(seed, digest);
@@ -283,6 +297,7 @@ impl<const N: usize, const O: usize> RegionRegistry<N, O> {
         self.invalidation_count = 0;
         self.applied = 0;
         self.last_op = RgOpMemo::empty();
+        self.unvoided = [false; N];
     }
 
     /// Empty an initialised registry, keeping what it admits.
@@ -293,6 +308,7 @@ impl<const N: usize, const O: usize> RegionRegistry<N, O> {
         self.invalidation_count = 0;
         self.applied = 0;
         self.last_op = RgOpMemo::empty();
+        self.unvoided = [false; N];
     }
 
     fn derive_seed(seed: &[u8; VB_SEED], digest: DigestFn) -> [u8; VB_SEED] {
@@ -417,14 +433,22 @@ impl<const N: usize, const O: usize> RegionRegistry<N, O> {
                 return r;
             }
             VB_OP_RECOVERY_MARK => {
-                let before = self.vip.unsafe_recovery_generation;
+                // Only a binding the mark voids has had its owner set
+                // changed: one already void, or a claim in flight (voided
+                // by its ABORT, if it comes), is not counted here.
+                let mut at = 0;
+                while let Some(i) = self.vip.next_binding(at) {
+                    self.unvoided[i] = !self.vip.slots[i].voided;
+                    at = i + 1;
+                }
                 let r = self.vip.apply(body, digest);
-                if self.vip.unsafe_recovery_generation != before {
-                    let mut at = 0;
-                    while let Some(i) = self.vip.next_binding(at) {
-                        self.dr_generation[i] += 1;
-                        at = i + 1;
+                let mut at = 0;
+                while let Some(i) = self.vip.next_binding(at) {
+                    if self.unvoided[i] && self.vip.slots[i].voided {
+                        self.dr_generation[i] = self.dr_generation[i].saturating_add(1);
                     }
+                    self.unvoided[i] = false;
+                    at = i + 1;
                 }
                 return self.wrap(r);
             }
@@ -456,7 +480,7 @@ impl<const N: usize, const O: usize> RegionRegistry<N, O> {
                 None => self.vip.slots[i].owner_count != 0,
             };
             if changed && r.status == VB_ST_OK {
-                self.dr_generation[i] += 1;
+                self.dr_generation[i] = self.dr_generation[i].saturating_add(1);
             }
         }
         if op == VB_OP_TOKEN_REISSUE
@@ -539,6 +563,9 @@ impl<const N: usize, const O: usize> RegionRegistry<N, O> {
     fn invalidate(&mut self, region: [u8; VB_HOST_ID], readiness: u64, mut r: RgReply) -> RgReply {
         let n = self.invalidation_count as usize;
         let at = (0..n).find(|&i| self.invalidations[i].region == region);
+        // Owners admitted at or below the earlier readiness were void
+        // already: only the ones this raise reaches change their set.
+        let earlier = at.map_or(0, |i| self.invalidations[i].readiness);
         match at {
             Some(i) if readiness <= self.invalidations[i].readiness => {
                 r.vip.status = VB_ST_RECOVERY_STALE;
@@ -556,15 +583,17 @@ impl<const N: usize, const O: usize> RegionRegistry<N, O> {
             }
         }
         // Every binding the region holds authority in under a readiness
-        // now void has had its owner set changed.
+        // this raise voids has had its owner set changed.
         let mut touched = 0u64;
         let mut i = 0;
         while let Some(b) = self.vip.next_binding(i) {
             let s = &self.vip.slots[b];
-            let holds = (0..s.owner_count as usize)
-                .any(|k| s.owners[k] == region && boot_readiness(&s.owner_boot[k]) <= readiness);
+            let holds = (0..s.owner_count as usize).any(|k| {
+                let at = boot_readiness(&s.owner_boot[k]);
+                s.owners[k] == region && at > earlier && at <= readiness
+            });
             if holds {
-                self.dr_generation[b] += 1;
+                self.dr_generation[b] = self.dr_generation[b].saturating_add(1);
                 touched += 1;
             }
             i = b + 1;

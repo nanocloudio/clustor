@@ -19,9 +19,9 @@
 //! registry answers it from the grant or record it made), passes an
 //! operation REPLAY's streamed records through as they come and completes
 //! it on its end, and refuses — before the directory sees it — a request
-//! outside its namespace (or, for `op/`, of another kind than its own).
-//! It never answers from state of its own and holds no record past its
-//! reply.
+//! outside its namespace (or, for `op/`, of another kind than its own),
+//! answering the refusal at once (`refusal_answer`). It never answers a
+//! command from state of its own and holds no record past its reply.
 //!
 //! Pure, `no_std`, allocation-free.
 
@@ -56,6 +56,34 @@ pub const FRONT_PENDING: usize = 8;
 const OP_OP_CAS: u8 = 1;
 const OP_OP_REPLAY: u8 = 2;
 const OP_ST_REPLAY: u8 = 2;
+
+/// A refused request's answer to its consumer, in the directory's own
+/// out-of-scope shape: `MSG_DIR_OUT_OF_SCOPE` `[consumer id:u64]
+/// [request msg][reason]`, the reason one of `FRONT_REFUSED_*`.
+pub const FRONT_REFUSED_NAMESPACE: u8 = 1;
+pub const FRONT_REFUSED_KIND: u8 = 2;
+pub const FRONT_REFUSED_MALFORMED: u8 = 3;
+pub const FRONT_REFUSAL_LEN: usize = 8 + 2;
+
+/// The answer to a request refused for `why`; `None` for a request that is
+/// only waiting (`Busy`).
+pub fn refusal_answer(
+    consumer_id: u64,
+    msg: u8,
+    why: FrontRefusal,
+) -> Option<[u8; FRONT_REFUSAL_LEN]> {
+    let reason = match why {
+        FrontRefusal::Namespace => FRONT_REFUSED_NAMESPACE,
+        FrontRefusal::Kind => FRONT_REFUSED_KIND,
+        FrontRefusal::Malformed => FRONT_REFUSED_MALFORMED,
+        FrontRefusal::Busy => return None,
+    };
+    let mut a = [0u8; FRONT_REFUSAL_LEN];
+    a[..8].copy_from_slice(&consumer_id.to_le_bytes());
+    a[8] = msg;
+    a[9] = reason;
+    Some(a)
+}
 
 /// Why a consumer's request was refused here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

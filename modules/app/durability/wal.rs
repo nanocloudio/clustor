@@ -484,11 +484,12 @@ impl RetentionFloorSlot {
 pub struct Wal {
     // Channels (composite indices per `mod.rs::module_new`)
     pub in_entries: i32, // in[0]: WalEntry from consensus
-    /// Voter-set update lifted off the entry stream for the dispatch
+    /// Quorum configuration lifted off the entry stream for the dispatch
     /// table to hand to `ledger` (components never call each other —
-    /// see the module header). Mirrors raft's `voter_out` latch.
-    /// Latest-wins: only the newest configuration matters.
-    pub voter_out: Option<(u8, u8, bool, u8)>,
+    /// see the module header). The step that lifts one reads no entry
+    /// after it, so the dispatch table delivers it before any ack of a
+    /// later entry is tallied.
+    pub quorum_out: Option<wire::QuorumConfig>,
     /// Per-slot inboxes. The module reads each shared channel once and
     /// routes by the partitioned envelope's id; this slot drains only
     /// its own. Without this a slot's destructive read would consume —
@@ -1120,7 +1121,7 @@ unsafe fn write_part(s: &Wal, sys: &SyscallTable, chan: i32, msg_type: u8, paylo
 }
 
 pub unsafe fn init(s: &mut Wal) {
-    s.voter_out = None;
+    s.quorum_out = None;
     s.inbox_entries = super::inbox::Inbox::new();
     s.inbox_entry_req = super::inbox::Inbox::new();
     s.inbox_cold_read = super::inbox::Inbox::new();
@@ -5764,14 +5765,14 @@ unsafe fn process_entries(s: &mut Wal, sys: &SyscallTable) {
         let Some((msg_type, plen)) = s.inbox_entries.next(sys, &mut s.msg_buf) else {
             return;
         };
-        // The entry stream is multiplexed: raft also publishes voter-set
-        // updates here so the ledger's union-quorum tally sees a
-        // configuration change in FIFO order with the entries whose
-        // acks it governs. Lift it to the latch and yield the step —
-        // the next step reads the following entry.
-        if msg_type == wire::MSG_VOTER_SET_UPDATE {
-            if let Some(v) = wire::decode_voter_set_update(&s.msg_buf[..plen as usize]) {
-                s.voter_out = Some((v.0, v.1, v.2, v.3));
+        // The entry stream is multiplexed: raft also publishes its quorum
+        // configuration here, so the ledger tallies each entry's acks
+        // under the configuration ahead of it in the stream. Lift it to
+        // the latch and yield the step — the next step reads the
+        // following entry.
+        if msg_type == wire::MSG_QUORUM_CONFIG {
+            if let Some(c) = wire::decode_quorum_config(&s.msg_buf[..plen as usize]) {
+                s.quorum_out = Some(c);
             }
             return;
         }

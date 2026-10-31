@@ -58,8 +58,6 @@ modules:
       self_id: __SELF_ID__
       voter_count: 3
       partition_id: 0
-      site_map: 256
-      min_sites: 2
   - name: control_plane
   - name: admission
   - name: operations

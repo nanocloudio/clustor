@@ -11,9 +11,13 @@
 # / `MSG_RG_REQUEST` / `MSG_OP_REQUEST` / `MSG_AT_REQUEST` /
 # `MSG_RS_REQUEST` (`[request_id u64][command body]`), and `replies`
 # answers each one only once its entry is committed and applied — the
-# directory's "quorum-durable before emit" boundary, unchanged by being
-# included. A continuity coordinator's `MOVE_FENCED` comes back with its
-# `FlowToken` trailer exactly as it does in Clustor's own graphs.
+# directory's "quorum-durable before emit" boundary, which holds as well
+# included as in Clustor's own graphs. `checks` takes a continuity or
+# address provider's token checks, whose verdicts come back on `replies`
+# once a barrier entry proposed behind the check has applied, so a
+# verdict reflects every command committed before the check. A continuity coordinator's
+# `MOVE_FENCED` comes back with its `FlowToken` trailer as it does in
+# Clustor's own graphs.
 #
 # The group is one voter: `peer_router` listens on `listen_port` and names
 # itself as its only peer, so the includer wires the platform's socket
@@ -59,6 +63,7 @@ params:
 exports:
   requests: session_directory.requests
   replies: session_directory.replies
+  checks: session_directory.checks
   net_in: peer_router.net_in
   net_out: peer_router.net_out
 
