@@ -295,13 +295,32 @@ The leader snapshots its commit index, then broadcasts
 both sets while a joint configuration is active — confirms, raft
 replies to apply with the snapshotted commit index as the read's
 linearization point. This confirms leadership at submission time, so a
-partitioned former leader cannot serve a stale answer. A probe that
-fails to reach majority within 1500 ms, or that lands on a non-leader,
-is answered unconfirmed and the read is rejected with
-`CLIENT_REJECT_FALLBACK`. On a single-node cluster the leader is its
-own majority and confirms immediately. If the probe queue is full the
-read degrades to the legacy gate: the commit horizon captured at
-submission time.
+partitioned former leader cannot serve a stale answer. A leader starts
+no round until its current-term no-op has committed: before that its
+commit index can trail entries the previous leader acknowledged, so the
+read waits (inside its deadline) rather than answering below them. A
+probe that fails to reach majority within 1500 ms, or whose leader
+steps down or changes term first, is answered unconfirmed and the read
+is rejected with `CLIENT_REJECT_FALLBACK`. On a single-node cluster the
+leader is its own majority and confirms immediately. If the probe queue
+is full the read degrades to the legacy gate: the commit horizon
+captured at submission time.
+
+**Follower ReadIndex.** A follower that knows the leader of its term
+serves linearizable reads too. Raft forwards the read to the leader as
+`MSG_READ_INDEX_REQ` `[read_id][term][origin]`; the leader runs the
+same confirm round and answers `MSG_READ_INDEX_RESP`
+`[read_id][term][read_index][granted]` with the commit index it held
+when the request arrived. The follower honours a grant only while it
+is still a follower of that leader in that term, then arms the read at
+`read_index`: apply releases it once this replica has applied through
+it, so the read observes every write acknowledged before it was
+submitted. Everything else is a retryable refusal, never a stale
+answer: a leader that does not lead the asked term refuses at once; an
+answer from a deposed leader, a term or leader change while the read
+is outstanding, a follower with no known leader, and a round that does
+not complete within 1500 ms (a partition) all reject the read with
+`CLIENT_REJECT_FALLBACK`.
 
 **Permits.** The admission module's proof cache classifies
 control-plane proof age into Fresh / Cached / Stale / Expired

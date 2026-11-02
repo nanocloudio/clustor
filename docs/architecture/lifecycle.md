@@ -215,8 +215,13 @@ Two flags modify a node's participation:
   admin-magic envelopes are exempt so the `THAW` that lifts the freeze
   can itself commit.
 
-Followers never serve linearizable reads; the ReadIndex path answers
-only on the leader, and there is no follower-read capability grant.
+Followers serve linearizable reads through follower ReadIndex: the
+read is forwarded to the leader for a read index and released once the
+follower has applied through it (see
+[replication.md](replication.md#read-gate-predicate)). A follower with
+no known leader, or whose leader or term changes while the read is
+outstanding, refuses the read retryably; it never answers from its own
+commit index alone.
 
 ---
 

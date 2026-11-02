@@ -5,10 +5,10 @@
 //
 // - **egress blocks** `egress/<identity>/<protocol>/<block>`: a block of an
 //   egress identity's ports, reserved to one gateway boot incarnation —
-//   the authority behind Wormhole's `egress_core::BlockAuthority`. Per-flow
+//   the authority behind the traffic fabric's `egress_core::BlockAuthority`. Per-flow
 //   tuples stay local to the gateway's shard; only blocks are committed.
 // - **address ranges** `addr/<record_id>`: a service address or routed
-//   prefix reserved to a tenant — the allocation truth behind Wormhole's
+//   prefix reserved to a tenant — the allocation truth behind the traffic fabric's
 //   `address_core` — never overlapping another live or quarantined range.
 //
 // Pure no_std, zero-alloc, DETERMINISTIC: `ReservationRegistry::apply` is a

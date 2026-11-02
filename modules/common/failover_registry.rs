@@ -9,11 +9,11 @@
 // No clocks, no randomness, no I/O. The PIC module wrapper
 // (`modules/app/session_directory/mod.rs`) hosts it beside the session,
 // transport and VIP registries, dispatching on the `"FO"` magic;
-// `clustor-common` mounts it for host tests and for Wormhole, whose store
+// `clustor-common` mounts it for host tests and for the traffic fabric, whose store
 // adapter builds these commands and reads these replies.
 //
-// The record is Wormhole's `FailoverOperation`, the fixed 264-byte `WHFO`
-// frame (`modules/common/traffic/failover_core.rs` in Wormhole), held as
+// The record is the traffic fabric's `FailoverOperation`, the fixed 264-byte
+// `WHFO` frame, held as
 // its bytes. The registry does not interpret what a record asks for —
 // that is the coordinator's — but it owns the rule a record may change by,
 // which is the rule `fo_cas_check` states there:
@@ -28,11 +28,11 @@
 //   (every field fixed at intent unchanged), its phase generation must be
 //   the stored one plus exactly one, and the phase move must be a legal
 //   transition of the record's kind under its fence requirement
-//   (`transition_legal`, the same table as Wormhole's
+//   (`transition_legal`, the same table as the traffic fabric's
 //   `fo_transition_legal`). Anything else is `CONFLICT`, and the reply
 //   carries the stored record so the writer follows it.
 // - **a frame is checked whole.** Magic, version, reserved bytes, enum
-//   ranges, the target as Wormhole's `VipTarget::decode` checks it (a
+//   ranges, the target as the traffic fabric's `VipTarget::decode` checks it (a
 //   known family, reserved bytes zero, a canonical IPv4 prefix, a length
 //   within the family), and the record's own SHA-256 trailer; a malformed
 //   record is `INVALID` and nothing is stored.
@@ -70,7 +70,7 @@ pub const FO_PROFILE_RP2350: usize = 16;
 pub const FO_PROFILE_PI5: usize = 256;
 pub const FO_PROFILE_SERVER: usize = 4096;
 
-// ── Record (Wormhole's `FailoverOperation`, failover_core.rs) ───────
+// ── Record (the traffic fabric's `FailoverOperation`) ───────────────
 
 pub const FO_RECORD_LEN: usize = 264;
 /// Bytes the record's SHA-256 trailer covers.
@@ -89,7 +89,7 @@ const FO_TARGET_LEN: usize = 36;
 const AT_PHASE_GEN: usize = 104;
 const AT_READY: usize = 148;
 
-/// The byte ranges fixed at intent (Wormhole's `same_operation`):
+/// The byte ranges fixed at intent (the traffic fabric's `same_operation`):
 /// operation id, kind, fence; fence provider; actor and target; source
 /// fault domain and expected epoch; recovery generation; deadline and
 /// allowed interfaces; ready; the four host/boot identities and the
@@ -160,7 +160,7 @@ pub const fn phase_claim_window(p: u8) -> bool {
 }
 
 /// The next phase on the forward path of `kind` under `fence` from
-/// `from` (Wormhole's `fo_successor`).
+/// `from` (the traffic fabric's `fo_successor`).
 pub const fn successor(kind: u8, fence: u8, from: u8) -> Option<u8> {
     match kind {
         FO_KIND_RECOVERY_MARK => match from {
@@ -203,7 +203,7 @@ pub const fn successor(kind: u8, fence: u8, from: u8) -> Option<u8> {
     }
 }
 
-/// Whether `from → to` is a legal phase move (Wormhole's
+/// Whether `from → to` is a legal phase move (the traffic fabric's
 /// `fo_transition_legal`): one step forward, or ABORTING from a phase whose
 /// claim can still be aborted, ABORTED from ABORTING or INTENT, FAILED
 /// before the boundary, BLOCKED past it (or from ABORTING).
@@ -258,7 +258,7 @@ pub fn record_valid(rec: &[u8], digest: DigestFn) -> bool {
 }
 
 /// The record's target, `[service_id:16][family:1][prefix_len:1]
-/// [reserved:2][prefix:16]`, checked as Wormhole's `VipTarget::decode`
+/// [reserved:2][prefix:16]`, checked as the traffic fabric's `VipTarget::decode`
 /// checks it: reserved bytes zero, family 4 or 6, an IPv4 prefix
 /// canonical (its first twelve bytes zero), and a length within the
 /// family.
@@ -345,7 +345,7 @@ pub const FO_ST_CAPACITY: u8 = 4;
 /// [record:264]`. `present` says whether `record` is a stored record;
 /// `live` is the count of non-terminal records after the apply (for the
 /// end of a replay, the count streamed). The statuses OK, CONFLICT,
-/// REPLAY and INVALID are Wormhole's `fo_store` values, so the store
+/// REPLAY and INVALID are the traffic fabric's `fo_store` values, so the store
 /// adapter forwards them as they are.
 pub const FO_REPLY_LEN: usize = 8 + FO_RECORD_LEN;
 

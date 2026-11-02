@@ -9,7 +9,7 @@
 // clocks, no randomness, no I/O. The PIC module wrapper
 // (`modules/app/session_directory/mod.rs`) hosts it beside the other
 // registries, dispatching on the `"RG"` magic; `clustor-common` mounts it
-// for host tests and for Wormhole's region controller.
+// for host tests and for a traffic fabric's region controller.
 //
 // **The owner set is a VIP binding of regions.** A service's global
 // binding is exactly the `vip/` state machine (`vip_registry.rs`) — owner
@@ -49,7 +49,7 @@
 //   stands in for a fence; it is the committed, group-wide statement that
 //   a lost or drained region's old authority is void.
 // - **region boot incarnation.** A region owner's `boot_incarnation` is
-//   `[tag:8][readiness_generation:u64 LE]` (Wormhole's `region_boot`): the
+//   `[tag:8][readiness_generation:u64 LE]` (the traffic fabric's `region_boot`): the
 //   readiness it was admitted under is the boot's second half.
 // - **its own seed.** Tokens are minted under a seed derived from the
 //   group's capability seed (`adopt_seed`: SHA-256 over a domain tag and

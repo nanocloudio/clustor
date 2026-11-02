@@ -3146,6 +3146,12 @@ fn peer_dest(peer_rx: i32, raft_rpc: i32, peer_msg_type: u8) -> i32 {
         // exactly why the omission survived so long.
         | wire::MSG_READ_INDEX_PROBE
         | wire::MSG_READ_INDEX_PROBE_RESP
+        // Follower ReadIndex: the follower's request to the leader and
+        // the leader's answer back. Same rule as the probe pair — left
+        // off this list, every follower linearizable read would time
+        // out instead of being served.
+        | wire::MSG_READ_INDEX_REQ
+        | wire::MSG_READ_INDEX_RESP
         | wire::MSG_TIMEOUT_NOW
         // A follower relaying a client proposal to the leader
         // (consensus param 20). Rides the raft RPC path like every

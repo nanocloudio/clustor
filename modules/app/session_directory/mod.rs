@@ -210,10 +210,10 @@ use transport_registry::{
     TR_PROFILE_SERVER, TR_REPLY_LEN, TR_SNAP_MAX_UNIT, TR_ST_OK, TR_TOKEN_LEN, TR_WIRE_REPLY_LEN,
 };
 use vip_registry::{
-    build_seed, VbExportCursor, VbInstaller, VipRegistry, VipReply, VB_MAX_CMD, VB_OP_ACTIVATE,
-    VB_OP_SEED, VB_OWNERS_PI5, VB_OWNERS_RP2350, VB_OWNERS_SERVER, VB_PROFILE_PI5,
-    VB_PROFILE_RP2350, VB_PROFILE_SERVER, VB_REPLY_LEN, VB_SEED, VB_SNAP_MAX_UNIT, VB_ST_OK,
-    VB_ST_UNAUTHORIZED, VB_TOKEN_LEN,
+    build_seed, SeedPacer, SeedStep, VbExportCursor, VbInstaller, VipRegistry, VipReply,
+    VB_MAX_CMD, VB_OP_ACTIVATE, VB_OP_SEED, VB_OWNERS_PI5, VB_OWNERS_RP2350, VB_OWNERS_SERVER,
+    VB_PROFILE_PI5, VB_PROFILE_RP2350, VB_PROFILE_SERVER, VB_REPLY_LEN, VB_SEED, VB_SNAP_MAX_UNIT,
+    VB_ST_CONFLICT, VB_ST_OK, VB_ST_UNAUTHORIZED, VB_TOKEN_LEN,
 };
 
 // ── Profile (variant-selected arenas) ───────────────────────────────
@@ -779,9 +779,11 @@ struct ModuleState {
     op_replay_queued: u64,
     op_replay_queued_kind: u8,
     _pad9: [u8; 7],
-    /// A SEED proposal is in flight (do not propose another until it
-    /// commits or the pending slot expires).
-    seed_proposed_ms: u64,
+    /// Paces the group's one SEED: barrier, then SEED, per leader term
+    /// (`vip_registry::SeedPacer`).
+    seed_pacer: SeedPacer,
+    /// The term of the current leader per MSG_LEADER_HINT.
+    leader_term: u64,
     /// Staged export bytes not yet framed (`snap_buf[..snap_staged]`).
     snap_staged: u32,
     _pad6: u32,
@@ -851,6 +853,11 @@ mod params_def {
 /// by the facade; the counter starts at 1.
 fn next_correlation(s: &mut ModuleState) -> u64 {
     s.corr_counter = s.corr_counter.wrapping_add(1);
+    last_correlation(s)
+}
+
+/// The correlation `next_correlation` handed out last.
+fn last_correlation(s: &ModuleState) -> u64 {
     ((s.replica_id as u64) << 56) | (s.corr_counter & 0x00FF_FFFF_FFFF_FFFF)
 }
 
@@ -1324,7 +1331,8 @@ pub unsafe extern "C" fn module_new(
         s.op_replay_queued = 0;
         s.op_replay_queued_kind = 0;
         s._pad9 = [0; 7];
-        s.seed_proposed_ms = 0;
+        s.seed_pacer = SeedPacer::new();
+        s.leader_term = 0;
         s.snap_staged = 0;
         s._pad6 = 0;
 
@@ -1555,6 +1563,11 @@ unsafe fn apply_committed_vip(s: &mut ModuleState, index: u64, body: &[u8]) {
     // (under its derived seed) on the same committed entry, every replica.
     if reply.status == VB_ST_OK && reply.op == VB_OP_SEED {
         s.region.adopt_seed(body, digest);
+        let m = b"[sess_dir] vip seeded";
+        dev_log(sys, 3, m.as_ptr(), m.len());
+    } else if reply.status == VB_ST_CONFLICT && reply.op == VB_OP_SEED {
+        let m = b"[sess_dir] vip seed refused";
+        dev_log(sys, 2, m.as_ptr(), m.len());
     }
     if reply.status == VB_ST_OK {
         s.applied_ok = s.applied_ok.saturating_add(1);
@@ -2176,6 +2189,9 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     s.msg_buf[16],
                     s.msg_buf[17],
                 ]);
+                if partition == s.partition_id {
+                    s.seed_pacer.assigned(corr, wal_index);
+                }
                 for i in 0..MAX_PENDING {
                     if s.pending_used[i] && s.pending_corr[i] == corr {
                         s.pending_idx[i] = wal_index;
@@ -2599,6 +2615,11 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 };
                 if msg_type == wire::MSG_LEADER_HINT && plen >= 1 {
                     s.leader_id = s.msg_buf[0];
+                    if plen >= 9 {
+                        let mut term = [0u8; 8];
+                        term.copy_from_slice(&s.msg_buf[1..9]);
+                        s.leader_term = u64::from_le_bytes(term);
+                    }
                 }
             }
         }
@@ -2678,21 +2699,42 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         //      the kernel CSPRNG and replicated like any command, so every
         //      replica mints and verifies the same emission tokens. Not a
         //      restart concern: the seed lives in the log and the
-        //      snapshot. Retried after the pending TTL if the proposal
-        //      was lost; a second committed SEED is refused CONFLICT.
-        if is_leader(s) && !s.vip.seeded() && !s.hold_applies {
+        //      snapshot. Proposed as soon as this node leads: a barrier in
+        //      its term first, and the SEED once that barrier has applied
+        //      with the registry still unseeded, so no SEED an earlier
+        //      leader left in the log can commit behind it. A proposal
+        //      raft never places is retried from a fresh barrier after
+        //      VB_SEED_RETRY_MS; a new term starts over. A second
+        //      committed SEED would be refused CONFLICT.
+        if !s.hold_applies {
             let now = dev_millis(sys);
-            if now.wrapping_sub(s.seed_proposed_ms) > PENDING_TTL_MS {
-                let mut seed = [0u8; VB_SEED];
-                if dev_csprng_fill(sys, seed.as_mut_ptr(), VB_SEED) == 0 && seed != [0u8; VB_SEED] {
-                    let mut op_id = [0u8; 16];
-                    op_id[..8].copy_from_slice(&now.to_le_bytes());
-                    op_id[8] = s.replica_id;
-                    let mut cmd = [0u8; VB_MAX_CMD];
-                    let n = build_seed(&mut cmd, &op_id, &seed);
-                    if n > 0 && propose_ns(s, 0, &cmd[..n], FACE_NONE, NS_VB) {
-                        s.seed_proposed_ms = now;
-                        dev_log(sys, 3, b"[sess_dir] vip seed proposed".as_ptr(), 27);
+            let applied = s.subscriber.cursor();
+            let step = s
+                .seed_pacer
+                .next(is_leader(s), s.leader_term, s.vip.seeded(), applied, now);
+            match step {
+                SeedStep::Wait => {}
+                SeedStep::Barrier => {
+                    if let Some(corr) = propose_raw(s, &CK_CMD_MAGIC) {
+                        s.seed_pacer.barrier_proposed(corr, now);
+                    }
+                }
+                SeedStep::Seed => {
+                    let mut seed = [0u8; VB_SEED];
+                    if dev_csprng_fill(sys, seed.as_mut_ptr(), VB_SEED) == 0
+                        && seed != [0u8; VB_SEED]
+                    {
+                        let mut op_id = [0u8; 16];
+                        op_id[..8].copy_from_slice(&now.to_le_bytes());
+                        op_id[8] = s.replica_id;
+                        op_id[9..].copy_from_slice(&s.leader_term.to_le_bytes()[..7]);
+                        let mut cmd = [0u8; VB_MAX_CMD];
+                        let n = build_seed(&mut cmd, &op_id, &seed);
+                        if n > 0 && propose_ns(s, 0, &cmd[..n], FACE_NONE, NS_VB) {
+                            s.seed_pacer.seed_proposed(last_correlation(s), now);
+                            let m = b"[sess_dir] vip seed proposed";
+                            dev_log(sys, 3, m.as_ptr(), m.len());
+                        }
                     }
                 }
             }

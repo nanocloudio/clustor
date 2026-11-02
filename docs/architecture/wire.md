@@ -99,6 +99,8 @@ catalog covers the major families rather than every id.
 | 0x0A | `MSG_TIMEOUT_NOW` | `[caller_term:u64 LE]` — leader-transfer promotion |
 | 0x0B / 0x0C | `MSG_READ_INDEX_PROBE` / `_RESP` | probe `[probe_id:u64][term:u64]`; response adds `[replica:u8]` |
 | 0x0D / 0x0E | `MSG_READ_PROBE_REQ` / `_REPLY` | internal apply ↔ raft read-confirmation seam |
+| 0x1F | `MSG_READ_INDEX_REQ` | follower → leader read-index request `[read_id:u64][term:u64][origin:u8]` (17 B) |
+| 0x26 | `MSG_READ_INDEX_RESP` | leader → origin `[read_id:u64][term:u64][read_index:u64][granted:u8]` (25 B); `granted = 0` refuses |
 
 `MSG_APPEND_ENTRIES` fixed header (`AE_HDR_LEN = 49`), one entry per
 frame; an empty-entry log-matching probe sets

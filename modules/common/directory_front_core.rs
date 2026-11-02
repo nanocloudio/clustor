@@ -1,7 +1,7 @@
 //! directory_front_core — one namespace of the session directory behind
 //! a consumer's own port pair (the `directory_front` module's logic).
 //!
-//! The broker and egress surfaces Wormhole's modules stand on are
+//! The broker and egress surfaces a traffic fabric's modules stand on are
 //! directory namespaces: `rs/` egress block and address-range
 //! reservations (an egress gateway's `BlockAuthority`, a prefix's address
 //! record), `att/` attachment boundaries (the private-service broker's

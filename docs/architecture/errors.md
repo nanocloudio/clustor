@@ -30,9 +30,9 @@ rides an internal envelope (`MSG_CLIENT_REJECT_INTERNAL`) keyed by an
 | Status | Value | When it occurs |
 |---|---|---|
 | `CLIENT_REJECT_THROTTLED` | 0x01 | The gateway's throttle could not admit the proposal: credits are exhausted, or raft's intake channel was full and nothing was written. The client should retry. |
-| `CLIENT_REJECT_NOT_LEADER` | 0x02 | The gateway's codec knows the leader and it is not the local node. The `reserved` byte carries the believed `leader_id` so the client can redirect. Applies to both writes and reads. |
+| `CLIENT_REJECT_NOT_LEADER` | 0x02 | The gateway's codec knows the leader and it is not the local node. The `reserved` byte carries the believed `leader_id` so the client can redirect. Writes only: a follower serves linearizable reads itself (follower ReadIndex). |
 | `CLIENT_REJECT_STALE_EPOCH` | 0x03 | The local node has seen a newer placement epoch than the request implies. The client refreshes placement and retries. |
-| `CLIENT_REJECT_FALLBACK` | 0x04 | A linearizable read failed in the consensus apply pipeline: the ReadIndex probe was unconfirmed (not leader, or the probe timed out), the read aged past its 5 s queue timeout, or it was evicted from the bounded read queue. |
+| `CLIENT_REJECT_FALLBACK` | 0x04 | A linearizable read failed in the consensus apply pipeline: the ReadIndex probe was unconfirmed (no leader known, the probe timed out, the leader or term changed underneath it, or a follower's forwarded read was refused by the leader), the read aged past its 5 s queue timeout, or it was evicted from the bounded read queue. |
 | `CLIENT_REJECT_READ_UNSUPPORTED` | 0x05 | A read arrived but the graph has no read path wired to consensus, so a structured reject replaces a silent drop. |
 | `CLIENT_REJECT_TOO_LARGE` | 0x06 | The record's payload exceeds the largest proposal the log can carry (`MAX_ENTRY_BODY`, see [wire.md](wire.md#wal-frame-contract)). Rejected at the gateway surface before any bytes are consumed downstream — proposing a truncated prefix would commit a corrupted entry while acking the full write. |
 

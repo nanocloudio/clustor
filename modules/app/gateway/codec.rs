@@ -438,20 +438,11 @@ pub unsafe fn on_request(
                     0,
                 ));
             }
-            if c.leader_id != LEADER_UNKNOWN && c.leader_id != c.self_id {
-                // Reads also need a leader (ReadIndex protocol). On a
-                // follower, redirect.
-                c.not_leader_rejected += 1;
-                return Route::Respond(build_reject_wire(
-                    origin,
-                    conn_id,
-                    wire::CLIENT_REJECT_NOT_LEADER,
-                    0,
-                    0,
-                    0,
-                    c.leader_id,
-                ));
-            }
+            // No leader redirect: a follower serves the read itself.
+            // Consensus forwards it to the leader for a read index
+            // (follower ReadIndex) and answers once this replica has
+            // applied through it; with no leader known the read is
+            // refused retryably there.
             let total = wire::TAGGED_PROPOSAL_HDR + body_len;
             if total > wal_frame::MAX_ENTRY_BODY {
                 // Refused, not dropped: a silent drop leaves the client

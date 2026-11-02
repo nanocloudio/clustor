@@ -46,7 +46,7 @@
 //   carried). It commits the same promotion, and the promoted anchor's
 //   `FlowToken` is then a pure function of replicated state: the flow, the
 //   epoch that move committed, the anchor and the fence generation — the
-//   fields of Wormhole's `cc_emission_token` — and a 16-byte capability,
+//   fields of the traffic fabric's `cc_emission_token` — and a 16-byte capability,
 //   the first 16 bytes of SHA-256 over the group's capability seed (the VIP
 //   registry's, replicated once by SEED), a domain tag and those fields
 //   (`flow_token`). The seed is passed in, so this file stays pure; an
@@ -240,7 +240,7 @@ impl TransportReply {
 pub const TR_SEED: usize = 32;
 pub const TR_CAPABILITY: usize = 16;
 /// `[flow:16][epoch:4][anchor:8][fence_gen:4][capability:16]`: the fields
-/// of Wormhole's `cc_emission_token(flow_id, new_epoch, anchor,
+/// of the traffic fabric's `cc_emission_token(flow_id, new_epoch, anchor,
 /// fence_gen)`, in its order, then the capability.
 pub const TR_TOKEN_LEN: usize = TR_FLOW_ID + 4 + TR_ANCHOR_ID + 4 + TR_CAPABILITY;
 const TR_TOKEN_FIELDS: usize = TR_TOKEN_LEN - TR_CAPABILITY;

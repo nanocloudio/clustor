@@ -1,6 +1,6 @@
 # The Multi-Site Group
 
-Wormhole's traffic fabric puts authority in
+A traffic fabric that puts authority in
 three tiers — a cell, a region, the world — and asks two things of Clustor
 that a group inside one site cannot give: a group whose committed state
 outlives the loss of a whole site, and a rule for which state may live in
@@ -184,7 +184,7 @@ namespace) is the global tier's state machine. Under a multi-site group:
 - a site loss is answered by INVALIDATE of the lost region at the
   readiness it last held — its authority void across every binding at
   once — and an `ACTIVATE` of the surviving region(s) under the DR policy
-  (`dr_core` in Wormhole drives both, its REGION operation record in `op/`
+  (the fabric's DR coordinator drives both, its REGION operation record in `op/`
   of the same group);
 - an emission token minted by the global tier verifies against committed
   state that is in two sites, so a token never outlives the record that
@@ -235,5 +235,5 @@ two-site, RPO-zero posture.
 - **Automatic reconfiguration after a site loss.** A group that survives
   a site does not shrink itself; re-forming a group that stopped (the
   two-site posture) is an operator's joint-consensus change.
-- **Which region a session is moved to.** That is Wormhole's DR policy
-  (`dr_core`), driven over `rg/` and `op/`; this group only orders it.
+- **Which region a session is moved to.** That is the traffic fabric's DR policy,
+  driven over `rg/` and `op/`; this group only orders it.

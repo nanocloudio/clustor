@@ -158,6 +158,16 @@ struct ProbeSlot {
     /// (occupied, nothing in flight, guaranteed timeout-reject);
     /// `expire_probes` re-attempts unsent broadcasts each step.
     broadcast_sent: bool,
+    /// Who the answer goes to: `ORIGIN_LOCAL` for this node's own apply
+    /// queue (`correlation_id` is apply's), or the replica id of a
+    /// follower that forwarded the read (`correlation_id` is that
+    /// follower's `read_id`).
+    origin: u8,
+    /// The confirm round has begun: `snapshot_commit` is sampled and the
+    /// probe may be broadcast. A slot taken before this leader has
+    /// committed an entry of its own term waits unstarted (see
+    /// `read_index_ready`); the deadline still runs.
+    started: bool,
 }
 
 impl ProbeSlot {
@@ -170,6 +180,40 @@ impl ProbeSlot {
             votes: NodeSet::empty(),
             deadline_ms: 0,
             broadcast_sent: false,
+            origin: ORIGIN_LOCAL,
+            started: false,
+        }
+    }
+}
+
+/// A linearizable read this FOLLOWER forwarded to its leader
+/// (`MSG_READ_INDEX_REQ`), waiting for the leader's read index.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ForwardedRead {
+    /// 0 = slot empty. Our handle on the wire; never apply's id.
+    read_id: u64,
+    /// Apply's correlation id, answered through the probe reply seam.
+    correlation_id: u64,
+    /// The term in which `leader` was asked. An answer is honoured only
+    /// while this node is still a follower of `leader` in this term.
+    term: u64,
+    leader: u8,
+    deadline_ms: u64,
+    /// The request landed on `out_rpc`; unsent ones are re-offered each
+    /// step until they land or the deadline refuses the read.
+    sent: bool,
+}
+
+impl ForwardedRead {
+    const fn empty() -> Self {
+        Self {
+            read_id: 0,
+            correlation_id: 0,
+            term: 0,
+            leader: 0,
+            deadline_ms: 0,
+            sent: false,
         }
     }
 }
@@ -802,6 +846,14 @@ pub struct Raft {
     // ── In-flight strict-ReadIndex probes ───────────────────
     probes: [ProbeSlot; MAX_INFLIGHT_PROBES],
     next_probe_id: u64,
+    /// Follower ReadIndex: reads forwarded to the leader, awaiting its
+    /// read index. Ids come from `next_probe_id` too.
+    fwd_reads: [ForwardedRead; MAX_INFLIGHT_PROBES],
+    /// Index of this leader's current-term no-op, 0 until it lands.
+    /// A leader answers no ReadIndex until `commit_index` reaches it:
+    /// before that its commit index may trail entries the previous
+    /// leader already acknowledged (Raft §6.4, step 1).
+    term_first_index: Index,
 
     // ── Admin-induced state ─────────────────────────────────
     /// Set by `ADMIN_OP_FREEZE`; cleared by `ADMIN_OP_THAW`. While
@@ -931,6 +983,8 @@ pub fn init(s: &mut Raft) {
     s.voter_count = 1;
     s.probes = [ProbeSlot::empty(); MAX_INFLIGHT_PROBES];
     s.next_probe_id = 1;
+    s.fwd_reads = [ForwardedRead::empty(); MAX_INFLIGHT_PROBES];
+    s.term_first_index = 0;
     s.current_voters = NodeSet::empty();
     s.learners = NodeSet::empty();
     s.joint_voters = NodeSet::empty();
@@ -1564,6 +1618,12 @@ unsafe fn process_rpc(s: &mut Raft, sys: &SyscallTable, now: u64) {
             wire::MSG_READ_INDEX_PROBE_RESP => {
                 handle_read_index_probe_resp(s, sys, plen);
             }
+            wire::MSG_READ_INDEX_REQ => {
+                handle_read_index_req(s, sys, plen, now);
+            }
+            wire::MSG_READ_INDEX_RESP => {
+                handle_read_index_resp(s, sys, plen);
+            }
             _ => {}
         }
     }
@@ -1640,7 +1700,7 @@ unsafe fn handle_read_index_probe_resp(s: &mut Raft, sys: &SyscallTable, plen: u
         if probe_id_slot == 0 || probe_id_slot != probe_id {
             continue;
         }
-        if s.probes[i].term != s.current_term {
+        if !s.probes[i].started || s.probes[i].term != s.current_term {
             continue;
         }
         s.probes[i].votes.insert(replica);
@@ -1651,13 +1711,87 @@ unsafe fn handle_read_index_probe_resp(s: &mut Raft, sys: &SyscallTable, plen: u
             s.joint_active,
             s.sites,
         ) {
-            let corr = s.probes[i].correlation_id;
             let commit = s.probes[i].snapshot_commit;
-            emit_read_probe_reply(s, sys, corr, commit, true);
-            s.probes[i] = ProbeSlot::empty();
+            finish_probe(s, sys, i, commit, true);
         }
         return;
     }
+}
+
+/// Leader side of follower ReadIndex: a follower forwarded a
+/// linearizable read. Served by the same leadership-confirm round as a
+/// local read; the answer travels back to `origin` instead of to this
+/// node's apply queue. Refused at once when this node does not lead
+/// the follower's term — the follower refuses its read retryably.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn handle_read_index_req(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u64) {
+    let pl = plen as usize;
+    let Some((read_id, term, origin)) = wire::decode_read_index_req(&s.msg_buf[..pl]) else {
+        return;
+    };
+    if read_id == 0 || (origin as usize) >= MAX_NODES || origin == s.self_id {
+        return;
+    }
+    // Raft §5.1 holds for this RPC as for every other.
+    if term > s.current_term {
+        become_follower(s, sys, term);
+    }
+    if s.role != ROLE_LEADER || term != s.current_term {
+        log_static(sys, b"[raft] read fwd refused: not leader of term");
+        send_read_index_resp(s, sys, origin, read_id, s.current_term, 0, false);
+        return;
+    }
+    open_probe(s, sys, origin, read_id, now);
+}
+
+/// Follower side of follower ReadIndex: the leader's answer to a read
+/// this node forwarded. Armed only while this node is still a follower
+/// of the same leader in the same term it asked in; anything else —
+/// a refusal, an answer from a deposed leader, a term that moved
+/// underneath the read — refuses the read retryably. Never stale: the
+/// index is the leader's quorum-confirmed commit index, and apply holds
+/// the read until this node has applied through it.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn handle_read_index_resp(s: &mut Raft, sys: &SyscallTable, plen: u16) {
+    let pl = plen as usize;
+    let Some((read_id, term, read_index, granted)) = wire::decode_read_index_resp(&s.msg_buf[..pl])
+    else {
+        return;
+    };
+    if read_id == 0 {
+        return;
+    }
+    if term > s.current_term {
+        become_follower(s, sys, term);
+    }
+    let Some(i) = s.fwd_reads.iter().position(|f| f.read_id == read_id) else {
+        return;
+    };
+    let f = s.fwd_reads[i];
+    s.fwd_reads[i] = ForwardedRead::empty();
+    let honoured = granted
+        && term == f.term
+        && s.current_term == f.term
+        && s.role == ROLE_FOLLOWER
+        && s.leader_id == f.leader as i8;
+    if !honoured {
+        log_static(sys, b"[raft] read fwd refused");
+    }
+    emit_read_probe_reply(
+        s,
+        sys,
+        f.correlation_id,
+        if honoured { read_index } else { 0 },
+        honoured,
+    );
 }
 
 /// Drain strict-ReadIndex probe requests from apply's probe queue
@@ -1692,6 +1826,11 @@ unsafe fn drain_read_probes(
     }
 }
 
+/// A linearizable read from this node's apply queue. The leader runs
+/// the confirm round itself; a follower that knows its leader forwards
+/// the read there (follower ReadIndex); a node with no leader refuses
+/// at once so apply rejects the read retryably.
+///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Raft` (or shared
@@ -1699,62 +1838,183 @@ unsafe fn drain_read_probes(
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn start_probe(s: &mut Raft, sys: &SyscallTable, correlation_id: u64, now: u64) {
-    // Not the leader: immediately reply with confirmed=0 so the apply
-    // pipeline can fall back to rejecting the read.
-    if s.role != ROLE_LEADER {
+    if s.role == ROLE_LEADER {
+        open_probe(s, sys, ORIGIN_LOCAL, correlation_id, now);
+    } else if s.role == ROLE_FOLLOWER && s.leader_id >= 0 && s.leader_id as u8 != s.self_id {
+        forward_read(s, sys, correlation_id, now);
+    } else {
         dev_log(sys, 3, b"[raft] probe nolead".as_ptr(), 19);
         emit_read_probe_reply(s, sys, correlation_id, 0, false);
-        return;
     }
-    // Allocate an empty slot.
-    let mut slot_idx: Option<usize> = None;
-    for (i, slot) in s.probes.iter().enumerate() {
-        if slot.probe_id == 0 {
-            slot_idx = Some(i);
-            break;
-        }
-    }
-    let slot_idx = match slot_idx {
-        Some(i) => i,
-        None => {
-            // Probe table full — reply with confirmed=0, caller retries.
-            dev_log(sys, 3, b"[raft] probe full".as_ptr(), 17);
+}
+
+/// Take a probe slot for a read owed to `origin` (`ORIGIN_LOCAL` or a
+/// forwarding follower) and start its round when this leader may.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn open_probe(s: &mut Raft, sys: &SyscallTable, origin: u8, correlation_id: u64, now: u64) {
+    let Some(slot_idx) = s.probes.iter().position(|p| p.probe_id == 0) else {
+        // Probe table full — refuse, caller retries.
+        dev_log(sys, 3, b"[raft] probe full".as_ptr(), 17);
+        if origin == ORIGIN_LOCAL {
             emit_read_probe_reply(s, sys, correlation_id, 0, false);
-            return;
+        } else {
+            send_read_index_resp(s, sys, origin, correlation_id, s.current_term, 0, false);
         }
+        return;
     };
     let probe_id = s.next_probe_id;
     s.next_probe_id = s.next_probe_id.wrapping_add(1).max(1);
-    let mut votes = NodeSet::empty();
-    votes.insert(s.self_id);
-
     s.probes[slot_idx] = ProbeSlot {
         probe_id,
         correlation_id,
-        snapshot_commit: s.commit_index,
+        snapshot_commit: 0,
         term: s.current_term,
-        votes,
+        votes: NodeSet::empty(),
         deadline_ms: now + PROBE_TIMEOUT_MS,
         broadcast_sent: false,
+        origin,
+        started: false,
     };
+    advance_probe(s, sys, slot_idx);
+}
 
-    // Single-node cluster: we already have majority (self).
-    if set_majority(
-        votes,
-        s.current_voters,
-        s.joint_voters,
-        s.joint_active,
-        s.sites,
-    ) {
-        emit_read_probe_reply(s, sys, correlation_id, s.commit_index, true);
-        s.probes[slot_idx] = ProbeSlot::empty();
-        return;
+/// Whether this leader's commit index may serve as a read index: its
+/// current-term no-op has committed. Until then the commit index can
+/// trail entries the previous leader acknowledged, so a round started
+/// now could answer below a completed write. A graph with no WAL edge
+/// never lands the no-op and keeps the old behaviour.
+fn read_index_ready(s: &Raft) -> bool {
+    s.out_log < 0 || (s.term_first_index != 0 && s.commit_index >= s.term_first_index)
+}
+
+/// Start probe slot `i`'s round once the leader may answer reads, then
+/// push its broadcast. Safe to call every step.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn advance_probe(s: &mut Raft, sys: &SyscallTable, i: usize) {
+    if !s.probes[i].started {
+        if !read_index_ready(s) {
+            return;
+        }
+        let mut votes = NodeSet::empty();
+        votes.insert(s.self_id);
+        s.probes[i].votes = votes;
+        s.probes[i].snapshot_commit = s.commit_index;
+        s.probes[i].started = true;
+        // Single-voter group: self is the majority.
+        if set_majority(
+            votes,
+            s.current_voters,
+            s.joint_voters,
+            s.joint_active,
+            s.sites,
+        ) {
+            let commit = s.commit_index;
+            finish_probe(s, sys, i, commit, true);
+            return;
+        }
     }
+    // On backpressure the slot stays `broadcast_sent = false` and
+    // `expire_probes` retries every step until it lands or the
+    // deadline rejects it — never a zombie.
+    if !s.probes[i].broadcast_sent {
+        broadcast_probe(s, sys, i);
+    }
+}
 
-    // Broadcast the probe to all peers. On backpressure the slot stays
-    // `broadcast_sent = false` and `expire_probes` retries every step
-    // until it lands or the deadline rejects it — never a zombie.
-    broadcast_probe(s, sys, slot_idx);
+/// Answer probe slot `i` to its origin and free the slot.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn finish_probe(s: &mut Raft, sys: &SyscallTable, i: usize, read_index: u64, granted: bool) {
+    let slot = s.probes[i];
+    s.probes[i] = ProbeSlot::empty();
+    if slot.origin == ORIGIN_LOCAL {
+        emit_read_probe_reply(s, sys, slot.correlation_id, read_index, granted);
+    } else {
+        send_read_index_resp(
+            s,
+            sys,
+            slot.origin,
+            slot.correlation_id,
+            slot.term,
+            read_index,
+            granted,
+        );
+    }
+}
+
+/// Send the leader's answer to a forwarded read. A write the channel
+/// refuses is not retried: the follower's own deadline refuses the
+/// read, which is retryable and never stale.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn send_read_index_resp(
+    s: &mut Raft,
+    sys: &SyscallTable,
+    target: u8,
+    read_id: u64,
+    term: u64,
+    read_index: u64,
+    granted: bool,
+) {
+    let mut buf = [0u8; wire::READ_INDEX_RESP_LEN];
+    let index = if granted { read_index } else { 0 };
+    wire::encode_read_index_resp(&mut buf, read_id, term, index, granted);
+    let _ = rpc_send(s, sys, target, wire::MSG_READ_INDEX_RESP, &buf);
+}
+
+/// Forward a read to the leader this follower knows for its current
+/// term (follower ReadIndex).
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn forward_read(s: &mut Raft, sys: &SyscallTable, correlation_id: u64, now: u64) {
+    let Some(i) = s.fwd_reads.iter().position(|f| f.read_id == 0) else {
+        log_static(sys, b"[raft] read fwd full");
+        emit_read_probe_reply(s, sys, correlation_id, 0, false);
+        return;
+    };
+    let read_id = s.next_probe_id;
+    s.next_probe_id = s.next_probe_id.wrapping_add(1).max(1);
+    s.fwd_reads[i] = ForwardedRead {
+        read_id,
+        correlation_id,
+        term: s.current_term,
+        leader: s.leader_id as u8,
+        deadline_ms: now + PROBE_TIMEOUT_MS,
+        sent: false,
+    };
+    send_forwarded_read(s, sys, i);
+}
+
+/// Offer forwarded read `i` to its leader; marks it sent on success.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn send_forwarded_read(s: &mut Raft, sys: &SyscallTable, i: usize) {
+    let f = s.fwd_reads[i];
+    let mut buf = [0u8; wire::READ_INDEX_REQ_LEN];
+    wire::encode_read_index_req(&mut buf, f.read_id, f.term, s.self_id);
+    if rpc_send(s, sys, f.leader, wire::MSG_READ_INDEX_REQ, &buf) {
+        s.fwd_reads[i].sent = true;
+    }
 }
 
 /// Attempt the routed peer broadcast for probe slot `i`; marks the slot
@@ -1782,6 +2042,11 @@ unsafe fn broadcast_probe(s: &mut Raft, sys: &SyscallTable, i: usize) -> bool {
     }
 }
 
+/// Refuse every read whose round can no longer be answered — past its
+/// deadline, or (leader side) from a term this node no longer leads, or
+/// (follower side) asked of a leader this node no longer follows in
+/// that term — and push the rest along.
+///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Raft` (or shared
@@ -1794,17 +2059,40 @@ unsafe fn expire_probes(s: &mut Raft, sys: &SyscallTable, now: u64) {
         if slot.probe_id == 0 {
             continue;
         }
-        if now >= slot.deadline_ms {
-            emit_read_probe_reply(s, sys, slot.correlation_id, 0, false);
-            s.probes[i] = ProbeSlot::empty();
+        if now >= slot.deadline_ms || s.role != ROLE_LEADER || slot.term != s.current_term {
+            finish_probe(s, sys, i, 0, false);
             continue;
         }
-        // Backpressured-at-issue broadcasts retry until they land
-        // (see ProbeSlot::broadcast_sent).
-        if !slot.broadcast_sent {
-            broadcast_probe(s, sys, i);
+        advance_probe(s, sys, i);
+    }
+    for i in 0..MAX_INFLIGHT_PROBES {
+        let f = s.fwd_reads[i];
+        if f.read_id == 0 {
+            continue;
+        }
+        if now >= f.deadline_ms
+            || s.role != ROLE_FOLLOWER
+            || s.current_term != f.term
+            || s.leader_id != f.leader as i8
+        {
+            s.fwd_reads[i] = ForwardedRead::empty();
+            log_static(sys, b"[raft] read fwd expired");
+            emit_read_probe_reply(s, sys, f.correlation_id, 0, false);
+            continue;
+        }
+        if !f.sent {
+            send_forwarded_read(s, sys, i);
         }
     }
+}
+
+/// One fixed log line.
+///
+/// # Safety
+///
+/// Caller must supply a valid `&SyscallTable` per the module ABI.
+unsafe fn log_static(sys: &SyscallTable, m: &[u8]) {
+    dev_log(sys, 3, m.as_ptr(), m.len());
 }
 
 /// Queue a probe reply for apply (seam E8).
@@ -4770,6 +5058,7 @@ unsafe fn append_noop(s: &mut Raft, sys: &SyscallTable) {
 
     s.entries_appended += 1;
     s.commit_fence_out = Some((s.current_term, new_index));
+    s.term_first_index = new_index;
     s.noop_pending = false;
     dev_log(sys, 3, b"[raft] noop".as_ptr(), 11);
 }
@@ -6251,6 +6540,7 @@ unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // with no WAL edge can never land the no-op, so arming there would
     // block commit forever.
     s.noop_pending = true;
+    s.term_first_index = 0;
     if s.out_log >= 0 {
         s.commit_fence_out = Some((s.current_term, 0));
     }

@@ -2,11 +2,11 @@
 // directory: the replicated compare-and-swap store the coordinators that
 // have no VIP-shaped record keep their restart-safe operations in, so every
 // drain, ownership transfer and transport migration has one bounded
-// operation record. `fo/` holds Wormhole's `WHFO` VIP moves; this
+// operation record. `fo/` holds the traffic fabric's `WHFO` VIP moves; this
 // namespace holds the other kinds under one envelope:
 //
 //   TAKEOVER    a transport-continuity takeover of one protected flow
-//               (Wormhole's `takeover_core::Takeover`: pair, planned or
+//               (the fabric's `takeover_core::Takeover`: pair, planned or
 //               crash), so a restarted continuity coordinator resumes from
 //               the committed step;
 //   EVACUATION  a failure-domain evacuation, practice run or restore
@@ -34,7 +34,7 @@
 //   160  progress [64]               free between writes, but see below
 //   224  sha256(bytes 0..224) [32]
 //
-// `step` is the coordinator's own step or state enum, unchanged (Wormhole's
+// `step` is the coordinator's own step or state enum, unchanged (the fabric's
 // `TkStep`, `fd_state`, `DrStep` values); `intent[0]` names the kind's
 // variant (the takeover sequence, the evacuation action, the DR operation
 // kind). Clustor interprets only what the rule below needs; the rest of
@@ -60,7 +60,7 @@
 //   epoch in its progress are fixed once set, and a committed record must
 //   name both. An evacuation is never ABORTED from MOVING, DRAINING or
 //   EVACUATED (an authority move in flight, or done); from RESTORING it
-//   may be, which is Wormhole's restart rolling a ramp in flight back. It
+//   may be, which is the fabric's restart rolling a ramp in flight back. It
 //   reaches BLOCKED_FENCE only from a phase that moves authority, MOVING
 //   or RESTORING. A DR operation's steps only increase.
 // - **a frame is checked whole.** Magic, version, reserved bytes, kind,
@@ -121,7 +121,7 @@ pub const OP_KIND_REGION: u8 = 3;
 /// `flags`: the takeover's commit point has passed (TR MOVE committed).
 pub const OP_FLAG_COMMITTED: u8 = 1;
 
-// Takeover (`intent[0]` = Wormhole's `TkKind`; `step` = `TkStep`).
+// Takeover (`intent[0]` = the traffic fabric's `TkKind`; `step` = `TkStep`).
 pub const TK_SEQ_PAIR: u8 = 1;
 pub const TK_SEQ_PLANNED: u8 = 2;
 pub const TK_SEQ_CRASH: u8 = 3;
@@ -160,7 +160,7 @@ pub const TK_FAILED: u8 = 27;
 pub const TK_AT_FENCE_GEN: usize = OP_AT_PROGRESS + 8;
 pub const TK_AT_NEW_TR_EPOCH: usize = OP_AT_PROGRESS + 12;
 
-// Evacuation (`intent[0]` = Wormhole's `fd_action`; `step` = `fd_state`).
+// Evacuation (`intent[0]` = the traffic fabric's `fd_action`; `step` = `fd_state`).
 pub const EV_ACTION_LAST: u8 = 6;
 pub const EV_REQUESTED: u8 = 1;
 pub const EV_PREFLIGHTED: u8 = 2;
@@ -174,7 +174,7 @@ pub const EV_COMPLETE: u8 = 9;
 pub const EV_ABORTED: u8 = 10;
 pub const EV_BLOCKED_FENCE: u8 = 11;
 
-// DR operation (`intent[0]` = Wormhole's `fx_kind`; `step` = `DrStep`).
+// DR operation (`intent[0]` = the traffic fabric's `fx_kind`; `step` = `DrStep`).
 pub const RC_KIND_LAST: u8 = 5;
 pub const RC_WAIT: u8 = 1;
 pub const RC_DONE: u8 = 11;
@@ -223,7 +223,7 @@ pub const fn first_step(kind: u8, variant: u8) -> u8 {
     }
 }
 
-/// The takeover's forward path (Wormhole's `takeover_core` sequences):
+/// The takeover's forward path (the traffic fabric's `takeover_core` sequences):
 /// whether `to` follows `from` in sequence `seq`.
 const fn takeover_next(seq: u8, from: u8, to: u8) -> bool {
     match seq {
@@ -277,7 +277,7 @@ const fn takeover_next(seq: u8, from: u8, to: u8) -> bool {
     }
 }
 
-/// The evacuation's edges (Wormhole's `failure_domain_core`; a writer may
+/// The evacuation's edges (the traffic fabric's `failure_domain_core`; a writer may
 /// persist only the later of two states one call passes through).
 const fn evacuation_next(from: u8, to: u8) -> bool {
     match to {

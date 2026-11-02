@@ -1,8 +1,7 @@
 // Attachment registry — the `att/<attachment_id>` namespace of the session
 // directory: the boundaries a private service attachment is admitted under,
 // each attachment's committed generation and each service's revocation
-// generation. Wormhole's broker
-// (`modules/common/traffic/attachment_core.rs` in Wormhole) admits a
+// generation. A traffic fabric's private-service broker admits a
 // connection only when the Kagi-verified grant names exactly these two
 // generations (`AttachmentBoundary`), and stops new connections the moment
 // a service's revocation boundary moves past the grant.
@@ -152,7 +151,7 @@ fn u64_at(src: &[u8], o: usize) -> u64 {
 
 /// Encoded reply: `[op:1][status:1][reserved:2][covered:4]
 /// [attachment_id:16][producer_tenant:16][service_id:16]
-/// [attachment_generation:8][revocation_generation:8]` — Wormhole's
+/// [attachment_generation:8][revocation_generation:8]` — the traffic fabric's
 /// `AttachmentBoundary` in its last 16 bytes. `covered` is the attachments
 /// the service's boundary covers: what a REVOKE ends, on every reply.
 pub const AT_REPLY_LEN: usize = 8 + AT_ID + AT_SERVICE_KEY + 16;

@@ -435,7 +435,7 @@ fn u64_at(src: &[u8], o: usize) -> u64 {
 // ── Command builders (proposer side) ────────────────────────────────
 
 /// Address families a binding key names. A key's prefix is in the
-/// canonical 16-byte form its producer (Wormhole's `VipTarget`) keys by:
+/// canonical 16-byte form its producer (the VIP controller's `VipTarget`) keys by:
 /// IPv4 in bytes 12..16 with the first twelve zero, IPv6 in all sixteen.
 pub const VB_FAMILY_V4: u8 = 4;
 pub const VB_FAMILY_V6: u8 = 6;
@@ -651,6 +651,144 @@ pub fn build_seed(dst: &mut [u8], op_id: &[u8; VB_OP_ID], seed: &[u8; VB_SEED]) 
     dst[1..17].copy_from_slice(op_id);
     dst[17..49].copy_from_slice(seed);
     VB_SEED_LEN
+}
+
+// ── Seed pacing ─────────────────────────────────────────────────────
+
+/// How long a barrier or `SEED` proposal may go without its log position
+/// (the proposal assignment) before it counts as lost and the leader
+/// starts over from a fresh barrier.
+pub const VB_SEED_RETRY_MS: u64 = 1_000;
+
+/// What the leader proposes next for the group's capability seed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeedStep {
+    /// Nothing: not the leader, already seeded, or a proposal in flight.
+    Wait,
+    /// Propose a barrier (an empty entry) in this term.
+    Barrier,
+    /// Propose the `SEED`: this term's barrier has applied, so every
+    /// entry any earlier leader appended has applied too, and the
+    /// registry is still unseeded.
+    Seed,
+}
+
+/// Paces the one `SEED` a group commits. The leader proposes it as soon
+/// as it leads, barrier first: the barrier is proposed in the leader's
+/// own term and, once it has applied, no entry an earlier leader left in
+/// the log can still commit after it. A `SEED` proposed after that
+/// barrier, unseeded, is therefore the only one in the log, unless the
+/// leader loses its term with it in flight. Pure state over
+/// (leadership, term, seeded, applied cursor, clock): the module feeds it
+/// the proposals it made and the assignments raft answers them with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeedPacer {
+    /// The term the in-flight proposals belong to (0: none).
+    term: u64,
+    /// The barrier's correlation (0: none proposed this round).
+    barrier_corr: u64,
+    /// The barrier's log index (0: not yet assigned).
+    barrier_idx: u64,
+    barrier_ms: u64,
+    /// The `SEED`'s correlation (0: none proposed this round).
+    seed_corr: u64,
+    /// The `SEED`'s log index (0: not yet assigned).
+    seed_idx: u64,
+    seed_ms: u64,
+}
+
+impl SeedPacer {
+    pub const fn new() -> Self {
+        SeedPacer {
+            term: 0,
+            barrier_corr: 0,
+            barrier_idx: 0,
+            barrier_ms: 0,
+            seed_corr: 0,
+            seed_idx: 0,
+            seed_ms: 0,
+        }
+    }
+
+    /// The next step at `now_ms` for a node that `leads` term `term`, with
+    /// the registry `seeded` or not and its applied cursor at `applied`.
+    /// Losing leadership or a new term forgets the round: proposals of
+    /// another term are not this leader's to wait on.
+    pub fn next(
+        &mut self,
+        leads: bool,
+        term: u64,
+        seeded: bool,
+        applied: u64,
+        now_ms: u64,
+    ) -> SeedStep {
+        if seeded || !leads {
+            *self = SeedPacer::new();
+            return SeedStep::Wait;
+        }
+        if term != self.term {
+            *self = SeedPacer::new();
+            self.term = term;
+        }
+        if self.seed_corr != 0 {
+            // A placed SEED commits, or the term ends with it; one never
+            // placed is lost and the round starts over from a barrier,
+            // which orders any late placement of it before the next SEED.
+            if self.seed_idx != 0 || now_ms.wrapping_sub(self.seed_ms) <= VB_SEED_RETRY_MS {
+                return SeedStep::Wait;
+            }
+            *self = SeedPacer {
+                term,
+                ..SeedPacer::new()
+            };
+            return SeedStep::Barrier;
+        }
+        if self.barrier_corr == 0 {
+            return SeedStep::Barrier;
+        }
+        if self.barrier_idx == 0 {
+            if now_ms.wrapping_sub(self.barrier_ms) > VB_SEED_RETRY_MS {
+                return SeedStep::Barrier;
+            }
+            return SeedStep::Wait;
+        }
+        if applied >= self.barrier_idx {
+            SeedStep::Seed
+        } else {
+            SeedStep::Wait
+        }
+    }
+
+    /// The barrier went out under correlation `corr` at `now_ms`.
+    pub fn barrier_proposed(&mut self, corr: u64, now_ms: u64) {
+        self.barrier_corr = corr;
+        self.barrier_idx = 0;
+        self.barrier_ms = now_ms;
+    }
+
+    /// The `SEED` went out under correlation `corr` at `now_ms`.
+    pub fn seed_proposed(&mut self, corr: u64, now_ms: u64) {
+        self.seed_corr = corr;
+        self.seed_idx = 0;
+        self.seed_ms = now_ms;
+    }
+
+    /// Raft placed the proposal `corr` at log index `index` of this
+    /// group. False when `corr` is none of this round's.
+    pub fn assigned(&mut self, corr: u64, index: u64) -> bool {
+        if corr == 0 || index == 0 {
+            return false;
+        }
+        if corr == self.barrier_corr {
+            self.barrier_idx = index;
+            true
+        } else if corr == self.seed_corr {
+            self.seed_idx = index;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 // ── State ───────────────────────────────────────────────────────────

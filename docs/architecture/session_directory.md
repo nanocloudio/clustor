@@ -65,7 +65,7 @@ numbered from 1, and only this group's entries apply here.
 | Session state machine | `modules/common/session_registry.rs` | `session/<session_id>`: deterministic `apply(committed body) → reply`; pure no_std, profile-sized. |
 | Transport state machine | `modules/common/transport_registry.rs` | `transport/<flow_id>`: primary / standbys / emitter epoch / mirror horizons; idempotent operation ids. |
 | VIP state machine | `modules/common/vip_registry.rs` | `vip/<service_address>`: the binding phase sequence, fence ordering, emission tokens; owner sets as wide as the profile. |
-| Failover-operation store | `modules/common/failover_registry.rs` | `fo/<operation_id>`: Wormhole's `WHFO` VIP-move records, compare-and-swap. |
+| Failover-operation store | `modules/common/failover_registry.rs` | `fo/<operation_id>`: the traffic fabric's `WHFO` VIP-move records, compare-and-swap. |
 | Region state machine | `modules/common/region_registry.rs` | `rg/<service>`: the VIP state machine with regions as owners, DR generations, regional invalidation. |
 | Operation store | `modules/common/operation_registry.rs` | `op/<operation_id>`: takeover, evacuation and DR operation records (`CLOP`), compare-and-swap. |
 | Attachment boundaries | `modules/common/attachment_registry.rs` | `att/<attachment_id>`: attachment generations, service revocation boundaries. |
@@ -287,7 +287,7 @@ custody generation the session namespace's `FENCE_CONFIRM` carried); the
     [flow_id:16][epoch:4][anchor:8][fence_gen:4][capability:16]
     capability = SHA-256(seed ‖ "TRFLOW01" ‖ flow_id ‖ epoch ‖ anchor ‖ fence_gen)[..16]
 
-— the fields of Wormhole's `cc_emission_token(flow_id, new_epoch,
+— the fields of the traffic fabric's `cc_emission_token(flow_id, new_epoch,
 anchor, fence_gen)` in its order, keyed by the group's capability seed
 (the VIP registry's, replicated once by `SEED`; an unseeded group mints
 nothing). The module puts the token in the `MOVE_FENCED` reply's trailer;
@@ -322,7 +322,7 @@ are the answers (`tests/flow_token.rs`, `tests/vip_registry.rs`).
 The fence generation is not taken on trust. The module applies transport
 commands through `apply_fenced`, and a new `MOVE_FENCED` commits only if
 the session namespace's record of the flow (session id = flow id,
-Wormhole's convention) holds a confirmed fence of exactly that generation
+the traffic fabric's convention) holds a confirmed fence of exactly that generation
 on the emitter being replaced, not yet consumed by the takeover's
 `ACTIVATE` (`SessionRegistry::fence_confirmed_on`); otherwise it is
 `unauthorized` (12), recorded like any refusal. Both namespaces are
@@ -399,7 +399,21 @@ emission. That exception is what lets a claim over an
 regain authority. The seed is replicated state, so every replica mints
 and verifies the same tokens: the module's leader proposes it once per
 group from the kernel CSPRNG (`SEED`), and until it commits `ACTIVATE`
-answers `not_ready` everywhere. A token is a pure function of that
+answers `not_ready` everywhere. The leader proposes it the moment it
+leads, not after a start-up delay: first a barrier (an empty entry) in
+its own term, then, once that barrier has applied and the registry is
+still unseeded, the `SEED` (`vip_registry::SeedPacer`). The barrier is
+what keeps the `SEED` single: once an entry of the new term has applied,
+no `SEED` an earlier leader left in the log can still commit behind it,
+so a new leader either finds the group seeded or proposes the only one.
+A barrier or `SEED` raft never places is proposed again from a fresh
+barrier after `VB_SEED_RETRY_MS` (1 s); a new term starts the round
+over. On a three-replica group on loopback the `SEED` applies on every
+replica some tens of milliseconds after the election, so a consumer
+needs no settle delay before its first `ACTIVATE` beyond waiting for a
+leader (a `not_ready` answer is retried like any other). A second
+committed `SEED`, should one ever race, is refused `conflict` on every
+replica and the first stands. A token is a pure function of that
 state: `emission_token` re-derives the current one for any owner on any
 replica, a restart loses nothing, and a cached token stops verifying the
 moment authority moves past it.
@@ -423,20 +437,20 @@ it, so a disabled owner is never re-admitted by another host's commit.
 ## Failover-operation namespace
 
 `fo/<operation_id>` (`modules/common/failover_registry.rs`) holds one
-Wormhole `FailoverOperation` per operation id: the fixed 264-byte `WHFO`
-record (Wormhole's `modules/common/traffic/failover_core.rs`), kept as its
+traffic-fabric `FailoverOperation` per operation id: the fixed 264-byte `WHFO`
+record, kept as its
 bytes. Clustor does not act on what a record asks
 for; it owns the rule a record may change by, which is the rule
-Wormhole's `fo_cas_check` states:
+the producer's `fo_cas_check` states:
 
 | Command | Body | Effect |
 |---|---|---|
-| `CAS` (1) | `[record:264]` | A new operation id is stored only as INTENT at phase generation 1. A byte-identical write of the stored record is `OK`. Otherwise the write must leave every field fixed at intent unchanged, advance the phase generation by exactly one, and make a legal transition of the record's kind under its fence requirement (the forward path, ABORTING inside a claim window, FAILED before the unsafe boundary, BLOCKED past it); anything else is `CONFLICT` carrying the stored record. A malformed frame (magic, version, reserved bytes, enum ranges, a target Wormhole's `VipTarget::decode` would refuse, its own SHA-256 trailer) is `INVALID`. |
+| `CAS` (1) | `[record:264]` | A new operation id is stored only as INTENT at phase generation 1. A byte-identical write of the stored record is `OK`. Otherwise the write must leave every field fixed at intent unchanged, advance the phase generation by exactly one, and make a legal transition of the record's kind under its fence requirement (the forward path, ABORTING inside a claim window, FAILED before the unsafe boundary, BLOCKED past it); anything else is `CONFLICT` carrying the stored record. A malformed frame (magic, version, reserved bytes, enum ranges, a target the traffic fabric's `VipTarget::decode` would refuse, its own SHA-256 trailer) is `INVALID`. |
 | `REPLAY` (2) | — | A read through the log: changes nothing. Once it commits, the replica that proposed it streams every live (non-terminal) record to the requester, in creation order, as `REPLAY` replies, then an end-of-replay reply (op `REPLAY`, status `OK`, the count). |
 
 The reply is `[op:1][status:1][present:1][reserved:1][live:4][record:264]`;
 the statuses `OK` (0), `CONFLICT` (1), `REPLAY` (2) and `INVALID` (3) are
-Wormhole's store answers, and `CAPACITY` (4) refuses a new operation
+the traffic fabric's store answers, and `CAPACITY` (4) refuses a new operation
 when every slot holds a live one. A terminal record stays, so a late
 retry or a re-sent request with the same operation id is answered from
 it, until a new operation needs its slot (the oldest terminal record
@@ -484,7 +498,7 @@ incarnation is `[tag:8][readiness_generation:u64 LE]`.
 
 `op/<operation_id>` (`modules/common/operation_registry.rs`) is the
 restart-safe operation record for the coordinators that have no
-VIP-shaped one: a transport-continuity takeover (Wormhole's
+VIP-shaped one: a transport-continuity takeover (the traffic fabric's
 `takeover_core`), a failure-domain evacuation (`failure_domain_core`) and
 a region controller's DR operation (`dr_core`). One 256-byte `CLOP`
 record per operation id, sealed by its own SHA-256 trailer:
@@ -534,7 +548,7 @@ state mechanically (Clustor reads only the bytes the rule names):
 ## Attachment namespace
 
 `att/<attachment_id>` (`modules/common/attachment_registry.rs`) commits
-what Wormhole's private-service broker admits a connection under
+what the traffic fabric's private-service broker admits a connection under
 (`attachment_core::AttachmentBoundary`): each attachment's generation and
 each service's revocation generation.
 
@@ -568,7 +582,7 @@ are declared with that margin.
 
 | Command | Body after `[op][op_id:16]` | Effect |
 |---|---|---|
-| `RESERVE` (1) | `[identity:16][protocol:1][gateway:16][boot:8][pool_blocks:4]` | The lowest block of the pool that is free, released, or retired past its horizon, to `(gateway, boot)`; `exhausted` when none is, `retired` when the incarnation was. A block keeps the operation id and pool size of the grant that took it, so a retry is that grant: repeated while it stands, `conflict` (nothing granted) once the block was released, moved or retired. A zero operation id is `invalid`. Wormhole's `BlockAuthority::reserve`. |
+| `RESERVE` (1) | `[identity:16][protocol:1][gateway:16][boot:8][pool_blocks:4]` | The lowest block of the pool that is free, released, or retired past its horizon, to `(gateway, boot)`; `exhausted` when none is, `retired` when the incarnation was. A block keeps the operation id and pool size of the grant that took it, so a retry is that grant: repeated while it stands, `conflict` (nothing granted) once the block was released, moved or retired. A zero operation id is `invalid`. the traffic fabric's `BlockAuthority::reserve`. |
 | `RELEASE` (2) | `[identity:16][protocol:1][block:4][gateway:16][boot:8]` | Frees the block; only its holder may (`not_holder`). |
 | `RETIRE_BOOT` (3) | `[gateway:16][boot:8][horizon_ms:8]` | The incarnation is gone: each block it holds is grantable once `horizon_ms` of committed time has passed, and the incarnation is remembered as retired (the last as many as the block arena holds), granted nothing again. The one block command that walks the arena. |
 | `MOVE` (4) | `[identity:16][protocol:1][block:4][from_gateway:16][from_boot:8][to_gateway:16][to_boot:8]` | Hands a block to another incarnation for continuity (`retired` if that one was); `until` in the reply is the previous holder's horizon, the quarantine `adopt_block` honours. |
@@ -812,7 +826,7 @@ them (without the diagnostic HTTP surface). Its exports are the
 directory's `requests`, `replies` and `checks` and the peer router's `net_in` /
 `net_out`, which the includer wires to the platform's `linux_net`; its
 params are `self_id`, `listen_port` (required) and the boot `smoke`. A
-graph that needs a directory beside its own modules — Wormhole's
+graph that needs a directory beside its own modules — a traffic fabric's
 `continuity_coordinator`, whose transport and session requests and the
 `MOVE_FENCED` reply with its `FlowToken` trailer go to it — includes the
 stack and wires two edges; the reply boundary (committed and applied

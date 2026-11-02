@@ -255,6 +255,62 @@ pub const MSG_READ_INDEX_PROBE: u8 = 0x0B;
 /// majority before answering the read. Payload (17 bytes):
 /// `[probe_id:u64 LE][term:u64 LE][replica:u8]`.
 pub const MSG_READ_INDEX_PROBE_RESP: u8 = 0x0C;
+/// Follower ReadIndex: a follower holding a linearizable read asks the
+/// leader of its term for a read index. The leader runs its ordinary
+/// leadership-confirm round (`MSG_READ_INDEX_PROBE`) and answers with
+/// the commit index it held when the request arrived. Payload
+/// (`READ_INDEX_REQ_LEN` bytes): `[read_id:u64 LE][term:u64 LE][origin:u8]`
+/// — `read_id` is the follower's own handle, `term` the term in which
+/// the follower knows the addressee as leader, `origin` the follower's
+/// replica id (where the answer goes).
+pub const MSG_READ_INDEX_REQ: u8 = 0x1F;
+/// The leader's answer to `MSG_READ_INDEX_REQ`, addressed to its
+/// origin. Payload (`READ_INDEX_RESP_LEN` bytes):
+/// `[read_id:u64 LE][term:u64 LE][read_index:u64 LE][granted:u8]`.
+/// `granted == 0` is a refusal (not leader, term moved, round timed
+/// out, table full) and carries no index; the follower refuses the
+/// read retryably. A grant is honoured only while the follower is
+/// still in `term` under the same leader.
+pub const MSG_READ_INDEX_RESP: u8 = 0x26;
+pub const READ_INDEX_REQ_LEN: usize = 17;
+pub const READ_INDEX_RESP_LEN: usize = 25;
+
+#[inline]
+pub fn encode_read_index_req(
+    buf: &mut [u8; READ_INDEX_REQ_LEN],
+    read_id: u64,
+    term: u64,
+    origin: u8,
+) {
+    Writer::new(buf).u64(read_id).u64(term).u8(origin);
+}
+
+#[inline]
+pub fn decode_read_index_req(buf: &[u8]) -> Option<(u64, u64, u8)> {
+    let mut r = Reader::new(buf, READ_INDEX_REQ_LEN)?;
+    Some((r.u64(), r.u64(), r.u8()))
+}
+
+#[inline]
+pub fn encode_read_index_resp(
+    buf: &mut [u8; READ_INDEX_RESP_LEN],
+    read_id: u64,
+    term: u64,
+    read_index: u64,
+    granted: bool,
+) {
+    Writer::new(buf)
+        .u64(read_id)
+        .u64(term)
+        .u64(read_index)
+        .bool(granted);
+}
+
+#[inline]
+pub fn decode_read_index_resp(buf: &[u8]) -> Option<(u64, u64, u64, bool)> {
+    let mut r = Reader::new(buf, READ_INDEX_RESP_LEN)?;
+    Some((r.u64(), r.u64(), r.u64(), r.bool()))
+}
 /// Internal consensus seam, apply → raft: "I have a read with this
 /// correlation id, please confirm a read-index for me." Payload (8 bytes):
 /// `[correlation_id:u64 LE]`.
