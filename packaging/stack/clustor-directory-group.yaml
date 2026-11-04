@@ -1,0 +1,360 @@
+# clustor-directory-group: Clustor's session directory over a MULTI-voter
+# replica group — the `clustor-directory` stack's directory and group, with
+# the group's peers named, authenticated and changeable. Each member of the
+# group is one include of this stack, in its own graph, with its own
+# `self_id` and the same peer addresses and authority:
+#
+#   requests ─▶ directory ── proposals ──▶ consensus ── committed ──▶ directory ─▶ replies
+#   admin_in ─▶ operations ── membership / transfer ──▶ consensus ─▶ operations ─▶ admin_out
+#                     consensus ⇅ peer_router ⇅ tls (server · client) ⇅ net_in / net_out
+#
+# Peers. `peer0`..`peer4` are the members' peer addresses (`host:port`), by
+# replica id; an id with no member yet keeps an empty address and is never
+# dialled. Ids below `voters` are the initial voters; one at or above it is a
+# learner slot — a member started there boots outside the group and is
+# admitted as a learner once its certificate binds (see Identity), so its
+# address is configured in every member from the start.
+#
+# Identity. Every peer link is mutual TLS to the group's authority:
+# `peer_tls_server` carries the links a member accepts, `peer_tls_client`
+# the links it dials, both verifying the other end's chain to `trust` and
+# requiring a URI SAN under `peer_uri`; `peer_router` binds a replica id only
+# from a verified principal `principal_prefix` + id
+# (`require_identity: principal`). Which key is which replica is the
+# authority's statement. `cert` / `key` are this member's chain and key,
+# `trust` the authority's anchors — absolute paths, read at run time and
+# re-read when they change (Fluxor's `tls`), so an image carries no
+# credential. A member presenting replica N's principal is replica N; a
+# member that cannot is no peer.
+#
+# Membership and leadership. `admin_in` takes pre-authorized admin commands
+# — `MSG_ADMIN_COMMAND [conn_id:u16 LE][op_code:u8][op_body]`, the includer's
+# own `conn_id` — and `admin_out` answers each with `MSG_ADMIN_RESPONSE
+# [conn_id:u16 LE][status:u8]` (`ADMIN_STATUS_*`). PRE-AUTHORIZED: whatever
+# the includer wires to `admin_in` may change the group's membership, so it
+# carries the includer's own admission in front. The ops:
+#
+#   ADMIN_OP_ADD_LEARNER    0x0C [replica]  attach a replica that receives the log, counts for nothing
+#   ADMIN_OP_REMOVE_LEARNER 0x0D [replica]
+#   ADMIN_OP_ADD_VOTER      0x06 [replica]  promote a caught-up learner (joint consensus)
+#   ADMIN_OP_REMOVE_VOTER   0x07 [replica]  retire a voter, dead or alive (joint consensus)
+#   ADMIN_OP_TRANSFER_LEADER 0x03 [replica]
+#
+# Any member takes them: a follower forwards each to the leader of its term
+# and answers with the leader's status. OK means the change is under way
+# (its configuration entries commit through the log, one transition at a
+# time); REJECTED a second transition while one is open, a promotion of a
+# replica that is not a caught-up learner, or a removal that would leave no
+# quorum; NOT_LEADER no leader to ask (retry); DUPLICATE an identical
+# command inside the 2 s retransmit window (the router's own learner ask,
+# say) — ask again after it for the outcome. Replacing a failed voter is
+# two transitions: ADD_VOTER of the caught-up learner, then REMOVE_VOTER of
+# the failed one, each a joint configuration committed under both majorities.
+# `leader` carries the group's `MSG_LEADER_HINT [leader_id:u8 (0xFF none)]
+# [term:u64 LE]` for an includer that wants to watch it.
+#
+# Writes and reads. The directory's `requests` / `replies` / `checks` are the
+# `clustor-directory` stack's, on every member: a follower forwards the
+# directory's proposals to the leader of its term and serves its
+# linearizable reads through the leader's read index, so an includer talks
+# to its own member, leader or not.
+#
+# State. `wal_dir` / `meta_dir` as in `clustor-directory`: both on the same
+# storage, both kept for as long as the member is.
+stack: clustor-directory-group
+version: 0.1.0
+description: >-
+  Clustor's session directory over a multi-voter replica group with
+  mutually authenticated peers, reached through its request/reply pair and
+  an admin pair that adds learners, replaces voters by joint consensus and
+  transfers leadership.
+
+params:
+  self_id:
+    type: integer
+    required: true
+    example: 0
+    min: 0
+    max: 4
+    description: This member's replica id (0..4)
+  voters:
+    type: integer
+    default: 3
+    min: 1
+    max: 5
+    description: >-
+      The initial voters: replica ids 0 .. voters-1. A member at or above it
+      is a learner slot, admitted when its certificate binds.
+  listen_port:
+    type: integer
+    required: true
+    min: 1
+    max: 65535
+    example: 18790
+    description: This member's peer listener
+  peer0:
+    type: string
+    default: ""
+    description: Replica 0's peer address, host:port (empty, no member)
+  peer1:
+    type: string
+    default: ""
+    description: Replica 1's peer address, host:port (empty, no member)
+  peer2:
+    type: string
+    default: ""
+    description: Replica 2's peer address, host:port (empty, no member)
+  peer3:
+    type: string
+    default: ""
+    description: Replica 3's peer address, host:port (empty, no member)
+  peer4:
+    type: string
+    default: ""
+    description: Replica 4's peer address, host:port (empty, no member)
+  trust:
+    type: string
+    required: true
+    example: /etc/clustor/pki/ca.pem
+    description: The group authority's anchors (absolute path, PEM or DER)
+  cert:
+    type: string
+    required: true
+    example: /etc/clustor/pki/node0.der
+    description: This member's certificate chain (absolute path)
+  key:
+    type: string
+    required: true
+    example: /etc/clustor/pki/node0.key.der
+    description: This member's private key (absolute path)
+  peer_uri:
+    type: string
+    required: true
+    example: "spiffe://cluster.example/tenant/peers/device/"
+    description: The URI SAN prefix every member's certificate carries
+  principal_prefix:
+    type: string
+    required: true
+    example: "spiffe://cluster.example/tenant/peers/device/replica-"
+    description: The principal a replica's id completes (prefix + id)
+  wal_dir:
+    type: string
+    default: wal
+    description: >-
+      The directory the WAL's segments and snapshots live in (absolute, or
+      relative to the working directory); up to 128 bytes, no `..`.
+  meta_dir:
+    type: string
+    default: raft
+    description: The election metadata's directory, on the same storage as `wal_dir`
+  smoke:
+    type: integer
+    default: 0
+    min: 0
+    max: 2
+    description: The directory's boot smoke (0 off; an includer leaves it 0)
+
+exports:
+  requests: session_directory.requests
+  replies: session_directory.replies
+  checks: session_directory.checks
+  admin_in: operations.admin_requests
+  admin_out: operations.admin_answers
+  leader: consensus.leader_state
+  net_in: [peer_tls_server.cipher_in, peer_tls_client.cipher_in]
+  net_out: [peer_tls_server.cipher_out, peer_tls_client.cipher_out]
+
+modules:
+  - name: peer_tls_server
+    type: tls
+    mode: 1
+    verify_peer: 1
+    peer_auth: ca_uri
+    trust: ${param:trust}
+    verify_uri: ${param:peer_uri}
+    cert_file: ${param:cert}
+    key_file: ${param:key}
+  - name: peer_tls_client
+    type: tls
+    mode: 0
+    peer_auth: ca_uri
+    trust: ${param:trust}
+    verify_uri: ${param:peer_uri}
+    cert_file: ${param:cert}
+    key_file: ${param:key}
+  - name: peer_router
+    params:
+      self_id: ${param:self_id}
+      peer_count: 5
+      listen_port: ${param:listen_port}
+      peer0: ${param:peer0}
+      peer1: ${param:peer1}
+      peer2: ${param:peer2}
+      peer3: ${param:peer3}
+      peer4: ${param:peer4}
+      require_identity: principal
+      principal_prefix: ${param:principal_prefix}
+      voters: ${param:voters}
+      partitions: 1
+  - name: gateway
+    params:
+      self_id: ${param:self_id}
+  - name: consensus
+    params:
+      self_id: ${param:self_id}
+      voter_count: ${param:voters}
+      peer_count: ${param:voters}
+      heartbeat_interval_ms: 150
+      meta_dir: ${param:meta_dir}
+  - name: session_directory
+    params:
+      replica_id: ${param:self_id}
+      smoke: ${param:smoke}
+  - name: durability
+    params:
+      self_id: ${param:self_id}
+      voter_count: ${param:voters}
+      partition_id: 0
+      wal_dir: ${param:wal_dir}
+  - name: control_plane
+  - name: admission
+  - name: operations
+
+wiring:
+  # The transport: accepted links through the server, dialled links through
+  # the client, each handshake's verified identity before its link opens.
+  - from: peer_tls_server.clear_out
+    to: peer_router.net_in
+  - from: peer_router.net_out
+    to: peer_tls_server.clear_in
+  - from: peer_tls_client.clear_out
+    to: peer_router.dial_in
+  - from: peer_router.dial_out
+    to: peer_tls_client.clear_in
+  - from: peer_tls_server.peer_identity
+    to: peer_router.tls_identity
+  - from: peer_tls_client.peer_identity
+    to: peer_router.tls_identity
+  # A learner slot whose principal binds is added by the router itself.
+  - from: peer_router.learner_admin
+    to: operations.admin_requests
+
+  # peer_router → the group.
+  - from: peer_router.cleartext
+    to: gateway.requests
+  - from: peer_router.peer_rx
+    to: consensus.ack
+    buffer_bytes: 16384
+  - from: peer_router.raft_rpc
+    to: consensus.rpc
+    buffer_bytes: 16384
+  - from: gateway.admin_req
+    to: operations.admin_req
+  - from: gateway.responses
+    to: peer_router.client_resp
+
+  # Proposals: the gateway's and the directory's, frame-atomic fan-in.
+  - from: gateway.proposals_tagged
+    to: consensus.proposals_tagged
+  - from: consensus.proposal_assigned
+    to: session_directory.proposal_assigned
+  - from: consensus.proposal_assigned
+    to: gateway.proposal_assigned
+  - from: consensus.leader_state
+    to: gateway.leader_state
+  - from: consensus.leader_state
+    to: session_directory.leader_state
+
+  - from: admission.credits
+    to: gateway.credit_supply
+
+  # Replication.
+  - from: consensus.net_out
+    to: peer_router.repl_tx
+    buffer_bytes: 16384
+  - from: consensus.lag_signal
+    to: admission.lag
+  - from: consensus.rpc_out
+    to: peer_router.peer_tx
+    buffer_bytes: 16384
+
+  # Persistence.
+  - from: consensus.log_append
+    to: durability.entries
+  - from: durability.replay_complete
+    to: consensus.wal_replay_complete
+    rate: transaction
+  - from: consensus.log_maintenance
+    to: durability.compact_before
+  - from: durability.flushed
+    to: consensus.wal_flushed
+  - from: consensus.cross_durability_ack
+    to: durability.ack
+  - from: durability.quorum_durable
+    to: consensus.durable
+
+  # Commit → apply, and the gap refetch.
+  - from: consensus.entry_request
+    to: durability.entry_request
+    buffer_bytes: 8192
+  - from: durability.entry_reply
+    to: consensus.entry_reply
+    buffer_bytes: 8192
+  - from: gateway.reads
+    to: consensus.read
+  - from: consensus.applied
+    to: gateway.applied
+
+  # Snapshots.
+  - from: durability.export_chunks
+    to: consensus.snapshot_rx
+  - from: consensus.snapshot_import
+    to: durability.import_chunks
+  - from: durability.manifest_auth
+    to: peer_router.peer_tx
+  - from: durability.installed_local
+    to: consensus.snapshot_installed
+
+  # Control plane.
+  - from: control_plane.proof
+    to: admission.proof
+  - from: admission.cache_state
+    to: consensus.cp_state
+  - from: admission.strict_fallback
+    to: consensus.cp_state
+  - from: admission.permits
+    to: consensus.read_permits
+  - from: control_plane.routing
+    to: gateway.placement
+
+  # Admin.
+  - from: operations.denied
+    to: gateway.admin_responses
+  - from: operations.raft_commands
+    to: consensus.admin_proposals
+  - from: consensus.admin_applied
+    to: operations.admin_applied
+  - from: operations.responses
+    to: gateway.admin_responses
+  - from: operations.raft_proposal
+    to: consensus.proposals
+
+  # Telemetry.
+  - from: consensus.metrics
+    to: operations.ingest
+  - from: durability.metrics
+    to: operations.ingest
+  - from: admission.metrics
+    to: operations.ingest
+  - from: peer_router.metrics
+    to: operations.ingest
+  - from: gateway.metrics
+    to: operations.ingest
+
+  # The directory as the group's replicated consumer.
+  - from: consensus.committed_entries
+    to: session_directory.committed_entries
+  - from: session_directory.proposals
+    to: consensus.proposals_tagged
+  - from: session_directory.metrics
+    to: operations.ingest

@@ -9,8 +9,9 @@
 //! app snapshot round-trip — is documented on the struct below.
 //!
 //! Snapshot files:
-//!   partition_id == 0  →  `wal/p0000_snap_<NNNNNNNN>.bin`
-//!   partition_id == N  →  `wal/p<NNNN>_snap_<NNNNNNNN>.bin`
+//!   partition_id == 0  →  `<wal_dir>/p0000_snap_<NNNNNNNN>.bin`
+//!   partition_id == N  →  `<wal_dir>/p<NNNN>_snap_<NNNNNNNN>.bin`
+//!   (`wal_dir` defaults to `wal`)
 //!   root_path == 1     →  `<p:1hex><idx:7hex>.SNP` at the FS root.
 
 use super::abi::SyscallTable;
@@ -19,6 +20,7 @@ use super::types::{Index, Term};
 use super::{dev_log, dev_millis, fmt_u32_raw, wire, wire_channels};
 use crate::abi::contracts::key_vault as kv;
 
+use super::store_dir::{StoreDir, STORE_DIR_MAX};
 use super::{fs_step, sealed};
 use fs_step::{later, Io};
 
@@ -154,7 +156,11 @@ const FS_E_NOSYS: i32 = -38;
 /// headroom grant, not unbounded I/O.
 const STEP_BURST: i32 = 2;
 
-const SNAP_PATH_MAX: usize = 64;
+/// Longest path this file builds: the `wal_dir` directory, its `/`, and
+/// the longest name placed in it (`p<NNNN>_snap_<NNNNNNNN>.bin`, 23
+/// bytes, plus the slot digit a pointer name gains). Derived from
+/// `STORE_DIR_MAX`, so a builder never truncates a name.
+const SNAP_PATH_MAX: usize = STORE_DIR_MAX + 32;
 
 /// Number of snapshot-pointer slots. Each slot is a SEPARATE FILE, so
 /// the two records never share a read-modify-write unit: a publish
@@ -313,8 +319,11 @@ pub struct Snapshot {
 
     pub partition_id: u16,
     /// Param `root_path`: 1 = 8.3 snapshot names at the FS root (bare-metal
-    /// FAT32); 0 = `wal/p<NNNN>_snap_<NNNNNNNN>.bin` (linux layout).
+    /// FAT32); 0 = `<wal_dir>/p<NNNN>_snap_<NNNNNNNN>.bin` (linux layout).
     pub root_path: u8,
+    /// The `wal_dir` param, shared with the wal component: snapshots and
+    /// pointer slots live beside the segments.
+    pub dir: StoreDir,
     /// FS `caps::UNLINK` probe cache for previous-snapshot retirement:
     /// 0 = unprobed, 1 = supported, 2 = unsupported. See
     /// `fs_unlink_supported`.
@@ -705,6 +714,7 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.snap_ptr_generation = 0;
     s.partition_id = 0;
     s.root_path = 0;
+    s.dir = StoreDir::named(b"wal");
     s.fs_unlink_probe = 0;
     s.name_fence_probe = NAME_FENCE_UNPROBED;
     s.name_fence = 0;
@@ -2638,7 +2648,7 @@ unsafe fn emit_install_body(
 /// Path of pointer slot `slot`. The two slots are distinct files so a
 /// failure in one cannot reach the other.
 ///   root mode: `<p>SNAPPT<slot>.SNP` (8.3-legal: 8-char stem)
-///   dir mode:  `wal/p<NNNN>_snapptr<slot>.bin`
+///   dir mode:  `<wal_dir>/p<NNNN>_snapptr<slot>.bin`
 ///
 /// # Safety
 ///
@@ -2735,12 +2745,15 @@ unsafe fn build_snap_pointer_path(s: &mut Snapshot) -> usize {
         }
         return i;
     }
-    for &b in b"wal/p" {
-        if i < SNAP_PATH_MAX {
-            s.path_buf[i] = b;
-            i += 1;
-        }
-    }
+    // `<wal_dir>/p`. `SNAP_PATH_MAX` holds the directory and the name; a
+    // buffer that could not would yield an empty path (refused by the
+    // provider), never a truncated name.
+    i = match s.dir.put_prefix(&mut s.path_buf) {
+        Some(n) => n,
+        None => return 0,
+    };
+    s.path_buf[i] = b'p';
+    i += 1;
     for digit in (0..4).rev() {
         let nibble = ((s.partition_id >> (digit * 4)) & 0xF) as u8;
         let ch = if nibble < 10 {
@@ -3547,13 +3560,14 @@ unsafe fn boot_seal_fault(s: &mut Snapshot, sys: &SyscallTable, e: ChunkErr) {
     }
 }
 
-/// Build the snapshot path: `wal/p<NNNN>_snap_<NNNNNNNN>.bin`.
+/// Build the snapshot path: `<wal_dir>/p<NNNN>_snap_<NNNNNNNN>.bin`.
 ///
-/// All partitions share the one `wal/` directory; the partition_id is
+/// All partitions share the one `wal_dir` directory; the partition_id is
 /// stamped into the filename rather than a per-partition subdirectory,
 /// mirroring `wal::encode_segment_path`. `OPEN_CREATE` creates files
 /// but does not `mkdir` parents, so the flat layout is what makes the
-/// artefact appear on disk given a single operator-created `wal/`.
+/// artefact appear on disk given the one directory the wal component
+/// creates.
 ///
 /// # Safety
 ///
@@ -3587,12 +3601,15 @@ unsafe fn build_snapshot_path(s: &mut Snapshot, index: Index) -> usize {
         }
         return i;
     }
-    for &b in b"wal/p" {
-        if i < SNAP_PATH_MAX {
-            s.path_buf[i] = b;
-            i += 1;
-        }
-    }
+    // `<wal_dir>/p`. `SNAP_PATH_MAX` holds the directory and the name; a
+    // buffer that could not would yield an empty path (refused by the
+    // provider), never a truncated name.
+    i = match s.dir.put_prefix(&mut s.path_buf) {
+        Some(n) => n,
+        None => return 0,
+    };
+    s.path_buf[i] = b'p';
+    i += 1;
     for digit in (0..4).rev() {
         let nibble = ((s.partition_id >> (digit * 4)) & 0xF) as u8;
         let ch = if nibble < 10 {

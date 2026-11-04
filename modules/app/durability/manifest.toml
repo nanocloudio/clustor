@@ -26,10 +26,18 @@ hardware_targets = ["bcm2712", "linux"]
 #     emitting a durability proof. Acknowledgements on `flushed` mean
 #     replicated-volatile at best.
 #
-# Deployment note (disk): segments live under `wal/` in the process
-# working directory unless `root_path = 1` (bare-metal FAT32 8.3
-# layout at the FS root, shared by segments and snapshots). A missing
-# `wal/` is created at first open; a hard FS failure holds entry
+# Deployment note (disk): segments, the floor sidecar, the seal state
+# and snapshots live in one directory, `wal_dir` (default `wal`, in the
+# process working directory), unless `root_path = 1` (bare-metal FAT32
+# 8.3 layout at the FS root, shared by segments and snapshots).
+# `wal_dir` is a path the FS provider resolves: absolute — how a
+# workload puts its log on a volume lent at an absolute path — or
+# relative to the working directory; up to 128 bytes
+# (`store_dir::STORE_DIR_MAX`), no `..` component. Its last component is
+# created at first open (and its name fenced); its parents must exist.
+# A value it refuses (too long, a `..`, a NUL, `/` alone, or any value
+# beside `root_path = 1`) fails construction. Keep consensus's
+# `meta_dir` on the same storage. A hard FS failure holds entry
 # intake (raft backpressures) rather than degrading — in-memory
 # operation is only ever the volatile variant's declared mode.
 

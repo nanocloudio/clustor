@@ -29,6 +29,7 @@ use super::wal_frame;
 use super::{fs_step, sealed};
 #[path = "wal_seal.rs"]
 pub mod wal_seal;
+use super::store_dir::{StoreDir, STORE_DIR_MAX};
 use super::{
     dev_input_flow_budget, dev_log, dev_micros, dev_millis, dev_report_step_effect, fmt_u32_raw,
     step_effect, wire, wire_channels, POLL_IN, POLL_OUT,
@@ -416,7 +417,10 @@ const SV_SEEK: u8 = 1;
 const SV_READ: u8 = 2;
 const SV_REPLY: u8 = 3;
 
-const WAL_PATH_MAX: usize = 48;
+/// Longest path this file builds: the `wal_dir` directory, its `/`, and
+/// the longest name placed in it (`p<NNNN>_seg_<NNNNNNNN>`, 18 bytes).
+/// Derived from `STORE_DIR_MAX`, so a builder never truncates a name.
+const WAL_PATH_MAX: usize = STORE_DIR_MAX + 32;
 
 // Module phases
 const PHASE_REPLAY: u8 = 0;
@@ -761,6 +765,10 @@ pub struct Wal {
     pub group_window_ms: u16,
     pub group_max_pending: u16,
     pub root_path: u8,
+    /// The `wal_dir` param: where segments, the floor sidecar and the seal
+    /// state live in the directory layout (`root_path = 0`). Shared with the
+    /// snapshot component, so one directory holds the whole group.
+    pub dir: StoreDir,
     /// 1 = skip boot replay and start fresh (segment_seq=1), orphaning any
     /// pre-existing segments. For throughput/latency benches (L1/L2) where a
     /// clean slate is wanted and stale segments from prior runs would
@@ -1188,6 +1196,7 @@ pub unsafe fn init(s: &mut Wal) {
     s.group_window_ms = 2;
     s.group_max_pending = 64;
     s.root_path = 0;
+    s.dir = StoreDir::named(b"wal");
     s.skip_replay = 0;
     s.fixed_segment = 0;
     s.preallocate_unsupported = false;
@@ -2224,8 +2233,13 @@ unsafe fn continue_serve(s: &mut Wal, sys: &SyscallTable) {
                 s.serve_fd = -1;
             }
             let mut path = [0u8; WAL_PATH_MAX];
-            let plen =
-                encode_segment_path(s.partition_id, loc.seg_seq, s.root_path != 0, &mut path);
+            let plen = encode_segment_path(
+                s.partition_id,
+                loc.seg_seq,
+                s.root_path != 0,
+                &s.dir,
+                &mut path,
+            );
             let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
             if later(fd) {
                 return; // the open is asked again next step
@@ -3079,7 +3093,13 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
             return;
         }
         let mut path = [0u8; WAL_PATH_MAX];
-        let plen = encode_segment_path(s.partition_id, s.scan_seg, s.root_path != 0, &mut path);
+        let plen = encode_segment_path(
+            s.partition_id,
+            s.scan_seg,
+            s.root_path != 0,
+            &s.dir,
+            &mut path,
+        );
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
         if later(fd) {
             return;
@@ -4083,8 +4103,13 @@ unsafe fn continue_retire_prep(s: &mut Wal, sys: &SyscallTable) -> Step {
         match s.retire_prep {
             PREP_OPEN => {
                 let mut path = [0u8; WAL_PATH_MAX];
-                let plen =
-                    encode_segment_path(s.partition_id, s.retire_seq, s.root_path != 0, &mut path);
+                let plen = encode_segment_path(
+                    s.partition_id,
+                    s.retire_seq,
+                    s.root_path != 0,
+                    &s.dir,
+                    &mut path,
+                );
                 let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
                 if later(fd) {
                     return Step::Later;
@@ -4157,8 +4182,13 @@ unsafe fn continue_retire_prep(s: &mut Wal, sys: &SyscallTable) -> Step {
             }
             PREP_NAME => {
                 let mut path = [0u8; WAL_PATH_MAX];
-                let plen =
-                    encode_segment_path(s.partition_id, s.retire_seq, s.root_path != 0, &mut path);
+                let plen = encode_segment_path(
+                    s.partition_id,
+                    s.retire_seq,
+                    s.root_path != 0,
+                    &s.dir,
+                    &mut path,
+                );
                 match publish_name(s, sys, &mut path, plen) {
                     Step::Later => return Step::Later,
                     Step::Fail => {
@@ -4352,7 +4382,7 @@ unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> Step 
         };
     }
     let mut path = [0u8; WAL_PATH_MAX];
-    let plen = encode_segment_path(s.partition_id, seq, s.root_path != 0, &mut path);
+    let plen = encode_segment_path(s.partition_id, seq, s.root_path != 0, &s.dir, &mut path);
     loop {
         match s.rm_phase {
             RM_UNLINK => {
@@ -4750,6 +4780,7 @@ unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) -> bool {
                 s.partition_id,
                 s.oldest_segment_seq,
                 s.root_path != 0,
+                &s.dir,
                 &mut path,
             );
             if s.cp_phase == CP_UNLINK {
@@ -4840,7 +4871,7 @@ unsafe fn ensure_fs_caps(s: &mut Wal, sys: &SyscallTable) -> bool {
     true
 }
 
-/// Fence the `wal/` directory's own name when this boot minted it
+/// Fence the `wal_dir` directory's own name when this boot minted it
 /// (`FS_MKDIR` answered 0): a directory created by `MKDIR` is no more
 /// durable than a file created by `OPEN_CREATE` until `FS_FSYNC_NAME`
 /// covers it, and every segment, the floor sidecar and the seal state
@@ -4852,9 +4883,9 @@ unsafe fn fence_wal_dir(s: &mut Wal, sys: &SyscallTable) -> Step {
     if !s.dir_unfenced {
         return Step::Done;
     }
-    let mut dir = [0u8; 4];
-    dir[..3].copy_from_slice(b"wal");
-    let st = publish_name(s, sys, &mut dir, 3);
+    let mut dir = [0u8; STORE_DIR_MAX];
+    let dlen = s.dir.put(&mut dir).unwrap_or(0);
+    let st = publish_name(s, sys, &mut dir, dlen);
     if st == Step::Done {
         s.dir_unfenced = false;
     }
@@ -5270,7 +5301,7 @@ unsafe fn end_replay_segment(s: &mut Wal, sys: &SyscallTable, torn: bool) {
 unsafe fn read_replay_floor(s: &mut Wal, sys: &SyscallTable) -> i32 {
     if s.floor_rd_fd < 0 {
         let mut path = [0u8; WAL_PATH_MAX];
-        let plen = encode_floor_path(s.partition_id, s.root_path != 0, &mut path);
+        let plen = encode_floor_path(s.partition_id, s.root_path != 0, &s.dir, &mut path);
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
         if later(fd) {
             return 0; // provider initialising — retry
@@ -5328,7 +5359,13 @@ unsafe fn read_replay_floor(s: &mut Wal, sys: &SyscallTable) -> i32 {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn build_segment_path(s: &mut Wal, seq: u32) {
-    let n = encode_segment_path(s.partition_id, seq, s.root_path != 0, &mut s.path_buf);
+    let n = encode_segment_path(
+        s.partition_id,
+        seq,
+        s.root_path != 0,
+        &s.dir,
+        &mut s.path_buf,
+    );
     s.path_len = n as u8;
 }
 
@@ -5337,21 +5374,27 @@ unsafe fn build_segment_path(s: &mut Wal, seq: u32) {
 /// stateful `build_segment_path` (above) and by random-access
 /// readers that need a local path buffer.
 ///
-/// Layout: `wal/p<NNNN>_seg_<NNNNNNNN>` — single-directory, every
-/// partition's segments live alongside each other under one
-/// `wal/` directory. The partition prefix is always present
+/// Layout: `<wal_dir>/p<NNNN>_seg_<NNNNNNNN>` (`wal_dir` defaults to
+/// `wal`) — single-directory, every partition's segments live alongside
+/// each other under one directory. The partition prefix is always present
 /// (`p0000` for single-partition deployments) so the directory
 /// contains one consistent filename shape and operators see at a
 /// glance which partition a segment belongs to.
 ///
-/// The `wal/` parent is self-healed at first open (`FS_MKDIR`, once
-/// per boot) when absent, so a fresh working directory needs no
-/// manual `mkdir`. An operator who wants the segments elsewhere
-/// pre-creates a symlink in the working directory (`ln -s
-/// <somewhere> wal`); the single-directory layout serves any
-/// partition count. See
-/// `modules/app/durability/manifest.toml` for the wider deployment note.
-fn encode_segment_path(partition_id: u16, seq: u32, root: bool, out: &mut [u8]) -> usize {
+/// The directory's last component is self-healed at first open
+/// (`FS_MKDIR`, once per boot) when absent, so a fresh working directory
+/// needs no manual `mkdir`. A deployment that wants the segments
+/// elsewhere — a volume lent at an absolute path — names it in
+/// `wal_dir`; the single-directory layout serves any partition count.
+/// See `modules/app/durability/manifest.toml` for the wider deployment
+/// note.
+fn encode_segment_path(
+    partition_id: u16,
+    seq: u32,
+    root: bool,
+    dir: &StoreDir,
+    out: &mut [u8],
+) -> usize {
     let cap = out.len();
     let mut i = 0usize;
     if root {
@@ -5382,12 +5425,14 @@ fn encode_segment_path(partition_id: u16, seq: u32, root: bool, out: &mut [u8]) 
         }
         return i;
     }
-    for &b in b"wal/p" {
-        if i < cap {
-            out[i] = b;
-            i += 1;
-        }
-    }
+    // `<wal_dir>/p`. A buffer that cannot hold the directory yields an
+    // empty path — refused by the provider, never a truncated name.
+    i = match dir.put_prefix(out) {
+        Some(n) if n < cap => n,
+        _ => return 0,
+    };
+    out[i] = b'p';
+    i += 1;
     for digit in (0..4).rev() {
         let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
         let ch = if nibble < 10 {
@@ -5422,10 +5467,10 @@ fn encode_segment_path(partition_id: u16, seq: u32, root: bool, out: &mut [u8]) 
 }
 
 /// Write the segment-floor sidecar path for `partition_id` into `out`
-/// and return the length. Non-root: `wal/p<NNNN>_floor`. Root (8.3
+/// and return the length. Non-root: `<wal_dir>/p<NNNN>_floor`. Root (8.3
 /// bare-metal FAT32): `<p:1hex>FLOOR.WAL` — six-char basename, so it
 /// can never collide with the eight-hex-digit segment names.
-fn encode_floor_path(partition_id: u16, root: bool, out: &mut [u8]) -> usize {
+fn encode_floor_path(partition_id: u16, root: bool, dir: &StoreDir, out: &mut [u8]) -> usize {
     let cap = out.len();
     let mut i = 0usize;
     if root {
@@ -5440,12 +5485,14 @@ fn encode_floor_path(partition_id: u16, root: bool, out: &mut [u8]) -> usize {
         }
         return i;
     }
-    for &b in b"wal/p" {
-        if i < cap {
-            out[i] = b;
-            i += 1;
-        }
-    }
+    // `<wal_dir>/p`. A buffer that cannot hold the directory yields an
+    // empty path — refused by the provider, never a truncated name.
+    i = match dir.put_prefix(out) {
+        Some(n) if n < cap => n,
+        _ => return 0,
+    };
+    out[i] = b'p';
+    i += 1;
     for digit in (0..4).rev() {
         let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
         let ch = if nibble < 10 {
@@ -5545,7 +5592,7 @@ unsafe fn sidecar_step(s: &mut Wal, sys: &SyscallTable) {
         s.sc_phase = SC_OPEN;
     }
     let mut path = [0u8; WAL_PATH_MAX];
-    let plen = encode_floor_path(s.partition_id, s.root_path != 0, &mut path);
+    let plen = encode_floor_path(s.partition_id, s.root_path != 0, &s.dir, &mut path);
     loop {
         match s.sc_phase {
             SC_OPEN => {
@@ -6552,9 +6599,9 @@ unsafe fn open_segment_attempt(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
                 };
             }
             OPEN_MKDIR => {
-                let mut dir = [0u8; 4];
-                dir[..3].copy_from_slice(b"wal");
-                let rc = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), 3);
+                let mut dir = [0u8; STORE_DIR_MAX];
+                let dlen = s.dir.put(&mut dir).unwrap_or(0);
+                let rc = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dlen);
                 if later(rc) {
                     return OpenOutcome::Settling;
                 }

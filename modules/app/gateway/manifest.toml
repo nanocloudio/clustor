@@ -8,7 +8,7 @@ hardware_targets = ["bcm2712", "linux"]
 # admission as one composite module (standards fluxor-modules.md §8).
 #
 # Components: surface (peer_router frame demux + response framing),
-# codec (correlation hub, tagged proposals, leader redirect, epoch
+# codec (correlation hub, tagged proposals, forwarded-write refusals, epoch
 # fencing), throttle (credit-based admission).
 #
 # The client path runs surface → codec → throttle inside the module;

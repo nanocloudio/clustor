@@ -242,9 +242,9 @@ pub unsafe fn step(l: &mut Ledger, sys: &SyscallTable, local_advanced: bool) {
             // Bare envelope, deliberately: the proof's own payload
             // already carries `partition_id` (see
             // `encode_durability_proof` above), so consumers filter
-            // on that. Wrapping it in the partitioned envelope too
-            // would duplicate the field AND break `quantum`'s
-            // `flow` module, which reads this same channel.
+            // on that. This is a durability proof, not a commit point:
+            // an acknowledging consumer reads consensus's
+            // `durable_horizon` (and the apply stream's terms) instead.
             let w = wire_channels::channel_write_msg(
                 sys,
                 l.out_quorum,

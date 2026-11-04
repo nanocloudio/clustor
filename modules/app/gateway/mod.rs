@@ -235,6 +235,18 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // 1. codec drains, then the applied-response loop.
         let mut t0 = dev_micros(sys);
         codec::step(&mut s.codec, sys);
+        // Answers the codec resolved off the assignment port: consensus
+        // refusals, and assignments whose entry had already applied.
+        for _ in 0..8 {
+            if !codec::has_owed(&s.codec) || !surface::ready_to_send(&mut s.surface, sys) {
+                break;
+            }
+            if let Some(out) = codec::next_owed(&mut s.codec) {
+                if surface::send_outbound(&mut s.surface, sys, &out) {
+                    codec::note_response_sent(&mut s.codec);
+                }
+            }
+        }
         for _ in 0..8 {
             // Consume-gate: pulling an applied response retires its
             // correlation entry inside next_applied, so only pull one

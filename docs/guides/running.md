@@ -494,8 +494,27 @@ fluxor run n0.yaml
 ```
 
 Run each node in its own working directory: the durability module
-persists its WAL under `./wal/` relative to the process cwd, and two
-nodes sharing a directory would interleave their logs.
+persists its WAL under `./wal/` relative to the process cwd (and
+consensus its election metadata under `./raft/`), and two nodes
+sharing a directory would interleave their logs. Alternatively give
+each node its own directories through durability's `wal_dir` and
+consensus's `meta_dir` params — absolute paths, up to 128 bytes, no
+`..` component, parents existing:
+
+```yaml
+  - name: consensus
+    params:
+      meta_dir: /var/lib/clustor/n0/raft
+  - name: durability
+    params:
+      wal_dir: /var/lib/clustor/n0/wal
+```
+
+A graph that runs as a workload and must keep its state across
+restarts names directories on a volume lent to it at an absolute path
+the same way (the `clustor-directory` stack takes both params). Keep
+both on the same storage: a log that outlives the term and vote it was
+written under lets a restarted replica vote twice in one term.
 
 ## Reading the graph
 

@@ -302,9 +302,12 @@ read waits (inside its deadline) rather than answering below them. A
 probe that fails to reach majority within 1500 ms, or whose leader
 steps down or changes term first, is answered unconfirmed and the read
 is rejected with `CLIENT_REJECT_FALLBACK`. On a single-node cluster the
-leader is its own majority and confirms immediately. If the probe queue
-is full the read degrades to the legacy gate: the commit horizon
-captured at submission time.
+leader is its own majority and confirms immediately. Every read waits on
+a probe: apply takes a read off its channel only when the probe queue has
+room for it, and raft takes a probe only while it can owe its reply
+(`PROBE_REPLIES_OWED_MAX`), holding replies the eight-slot reply queue
+cannot take in a backlog — so a full queue is backpressure to the reader,
+and no confirmation or refusal is ever dropped.
 
 **Follower ReadIndex.** A follower that knows the leader of its term
 serves linearizable reads too. Raft forwards the read to the leader as
@@ -321,6 +324,32 @@ answer from a deposed leader, a term or leader change while the read
 is outstanding, a follower with no known leader, and a round that does
 not complete within 1500 ms (a partition) all reject the read with
 `CLIENT_REJECT_FALLBACK`.
+
+**Follower writes.** A response-owed write (a tagged proposal — the
+gateway's client writes, the directory's commands) that lands on a
+follower is forwarded to the leader of the follower's term as
+`MSG_PROPOSAL_FORWARD_TAGGED` `[origin][fwd_id][term][body]`, so a client
+of any member writes as it would on the leader. Only the leader of that
+term appends it, at most once; it answers `MSG_PROPOSAL_ASSIGNED_REMOTE`
+with the `(wal_index, term)` it appended at, and the follower re-emits
+that to its proposer as the `MSG_PROPOSAL_ASSIGNED` it would have had on
+the leader — the gateway then answers the client when the entry applies
+on the follower, or refuses it NOT_LEADER if another term's entry took
+that position. The leader records every answer per origin
+(`FWD_WINDOW` per replica), so a lost answer is recovered by a status
+query (the same id, empty body) to that leader, deposed or not: it
+answers from its record for every term it led since it booted, and
+tombstones an id it never saw so a late copy can never append. The
+follower never proposes a write to a second leader. Refusals reach the
+proposer as `MSG_PROPOSAL_REFUSED` on `proposal_assigned`: `NOT_LEADER`
+(no leader within `NO_LEADER_HOLD_MS`, 8 s or two election timeouts, or the node asked no longer led
+the term), `THROTTLED` (leader backpressure), `FALLBACK` (frozen or
+strict fallback), `TOO_LARGE` — all never appended — and
+`OUTCOME_UNKNOWN` when no node that led the term could answer within
+`FWD_DEADLINE_MS` (4 s). At most `FWD_WINDOW` (16) writes are in flight
+per follower and group; the rest wait on their channel. Untagged
+(fire-and-forget) proposals are relayed only with consensus's
+`forward_proposals` param on.
 
 **Permits.** The admission module's proof cache classifies
 control-plane proof age into Fresh / Cached / Stale / Expired

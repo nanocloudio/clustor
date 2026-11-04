@@ -25,7 +25,7 @@ Boot runs in two stages: snapshot restore, then WAL replay.
 
 **Snapshot restore** (`modules/app/durability/snapshot.rs`) reads the
 two CRC-protected pointer slots naming the durable local snapshot
-(`<p>SNAPPT<slot>.SNP` on FAT32, `wal/p<NNNN>_snapptr<slot>.bin`
+(`<p>SNAPPT<slot>.SNP` on FAT32, `<wal_dir>/p<NNNN>_snapptr<slot>.bin`
 otherwise, plus the flat 8-byte record as a last resort), loads and
 CRC-validates the file the highest valid
 pointer names, replays the application body to the state machine (a
@@ -85,9 +85,9 @@ it does in steady state.
 
 Raft persists its own metadata (current term, vote, durable index and
 its term) as two CRC-protected slot records in separate files:
-`RAFT<pppp>.M0` / `RAFT<pppp>.M1` on bare-metal FAT32, `raft/meta0` /
-`raft/meta1` otherwise (the `raft/` parent is created at first persist
-if absent). Each persist writes the slot that is NOT currently
+`RAFT<pppp>.M0` / `RAFT<pppp>.M1` on bare-metal FAT32, `<meta_dir>/meta0` /
+`<meta_dir>/meta1` otherwise (`meta_dir` defaults to `raft`; the
+directory is created at first persist if absent). Each persist writes the slot that is NOT currently
 authoritative, fsyncs it, reads it back, and only then adopts its
 generation, so a torn or lost write damages a record nothing was
 relying on. Boot selects the highest generation whose magic, format id

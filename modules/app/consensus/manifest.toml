@@ -35,8 +35,12 @@ capabilities = ["replication.state_machine"]
 
 # raft persists term + voted_for + durable-index metadata via the FS
 # contract, as two CRC-protected generational slots (root-level
-# RAFT<pppp>.M<slot> when root_path = 1, raft/meta<slot> otherwise —
-# the raft/ parent is self-healed at first persist).
+# RAFT<pppp>.M<slot> when root_path = 1, <meta_dir>/meta<slot> otherwise —
+# `meta_dir` defaults to `raft` in the working directory and may name an
+# absolute path (a volume) up to 128 bytes with no `..` component; its
+# last component is self-healed at first persist, its parents must
+# exist, and a value it refuses fails construction. Keep it on the same
+# storage as durability's `wal_dir`).
 # Persist failures are counted (meta_write_errors) and withhold vote
 # grants and election starts. The `persist_meta: 0` posture disables
 # metadata persistence deliberately (volatile graphs); the declaration
@@ -371,9 +375,14 @@ content_type = "OctetStream"
 # NOT emitted under DUR_RELAXED, where the self match slot seeds on
 # append and commit CAN outrun fsync.
 #
-# `flow`'s mark is a monotonic max, so this and `quorum_durable` may be
-# wired together with no ordering or duplication hazard; on the leader
-# they agree, on a follower only this one fires.
+# Contract: `[pid][current_term][commit_index][self]` — `commit_index` is
+# a commit point and never runs ahead of commit; `current_term` is this
+# node's term, NOT the term of the entry at `commit_index`. A consumer
+# that acknowledges entry (i, t) may do so on the horizon alone only when
+# the horizon's index is >= i AND its term equals t; otherwise it must
+# learn the entry's term from the apply stream. Do NOT wire durability's
+# `quorum_durable` proof in its place: a quorum-durable entry is not a
+# committed one (an older-term entry may still be overwritten).
 [[ports]]
 name = "durable_horizon"
 direction = "output"

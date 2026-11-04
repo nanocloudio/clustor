@@ -76,6 +76,7 @@ numbered from 1, and only this group's entries apply here.
 | Contract face | `modules/common/session_directory_face.rs` | An anchor's SessionCtrlV1 verbs (HELLO / ATTACH / EPOCH_BUMP / DETACH on `ctrl_in`) mapped onto registry commands, and committed replies mapped back onto the contract's frames (ATTACHED / EPOCH_CONFIRMED / DETACHED / ERROR, then the reservation grant) on `ctrl_out`. |
 | Deployment | the substrate graph plus this module wired as a consumer | Boots a real group; grants are quorum-committed and monotone end to end. |
 | Stack | `packaging/stack/clustor-directory.yaml` | `clustor-directory`: a one-voter group with this module as its consumer, published so another project's graph includes it whole and reaches only `requests` / `replies` (and `net_in` / `net_out` for the peer router's socket). |
+| Stack | `packaging/stack/clustor-directory-group.yaml` | `clustor-directory-group`: the same directory over a multi-voter group — peer addresses by replica id, mutually authenticated peer links bound by the group authority's principals, learner slots — with an admin pair (`admin_in` / `admin_out`) through which an includer adds learners, replaces voters by joint consensus and transfers leadership. |
 
 ## What the registry enforces
 
@@ -838,10 +839,53 @@ same log.
 `configs/session-directory-stack.yaml`, a graph holding nothing but the
 included stack and its two socket edges, and proves the group elects
 itself and the included directory's grants and committed expiry land as
-in Clustor's own graph. A multi-voter directory stays Clustor's own
-graphs (`session-directory-3node.yaml`): a stack cannot carry its peers'
-addresses as one list param, and the single-voter shape is what a graph
-that needs a local directory takes.
+in Clustor's own graph.
+
+### A multi-voter directory: `clustor-directory-group`
+
+`packaging/stack/clustor-directory-group.yaml` is the directory over a
+replica group of up to five members. Each member is one include, in its
+own graph, with its own `self_id` and the same `peer0`..`peer4`
+addresses (by replica id; an empty one has no member yet and is never
+dialled), `voters` (ids below it are the initial voters, one at or above
+it a learner slot), and the group authority: `trust` (its anchors),
+`cert` / `key` (this member's chain and key, absolute paths read at run
+time), `peer_uri` (the URI SAN every member carries) and
+`principal_prefix` (a replica's principal is the prefix plus its id).
+Every peer link is mutual TLS — a server-mode `tls` for the links a
+member accepts, a client-mode one for those it dials — and `peer_router`
+binds a replica id only from a verified principal naming it
+(`require_identity: principal`), so which key is which replica is the
+authority's statement. A member started in a learner slot boots outside
+the group and is admitted as a learner when its principal binds.
+
+Exports: the directory's `requests` / `replies` / `checks`; `admin_in` /
+`admin_out`, the admin pair; `leader` (`MSG_LEADER_HINT`); and `net_in` /
+`net_out`, which fan to both `tls` instances. `admin_in` takes
+pre-authorized `MSG_ADMIN_COMMAND [conn_id][op_code][op_body]` — the
+includer's admission sits in front of it, since whatever reaches it may
+change the membership — and `admin_out` answers each with
+`MSG_ADMIN_RESPONSE [conn_id][status]` (operations' `admin_answers`).
+`ADD_LEARNER`, `ADD_VOTER` (promotes a caught-up learner), `REMOVE_VOTER`,
+`REMOVE_LEARNER` and `TRANSFER_LEADER` are accepted on any member: a
+follower forwards each to the leader of its term (`MSG_ADMIN_FORWARD`) and
+answers with the leader's status. A voter change is a joint-consensus
+transition, one at a time (`REJECTED` while one is open); replacing a
+failed voter is `ADD_VOTER` of the caught-up learner and then
+`REMOVE_VOTER` of the failed one — while the group is joint, the new
+voter counts toward the new configuration's majority, which is what
+lets the replacement finish with the old voter dead. Directory writes and
+reads work on every member as well: a follower forwards the directory's
+proposals to the leader and serves linearizable reads through the
+leader's read index (see [replication.md](replication.md)).
+
+`tests/directory_group_e2e.rs` boots `configs/directory-group.yaml` — the
+stack included by path in four member graphs (voters 0-2, learner slot 3)
+under the fixture authority, each with an includer-side admin front — and
+takes the group 3 → 4 → 3: replica 3 admitted and caught up, a voter
+killed, replica 3 promoted and the dead voter retired, leadership
+transferred to replica 3, and the new group committing with a second old
+member gone.
 
 ## What is deliberately out of scope here
 

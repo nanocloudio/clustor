@@ -83,6 +83,13 @@ pub const TAGGED_PROPOSAL_HDR: usize = 8;
 /// [partition_id:u16][wal_index:u64][term:u64]`.
 pub const PROPOSAL_ASSIGNED_LEN: usize = 26;
 
+/// `MSG_PROPOSAL_REFUSED` id and payload size (match
+/// `wire::MSG_PROPOSAL_REFUSED` / `wire::PROPOSAL_REFUSED_LEN`):
+/// `[correlation_id:u64][status:u8][leader_id:u8]`, on the same
+/// `proposal_assigned` port.
+pub const MSG_PROPOSAL_REFUSED: u8 = 0x27;
+pub const PROPOSAL_REFUSED_LEN: usize = 10;
+
 /// MSG_COMMITTED_BATCH payload size: term(8) + index(8).
 pub const COMMITTED_BATCH_LEN: usize = 16;
 
@@ -426,6 +433,20 @@ pub fn decode_proposal_assigned(payload: &[u8]) -> Option<(u64, u16, u64, u64)> 
         payload[25],
     ]);
     Some((correlation_id, partition_id, wal_index, term))
+}
+
+/// Decode a `MSG_PROPOSAL_REFUSED` payload — `(correlation_id, status,
+/// leader_id)`: consensus refused the tagged proposal (`status` is a
+/// `CLIENT_REJECT_*` code; `OUTCOME_UNKNOWN` is the one that may still
+/// commit). The consumer cancels that correlation
+/// (`InflightTable::cancel`). Mirrors `wire::decode_proposal_refused`.
+pub fn decode_proposal_refused(payload: &[u8]) -> Option<(u64, u8, u8)> {
+    if payload.len() < PROPOSAL_REFUSED_LEN {
+        return None;
+    }
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&payload[..8]);
+    Some((u64::from_le_bytes(id), payload[8], payload[9]))
 }
 
 // ── In-flight correlation table ────────────────────────────────────────────

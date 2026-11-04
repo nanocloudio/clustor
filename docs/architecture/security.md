@@ -119,12 +119,14 @@ either way.
 | --- | --- | --- |
 | WAL frame | v1 `0xA5` frame: epoch, 128-bit segment incarnation, frame sequence, ciphertext of `term ‖ index ‖ entry`, tag, CRC32C | `DERIVE(master, "clustor/wal", cluster ‖ partition ‖ replica ‖ epoch ‖ incarnation)` |
 | Snapshot body | v1 `FXSC` chunks of 4096 plaintext bytes, the last flagged final; the file header and CRC trailer stay in the clear | `DERIVE(master, "clustor/snapshot", cluster ‖ partition ‖ generation ‖ epoch)`, 128-bit random generation per snapshot |
-| Allocator state | `wal/p<NNNN>_seal0`/`_seal1` A/B records: epoch, suite, reserved incarnation counter, live-epoch marks, HMAC-SHA256 | `DERIVE(master, "clustor/wal-state", cluster ‖ partition ‖ replica)` |
+| Allocator state | `<wal_dir>/p<NNNN>_seal0`/`_seal1` A/B records: epoch, suite, reserved incarnation counter, live-epoch marks, HMAC-SHA256 | `DERIVE(master, "clustor/wal-state", cluster ‖ partition ‖ replica)` |
 
 Keys live in the Fluxor KEY_VAULT; no key byte enters the module. Each
 group and replica has one persisted `KDF_KEY` master per key epoch,
 labelled `wal/p<partition>/r<replica>/e<epoch>` in the durability
-module's vault namespace. A master the vault would not give back after
+module's vault namespace — a vault label, not a path: it does not
+follow `wal_dir`, and the masters live wherever the node's vault
+keeps them. A master the vault would not give back after
 a restart is refused.
 
 **Nonces.** A frame's nonce is `"WAL0" ‖ frame sequence` under a key

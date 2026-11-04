@@ -165,7 +165,7 @@ likewise stay unwired.
 | Direction | Ports |
 |---|---|
 | in | `admin_req`, `admin_requests`, `identity`, `admin_applied`, `ingest`, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request_in`† |
-| out | `responses`, `denied`, `audit_events`, `authorized`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `response_out`† |
+| out | `responses`, `denied`, `audit_events`, `authorized`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `response_out`†, `migration_cmd`, `admin_answers` |
 
 † `diag` variant only. The `headless` variant omits the HTTP ports
 entirely; readiness and metrics still publish on `readyz`, `why`
@@ -174,7 +174,7 @@ and `export`.
 `admin_req` carries wire-side admin commands, evaluated against
 identity bindings supplied on `identity`. `admin_requests` accepts
 pre-authorized commands from a graph that runs its own admission
-upstream. There is no attach point *between* admission and the
+upstream, answered on `admin_answers` when that is wired. There is no attach point *between* admission and the
 admin workflow — an authorized command is delivered inside the
 module, so no configuration can route around the role check. The
 *decision* is observable on both sides: `denied` carries the

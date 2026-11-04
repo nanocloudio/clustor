@@ -120,7 +120,7 @@ feedback, the same shape a channel edge has.
 |---|---|
 | Inputs | `rpc`, `proposals`, `admin_proposals`, `proposals_tagged`, `proposals_partitioned`, `proposals_partitioned_tagged`, `snapshot_installed`, `wal_flushed`, `wal_replay_complete`, `ack`, `snapshot_rx`, `durable`, `cp_state`, `read_permits`, `read`, `entry_reply` |
 | Outputs | `rpc_out`, `net_out`, `log_append`, `metrics`, `proposal_assigned`, `leader_state`, `admin_applied`, `log_maintenance`, `lag_signal`, `snapshot_import`, `snapshot_request`, `cross_durability_ack`, `committed_entries`, `applied`, `entry_request`, `durable_horizon` |
-| Params | `self_id`, `voter_count`, `election_timeout_ms`, `heartbeat_interval_ms`, `proposal_batch_max`, `proposal_batch_timeout_ms`, `partition_id`, `root_path`, `peer_count`, `pipeline_depth`, `durability_mode`, `persist_meta`, `name_fence`, `site_map`, `min_sites` |
+| Params | `self_id`, `voter_count`, `election_timeout_ms`, `heartbeat_interval_ms`, `proposal_batch_max`, `proposal_batch_timeout_ms`, `partition_id`, `root_path`, `meta_dir`, `peer_count`, `pipeline_depth`, `durability_mode`, `persist_meta`, `name_fence`, `site_map`, `min_sites` |
 
 Two inputs and one output are shared handles with an in-module
 demux, because fluxor caps a module at 16 ports per direction:
@@ -136,8 +136,14 @@ demux, because fluxor caps a module at 16 ports per direction:
 `consensus` requires an `fs` write contract: `raft` persists term,
 `voted_for` and the durable index/term pair to two CRC-protected slot
 files, `RAFT<pppp>.M<slot>` (root-level 8.3 names when
-`root_path = 1`) or `raft/meta<slot>` otherwise, with the `raft/`
-parent created at first persist. A persist failure
+`root_path = 1`) or `<meta_dir>/meta<slot>` otherwise (`meta_dir`
+defaults to `raft`), with that directory created at first persist.
+`meta_dir` may name an absolute path — a volume — up to 128 bytes
+with no `..` component; its parents must exist, and a value it
+refuses (too long, a `..`, a NUL, `/` alone, or any value beside
+`root_path = 1`) fails construction. Keep it on the same storage as
+durability's `wal_dir`: a log that outlives the term and vote it was
+written under lets a restarted replica vote twice in one term. A persist failure
 is counted (`meta_write_errors`), logged once, and withholds vote
 grants and election starts until the store recovers. Setting
 `persist_meta = none` disables metadata persistence deliberately:
@@ -168,7 +174,7 @@ themselves rather than behind channel capacity.
 |---|---|
 | Inputs | `entries`, `entry_request`, `compact_before`, `ack`, `import_chunks`, `trigger`, `install_request`, `retention_floor`, `app_snapshot_body` |
 | Outputs | `flushed`, `replay_complete`, `entry_reply`, `compaction_signal`, `metrics`, `quorum_durable`, `export_chunks`, `manifest_auth`, `installed_local`, `app_snapshot_ctl`, `cert_refresh` |
-| Params | `encoding`, `segment_bytes`, `aead`, `cluster`, `partition_id`, `self_id`, `fsync_mode`, `group_window_ms`, `group_max_pending`, `root_path`, `skip_replay`, `fixed_segment`, `preallocate_settle_ms`, `fence_depth`, `voter_count`, `name_fence` |
+| Params | `encoding`, `segment_bytes`, `aead`, `cluster`, `partition_id`, `self_id`, `fsync_mode`, `group_window_ms`, `group_max_pending`, `root_path`, `wal_dir`, `skip_replay`, `fixed_segment`, `preallocate_settle_ms`, `fence_depth`, `voter_count`, `name_fence` |
 | Variants | `disk` (default), `volatile` |
 
 `disk` is the durable composition: FS-backed segments and
@@ -186,15 +192,25 @@ carries only the ring its retention model uses: a disk build holds
 the 8192-slot entry-location map and a single body slot, a
 volatile build holds `VOLATILE_RETENTION_SLOTS` of each. `Wal` is
 the largest component either way, so it is the dominant term:
-`size_of::<Wal>()` is 291,912 B on a disk build and 564,280 B on a
+`size_of::<Wal>()` is 295,256 B on a disk build and 567,624 B on a
 volatile one, bounded at compile time by `WAL_FOOTPRINT_BUDGET`.
 The kernel allocates module state from `module_state_size()` rather
 than BSS, so nothing in the linker output would show a regression
 here and that assertion is what catches one.
 
-`partition_id`, `self_id` and `root_path` are shared across all
-four components, so the on-disk layout for segments and snapshots
-is chosen once per module rather than per component.
+`partition_id`, `self_id`, `root_path` and `wal_dir` are shared
+across all four components, so the on-disk layout for segments and
+snapshots is chosen once per module rather than per component.
+
+`wal_dir` (default `wal`) is the directory segments, the floor
+sidecar, the seal state and snapshots live in when `root_path = 0`:
+relative to the working directory, or absolute — how a workload keeps
+its log on a volume lent at an absolute path. Up to 128 bytes
+(`STORE_DIR_MAX`, `modules/common/store_dir.rs`), no `..` component;
+its last component is created at first open and its name fenced, its
+parents must exist. A value it refuses (too long, a `..`, a NUL, `/`
+alone, or any value beside `root_path = 1`) fails construction
+(`[wal] wal_dir refused`) rather than writing elsewhere.
 
 ### `gateway`
 
@@ -203,7 +219,7 @@ Client envelope routing, framing/correlation and admission.
 | Component | Responsibility |
 |---|---|
 | `surface` | Demuxes inbound clustor wire envelopes from `peer_router` to the raft-RPC, client and admin routes; frames outbound responses, rejects and telemetry payloads back toward the connection namespace that asked. Not an HTTP parser — `operations` owns HTTP framing. |
-| `codec` | Request framer and `conn_id` correlation hub: stamps correlation ids (dense from 1, bit 63 clear), binds them to assigned WAL indices, applies leader redirect and placement-epoch fencing. |
+| `codec` | Request framer and `conn_id` correlation hub: stamps correlation ids (dense from 1, bit 63 clear), binds them to assigned WAL indices (a follower's writes are forwarded to the leader by consensus, and their refusals come back on the assignment port), applies placement-epoch fencing. |
 | `throttle` | Credit-based admission. Consumes credits from `admission` and rejects or admits requests against the throttle envelope. |
 
 Dispatch order is `codec → throttle → surface`, and the client
@@ -308,7 +324,10 @@ evaluated against identity bindings; `POST /admin/<op>` evaluates
 as `default_role`, because HTTP carries no peer identity, and is
 denied with 403 when that role is insufficient. `admin_requests`
 accepts pre-authorized commands from a graph that runs its own
-admission upstream. The decision is externally observable on both
+admission upstream; their answers leave on `admin_answers` when it is
+wired (the includer of `clustor-directory-group` reads them there), on
+`responses` otherwise, and an answer the port cannot take waits rather
+than being dropped. The decision is externally observable on both
 sides: `denied` carries the refusals and `authorized` tees the
 commands that passed, carrying the same `MSG_ADMIN_COMMAND` bytes
 the `admin` component received. The tee is best-effort — dropped
@@ -322,7 +341,7 @@ tick. An authorized command delivers into `admin` in the same step
 | | |
 |---|---|
 | Inputs | `admin_req`, `identity`, `admin_applied`, `admin_requests`, `ingest`, `proposal_assigned`†, `applied`†, `proposal_rejected`†, `request_in`† |
-| Outputs | `responses`, `denied`, `audit_events`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `authorized`, `response_out`† |
+| Outputs | `responses`, `denied`, `audit_events`, `raft_commands`, `raft_proposal`, `readyz`, `why`, `export`, `proposal`†, `authorized`, `response_out`†, `migration_cmd`, `admin_answers` |
 | Params | `admin_svid_prefix`, `observer_svid_prefix`, `default_role`, `emit_interval_ms`, `operator_key{0..3}`, `observer_key{0..3}` |
 | Variants | `diag` (default), `headless` |
 

@@ -42,6 +42,15 @@ use super::{types, wal_frame, wire, wire_channels};
 
 const CORR_RING: usize = 64;
 const IDX_RING: usize = 64;
+/// Recently applied `(partition, index, term)` the codec remembers, so
+/// an assignment that arrives after its entry applied — a forwarded
+/// write whose leader's answer came by a later status query — is still
+/// answered rather than left to the TTL.
+const APPLIED_RING: usize = 64;
+/// Answers owed to clients that the codec resolved off the assignment
+/// port (refusals, and assignments whose entry already applied), waiting
+/// for the surface. A full queue holds the assignment port.
+const OWED_REPLIES: usize = 16;
 
 const LEADER_UNKNOWN: u8 = 0xFF;
 
@@ -85,6 +94,20 @@ pub enum Pulled {
     Empty,
     Skipped,
     Frame(u8, usize),
+}
+
+/// An answer owed to a client, resolved off the assignment port.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OwedReply {
+    conn_id: u16,
+    origin: Origin,
+    /// 0 = committed at `(term, index)`; otherwise the
+    /// `CLIENT_REJECT_*` status, with `leader` its hint.
+    status: u8,
+    leader: u8,
+    term: u64,
+    index: u64,
 }
 
 /// Terminal route for one client request, resolved by [`on_request`].
@@ -141,7 +164,6 @@ pub struct Codec {
     requests_parsed: u32,
     responses_sent: u32,
     reads_rejected: u32,
-    not_leader_rejected: u32,
     /// Requests refused as larger than one log entry carries.
     too_large_rejected: u32,
     stale_epoch_rejected: u32,
@@ -160,6 +182,14 @@ pub struct Codec {
     corr_head: u16,
     idx_ring: [IdxEntry; IDX_RING],
     idx_head: u16,
+    /// `(partition_id, wal_index, term)` of the last `APPLIED_RING`
+    /// committed responses seen on `applied`.
+    applied_ring: [(u16, u64, u64); APPLIED_RING],
+    applied_head: u16,
+    owed: [OwedReply; OWED_REPLIES],
+    owed_len: u8,
+    /// Proposals consensus refused (`MSG_PROPOSAL_REFUSED`).
+    proposals_refused: u32,
 
     // Scratch
     msg_buf: [u8; 2048],
@@ -179,7 +209,6 @@ pub unsafe fn init(c: &mut Codec) {
     c.requests_parsed = 0;
     c.responses_sent = 0;
     c.reads_rejected = 0;
-    c.not_leader_rejected = 0;
     c.too_large_rejected = 0;
     c.stale_epoch_rejected = 0;
     c.corr_misses = 0;
@@ -190,6 +219,10 @@ pub unsafe fn init(c: &mut Codec) {
     c.next_corr_id = 1; // correlation_id MUST be non-zero
     c.corr_head = 0;
     c.idx_head = 0;
+    c.applied_ring = [(0, 0, 0); APPLIED_RING];
+    c.applied_head = 0;
+    c.owed_len = 0;
+    c.proposals_refused = 0;
     for slot in c.corr_ring.iter_mut() {
         *slot = CorrEntry {
             corr_id: 0,
@@ -320,26 +353,161 @@ unsafe fn drain_proposal_assigned(c: &mut Codec, sys: &SyscallTable) {
     }
     let now_ms = dev_millis(sys);
     for _ in 0..16 {
+        // Either message can owe a client an answer now; hold the port
+        // while there is no room to keep one.
+        if c.owed_len as usize >= OWED_REPLIES {
+            break;
+        }
         let Some((msg_type, plen)) =
             wire_channels::next_msg(sys, c.in_proposal_assigned, &mut c.msg_buf)
         else {
             break;
         };
-        if msg_type != wire::MSG_PROPOSAL_ASSIGNED {
-            continue;
-        }
-        let Some((corr_id, partition_id, wal_index, term)) =
-            wire::decode_proposal_assigned(&c.msg_buf[..plen as usize])
-        else {
-            continue;
-        };
-        // Look up the conn_id we recorded when emitting this proposal.
-        if let Some((conn_id, origin)) = take_corr(c, corr_id) {
-            put_idx(c, partition_id, wal_index, term, conn_id, origin, now_ms);
-        } else {
-            c.corr_misses += 1;
+        match msg_type {
+            wire::MSG_PROPOSAL_ASSIGNED => {
+                let Some((corr_id, partition_id, wal_index, term)) =
+                    wire::decode_proposal_assigned(&c.msg_buf[..plen as usize])
+                else {
+                    continue;
+                };
+                // Look up the conn_id we recorded when emitting this proposal.
+                let Some((conn_id, origin)) = take_corr(c, corr_id) else {
+                    c.corr_misses += 1;
+                    continue;
+                };
+                match applied_term(c, partition_id, wal_index) {
+                    Applied::Pending => {
+                        put_idx(c, partition_id, wal_index, term, conn_id, origin, now_ms);
+                    }
+                    Applied::At(t) if t == term => owe(
+                        c,
+                        OwedReply {
+                            conn_id,
+                            origin,
+                            status: 0,
+                            leader: 0,
+                            term,
+                            index: wal_index,
+                        },
+                    ),
+                    Applied::At(_) => {
+                        c.idx_superseded += 1;
+                        let leader = c.leader_id;
+                        owe(
+                            c,
+                            refusal(conn_id, origin, wire::CLIENT_REJECT_NOT_LEADER, leader),
+                        );
+                    }
+                    Applied::Forgotten => owe(
+                        c,
+                        refusal(
+                            conn_id,
+                            origin,
+                            wire::CLIENT_REJECT_OUTCOME_UNKNOWN,
+                            LEADER_UNKNOWN,
+                        ),
+                    ),
+                }
+            }
+            wire::MSG_PROPOSAL_REFUSED => {
+                let Some((corr_id, status, leader)) =
+                    wire::decode_proposal_refused(&c.msg_buf[..plen as usize])
+                else {
+                    continue;
+                };
+                let Some((conn_id, origin)) = take_corr(c, corr_id) else {
+                    c.corr_misses += 1;
+                    continue;
+                };
+                c.proposals_refused += 1;
+                owe(c, refusal(conn_id, origin, status, leader));
+            }
+            _ => {}
         }
     }
+}
+
+/// What the codec knows of the entry at `(partition_id, wal_index)`.
+enum Applied {
+    /// Not applied yet, as far as this codec has seen.
+    Pending,
+    /// Applied, in this term.
+    At(u64),
+    /// Applied too long ago for the ring to say in which term.
+    Forgotten,
+}
+
+fn applied_term(c: &Codec, partition_id: u16, wal_index: u64) -> Applied {
+    let mut top = 0u64;
+    let mut bottom = u64::MAX;
+    for &(p, index, term) in c.applied_ring.iter() {
+        if p != partition_id || index == 0 {
+            continue;
+        }
+        if index == wal_index {
+            return Applied::At(term);
+        }
+        top = top.max(index);
+        bottom = bottom.min(index);
+    }
+    if top != 0 && wal_index < top && wal_index < bottom {
+        Applied::Forgotten
+    } else {
+        Applied::Pending
+    }
+}
+
+/// Queue an answer for the dispatch table to send (the caller checked
+/// for room).
+fn owe(c: &mut Codec, r: OwedReply) {
+    let n = c.owed_len as usize;
+    if n < OWED_REPLIES {
+        c.owed[n] = r;
+        c.owed_len += 1;
+    }
+}
+
+/// A refusal owed to `conn_id`.
+fn refusal(conn_id: u16, origin: Origin, status: u8, leader: u8) -> OwedReply {
+    OwedReply {
+        conn_id,
+        origin,
+        status,
+        leader,
+        term: 0,
+        index: 0,
+    }
+}
+
+/// Whether an answer resolved off the assignment port is waiting.
+pub fn has_owed(c: &Codec) -> bool {
+    c.owed_len != 0
+}
+
+/// Take the oldest answer resolved off the assignment port, as the
+/// wire response the surface sends.
+pub fn next_owed(c: &mut Codec) -> Option<Outbound> {
+    if c.owed_len == 0 {
+        return None;
+    }
+    let r = c.owed[0];
+    let n = c.owed_len as usize;
+    c.owed.copy_within(1..n, 0);
+    c.owed_len -= 1;
+    if r.status != 0 {
+        return Some(build_reject_wire(
+            r.origin, r.conn_id, r.status, 0, 0, 0, r.leader,
+        ));
+    }
+    let mut out = Outbound {
+        msg_type: wire::MSG_CLIENT_RESPONSE,
+        len: 18,
+        origin: r.origin,
+        buf: [0u8; 64],
+    };
+    out.buf[..2].copy_from_slice(&r.conn_id.to_le_bytes());
+    wire::encode_term_index(&mut out.buf[2..18], r.term, r.index);
+    Some(out)
 }
 
 /// Read one frame off the module's `client_requests` port into
@@ -498,21 +666,10 @@ pub unsafe fn on_request(
                     0,
                 ));
             }
-            // Leader-redirect: if we know who the leader is and it
-            // isn't us, surface NOT_LEADER with the believed leader_id
-            // in the reject envelope.
-            if c.leader_id != LEADER_UNKNOWN && c.leader_id != c.self_id {
-                c.not_leader_rejected += 1;
-                return Route::Respond(build_reject_wire(
-                    origin,
-                    conn_id,
-                    wire::CLIENT_REJECT_NOT_LEADER,
-                    0,
-                    0,
-                    0,
-                    c.leader_id,
-                ));
-            }
+            // No leader redirect: on a follower consensus forwards the
+            // write to the leader of its term and answers it here — the
+            // assignment (then the applied response), or a refusal on
+            // the assignment port (`MSG_PROPOSAL_REFUSED`).
 
             // Tagged proposal `[correlation_id:u64][body]` so the
             // leader can echo MSG_PROPOSAL_ASSIGNED back on
@@ -607,6 +764,9 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
             let index = u64::from_le_bytes([
                 body[8], body[9], body[10], body[11], body[12], body[13], body[14], body[15],
             ]);
+            let slot = (c.applied_head as usize) % APPLIED_RING;
+            c.applied_ring[slot] = (partition_id, index, term);
+            c.applied_head = c.applied_head.wrapping_add(1);
             let (conn_id, origin) = match take_idx(c, partition_id, index, term) {
                 Some((v, origin, true)) => (v, origin),
                 Some((v, origin, false)) => {

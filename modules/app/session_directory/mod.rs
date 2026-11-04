@@ -2165,6 +2165,26 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 else {
                     break;
                 };
+                if msg_type == wire::MSG_PROPOSAL_REFUSED {
+                    // Never appended (or, OUTCOME_UNKNOWN, unknowable):
+                    // free the slot now rather than at its TTL. The
+                    // requester's reply-timeout retry is the signal, as
+                    // for an expired slot — there is no refusal reply
+                    // shape.
+                    if let Some((corr, _, _)) =
+                        wire::decode_proposal_refused(&s.msg_buf[..plen as usize])
+                    {
+                        for i in 0..MAX_PENDING {
+                            if s.pending_used[i] && s.pending_corr[i] == corr {
+                                s.pending_used[i] = false;
+                                s.proposals_expired = s.proposals_expired.saturating_add(1);
+                                dev_log(sys, 2, b"[sess_dir] proposal refused".as_ptr(), 27);
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if msg_type != wire::MSG_PROPOSAL_ASSIGNED || (plen as usize) < 18 {
                     continue;
                 }

@@ -146,14 +146,15 @@ define_params! {
     // `partition_id = partition_id_param + i`. Clamped to 1..=K_MAX; a
     // graph asking for more gets the ceiling rather than a silent
     // misroute.
-    // Relay client proposals from a follower to the leader. Default off.
-    // Off, a proposal landing on a non-leader is never drained at all
-    // (`drain_proposals` runs only from `step_leader`) and stalls in the
-    // channel. On, it is forwarded — but only the untagged,
-    // fire-and-forget path (MQTT QoS 0, Kafka acks=0); response-owed
-    // writes still need a leader connection. Applies to every slot: with
-    // K>1 each group elects its own leader, so a node is a follower for
-    // some groups and the leader for others simultaneously.
+    // Relay UNTAGGED (fire-and-forget: MQTT QoS 0, Kafka acks=0) client
+    // proposals from a follower to the leader. Default off: off, one
+    // landing on a non-leader is never drained and stalls in its
+    // channel. Response-owed (tagged) proposals do not depend on this:
+    // a follower always forwards them to the leader of its term and
+    // answers each one — the assignment, or `MSG_PROPOSAL_REFUSED`.
+    // Applies to every slot: with K>1 each group elects its own leader,
+    // so a node is a follower for some groups and the leader for others
+    // simultaneously.
     20, forward_proposals, u8, 0
         => |s, d, len| {
             // Slot 0 only: `clone_slot_from_zero` mirrors it into slots
@@ -189,6 +190,24 @@ define_params! {
     8, root_path, u8, 0
         => |s, d, len| { s.slots[0].raft.meta_root_path = p_u8(d, len, 0, 0); };
 
+    // The directory the election-metadata slots live in (`root_path = 0`):
+    // a path the FS provider resolves — absolute (a volume lent at an
+    // absolute path), or relative to the working directory. Up to 128
+    // bytes, no `..` component; its last component (and a partition's
+    // `p<NNNN>` beneath it) is created at first persist, its parents must
+    // exist. Empty: `raft`. Keep it on the same storage as durability's
+    // `wal_dir`: a log that outlives the term and vote it was written
+    // under lets a restarted replica vote twice in one term. A value
+    // construction refuses (too long, a `..`, a NUL, `/` alone, or any
+    // value beside `root_path = 1`) fails the module.
+    23, meta_dir, str, 0
+        => |s, d, len| {
+            // SAFETY: the params TLV names `len` bytes at `d` (none when
+            // `len` is 0, the default pass).
+            let raw = if len == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(d, len) } };
+            s.slots[0].raft.meta_dir.set(raw, b"raft");
+        };
+
     9, peer_count, u8, 0
         => |s, d, len| { s.slots[0].repl.peer_count = p_u8(d, len, 0, 0); };
 
@@ -203,7 +222,8 @@ define_params! {
     // timeout) plus a heard-term floor mitigate the restarted-node
     // double-vote hazard. Pair with the durability module's `volatile`
     // variant and `durability_mode: relaxed`. Default 1 persists via
-    // the FS contract (`root_path` selects the layout).
+    // the FS contract (`root_path` selects the layout, `meta_dir` the
+    // directory).
     12, persist_meta, u8, 1, enum { none=0, fs=1 }
         => |s, d, len| { s.slots[0].raft.persist_meta = p_u8(d, len, 0, 1); };
 
@@ -555,6 +575,17 @@ pub unsafe extern "C" fn module_new(
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
         }
+        // `meta_dir` is validated here, once: a value that would place the
+        // election metadata somewhere other than what it names refuses the
+        // module.
+        {
+            let d = &s.slots[0].raft.meta_dir;
+            if d.refused() || (d.explicit() && s.slots[0].raft.meta_root_path != 0) {
+                let m = b"[raft] meta_dir refused (1..=128 bytes, no `..`, not with root_path=1)";
+                dev_log(sys, 1, m.as_ptr(), m.len());
+                return -22;
+            }
+        }
         // A declared multi-site group: refused if no quorum can ever form
         // across its voters' sites, reported if one site's loss stops it.
         let sites = types::SiteMap::new(s.site_map, s.min_sites);
@@ -758,6 +789,7 @@ fn clone_slot_from_zero(
     dst.raft.catchup_lag_max = src.raft.catchup_lag_max;
     dst.raft.persist_meta = src.raft.persist_meta;
     dst.raft.meta_root_path = src.raft.meta_root_path;
+    dst.raft.meta_dir = src.raft.meta_dir;
     dst.raft.name_fence = src.raft.name_fence;
     dst.repl.peer_count = src.repl.peer_count;
     dst.repl.pipeline_depth = src.repl.pipeline_depth;
@@ -1286,6 +1318,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             //    timing preserved) and the E4 commit-horizon latch raised
             //    last step.
             let t0 = if timed { dev_micros(sys) } else { 0 };
+            s.slots[i].raft.apply_index_hint = apply::applied_index(&s.slots[i].apply);
             raft::step(
                 &mut s.slots[i].raft,
                 sys,

@@ -195,6 +195,14 @@ table via
 An assignment for an unknown `correlation_id` (e.g. cancelled after
 a leader change) is silently dropped.
 
+A proposal consensus refuses comes back on the same port as
+`MSG_PROPOSAL_REFUSED { correlation_id, status, leader_id }`
+(`decode_proposal_refused`); the consumer cancels that correlation.
+Every status but `CLIENT_REJECT_OUTCOME_UNKNOWN` means the proposal was
+never appended. A consumer on a follower is answered the same way: its
+proposals are forwarded to the leader, and the assignment it gets back
+is the leader's.
+
 The term is what makes the index name one entry. An index on its own
 can be overwritten by conflict repair, so a slot commits only when the
 committed entry's term matches the one it was assigned in: a slot at

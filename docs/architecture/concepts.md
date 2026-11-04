@@ -124,9 +124,11 @@ share state.
 Two targets exist. On Raspberry Pi 5 bare metal the filesystem is
 FAT32 with no mkdir, so persistent files live in the volume root under
 8.3 names (for example `RAFT<pppp>.M0` and `<p><seq7>.WAL`). On the
-Linux host harness files live under `./wal/` relative to the working
-directory (`wal/p<NNNN>_seg_<NNNNNNNN>`,
-`wal/p<NNNN>_snap_<NNNNNNNN>.bin`, `raft/meta0`). Strict-mode WAL
+Linux host files live under durability's `wal_dir` and consensus's
+`meta_dir` (by default `./wal/` and `./raft/` relative to the working
+directory; either may be absolute, such as a volume):
+`<wal_dir>/p<NNNN>_seg_<NNNNNNNN>`,
+`<wal_dir>/p<NNNN>_snap_<NNNNNNNN>.bin`, `<meta_dir>/meta0`. Strict-mode WAL
 appends issue a write plus fsync per entry; group_fsync batches writes
 inside the configured window.
 
@@ -183,8 +185,8 @@ Segments are plain append-only files rolled at `segment_bytes`
 (default 64 MiB). Naming (`encode_segment_path` in
 `modules/app/durability/wal.rs`):
 
-- Linux host: `wal/p<NNNN>_seg_<NNNNNNNN>` — partition id as four hex
-  digits, segment sequence as eight.
+- Linux host: `<wal_dir>/p<NNNN>_seg_<NNNNNNNN>` (`wal_dir` default
+  `wal`) — partition id as four hex digits, segment sequence as eight.
 - Bare-metal FAT32 root: `<p><seq7>.WAL` — one partition nibble plus
   seven sequence nibbles, 8.3-conforming.
 
@@ -195,8 +197,9 @@ is entirely the per-entry CRC chain.
 
 Consensus persists election and log-tip state via the FS contract
 (`modules/app/consensus/raft.rs`) as two slot records in separate
-files: `RAFT<pppp>.M<slot>` on bare-metal FAT32, `raft/meta<slot>` (or
-`raft/p<NNNN>/meta<slot>` for non-zero partitions) on the host. Each
+files: `RAFT<pppp>.M<slot>` on bare-metal FAT32, `<meta_dir>/meta<slot>`
+(or `<meta_dir>/p<NNNN>/meta<slot>` for non-zero partitions; `meta_dir`
+default `raft`) on the host. Each
 record is 64 bytes:
 
 ```

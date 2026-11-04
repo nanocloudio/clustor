@@ -4,8 +4,8 @@
 //! proposal batching, and heartbeat generation. Role-dependent step logic
 //! drives the follower/candidate/leader state machine. Persists
 //! term/vote/durable-index metadata into two generational CRC-sealed
-//! slots (`RAFT<pppp>.M<slot>` on bare-metal FAT32, `raft/meta<slot>`
-//! otherwise) via the FS contract.
+//! slots (`RAFT<pppp>.M<slot>` on bare-metal FAT32, `<meta_dir>/meta<slot>`
+//! otherwise, `meta_dir` defaulting to `raft`) via the FS contract.
 //!
 //! Seams (owned here, drained by the dispatch table in `mod.rs`):
 //! AppendEntries outbox ring → replicator; log-body outbox ring →
@@ -32,6 +32,10 @@ use super::collections::Crc32c;
 use super::inbox;
 #[path = "../../common/fs_step.rs"]
 mod fs_step;
+// The `meta_dir` param's validated directory (shared with durability's
+// `wal_dir`).
+#[path = "../../common/store_dir.rs"]
+pub mod store_dir;
 use super::seam::{HorizonLatch, SeamRing, PROBE_QUEUE_SLOTS};
 use super::types::*;
 use super::{
@@ -39,6 +43,7 @@ use super::{
     wire_channels,
 };
 use fs_step::{later, Io};
+use store_dir::{StoreDir, STORE_DIR_MAX};
 
 /// One coalesced batch = one WAL entry body. Derived from the shared
 /// frame contract so the write path can never exceed what replay
@@ -59,6 +64,15 @@ const MAX_BATCH_PROPOSALS: usize = 256;
 /// connection count or newcomers get rejected at the boundary. Slots
 /// are 48 bytes; 32 is cheap.
 const MAX_INFLIGHT_PROBES: usize = 32;
+
+/// Probe replies raft may owe apply at once: one per read it has taken
+/// off the E7 queue and not yet handed back on E8 — a local probe slot,
+/// a forwarded read, or a reply waiting in `reply_backlog`. Raft takes
+/// no further read off the E7 queue while this many are owed, so the
+/// backlog can never overflow and no confirmation is ever dropped; the
+/// reads behind it wait on the E7 queue, and apply stops taking
+/// submissions while that queue is full (backpressure to the reader).
+const PROBE_REPLIES_OWED_MAX: usize = 2 * MAX_INFLIGHT_PROBES;
 
 /// How long a strict-ReadIndex probe may wait for majority replies
 /// before we give up and answer the read with fallback. Sized to the
@@ -218,6 +232,133 @@ impl ForwardedRead {
     }
 }
 
+/// Response-owed writes this follower may have forwarded and not yet
+/// answered, per group — a sliding window over the forward sequence: a
+/// forward takes slot `seq % FWD_WINDOW` and only once the forward
+/// `FWD_WINDOW` before it is resolved, so the leader's per-origin
+/// record of the same width always still holds every forward the
+/// follower can ask about. A full window is backpressure: the next
+/// proposal stays queued upstream.
+const FWD_WINDOW: usize = 16;
+/// How often an unanswered forward is asked after: the leader's answer
+/// rides a best-effort rpc write, so a lost one is recovered by a status
+/// query to the same leader rather than by proposing the write again.
+const FWD_QUERY_MS: u64 = 250;
+/// How long a forward waits for its leader (or, once deposed, that same
+/// node) to say whether it appended it before the write is refused as
+/// `CLIENT_REJECT_OUTCOME_UNKNOWN`. Below the proposers' own reclaim
+/// windows (the directory's 10 s, the gateway's 30 s).
+const FWD_DEADLINE_MS: u64 = 4_000;
+/// How long a write waits on its channel for a leader to appear before it
+/// is refused NOT_LEADER: the longer of this and two election timeouts. A
+/// group forming at boot, or re-electing through split votes, takes a few
+/// election rounds; held this long the write is still proposed when a
+/// leader appears, and refused before the proposers' own reclaim windows
+/// (the directory's 10 s) give up on it silently.
+const NO_LEADER_HOLD_MS: u64 = 8_000;
+/// Terms this node led since boot whose forward record it can still
+/// answer from, newest first.
+const LED_TERMS: usize = 4;
+
+/// Leader-only admin ops a follower may have forwarded to its leader and
+/// not yet heard back about. A full table answers the next one
+/// `ADMIN_STATUS_NOT_LEADER` (retryable) rather than queueing it.
+const ADMIN_FWD_SLOTS: usize = 4;
+/// How long a forwarded admin op waits for its leader's answer before it
+/// is answered `ADMIN_STATUS_NOT_LEADER`. Every op it can carry is
+/// idempotent at the leader (re-adding a learner or voter it already
+/// has answers OK), so a retry after a lost answer is safe.
+const ADMIN_FWD_DEADLINE_MS: u64 = 2_000;
+
+/// A leader-only admin op forwarded to the leader.
+#[derive(Clone, Copy)]
+struct ForwardedAdmin {
+    /// 0 = empty; the operations command id it answers.
+    command_id: u32,
+    deadline_ms: u64,
+    /// The status owed on `admin_applied`, once known (`answered`).
+    status: u8,
+    answered: bool,
+}
+
+impl ForwardedAdmin {
+    const fn empty() -> Self {
+        Self {
+            command_id: 0,
+            deadline_ms: 0,
+            status: 0,
+            answered: false,
+        }
+    }
+}
+
+/// `ForwardedWrite::state`.
+const FW_WAIT: u8 = 1;
+const FW_OWED_ASSIGN: u8 = 2;
+const FW_OWED_REFUSE: u8 = 3;
+
+/// A response-owed write this follower forwarded to the leader of its
+/// term, waiting for the outcome its proposer is owed.
+#[derive(Clone, Copy)]
+struct ForwardedWrite {
+    /// 0 = slot empty. `(incarnation << 32) | seq`.
+    fwd_id: u64,
+    /// The proposer's correlation id, answered on `proposal_assigned`.
+    correlation_id: u64,
+    /// The term whose leader was asked, and that leader: the only node
+    /// that can have appended it, so the only one ever asked about it.
+    term: Term,
+    leader: u8,
+    state: u8,
+    /// `CLIENT_REJECT_*` for `FW_OWED_REFUSE`.
+    status: u8,
+    /// `(index, term)` the leader appended it at, for `FW_OWED_ASSIGN`.
+    index: Index,
+    entry_term: Term,
+    deadline_ms: u64,
+    next_query_ms: u64,
+}
+
+impl ForwardedWrite {
+    const fn empty() -> Self {
+        Self {
+            fwd_id: 0,
+            correlation_id: 0,
+            term: 0,
+            leader: 0,
+            state: 0,
+            status: 0,
+            index: 0,
+            entry_term: 0,
+            deadline_ms: 0,
+            next_query_ms: 0,
+        }
+    }
+}
+
+/// A leader's record of one forwarded write: what it answered, so a
+/// status query (or a duplicate) gets the same answer and a forward it
+/// refused can never be appended later.
+#[derive(Clone, Copy)]
+struct FwdSeen {
+    fwd_id: u64,
+    term: Term,
+    index: Index,
+    /// `wire::FWD_STATUS_ACCEPTED` or a `CLIENT_REJECT_*` refusal.
+    status: u8,
+}
+
+impl FwdSeen {
+    const fn empty() -> Self {
+        Self {
+            fwd_id: 0,
+            term: 0,
+            index: 0,
+            status: 0,
+        }
+    }
+}
+
 // FS opcodes
 const FS_OPEN: u32 = 0x0900;
 /// Write-side opener: creates the file if absent (FS_OPEN is read-only-
@@ -268,8 +409,9 @@ enum PersistOutcome {
 }
 
 // Metadata file path scheme:
-//   single-partition graphs (partition_id = 0):  raft/meta
-//   per-partition graphs   (partition_id = N>0): raft/p<NNNN>/meta
+//   single-partition graphs (partition_id = 0):  <meta_dir>/meta
+//   per-partition graphs   (partition_id = N>0): <meta_dir>/p<NNNN>/meta
+// (`meta_dir` param, default `raft`)
 // Width is enough for u16; we'll never have more than 65k partitions
 // per node and the volatile-FS provider keys files by hash of path.
 //
@@ -332,7 +474,10 @@ const META_FLAT_SIZE: usize = 28;
 /// rather than a fragment of something else. The three voter-set bytes
 /// are optional.
 const META_FLAT_MIN: usize = 25;
-const META_PATH_MAX: usize = 32;
+/// Longest metadata path: the `meta_dir` directory and the longest name
+/// built under it (`/p<NNNN>/meta<slot>`, 12 bytes). Derived from
+/// `STORE_DIR_MAX`, so a builder never truncates a name.
+const META_PATH_MAX: usize = STORE_DIR_MAX + 16;
 /// Persist metadata on the durable-ack path at most once per this many
 /// durable-index advances (a crash loses at most this much of the durable
 /// *hint*; the WAL replay re-derives the exact durable index on recovery).
@@ -403,10 +548,16 @@ pub struct Raft {
     /// `(term, index)`; consumed at the top of apply's step.
     pub apply_reset_out: Option<(Term, Index)>,
     /// E8: strict-ReadIndex probe replies → apply.
-    /// `(correlation_id, confirmed_commit, confirmed)`; a full queue
-    /// drops the reply — the client retry path re-covers it.
+    /// `(correlation_id, confirmed_commit, confirmed)`. Apply drains the
+    /// whole queue every step; a reply that finds it full waits in
+    /// `reply_backlog`, in order, and is moved in at the next step.
     pub probe_reply_out: [(u64, u64, u8); PROBE_QUEUE_SLOTS],
     pub probe_reply_count: u8,
+    /// Replies owed to apply that did not fit `probe_reply_out` this
+    /// step, oldest first. Bounded by `PROBE_REPLIES_OWED_MAX` through
+    /// the E7 admission in `drain_read_probes`.
+    reply_backlog: [(u64, u64, u8); PROBE_REPLIES_OWED_MAX],
+    reply_backlog_len: u8,
     /// E10: voter-set update → commit + replicator.
     /// `(current, joint, joint_active, learners)` bitmasks, delivered in
     /// the same step the configuration changes.
@@ -658,6 +809,9 @@ pub struct Raft {
     /// FAT32 (no mkdir, so the `raft/meta` path can't be created). Default 0
     /// keeps the `raft/meta` layout for the linux volatile-FS provider.
     pub meta_root_path: u8,
+    /// The `meta_dir` param: the directory the metadata slots live in when
+    /// `meta_root_path = 0` (default `raft`).
+    pub meta_dir: StoreDir,
     /// Cached fd per metadata slot (both path modes): opened once with
     /// FS_OPEN_CREATE and reused for every persist, so a save never pays
     /// a cold dir-scan re-open. -1 = not yet opened. Invalidated (closed
@@ -849,6 +1003,38 @@ pub struct Raft {
     /// Follower ReadIndex: reads forwarded to the leader, awaiting its
     /// read index. Ids come from `next_probe_id` too.
     fwd_reads: [ForwardedRead; MAX_INFLIGHT_PROBES],
+    /// Response-owed writes forwarded to the leader (follower side),
+    /// slot `seq % FWD_WINDOW`.
+    fwd_writes: [ForwardedWrite; FWD_WINDOW],
+    /// High half of every `fwd_id` this boot mints (CSPRNG, drawn at the
+    /// first forward), so a restarted follower's ids never match the
+    /// ones a leader recorded for its previous run. 0 = not drawn yet.
+    fwd_incarnation: u32,
+    /// Low half of the next `fwd_id`; never 0.
+    fwd_next_seq: u32,
+    /// When this node last saw no leader (0 = it has one): writes are held
+    /// on their channel through an election and refused past
+    /// `NO_LEADER_HOLD_MS` (or two election timeouts) without one.
+    no_leader_since_ms: u64,
+    /// Leader side: per origin replica, the answers given to its last
+    /// `FWD_WINDOW` forwards, slot `seq % FWD_WINDOW`.
+    fwd_seen: [[FwdSeen; FWD_WINDOW]; MAX_NODES],
+    /// Terms this node led since boot (newest first, 0 = none): the
+    /// terms its forward record is authoritative for.
+    led_terms: [Term; LED_TERMS],
+    /// Forwarded writes this node, as follower, answered refused or
+    /// outcome-unknown; and, as leader, refused.
+    pub fwd_writes_refused: u32,
+    pub fwd_writes_unknown: u32,
+    /// Leader-only admin ops forwarded to the leader (follower side).
+    admin_fwd: [ForwardedAdmin; ADMIN_FWD_SLOTS],
+    /// Index of the last config entry this leader queued (0 none).
+    config_fence: Index,
+    /// Apply's applied index, handed in by the dispatch table before each
+    /// step (`config_settled`).
+    pub apply_index_hint: Index,
+    /// Apply's admin seam held nothing unprocessed when last looked at.
+    admin_seam_empty: bool,
     /// Index of this leader's current-term no-op, 0 until it lands.
     /// A leader answers no ReadIndex until `commit_index` reaches it:
     /// before that its commit index may trail entries the previous
@@ -971,6 +1157,7 @@ pub fn init(s: &mut Raft) {
     s.apply_reset_out = None;
     s.probe_reply_out = [(0u64, 0u64, 0u8); PROBE_QUEUE_SLOTS];
     s.probe_reply_count = 0;
+    s.reply_backlog_len = 0;
     s.voter_out = None;
     s.quorum_owed = false;
     s.initial_voters = 1;
@@ -984,6 +1171,18 @@ pub fn init(s: &mut Raft) {
     s.probes = [ProbeSlot::empty(); MAX_INFLIGHT_PROBES];
     s.next_probe_id = 1;
     s.fwd_reads = [ForwardedRead::empty(); MAX_INFLIGHT_PROBES];
+    s.fwd_writes = [ForwardedWrite::empty(); FWD_WINDOW];
+    s.fwd_incarnation = 0;
+    s.fwd_next_seq = 1;
+    s.no_leader_since_ms = 0;
+    s.fwd_seen = [[FwdSeen::empty(); FWD_WINDOW]; MAX_NODES];
+    s.led_terms = [0; LED_TERMS];
+    s.fwd_writes_refused = 0;
+    s.fwd_writes_unknown = 0;
+    s.admin_fwd = [ForwardedAdmin::empty(); ADMIN_FWD_SLOTS];
+    s.config_fence = 0;
+    s.apply_index_hint = 0;
+    s.admin_seam_empty = true;
     s.term_first_index = 0;
     s.current_voters = NodeSet::empty();
     s.learners = NodeSet::empty();
@@ -1041,6 +1240,7 @@ pub fn init(s: &mut Raft) {
     s.local_durable_index = 0;
     s.local_durable_term = 0;
     s.meta_root_path = 0;
+    s.meta_dir = StoreDir::named(b"raft");
     s.meta_fds = [-1; META_SLOTS];
     s.meta_slot = 0;
     s.meta_generation = 0;
@@ -1329,6 +1529,10 @@ pub unsafe fn step(
     probes_count: &mut u8,
 ) {
     let work_before = s.proposals_received.wrapping_add(s.entries_appended);
+    // Before anything can judge a membership op (a forwarded one is
+    // judged in `process_rpc`): whether apply's admin seam holds config
+    // records raft has not taken in yet (`config_settled`).
+    s.admin_seam_empty = admin_in.is_empty();
 
     // 0a. Boot-time metadata load retry. At cold boot the fat32 provider
     //     isn't ready when module_new ran (FS_OPEN -> E_AGAIN), so retry
@@ -1405,10 +1609,15 @@ pub unsafe fn step(
     // 1. Process inbound RPCs (all roles)
     process_rpc(s, sys, now);
 
+    // 1a. Forwarded writes owed an outcome, in every role: a node that
+    //     forwarded as a follower keeps asking that leader until it
+    //     answers, whatever this node has become since.
+    service_forwarded_writes(s, sys, now);
+
     // 2. The fallback signal is delivered by the dispatch table's
     //    cp_state demux via `on_fallback` before this step runs.
 
-    // 3. Process admin commands (local effects only)
+    // 3. Process admin commands (local effects only).
     drain_admin(s, sys, now);
 
     // 3a. Absorb quorum-commit feedback from the commit component so the
@@ -1624,6 +1833,12 @@ unsafe fn process_rpc(s: &mut Raft, sys: &SyscallTable, now: u64) {
             wire::MSG_READ_INDEX_RESP => {
                 handle_read_index_resp(s, sys, plen);
             }
+            wire::MSG_ADMIN_FORWARD => {
+                handle_admin_forward(s, sys, plen);
+            }
+            wire::MSG_ADMIN_FORWARD_RESP => {
+                handle_admin_forward_resp(s, plen);
+            }
             _ => {}
         }
     }
@@ -1809,8 +2024,15 @@ unsafe fn drain_read_probes(
     probes_count: &mut u8,
     now: u64,
 ) {
+    flush_reply_backlog(s);
     for _ in 0..4 {
         if *probes_count == 0 {
+            break;
+        }
+        // Admission: every read taken here is owed exactly one reply, so
+        // take one only while a reply slot is free for it. What stays on
+        // the queue is picked up once apply drains replies.
+        if probe_replies_owed(s) >= PROBE_REPLIES_OWED_MAX {
             break;
         }
         let correlation_id = probes_in[0];
@@ -2095,25 +2317,66 @@ unsafe fn log_static(sys: &SyscallTable, m: &[u8]) {
     dev_log(sys, 3, m.as_ptr(), m.len());
 }
 
-/// Queue a probe reply for apply (seam E8).
-/// A full queue silently drops the reply.
+/// Replies raft owes apply: reads it holds in a local probe slot or a
+/// forwarded-read slot, plus replies queued or backlogged for apply.
+/// A probe slot a follower's forwarded read holds is owed to that
+/// follower over the wire, not to apply, and is not counted.
+fn probe_replies_owed(s: &Raft) -> usize {
+    let local = s
+        .probes
+        .iter()
+        .filter(|p| p.probe_id != 0 && p.origin == ORIGIN_LOCAL)
+        .count();
+    let forwarded = s.fwd_reads.iter().filter(|f| f.read_id != 0).count();
+    local + forwarded + s.reply_backlog_len as usize + s.probe_reply_count as usize
+}
+
+/// Move backlogged replies into the E8 queue, oldest first, while it has
+/// room.
+fn flush_reply_backlog(s: &mut Raft) {
+    let n = s.reply_backlog_len as usize;
+    let mut moved = 0usize;
+    while moved < n && (s.probe_reply_count as usize) < PROBE_QUEUE_SLOTS {
+        s.probe_reply_out[s.probe_reply_count as usize] = s.reply_backlog[moved];
+        s.probe_reply_count += 1;
+        moved += 1;
+    }
+    if moved == 0 {
+        return;
+    }
+    s.reply_backlog.copy_within(moved..n, 0);
+    s.reply_backlog_len = (n - moved) as u8;
+}
+
+/// Queue a probe reply for apply (seam E8). Lossless: a reply that finds
+/// the queue full (or replies already waiting ahead of it) waits in
+/// `reply_backlog`, which the E7 admission keeps from overflowing.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Raft` per the module ABI.
 unsafe fn emit_read_probe_reply(
     s: &mut Raft,
-    _sys: &SyscallTable,
+    sys: &SyscallTable,
     correlation_id: u64,
     confirmed_commit: u64,
     confirmed: bool,
 ) {
-    if (s.probe_reply_count as usize) >= PROBE_QUEUE_SLOTS {
+    let reply = (correlation_id, confirmed_commit, confirmed as u8);
+    if s.reply_backlog_len == 0 && (s.probe_reply_count as usize) < PROBE_QUEUE_SLOTS {
+        s.probe_reply_out[s.probe_reply_count as usize] = reply;
+        s.probe_reply_count += 1;
         return;
     }
-    s.probe_reply_out[s.probe_reply_count as usize] =
-        (correlation_id, confirmed_commit, confirmed as u8);
-    s.probe_reply_count += 1;
+    let n = s.reply_backlog_len as usize;
+    if n < PROBE_REPLIES_OWED_MAX {
+        s.reply_backlog[n] = reply;
+        s.reply_backlog_len += 1;
+    } else {
+        // Unreachable while the E7 admission holds; logged rather than
+        // assumed, so a broken invariant is visible.
+        log_static(sys, b"[raft] probe reply overflow");
+    }
 }
 
 /// # Safety
@@ -3053,7 +3316,13 @@ unsafe fn drain_admin(s: &mut Raft, sys: &SyscallTable, _now: u64) {
     if s.in_admin < 0 {
         return;
     }
+    service_admin_forwards(s, sys, _now);
     for _ in 0..4 {
+        // One status is announced at a time: popping past an unannounced
+        // one would overwrite it and leave that command with no outcome.
+        if !flush_admin_applied(s, sys) {
+            return;
+        }
         let Some((msg_type, plen)) = s.inbox_admin.next(sys, &mut s.msg_buf) else {
             break;
         };
@@ -3063,6 +3332,16 @@ unsafe fn drain_admin(s: &mut Raft, sys: &SyscallTable, _now: u64) {
         let command_id =
             u32::from_le_bytes([s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3]]);
         let op_code = s.msg_buf[4];
+        if s.role != ROLE_LEADER && admin_op_is_leaders(op_code) {
+            if let Some(leader) = forward_target(s) {
+                if forward_admin(s, sys, leader, command_id, plen as usize, _now) {
+                    continue;
+                }
+            }
+            // No leader to ask, or no room to remember the ask.
+            emit_admin_applied(s, sys, command_id, wire::ADMIN_STATUS_NOT_LEADER);
+            continue;
+        }
         let status = apply_admin_op(
             s,
             op_code,
@@ -3070,6 +3349,147 @@ unsafe fn drain_admin(s: &mut Raft, sys: &SyscallTable, _now: u64) {
             plen as usize,
         );
         emit_admin_applied(s, sys, command_id, status);
+    }
+}
+
+/// Admin ops only the leader can run — the ones a follower forwards.
+fn admin_op_is_leaders(op_code: u8) -> bool {
+    matches!(
+        op_code,
+        wire::ADMIN_OP_TRANSFER_LEADER
+            | wire::ADMIN_OP_ADD_VOTER
+            | wire::ADMIN_OP_REMOVE_VOTER
+            | wire::ADMIN_OP_ADD_LEARNER
+            | wire::ADMIN_OP_REMOVE_LEARNER
+    )
+}
+
+/// Forward the admin command in `msg_buf[..plen]`
+/// (`[command_id][op_code][op_body]`) to `leader`; whether it went (and is
+/// remembered for its answer).
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn forward_admin(
+    s: &mut Raft,
+    sys: &SyscallTable,
+    leader: u8,
+    command_id: u32,
+    plen: usize,
+    now: u64,
+) -> bool {
+    if command_id == 0 {
+        return false;
+    }
+    let Some(i) = s.admin_fwd.iter().position(|a| a.command_id == 0) else {
+        return false;
+    };
+    let op_len = plen - 4;
+    if op_len > 64 {
+        return false;
+    }
+    let mut buf = [0u8; wire::ADMIN_FORWARD_HDR + 64];
+    buf[0] = s.self_id;
+    buf[1..5].copy_from_slice(&command_id.to_le_bytes());
+    buf[5..13].copy_from_slice(&s.current_term.to_le_bytes());
+    buf[13..13 + op_len].copy_from_slice(&s.msg_buf[4..plen]);
+    if !rpc_send(s, sys, leader, wire::MSG_ADMIN_FORWARD, &buf[..13 + op_len]) {
+        return false;
+    }
+    s.admin_fwd[i] = ForwardedAdmin {
+        command_id,
+        deadline_ms: now + ADMIN_FWD_DEADLINE_MS,
+        status: 0,
+        answered: false,
+    };
+    true
+}
+
+/// Announce forwarded admin answers (and expired asks, as NOT_LEADER) on
+/// `admin_applied`, one at a time like every admin status.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn service_admin_forwards(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    for i in 0..ADMIN_FWD_SLOTS {
+        let a = s.admin_fwd[i];
+        if a.command_id == 0 {
+            continue;
+        }
+        if !a.answered && now < a.deadline_ms {
+            continue;
+        }
+        if !flush_admin_applied(s, sys) {
+            return;
+        }
+        let status = if a.answered {
+            a.status
+        } else {
+            log_static(sys, b"[raft] admin fwd expired");
+            wire::ADMIN_STATUS_NOT_LEADER
+        };
+        s.admin_fwd[i] = ForwardedAdmin::empty();
+        emit_admin_applied(s, sys, a.command_id, status);
+    }
+}
+
+/// A follower's forwarded admin op: run it as a local one if this node
+/// leads the term it was asked in, and answer the origin.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn handle_admin_forward(s: &mut Raft, sys: &SyscallTable, plen: u16) {
+    let pl = plen as usize;
+    if pl < wire::ADMIN_FORWARD_HDR + 1 {
+        return;
+    }
+    let origin = s.msg_buf[0];
+    if origin as usize >= MAX_NODES || origin == s.self_id {
+        return;
+    }
+    let mut cid = [0u8; 4];
+    cid.copy_from_slice(&s.msg_buf[1..5]);
+    let mut t = [0u8; 8];
+    t.copy_from_slice(&s.msg_buf[5..13]);
+    let term = u64::from_le_bytes(t);
+    let op_code = s.msg_buf[13];
+    let status = if s.role != ROLE_LEADER || term != s.current_term || !admin_op_is_leaders(op_code)
+    {
+        wire::ADMIN_STATUS_NOT_LEADER
+    } else {
+        // `apply_admin_op` reads `[command_id:4][op_code][body]`: shift
+        // the header off so the op code sits at offset 4.
+        let n = pl - 9;
+        s.msg_buf.copy_within(9..pl, 0);
+        s.msg_buf[..4].copy_from_slice(&cid);
+        apply_admin_op(s, op_code, &s.msg_buf as *const _ as *const u8, n)
+    };
+    let mut resp = [0u8; 5];
+    resp[..4].copy_from_slice(&cid);
+    resp[4] = status;
+    let _ = rpc_send(s, sys, origin, wire::MSG_ADMIN_FORWARD_RESP, &resp);
+}
+
+/// The leader's answer to an admin op this node forwarded.
+fn handle_admin_forward_resp(s: &mut Raft, plen: u16) {
+    if (plen as usize) < 5 {
+        return;
+    }
+    let command_id = u32::from_le_bytes([s.msg_buf[0], s.msg_buf[1], s.msg_buf[2], s.msg_buf[3]]);
+    let status = s.msg_buf[4];
+    if let Some(a) = s
+        .admin_fwd
+        .iter_mut()
+        .find(|a| a.command_id == command_id && command_id != 0 && !a.answered)
+    {
+        a.status = status;
+        a.answered = true;
     }
 }
 
@@ -3136,6 +3556,7 @@ unsafe fn apply_admin_op(s: &mut Raft, op_code: u8, buf_ptr: *const u8, plen: us
                 || s.pending_new_voters_set
                 || s.pending_joint_set
                 || s.pending_learners_set
+                || !config_settled(s)
             {
                 return wire::ADMIN_STATUS_REJECTED;
             }
@@ -3217,7 +3638,12 @@ unsafe fn apply_admin_op(s: &mut Raft, op_code: u8, buf_ptr: *const u8, plen: us
             // One config change in flight at a time: a learner entry
             // racing a joint transition would apply against a voter set
             // about to change underneath it.
-            if s.pending_new_voters_set || s.joint_active || s.pending_learners_set {
+            if s.pending_new_voters_set
+                || s.joint_active
+                || s.pending_learners_set
+                || s.pending_joint_set
+                || !config_settled(s)
+            {
                 return wire::ADMIN_STATUS_REJECTED;
             }
             let mut next = s.learners;
@@ -4100,6 +4526,9 @@ unsafe fn step_follower(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // term. Only runs when the leader is known — with no leader there
     // is nowhere to send, and the election below is the right response.
     // A learner relays too: it holds no vote, but its clients write.
+    // Response-owed writes are always forwarded (and refused when no
+    // leader appears); the fire-and-forget relay is opt-in.
+    forward_tagged_proposals(s, sys, now);
     if s.forward_proposals && s.leader_id >= 0 {
         forward_proposals_to_leader(s, sys);
     }
@@ -4125,6 +4554,9 @@ unsafe fn step_follower(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn step_candidate(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    // No leader while campaigning: writes wait on their channel, and
+    // are refused once the election has run long.
+    forward_tagged_proposals(s, sys, now);
     if set_majority(
         s.votes_granted,
         s.current_voters,
@@ -4336,7 +4768,33 @@ unsafe fn queue_config_entry(
     // is plentiful.
     let stage_off = 1024usize;
     s.msg_buf[stage_off..stage_off + body_len].copy_from_slice(&body[..body_len]);
-    append_to_batch(s, sys, stage_off, body_len, 0, ORIGIN_LOCAL, now)
+    if !append_to_batch(s, sys, stage_off, body_len, 0, ORIGIN_LOCAL, now) {
+        return false;
+    }
+    // The entry's index: flushed already (`proposal_batch_max` 1), or the
+    // next one (config entries are queued only into an empty batch).
+    s.config_fence = if s.proposal_batch_count == 0 {
+        s.last_log_index
+    } else {
+        s.last_log_index + 1
+    };
+    true
+}
+
+/// Whether this leader's view of the configuration is the log's: every
+/// config entry it queued, and every one an earlier leader left in the
+/// log, has applied and been taken in by raft. A config entry takes
+/// effect here only when it applies, so a change judged before that
+/// would be judged against a configuration about to change underneath
+/// it — two transitions open at once. The term's no-op committing
+/// settles every earlier term's entries; apply reaching our last config
+/// entry, with apply's admin seam drained, settles ours.
+fn config_settled(s: &Raft) -> bool {
+    let through = s.term_first_index.max(s.config_fence);
+    s.term_first_index != 0
+        && s.commit_index >= s.term_first_index
+        && s.apply_index_hint >= through
+        && s.admin_seam_empty
 }
 
 /// Append the `CONFIG_CHANGE_OP_JOINT` entry that opens a membership
@@ -4393,16 +4851,10 @@ unsafe fn emit_pending_learners(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-/// Relay a follower's queued client proposals to the leader.
-///
-/// Scope is deliberately fire-and-forget: only the UNTAGGED channel
-/// (`in_proposals`) is drained, so nothing here owes a response. The
-/// tagged channels carry a correlation id that identifies a slot in the
-/// ORIGIN node's ring; forwarding one would commit the entry on the
-/// leader and leave the origin's caller waiting forever, because the
-/// assignment comes back addressed to the leader's ring, not the
-/// origin's. Response-owed writes (MQTT QoS 1+, Kafka acks>=1) therefore
-/// still require a leader connection until that tag is plumbed.
+/// Relay a follower's queued fire-and-forget client proposals (the
+/// untagged channels, `in_proposals` and `in_proposals_partitioned`) to
+/// the leader. Nothing here owes a response; response-owed writes go
+/// through [`forward_tagged_proposals`], which answers every one.
 ///
 /// # Safety
 ///
@@ -4423,7 +4875,7 @@ unsafe fn forward_proposals_to_leader(s: &mut Raft, sys: &SyscallTable) {
         return;
     }
     let target = s.leader_id as u8;
-    // One inbox depth per step ACROSS the four sources: the leader
+    // One inbox depth per step ACROSS the two sources: the leader
     // drains that many per step per group, so a burst relayed faster
     // than that only fills its inbox and stalls the shared channel
     // behind it. What this does not relay this step stays queued
@@ -4460,42 +4912,6 @@ unsafe fn forward_proposals_to_leader(s: &mut Raft, sys: &SyscallTable) {
         );
     }
 
-    // Response-owed proposals (`in_proposals_tagged`). The correlation id
-    // names a slot in THIS node's ring, so it travels with the frame and
-    // the leader addresses its assignment back here.
-    if s.in_proposals_tagged >= 0 {
-        while budget > 0 {
-            budget -= 1;
-            if !wire_channels::writable(sys, s.out_rpc) {
-                return;
-            }
-            let Some((msg_type, plen)) =
-                wire_channels::next_msg(sys, s.in_proposals_tagged, &mut s.msg_buf)
-            else {
-                break;
-            };
-            let plen = plen as usize;
-            let key_off = match msg_type {
-                wire::MSG_CLIENT_PROPOSAL => 0,
-                wire::MSG_CLIENT_PROPOSAL_KEYED => wire::KEYED_PROPOSAL_HDR,
-                _ => continue,
-            };
-            if plen < key_off + wire::TAGGED_PROPOSAL_HDR {
-                continue;
-            }
-            let (correlation_id, rel_off) =
-                match wire::decode_tagged_proposal(&s.msg_buf[key_off..plen]) {
-                    Some(v) => v,
-                    None => continue,
-                };
-            let body_off = key_off + rel_off;
-            if plen <= body_off {
-                continue;
-            }
-            forward_tagged(s, sys, target, correlation_id, body_off, plen);
-        }
-    }
-
     // Proposals that arrived through `partition_router`
     // (`in_proposals_partitioned`), already demuxed to this slot. This is
     // the channel a partitioned node graph actually uses — it wires
@@ -4525,75 +4941,301 @@ unsafe fn forward_proposals_to_leader(s: &mut Raft, sys: &SyscallTable) {
             );
         }
     }
+}
 
-    // Partitioned + tagged (`in_proposals_partitioned_tagged`).
-    if s.in_proposals_partitioned_tagged >= 0 {
-        while budget > 0 {
-            budget -= 1;
-            if !wire_channels::writable(sys, s.out_rpc) {
-                return;
-            }
-            let Some((msg_type, plen)) = s.inbox_prop_pt.next(sys, &mut s.msg_buf) else {
-                break;
-            };
-            let plen = plen as usize;
-            let key_off = match msg_type {
-                wire::MSG_CLIENT_PROPOSAL => 0,
-                wire::MSG_CLIENT_PROPOSAL_KEYED => wire::KEYED_PROPOSAL_HDR,
-                _ => continue,
-            };
-            if plen < key_off + wire::TAGGED_PROPOSAL_HDR {
-                continue;
-            }
-            let (correlation_id, rel_off) =
-                match wire::decode_tagged_proposal(&s.msg_buf[key_off..plen]) {
-                    Some(v) => v,
-                    None => continue,
-                };
-            let body_off = key_off + rel_off;
-            if plen <= body_off {
-                continue;
-            }
-            forward_tagged(s, sys, target, correlation_id, body_off, plen);
-        }
+// ── Response-owed write forwarding ─────────────────────────
+
+/// This follower's leader for the current term, if it knows one other
+/// than itself.
+fn forward_target(s: &Raft) -> Option<u8> {
+    if s.role == ROLE_FOLLOWER && s.leader_id >= 0 && s.leader_id as u8 != s.self_id {
+        Some(s.leader_id as u8)
+    } else {
+        None
     }
 }
 
-/// Relay one response-owed proposal body, prefixed with this node's id
-/// and the caller's correlation id.
+/// The leader this node believes in, as a `MSG_PROPOSAL_REFUSED` hint.
+fn refusal_leader(s: &Raft) -> u8 {
+    if s.leader_id < 0 {
+        0xFF
+    } else {
+        s.leader_id as u8
+    }
+}
+
+/// Window slot of a forward id.
+fn fwd_slot(fwd_id: u64) -> usize {
+    (fwd_id as u32 as usize) % FWD_WINDOW
+}
+
+/// Forward response-owed proposals from a follower (or a candidate) to
+/// the leader of its term, one window slot each. With no leader they
+/// wait on their channel through an election and are refused
+/// `NOT_LEADER` past `NO_LEADER_HOLD_MS` (or two election timeouts, if
+/// longer); a frozen or
+/// strict-fallback node refuses them `FALLBACK` rather than laundering
+/// them past its own gate. A full window stops intake — backpressure,
+/// never a refusal.
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
-/// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI.
-unsafe fn forward_tagged(
-    s: &mut Raft,
-    sys: &SyscallTable,
-    target: u8,
-    correlation_id: u64,
-    body_off: usize,
-    body_end: usize,
-) {
-    let body_len = body_end - body_off;
-    let mut buf = [0u8; PROPOSAL_BATCH_CAP + wire::FORWARD_TAGGED_HDR];
-    if body_len > PROPOSAL_BATCH_CAP {
+/// `&SyscallTable` per the module ABI.
+unsafe fn forward_tagged_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    if s.in_proposals_tagged < 0 && s.in_proposals_partitioned_tagged < 0 {
         return;
     }
-    buf[0] = s.self_id;
-    buf[1..9].copy_from_slice(&correlation_id.to_le_bytes());
-    buf[9..9 + body_len].copy_from_slice(&s.msg_buf[body_off..body_end]);
-    rpc_send(
-        s,
-        sys,
-        target,
-        wire::MSG_PROPOSAL_FORWARD_TAGGED,
-        &buf[..wire::FORWARD_TAGGED_HDR + body_len],
-    );
+    let target = forward_target(s);
+    let refuse = if s.frozen || s.strict_fallback {
+        Some(wire::CLIENT_REJECT_FALLBACK)
+    } else if target.is_none() {
+        if s.no_leader_since_ms == 0 {
+            s.no_leader_since_ms = now.max(1);
+        }
+        let hold = NO_LEADER_HOLD_MS.max(2 * s.election_timeout_ms as u64);
+        if now.saturating_sub(s.no_leader_since_ms) < hold {
+            return;
+        }
+        Some(wire::CLIENT_REJECT_NOT_LEADER)
+    } else {
+        s.no_leader_since_ms = 0;
+        None
+    };
+    if s.fwd_incarnation == 0 {
+        let mut r = [0u8; 4];
+        let ok = (sys.provider_call)(
+            -1,
+            super::abi::kernel_abi::RANDOM_FILL,
+            r.as_mut_ptr(),
+            r.len(),
+        ) == 0;
+        let drawn = if ok {
+            u32::from_le_bytes(r)
+        } else {
+            // No CSPRNG: the clock and our id still separate this boot's
+            // ids from the last one's in practice.
+            (dev_micros(sys) as u32) ^ ((s.self_id as u32) << 24)
+        };
+        s.fwd_incarnation = drawn.max(1);
+    }
+    let mut budget = inbox::INBOX_DEPTH;
+    while budget > 0 {
+        budget -= 1;
+        let seq = s.fwd_next_seq;
+        let slot = (seq as usize) % FWD_WINDOW;
+        if s.fwd_writes[slot].fwd_id != 0 {
+            break;
+        }
+        if refuse.is_none() && !wire_channels::writable(sys, s.out_rpc) {
+            break;
+        }
+        // Tagged first, then partitioned + tagged.
+        let pulled = if s.in_proposals_tagged >= 0 {
+            wire_channels::next_msg(sys, s.in_proposals_tagged, &mut s.msg_buf)
+        } else {
+            None
+        };
+        let pulled = match pulled {
+            Some(v) => Some(v),
+            None if s.in_proposals_partitioned_tagged >= 0 => {
+                s.inbox_prop_pt.next(sys, &mut s.msg_buf)
+            }
+            None => None,
+        };
+        let Some((msg_type, plen)) = pulled else {
+            break;
+        };
+        let plen = plen as usize;
+        let key_off = match msg_type {
+            wire::MSG_CLIENT_PROPOSAL => 0,
+            wire::MSG_CLIENT_PROPOSAL_KEYED => wire::KEYED_PROPOSAL_HDR,
+            _ => continue,
+        };
+        if plen < key_off + wire::TAGGED_PROPOSAL_HDR {
+            continue;
+        }
+        let Some((correlation_id, rel_off)) =
+            wire::decode_tagged_proposal(&s.msg_buf[key_off..plen])
+        else {
+            continue;
+        };
+        let body_off = key_off + rel_off;
+        if plen <= body_off || correlation_id == 0 {
+            continue;
+        }
+        s.fwd_next_seq = seq.wrapping_add(1).max(1);
+        let fwd_id = ((s.fwd_incarnation as u64) << 32) | seq as u64;
+        let mut f = ForwardedWrite {
+            fwd_id,
+            correlation_id,
+            term: s.current_term,
+            leader: target.unwrap_or(0),
+            state: FW_OWED_REFUSE,
+            status: wire::CLIENT_REJECT_NOT_LEADER,
+            index: 0,
+            entry_term: 0,
+            deadline_ms: now + FWD_DEADLINE_MS,
+            next_query_ms: now + FWD_QUERY_MS,
+        };
+        let body_len = plen - body_off;
+        match (refuse, target) {
+            (Some(status), _) => f.status = status,
+            (None, _) if body_len > PROPOSAL_BATCH_CAP => f.status = wire::CLIENT_REJECT_TOO_LARGE,
+            (None, Some(leader)) => {
+                let mut buf = [0u8; PROPOSAL_BATCH_CAP + wire::FORWARD_TAGGED_HDR];
+                wire::encode_forward_tagged_hdr(&mut buf, s.self_id, fwd_id, s.current_term);
+                buf[wire::FORWARD_TAGGED_HDR..wire::FORWARD_TAGGED_HDR + body_len]
+                    .copy_from_slice(&s.msg_buf[body_off..plen]);
+                let total = wire::FORWARD_TAGGED_HDR + body_len;
+                if rpc_send(
+                    s,
+                    sys,
+                    leader,
+                    wire::MSG_PROPOSAL_FORWARD_TAGGED,
+                    &buf[..total],
+                ) {
+                    f.state = FW_WAIT;
+                } else {
+                    // Never left this node: not appended, retry is safe.
+                    f.status = wire::CLIENT_REJECT_THROTTLED;
+                }
+            }
+            (None, None) => {}
+        }
+        s.fwd_writes[slot] = f;
+        if f.state != FW_WAIT {
+            deliver_forward_outcome(s, sys, slot);
+        }
+    }
 }
 
-/// Accept a RESPONSE-OWED proposal relayed by a follower, remembering
-/// whose ring owes the answer.
+/// Drive every forwarded write toward its outcome: ask the leader it was
+/// sent to about one still unanswered, refuse one whose deadline passed
+/// as `OUTCOME_UNKNOWN`, and hand owed outcomes to the proposer.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn service_forwarded_writes(s: &mut Raft, sys: &SyscallTable, now: u64) {
+    for i in 0..FWD_WINDOW {
+        let f = s.fwd_writes[i];
+        if f.fwd_id == 0 {
+            continue;
+        }
+        if f.state == FW_WAIT {
+            if now >= f.deadline_ms {
+                s.fwd_writes[i].state = FW_OWED_REFUSE;
+                s.fwd_writes[i].status = wire::CLIENT_REJECT_OUTCOME_UNKNOWN;
+                s.fwd_writes_unknown = s.fwd_writes_unknown.saturating_add(1);
+                log_static(sys, b"[raft] fwd write unknown");
+            } else {
+                if now >= f.next_query_ms {
+                    let mut q = [0u8; wire::FORWARD_TAGGED_HDR];
+                    wire::encode_forward_tagged_hdr(&mut q, s.self_id, f.fwd_id, f.term);
+                    if rpc_send(s, sys, f.leader, wire::MSG_PROPOSAL_FORWARD_TAGGED, &q) {
+                        s.fwd_writes[i].next_query_ms = now + FWD_QUERY_MS;
+                    }
+                }
+                continue;
+            }
+        }
+        deliver_forward_outcome(s, sys, i);
+    }
+}
+
+/// Hand forwarded write `i`'s owed outcome to the proposer and free the
+/// slot — or keep it owed when `proposal_assigned` has no room this step.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn deliver_forward_outcome(s: &mut Raft, sys: &SyscallTable, i: usize) {
+    let f = s.fwd_writes[i];
+    let delivered = if s.out_proposal_assigned < 0 {
+        true
+    } else if f.state == FW_OWED_ASSIGN {
+        let mut buf = [0u8; wire::PROPOSAL_ASSIGNED_LEN];
+        wire::encode_proposal_assigned(
+            &mut buf,
+            f.correlation_id,
+            s.partition_id,
+            f.index,
+            f.entry_term,
+        );
+        wire_channels::channel_write_msg(
+            sys,
+            s.out_proposal_assigned,
+            wire::MSG_PROPOSAL_ASSIGNED,
+            &buf,
+        ) > 0
+    } else if f.state == FW_OWED_REFUSE {
+        let mut buf = [0u8; wire::PROPOSAL_REFUSED_LEN];
+        wire::encode_proposal_refused(&mut buf, f.correlation_id, f.status, refusal_leader(s));
+        wire_channels::channel_write_msg(
+            sys,
+            s.out_proposal_assigned,
+            wire::MSG_PROPOSAL_REFUSED,
+            &buf,
+        ) > 0
+    } else {
+        false
+    };
+    if delivered {
+        if f.state == FW_OWED_REFUSE {
+            s.fwd_writes_refused = s.fwd_writes_refused.saturating_add(1);
+        }
+        s.fwd_writes[i] = ForwardedWrite::empty();
+    }
+}
+
+/// Whether this node's forward record speaks for `term`: it leads it, or
+/// led it since it booted.
+fn led_term(s: &Raft, term: Term) -> bool {
+    term != 0 && ((is_leader(s) && term == s.current_term) || s.led_terms.contains(&term))
+}
+
+/// Record the answer given to `origin`'s forward `fwd_id`.
+fn record_forward(s: &mut Raft, origin: u8, fwd_id: u64, term: Term, index: Index, status: u8) {
+    if (origin as usize) < MAX_NODES {
+        s.fwd_seen[origin as usize][fwd_slot(fwd_id)] = FwdSeen {
+            fwd_id,
+            term,
+            index,
+            status,
+        };
+    }
+}
+
+/// Answer `origin`'s forward `fwd_id`.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Raft` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn answer_forward(
+    s: &mut Raft,
+    sys: &SyscallTable,
+    origin: u8,
+    fwd_id: u64,
+    index: Index,
+    term: Term,
+    status: u8,
+) {
+    let mut buf = [0u8; wire::FORWARD_ANSWER_LEN];
+    wire::encode_forward_answer(&mut buf, fwd_id, s.partition_id, index, term, status);
+    // Best effort: a lost answer is recovered by the origin's query.
+    let _ = rpc_send(s, sys, origin, wire::MSG_PROPOSAL_ASSIGNED_REMOTE, &buf);
+}
+
+/// A follower's forwarded write, or its status query (empty body). A
+/// forward is appended only by the leader of the term it names, at most
+/// once; every forward and query gets an answer from the record
+/// (appended at `(index, term)`, refused, or — for a term this node does
+/// not speak for — unknown), and a query about a forward this node
+/// never saw tombstones it, so a late copy can never append.
 ///
 /// # Safety
 ///
@@ -4601,42 +5243,81 @@ unsafe fn forward_tagged(
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI.
 unsafe fn handle_proposal_forward_tagged(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u64) {
-    if !is_leader(s) || s.frozen || s.strict_fallback {
+    let plen = plen as usize;
+    let Some((origin, fwd_id, term)) = wire::decode_forward_tagged_hdr(&s.msg_buf[..plen]) else {
+        return;
+    };
+    // Our own id would make the answer loop back here; a forward can only
+    // come from another replica.
+    if fwd_id == 0 || origin as usize >= MAX_NODES || origin == s.self_id {
         return;
     }
-    if s.flush_deferred
+    let body_len = plen - wire::FORWARD_TAGGED_HDR;
+    let seen = s.fwd_seen[origin as usize][fwd_slot(fwd_id)];
+    if seen.fwd_id == fwd_id {
+        answer_forward(s, sys, origin, fwd_id, seen.index, seen.term, seen.status);
+        return;
+    }
+    // In the batch not yet flushed: the flush answers it.
+    let in_batch = (0..s.proposal_batch_count as usize)
+        .any(|i| s.correlation_ids[i] == fwd_id && s.correlation_origin[i] == origin);
+    if in_batch {
+        return;
+    }
+    if body_len == 0 {
+        // A query. The slot holding a later forward of the same boot means
+        // ours was answered and its record overwritten: say nothing new.
+        let superseded = seen.fwd_id >> 32 == fwd_id >> 32 && seen.fwd_id > fwd_id;
+        if superseded || !led_term(s, term) {
+            answer_forward(s, sys, origin, fwd_id, 0, term, wire::FWD_STATUS_UNKNOWN);
+            return;
+        }
+        record_forward(s, origin, fwd_id, term, 0, wire::CLIENT_REJECT_NOT_LEADER);
+        s.fwd_writes_refused = s.fwd_writes_refused.saturating_add(1);
+        answer_forward(
+            s,
+            sys,
+            origin,
+            fwd_id,
+            0,
+            term,
+            wire::CLIENT_REJECT_NOT_LEADER,
+        );
+        return;
+    }
+    let status = if !is_leader(s) || term != s.current_term {
+        wire::CLIENT_REJECT_NOT_LEADER
+    } else if s.frozen || s.strict_fallback {
+        wire::CLIENT_REJECT_FALLBACK
+    } else if body_len > PROPOSAL_BATCH_CAP {
+        wire::CLIENT_REJECT_TOO_LARGE
+    } else if s.flush_deferred
         || s.last_log_index.saturating_sub(s.commit_index) >= MAX_UNCOMMITTED_INFLIGHT
     {
-        return;
-    }
-    let plen = plen as usize;
-    if plen <= wire::FORWARD_TAGGED_HDR {
-        return;
-    }
-    let origin = s.msg_buf[0];
-    // Our own id would make the assignment loop back here; a relay can
-    // only come from another node.
-    if origin == s.self_id || origin == ORIGIN_LOCAL {
-        return;
-    }
-    let mut cid = [0u8; 8];
-    cid.copy_from_slice(&s.msg_buf[1..9]);
-    let correlation_id = u64::from_le_bytes(cid);
-    append_to_batch(
+        wire::CLIENT_REJECT_THROTTLED
+    } else if append_to_batch(
         s,
         sys,
         wire::FORWARD_TAGGED_HDR,
-        plen - wire::FORWARD_TAGGED_HDR,
-        correlation_id,
+        body_len,
+        fwd_id,
         origin,
         now,
-    );
+    ) {
+        // Answered by `emit_proposal_assignments` once the batch lands.
+        return;
+    } else {
+        wire::CLIENT_REJECT_THROTTLED
+    };
+    record_forward(s, origin, fwd_id, term, 0, status);
+    s.fwd_writes_refused = s.fwd_writes_refused.saturating_add(1);
+    answer_forward(s, sys, origin, fwd_id, 0, term, status);
 }
 
-/// Re-emit an assignment the leader addressed to this node, for a
-/// proposal we relayed. The correlation id names a slot in OUR ring, so
-/// from the proposer's point of view this is indistinguishable from
-/// having been the leader all along.
+/// The leader's answer to one of our forwards (or a query about one):
+/// an appended write is re-emitted to the proposer as the assignment it
+/// would have had on the leader; a refusal is passed on as
+/// `MSG_PROPOSAL_REFUSED`; "unknown" keeps it waiting.
 ///
 /// # Safety
 ///
@@ -4644,19 +5325,29 @@ unsafe fn handle_proposal_forward_tagged(s: &mut Raft, sys: &SyscallTable, plen:
 /// `&SyscallTable` whose function pointers reach live kernel routines
 /// per the module ABI.
 unsafe fn handle_proposal_assigned_remote(s: &mut Raft, sys: &SyscallTable, plen: u16) {
-    if s.out_proposal_assigned < 0 || (plen as usize) < wire::PROPOSAL_ASSIGNED_LEN {
+    let Some((fwd_id, _partition, index, term, status)) =
+        wire::decode_forward_answer(&s.msg_buf[..plen as usize])
+    else {
+        return;
+    };
+    let i = fwd_slot(fwd_id);
+    let f = s.fwd_writes[i];
+    if fwd_id == 0 || f.fwd_id != fwd_id || f.state != FW_WAIT {
         return;
     }
-    if !wire_channels::writable(sys, s.out_proposal_assigned) {
-        return;
+    match status {
+        wire::FWD_STATUS_UNKNOWN => return,
+        wire::FWD_STATUS_ACCEPTED => {
+            s.fwd_writes[i].state = FW_OWED_ASSIGN;
+            s.fwd_writes[i].index = index;
+            s.fwd_writes[i].entry_term = term;
+        }
+        refused => {
+            s.fwd_writes[i].state = FW_OWED_REFUSE;
+            s.fwd_writes[i].status = refused;
+        }
     }
-    let buf = s.msg_buf;
-    wire_channels::channel_write_msg(
-        sys,
-        s.out_proposal_assigned,
-        wire::MSG_PROPOSAL_ASSIGNED,
-        &buf[..wire::PROPOSAL_ASSIGNED_LEN],
-    );
+    deliver_forward_outcome(s, sys, i);
 }
 
 /// Accept a proposal relayed by a follower.
@@ -5197,9 +5888,6 @@ unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
 /// `&SyscallTable` whose function pointers reach live kernel
 /// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
 unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
-    if s.out_proposal_assigned < 0 {
-        return;
-    }
     let count = s.proposal_batch_count as usize;
     let assigned_index = s.last_log_index;
     let pid = s.partition_id;
@@ -5216,22 +5904,33 @@ unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
         // Relayed proposal: the waiting inflight slot lives on the
         // ORIGIN's ring, so the assignment goes back over the peer path
         // instead of to our own proposer, which knows nothing about it.
+        //
+        // Recorded first, so a query (the answer is best effort) or a
+        // duplicate gets the same answer.
         if origin != ORIGIN_LOCAL && origin != s.self_id {
-            if s.out_rpc >= 0 && wire_channels::writable(sys, s.out_rpc) {
-                let mut buf = [0u8; wire::PROPOSAL_ASSIGNED_LEN];
-                wire::encode_proposal_assigned(&mut buf, cid, pid, assigned_index, term);
-                wire_channels::channel_write_routed_partitioned(
-                    sys,
-                    s.out_rpc,
-                    origin,
-                    pid,
-                    wire::MSG_PROPOSAL_ASSIGNED_REMOTE,
-                    &buf,
-                );
-            }
+            record_forward(
+                s,
+                origin,
+                cid,
+                term,
+                assigned_index,
+                wire::FWD_STATUS_ACCEPTED,
+            );
+            answer_forward(
+                s,
+                sys,
+                origin,
+                cid,
+                assigned_index,
+                term,
+                wire::FWD_STATUS_ACCEPTED,
+            );
             continue;
         }
 
+        if s.out_proposal_assigned < 0 {
+            continue;
+        }
         if !wire_channels::writable(sys, s.out_proposal_assigned) {
             // Channel full — drop the assignment. The proposer either
             // falls back to its own heuristic or treats this as a lost
@@ -5299,18 +5998,23 @@ unsafe fn send_heartbeat(s: &mut Raft, sys: &SyscallTable) {
 // ── Metadata persistence ────────────────────────────────────
 
 /// Build the per-partition metadata path. Returns `(buf, len)`.
-///   partition_id == 0 → "raft/meta"          (legacy single-partition)
-///   partition_id == N → "raft/p<NNNN>/meta"  (multi-Raft)
-fn build_meta_path(partition_id: u16) -> ([u8; META_PATH_MAX], usize) {
-    build_meta_path_ex(partition_id, false)
+///   partition_id == 0 → "<meta_dir>/meta"          (legacy single-partition)
+///   partition_id == N → "<meta_dir>/p<NNNN>/meta"  (multi-Raft)
+fn build_meta_path(partition_id: u16, dir: &StoreDir) -> ([u8; META_PATH_MAX], usize) {
+    build_meta_path_ex(partition_id, false, dir)
 }
 
 /// Build the path of metadata slot `slot` (0/1). The two slots are
 /// distinct files so that a failure in one cannot reach the other.
 ///   root mode: `RAFT<pppp>.M<slot>` (8.3-legal: 8-char stem, 2-char ext)
-///   dir mode:  `raft/meta<slot>` / `raft/p<NNNN>/meta<slot>`
-fn build_meta_slot_path(partition_id: u16, root: bool, slot: u8) -> ([u8; META_PATH_MAX], usize) {
-    let (mut buf, mut len) = build_meta_path_ex(partition_id, root);
+///   dir mode:  `<meta_dir>/meta<slot>` / `<meta_dir>/p<NNNN>/meta<slot>`
+fn build_meta_slot_path(
+    partition_id: u16,
+    root: bool,
+    dir: &StoreDir,
+    slot: u8,
+) -> ([u8; META_PATH_MAX], usize) {
+    let (mut buf, mut len) = build_meta_path_ex(partition_id, root, dir);
     let digit = b'0' + (slot & 1);
     if root {
         // Replace the ".MET" extension with ".M<slot>".
@@ -5404,7 +6108,11 @@ fn decode_meta_slot(buf: &[u8]) -> Option<MetaRecord> {
 /// name (`RAFT<pppp>.MET`, e.g. `RAFT0000.MET`) — FAT32 has no mkdir, so
 /// the `raft/` parent of the default path can't be created. The 8-char
 /// stem (`RAFT` + 4 hex partition digits) + 3-char extension is 8.3-legal.
-fn build_meta_path_ex(partition_id: u16, root: bool) -> ([u8; META_PATH_MAX], usize) {
+fn build_meta_path_ex(
+    partition_id: u16,
+    root: bool,
+    dir: &StoreDir,
+) -> ([u8; META_PATH_MAX], usize) {
     let mut buf = [0u8; META_PATH_MAX];
     if root {
         let mut i = 0usize;
@@ -5427,18 +6135,20 @@ fn build_meta_path_ex(partition_id: u16, root: bool) -> ([u8; META_PATH_MAX], us
         }
         return (buf, i);
     }
+    // `<meta_dir>/`: `META_PATH_MAX` holds the directory and the name.
+    let Some(mut i) = dir.put_prefix(&mut buf) else {
+        return (buf, 0);
+    };
     if partition_id == 0 {
-        let p = b"raft/meta";
-        buf[..p.len()].copy_from_slice(p);
-        return (buf, p.len());
+        for &b in b"meta" {
+            buf[i] = b;
+            i += 1;
+        }
+        return (buf, i);
     }
-    // "raft/p" + 4 hex digits + "/meta"
-    let prefix = b"raft/p";
-    let mut i = 0usize;
-    for &b in prefix {
-        buf[i] = b;
-        i += 1;
-    }
+    // "<meta_dir>/p" + 4 hex digits + "/meta"
+    buf[i] = b'p';
+    i += 1;
     for digit in (0..4).rev() {
         let nibble = ((partition_id >> (digit * 4)) & 0xF) as u8;
         buf[i] = if nibble < 10 {
@@ -5515,7 +6225,7 @@ unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
     while s.ml_phase == ML_SLOTS && (s.ml_slot as usize) < META_SLOTS {
         let slot = s.ml_slot;
         if s.ml_fd < 0 {
-            let (mut path, plen) = build_meta_slot_path(s.partition_id, root, slot);
+            let (mut path, plen) = build_meta_slot_path(s.partition_id, root, &s.meta_dir, slot);
             let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
             if later(fd) {
                 return true;
@@ -5647,7 +6357,7 @@ enum FlatLoad {
 /// `&SyscallTable` per the module ABI.
 unsafe fn load_flat_metadata(s: &mut Raft, sys: &SyscallTable, root: bool) -> FlatLoad {
     if s.ml_fd < 0 {
-        let (mut path, plen) = build_meta_path_ex(s.partition_id, root);
+        let (mut path, plen) = build_meta_path_ex(s.partition_id, root, &s.meta_dir);
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
         if later(fd) {
             return FlatLoad::Retry;
@@ -5890,7 +6600,8 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
     while (s.mz_slot as usize) < META_SLOTS {
         let slot = s.mz_slot;
         let idx = slot as usize;
-        let (mut path, plen) = build_meta_slot_path(s.partition_id, s.meta_root_path != 0, slot);
+        let (mut path, plen) =
+            build_meta_slot_path(s.partition_id, s.meta_root_path != 0, &s.meta_dir, slot);
         match s.mz_phase {
             MZ_START => {
                 // Same refusal as the persist path, for the same reason:
@@ -5929,9 +6640,9 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
                 s.mz_phase = MZ_SEEK;
             }
             MZ_MKDIR_ROOT => {
-                let mut root = [0u8; 4];
-                root[..4].copy_from_slice(b"raft");
-                let rc = (sys.provider_call)(-1, FS_MKDIR, root.as_mut_ptr(), 4);
+                let mut root = [0u8; STORE_DIR_MAX];
+                let rlen = s.meta_dir.put(&mut root).unwrap_or(0);
+                let rc = (sys.provider_call)(-1, FS_MKDIR, root.as_mut_ptr(), rlen);
                 if later(rc) {
                     return PersistOutcome::Transient;
                 }
@@ -5949,7 +6660,7 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
             }
             MZ_MKDIR_PART => {
                 // "raft/p<NNNN>" — the parent of the per-partition meta file.
-                let (mut dir, dlen) = build_meta_path(s.partition_id);
+                let (mut dir, dlen) = build_meta_path(s.partition_id, &s.meta_dir);
                 // Strip the trailing "/meta" (5 bytes) to get the directory.
                 let rc = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dlen - 5);
                 if later(rc) {
@@ -6039,16 +6750,16 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
                 // directories this boot minted come first, outermost first:
                 // a slot's entry survives a power cut only if they do.
                 if s.meta_dirs_unfenced & META_DIR_ROOT != 0 {
-                    let mut root = [0u8; 4];
-                    root[..4].copy_from_slice(b"raft");
-                    match publish_meta_name(s, sys, &mut root, 4) {
+                    let mut root = [0u8; STORE_DIR_MAX];
+                    let rlen = s.meta_dir.put(&mut root).unwrap_or(0);
+                    match publish_meta_name(s, sys, &mut root, rlen) {
                         PersistOutcome::Persisted => s.meta_dirs_unfenced &= !META_DIR_ROOT,
                         PersistOutcome::Transient => return PersistOutcome::Transient,
                         PersistOutcome::Failed => return mark_meta_failure(s, sys, slot),
                     }
                 }
                 if s.meta_dirs_unfenced & META_DIR_PART != 0 {
-                    let (mut dir, dlen) = build_meta_path(s.partition_id);
+                    let (mut dir, dlen) = build_meta_path(s.partition_id, &s.meta_dir);
                     match publish_meta_name(s, sys, &mut dir, dlen - 5) {
                         PersistOutcome::Persisted => s.meta_dirs_unfenced &= !META_DIR_PART,
                         PersistOutcome::Transient => return PersistOutcome::Transient,
@@ -6508,6 +7219,10 @@ unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     }
     s.role = ROLE_LEADER;
     s.leader_id = s.self_id as i8;
+    if s.led_terms[0] != s.current_term {
+        s.led_terms.copy_within(0..LED_TERMS - 1, 1);
+        s.led_terms[0] = s.current_term;
+    }
     s.votes_granted.clear();
     s.votes_rejected.clear();
     s.pre_vote_active = false;
@@ -6541,6 +7256,7 @@ unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // block commit forever.
     s.noop_pending = true;
     s.term_first_index = 0;
+    s.config_fence = 0;
     if s.out_log >= 0 {
         s.commit_fence_out = Some((s.current_term, 0));
     }

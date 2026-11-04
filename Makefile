@@ -81,7 +81,7 @@ e2e:
 	# a tests/harness sub-workspace, which this project does not have).
 	cargo test --test raft_meta --test wal_scan --test wal_truncate \
 	  --test snap_pointer --test name_fence --test wire_codec_truncation \
-	  --test sealed_records --test sealed_wal --test close_owed
+	  --test sealed_records --test sealed_wal --test close_owed --test store_dir
 	# The fault matrix mounts several nodes' composites in one crate
 	# against a process-global mock kernel: one test at a time.
 	cargo test --test raft_fault_matrix -- --test-threads=1
@@ -107,6 +107,8 @@ e2e:
 	# serialise the binary like the other port-heavy suites.
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test volatile_cluster -- --test-threads=1
 	CLUSTOR_REQUIRE_E2E=1 cargo test --test session_directory_e2e --test timing_cluster_e2e --test site_loss_e2e -- --test-threads=1
+	# Four members of the published multi-voter stack, one test.
+	CLUSTOR_REQUIRE_E2E=1 cargo test --test directory_group_e2e -- --test-threads=1
 	# ring_parity proves the kernel-ring and channel histogram wires agree.
 	# Its export hook is env-driven, and env is process-global, so it is
 	# its own binary rather than a case in cluster.rs.

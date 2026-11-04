@@ -35,7 +35,7 @@
 //!
 //! ## Allocator state
 //!
-//! Two slot files (`wal/p<NNNN>_seal<0|1>`, `<p>SEAL<0|1>.WAL` at the FS
+//! Two slot files (`<wal_dir>/p<NNNN>_seal<0|1>`, `<p>SEAL<0|1>.WAL` at the FS
 //! root) hold the A/B record below; the higher valid generation wins
 //! and a write goes to the other slot, so a torn write loses at most
 //! the record being written. Each record is HMAC-SHA256 authenticated
@@ -99,6 +99,7 @@ use super::{
 };
 use crate::abi::contracts::key_vault as kv;
 use crate::abi::SyscallTable;
+use crate::store_dir::{StoreDir, STORE_DIR_MAX};
 
 /// Incarnations reserved per allocator write.
 pub const INCARNATION_STRIDE: u64 = 64;
@@ -514,7 +515,13 @@ pub unsafe fn close_incarnation(s: &mut Wal, sys: &SyscallTable) {
 
 // ── Allocator state ─────────────────────────────────────────────────────
 
-fn state_path(partition_id: u16, root: bool, slot: u8, out: &mut [u8; WAL_PATH_MAX]) -> usize {
+fn state_path(
+    partition_id: u16,
+    root: bool,
+    dir: &StoreDir,
+    slot: u8,
+    out: &mut [u8; WAL_PATH_MAX],
+) -> usize {
     let mut i = 0usize;
     let hex = |n: u8| if n < 10 { b'0' + n } else { b'a' + n - 10 };
     if root {
@@ -532,10 +539,13 @@ fn state_path(partition_id: u16, root: bool, slot: u8, out: &mut [u8; WAL_PATH_M
         }
         return i;
     }
-    for &b in b"wal/p" {
-        out[i] = b;
-        i += 1;
-    }
+    // `<wal_dir>/p`; `WAL_PATH_MAX` holds the directory and the name.
+    i = match dir.put_prefix(out) {
+        Some(n) => n,
+        None => return 0,
+    };
+    out[i] = b'p';
+    i += 1;
     for digit in (0..4).rev() {
         out[i] = hex(((partition_id >> (digit * 4)) & 0xF) as u8);
         i += 1;
@@ -710,7 +720,7 @@ const NO_EFFECTS: Effects = Effects {
 unsafe fn read_slot(s: &mut Wal, sys: &SyscallTable, slot: u8) -> Option<SlotRead> {
     if s.seal.rd_fd < 0 {
         let mut path = [0u8; WAL_PATH_MAX];
-        let plen = state_path(s.partition_id, s.root_path != 0, slot, &mut path);
+        let plen = state_path(s.partition_id, s.root_path != 0, &s.dir, slot, &mut path);
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
         if later(fd) {
             return None;
@@ -862,7 +872,13 @@ unsafe fn sw_refused(s: &mut Wal, sys: &SyscallTable) -> Step {
 #[inline(never)]
 unsafe fn drive_state_write(s: &mut Wal, sys: &SyscallTable) -> Step {
     let mut path = [0u8; WAL_PATH_MAX];
-    let plen = state_path(s.partition_id, s.root_path != 0, s.seal.sw_slot, &mut path);
+    let plen = state_path(
+        s.partition_id,
+        s.root_path != 0,
+        &s.dir,
+        s.seal.sw_slot,
+        &mut path,
+    );
     loop {
         match s.seal.sw_phase {
             SW_OPEN => {
@@ -886,8 +902,9 @@ unsafe fn drive_state_write(s: &mut Wal, sys: &SyscallTable) -> Step {
                 s.seal.sw_phase = SW_WRITE;
             }
             SW_MKDIR => {
-                let mut dir = *b"wal";
-                let rc = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dir.len());
+                let mut dir = [0u8; STORE_DIR_MAX];
+                let dlen = s.dir.put(&mut dir).unwrap_or(0);
+                let rc = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dlen);
                 if later(rc) {
                     return Step::Later;
                 }

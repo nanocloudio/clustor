@@ -3162,7 +3162,11 @@ fn peer_dest(peer_rx: i32, raft_rpc: i32, peer_msg_type: u8) -> i32 {
         // Response-owed relay and the leader's answer back to the
         // origin's proposer ring.
         | wire::MSG_PROPOSAL_FORWARD_TAGGED
-        | wire::MSG_PROPOSAL_ASSIGNED_REMOTE => raft_rpc,
+        | wire::MSG_PROPOSAL_ASSIGNED_REMOTE
+        // A follower's leader-only admin op, forwarded to the leader,
+        // and its answer.
+        | wire::MSG_ADMIN_FORWARD
+        | wire::MSG_ADMIN_FORWARD_RESP => raft_rpc,
         _ => -1,
     }
 }

@@ -10,7 +10,7 @@ shapes, and only one of them rides a feedback loop back to the proposer.
 |------|-----------|-------|---------|
 | `proposals` | input | in[1] | Untagged proposals. Payload is the bare body. No feedback. |
 | `proposals_tagged` | input | in[3] | Tagged proposals carrying a per-message correlation id. Acknowledged via `proposal_assigned`. |
-| `proposal_assigned` | output | out[4] | One `MSG_PROPOSAL_ASSIGNED` per tagged proposal once a log index is assigned. |
+| `proposal_assigned` | output | out[4] | One `MSG_PROPOSAL_ASSIGNED` per tagged proposal once a log index is assigned, or a `MSG_PROPOSAL_REFUSED` when consensus refuses it. |
 
 The partitioned pair `proposals_partitioned` (in[4]) and
 `proposals_partitioned_tagged` (in[5]) carry the same two shapes
@@ -85,10 +85,27 @@ Helpers: `wire::encode_proposal_assigned`, `wire::decode_proposal_assigned`.
   useful safety net against that case.
 - Role transitions reset pending correlations: both `become_follower`
   and `become_leader` (`modules/app/consensus/raft.rs`) discard the
-  pending proposal batch and zero its correlation-id slots, so a
+  pending proposal batch and zero its correlation-id slots, so a LOCAL
   proposal caught in flight across a leadership change never produces
-  an assignment event. Producers should time out and retry against the
-  new leader.
+  an assignment event. Producers should time out and retry.
+- A tagged proposal on a FOLLOWER is forwarded to the leader of its term
+  and always answered: the leader's assignment, re-emitted as
+  `MSG_PROPOSAL_ASSIGNED` (the index names the entry only with its term —
+  match both, a leader change can put another entry there), or
+
+  ```
+  MSG_PROPOSAL_REFUSED on proposal_assigned:
+    [correlation_id : u64 LE]
+    [status         : u8    ]   CLIENT_REJECT_* (errors.md)
+    [leader_id      : u8    ]   0xFF = none known
+  ```
+
+  `NOT_LEADER`, `THROTTLED`, `FALLBACK` and `TOO_LARGE` mean never
+  appended (safe to retry); `OUTCOME_UNKNOWN` means the leader went
+  silent before saying, so the write may still commit. A forward is
+  proposed to one leader only, never re-proposed. See
+  [replication.md](../architecture/replication.md) "Follower writes".
+  Helpers: `wire::encode_proposal_refused`, `wire::decode_proposal_refused`.
 
 ## See also
 

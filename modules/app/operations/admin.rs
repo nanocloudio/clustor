@@ -64,6 +64,21 @@ const CMD_MAX: usize = ENV_BUF - 12;
 struct CmdEntry {
     command_id: u32,
     conn_id: u16,
+    /// Arrived on `admin_requests`: answered on `admin_answers`.
+    local: bool,
+}
+
+/// Answers owed and not yet written (the port had no room), oldest
+/// first: an operator's command never loses its outcome to a full
+/// channel.
+const OWED_ANSWERS: usize = 16;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OwedAnswer {
+    conn_id: u16,
+    status: u8,
+    local: bool,
 }
 
 #[repr(C)]
@@ -77,6 +92,10 @@ pub struct Admin {
     /// migration state machine. Optional — a graph without a
     /// controller leaves it unwired and migration ops are refused.
     pub out_migration: i32,
+    /// out: answers to `admin_requests` commands (`admin_answers`).
+    pub out_answers: i32,
+    owed: [OwedAnswer; OWED_ANSWERS],
+    owed_len: u8,
 
     /// Raft group an admin command targets. One consensus engine hosts
     /// K groups, and every interesting admin op (FREEZE,
@@ -113,6 +132,8 @@ pub unsafe fn init(a: &mut Admin) {
     a.out_responses = -1;
     a.out_proposal = -1;
     a.out_migration = -1;
+    a.out_answers = -1;
+    a.owed_len = 0;
     // In-flight retransmit window: a duplicate is only collapsed if
     // it lands within this gap of an identical predecessor. Long
     // enough to swallow a client TCP retransmit, short enough that a
@@ -129,6 +150,7 @@ pub unsafe fn init(a: &mut Admin) {
         *slot = CmdEntry {
             command_id: 0,
             conn_id: 0,
+            local: false,
         };
     }
 }
@@ -143,6 +165,7 @@ pub unsafe fn init(a: &mut Admin) {
 /// Caller must hold an exclusive `&mut Admin` and supply a valid
 /// `&SyscallTable` per the module ABI.
 pub unsafe fn step(a: &mut Admin, sys: &SyscallTable, now: u64) {
+    flush_owed(a, sys);
     drain_applied(a, sys);
     drain_requests(a, sys, now);
 }
@@ -156,6 +179,9 @@ unsafe fn drain_applied(a: &mut Admin, sys: &SyscallTable) {
         return;
     }
     for _ in 0..8 {
+        if a.owed_len as usize >= OWED_ANSWERS {
+            break;
+        }
         let Some((msg_type, plen)) = wire_channels::next_msg(sys, a.in_applied, &mut a.msg_buf)
         else {
             break;
@@ -166,8 +192,8 @@ unsafe fn drain_applied(a: &mut Admin, sys: &SyscallTable) {
         let command_id =
             u32::from_le_bytes([a.msg_buf[0], a.msg_buf[1], a.msg_buf[2], a.msg_buf[3]]);
         let status = a.msg_buf[4];
-        if let Some(conn_id) = take_cmd(a, command_id) {
-            emit_admin_response(a, sys, conn_id, status);
+        if let Some((conn_id, local)) = take_cmd(a, command_id) {
+            emit_admin_response(a, sys, conn_id, status, local);
         }
     }
 }
@@ -183,6 +209,11 @@ unsafe fn drain_requests(a: &mut Admin, sys: &SyscallTable, now: u64) {
         return;
     }
     for _ in 0..4 {
+        // Every command is owed an answer: take one only while there is
+        // room to keep it if the port is full.
+        if a.owed_len as usize >= OWED_ANSWERS {
+            break;
+        }
         let Some((msg_type, plen)) = wire_channels::next_msg(sys, a.in_requests, &mut a.msg_buf)
         else {
             break;
@@ -193,20 +224,21 @@ unsafe fn drain_requests(a: &mut Admin, sys: &SyscallTable, now: u64) {
         let pl = plen as usize;
         let mut local = [0u8; ENV_BUF];
         local[..pl].copy_from_slice(&a.msg_buf[..pl]);
-        on_command(a, sys, now, &local[..pl]);
+        on_command(a, sys, now, &local[..pl], true);
     }
 }
 
 /// Process one authorized admin command envelope
 /// `[conn_id:u16 LE][op_code:u8][op_body...]`. This is the single
 /// admission point regardless of how the command arrived (rbac
-/// delivery or the `admin_requests` port).
+/// delivery, or the `admin_requests` port: `local`, answered on
+/// `admin_answers` when that is wired).
 ///
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Admin` and supply a valid
 /// `&SyscallTable` per the module ABI.
-pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &[u8]) {
+pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &[u8], local: bool) {
     let pl = payload.len();
     if pl < 3 {
         return; // need conn_id + op_code at minimum
@@ -251,7 +283,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     // command past `CMD_MAX` cannot be staged — refuse it outright
     // rather than overrun (a panic here kills the whole module).
     if cmd_len > CMD_MAX {
-        emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_REJECTED);
+        emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_REJECTED, local);
         return;
     }
 
@@ -266,7 +298,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
         && a.last_cmd[..cmd_len] == cmd[..cmd_len]
         && now.wrapping_sub(a.last_cmd_ms) < a.idemp_ttl_ms;
     if dup {
-        emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_DUPLICATE);
+        emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_DUPLICATE, local);
         return;
     }
 
@@ -325,7 +357,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
             | wire::ADMIN_OP_SHARD_MAP
     );
     if !supported {
-        emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_UNSUPPORTED);
+        emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_UNSUPPORTED, local);
         return;
     }
 
@@ -342,7 +374,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
     if a.next_command_id == 0 {
         a.next_command_id = 1;
     }
-    put_cmd(a, command_id, conn_id);
+    put_cmd(a, command_id, conn_id, local);
 
     // Two paths:
     //   FREEZE / THAW / DURABILITY_MODE — replicate through Raft so
@@ -372,7 +404,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
             // No controller wired: nothing can own the migration, so
             // refusing is the honest answer rather than accepting a
             // command that will never run.
-            emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_UNSUPPORTED);
+            emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_UNSUPPORTED, local);
             return;
         }
         if wire_channels::writable(sys, a.out_migration) {
@@ -382,12 +414,12 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
                 wire::MSG_MIGRATION_COMMAND,
                 &cmd[..cmd_len],
             );
-            emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_OK);
+            emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_OK, local);
         } else {
             // Back-pressure. The controller decides migrations one at a
             // time; dropping silently would leave the operator believing
             // a migration started.
-            emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_UNSUPPORTED);
+            emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_UNSUPPORTED, local);
         }
         a.commands_processed += 1;
         return;
@@ -404,13 +436,18 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
         env[8..12].copy_from_slice(&command_id.to_le_bytes());
         env[12..12 + cmd_len].copy_from_slice(&cmd[..cmd_len]);
         let total = 12 + cmd_len;
-        if wire_channels::writable(sys, a.out_proposal) {
-            wire_channels::channel_write_msg(
-                sys,
-                a.out_proposal,
-                wire::MSG_CLIENT_PROPOSAL,
-                &env[..total],
-            );
+        let sent = wire_channels::channel_write_msg(
+            sys,
+            a.out_proposal,
+            wire::MSG_CLIENT_PROPOSAL,
+            &env[..total],
+        ) > 0;
+        if !sent {
+            // Never staged: answer now rather than leave the command
+            // waiting on an apply that cannot come.
+            let _ = take_cmd(a, command_id);
+            emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_REJECTED, local);
+            return;
         }
     } else {
         // Local-only: direct envelope to `consensus.admin_proposals`.
@@ -419,7 +456,7 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
         env[0..4].copy_from_slice(&command_id.to_le_bytes());
         env[4..4 + cmd_len].copy_from_slice(&cmd[..cmd_len]);
         let total = 4 + cmd_len;
-        if wire_channels::writable(sys, a.out_raft) {
+        {
             // Partitioned envelope: with one consensus engine hosting K
             // Raft groups, an admin op has to name the group it acts on
             // — FREEZE, TRANSFER_LEADER and the membership ops are all
@@ -433,13 +470,18 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
             // would produce K statuses for one id and the correlation
             // upstream would mishandle them. Cluster-wide admin needs a
             // response-aggregation design first.
-            wire_channels::channel_write_partitioned(
+            let sent = wire_channels::channel_write_partitioned(
                 sys,
                 a.out_raft,
                 a.target_partition,
                 wire::MSG_ADMIN_COMMAND,
                 &env[..total],
-            );
+            ) > 0;
+            if !sent {
+                let _ = take_cmd(a, command_id);
+                emit_admin_response(a, sys, conn_id, wire::ADMIN_STATUS_REJECTED, local);
+                return;
+            }
         }
     }
     a.commands_processed += 1;
@@ -449,30 +491,74 @@ pub unsafe fn on_command(a: &mut Admin, sys: &SyscallTable, now: u64, payload: &
 ///
 /// Caller must hold an exclusive `&mut Admin` and supply a valid
 /// `&SyscallTable` per the module ABI.
-unsafe fn emit_admin_response(a: &mut Admin, sys: &SyscallTable, conn_id: u16, status: u8) {
-    if a.out_responses < 0 {
+unsafe fn emit_admin_response(
+    a: &mut Admin,
+    sys: &SyscallTable,
+    conn_id: u16,
+    status: u8,
+    local: bool,
+) {
+    // peer_router's learner asks carry conn 0xFFFF: no one waits on them.
+    if local && conn_id == 0xFFFF {
         return;
     }
-    if wire_channels::writable(sys, a.out_responses) {
-        let cid = conn_id.to_le_bytes();
-        let resp = [cid[0], cid[1], status];
-        wire_channels::channel_write_msg(sys, a.out_responses, wire::MSG_ADMIN_RESPONSE, &resp);
+    let n = a.owed_len as usize;
+    if n < OWED_ANSWERS {
+        a.owed[n] = OwedAnswer {
+            conn_id,
+            status,
+            local,
+        };
+        a.owed_len += 1;
+    }
+    flush_owed(a, sys);
+}
+
+/// Write owed answers, oldest first, until a port has no room.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Admin` and supply a valid
+/// `&SyscallTable` per the module ABI.
+unsafe fn flush_owed(a: &mut Admin, sys: &SyscallTable) {
+    let mut sent = 0usize;
+    let n = a.owed_len as usize;
+    while sent < n {
+        let r = a.owed[sent];
+        let port = if r.local && a.out_answers >= 0 {
+            a.out_answers
+        } else {
+            a.out_responses
+        };
+        if port >= 0 {
+            let cid = r.conn_id.to_le_bytes();
+            let resp = [cid[0], cid[1], r.status];
+            if wire_channels::channel_write_msg(sys, port, wire::MSG_ADMIN_RESPONSE, &resp) <= 0 {
+                break;
+            }
+        }
+        sent += 1;
+    }
+    if sent > 0 {
+        a.owed.copy_within(sent..n, 0);
+        a.owed_len = (n - sent) as u8;
     }
 }
 
-fn put_cmd(a: &mut Admin, command_id: u32, conn_id: u16) {
+fn put_cmd(a: &mut Admin, command_id: u32, conn_id: u16, local: bool) {
     let slot = (a.cmd_head as usize) % CMD_RING;
     a.cmd_ring[slot] = CmdEntry {
         command_id,
         conn_id,
+        local,
     };
     a.cmd_head = a.cmd_head.wrapping_add(1);
 }
 
-fn take_cmd(a: &mut Admin, command_id: u32) -> Option<u16> {
+fn take_cmd(a: &mut Admin, command_id: u32) -> Option<(u16, bool)> {
     for slot in a.cmd_ring.iter_mut() {
         if slot.command_id == command_id {
-            let c = slot.conn_id;
+            let c = (slot.conn_id, slot.local);
             slot.command_id = 0;
             return Some(c);
         }

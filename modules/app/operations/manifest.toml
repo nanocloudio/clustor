@@ -201,3 +201,17 @@ metrics = ["requests", "requests_404", "correlations_inflight", "indices_infligh
 name = "migration_cmd"
 direction = "output"
 content_type = "OctetStream"
+
+# out[12]: answers to the commands that arrived on `admin_requests` —
+# `MSG_ADMIN_RESPONSE [conn_id:u16 LE][status]`, the conn_id the command
+# carried — so a graph driving admin through that pre-authorized input
+# hears the outcome itself. Unwired, they leave on `responses` as every
+# answer did. Commands under conn_id 0xFFFF (peer_router's learner asks)
+# are answered nowhere. Appended last, like `migration_cmd`.
+[[ports]]
+name = "admin_answers"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+max_record = 5
+rate_class_max = "transaction"

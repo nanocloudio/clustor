@@ -186,6 +186,9 @@ impl CorrSlot {
 #[repr(C)]
 struct IndexSlot {
     index: u64,
+    /// The term the entry was appended in: the index names this
+    /// proposal's entry only together with it.
+    term: u64,
     started_ms: u64,
     id: ExchangeId,
 }
@@ -194,6 +197,7 @@ impl IndexSlot {
     const fn empty() -> Self {
         Self {
             index: 0,
+            term: 0,
             started_ms: 0,
             id: ExchangeId::NONE,
         }
@@ -631,15 +635,44 @@ unsafe fn drain_proposal_assignments(h: &mut Http, sys: &SyscallTable) {
         return;
     }
     for _ in 0..16 {
+        // A refusal on this port is answered here, so nothing is pulled
+        // while an answer would have nowhere to go.
+        if !ready_to_answer(h, sys) {
+            break;
+        }
         let Some((msg_type, plen)) =
             wire_channels::next_msg(sys, h.in_proposal_assigned, &mut h.msg_buf)
         else {
             break;
         };
+        if msg_type == wire::MSG_PROPOSAL_REFUSED {
+            let Some((correlation_id, status, _leader)) =
+                wire::decode_proposal_refused(&h.msg_buf[..plen as usize])
+            else {
+                continue;
+            };
+            if let Some(pos) = h
+                .correlations
+                .iter()
+                .position(|slot| slot.correlation_id == correlation_id && correlation_id != 0)
+            {
+                let id = h.correlations[pos].id;
+                h.correlations[pos] = CorrSlot::empty();
+                h.proposal_rejections = h.proposal_rejections.saturating_add(1);
+                match status {
+                    wire::CLIENT_REJECT_OUTCOME_UNKNOWN => {
+                        finish(h, sys, id, 504, b"proposal outcome unknown");
+                    }
+                    wire::CLIENT_REJECT_TOO_LARGE => finish(h, sys, id, 413, b"proposal too large"),
+                    _ => finish(h, sys, id, 503, b"proposal refused"),
+                }
+            }
+            continue;
+        }
         if msg_type != wire::MSG_PROPOSAL_ASSIGNED {
             continue;
         }
-        let Some((correlation_id, _partition_id, index, _term)) =
+        let Some((correlation_id, _partition_id, index, term)) =
             wire::decode_proposal_assigned(&h.msg_buf[..plen as usize])
         else {
             continue;
@@ -655,6 +688,7 @@ unsafe fn drain_proposal_assignments(h: &mut Http, sys: &SyscallTable) {
                 h.correlations[c] = CorrSlot::empty();
                 h.indices[i] = IndexSlot {
                     index,
+                    term,
                     started_ms: corr.started_ms,
                     id: corr.id,
                 };
@@ -730,7 +764,10 @@ pub unsafe fn next_applied(h: &mut Http, sys: &SyscallTable) -> Feedback {
     if msg_type != wire::MSG_CLIENT_RESPONSE || pl < 18 {
         return Feedback::Handled;
     }
-    // `[partition:u16][term:u64][index:u64]` — index at offset 10.
+    // `[partition:u16][term:u64][index:u64]` — term at 2, index at 10.
+    let mut t = [0u8; 8];
+    t.copy_from_slice(&h.msg_buf[2..10]);
+    let term = u64::from_le_bytes(t);
     let index_off = 10;
     let index = u64::from_le_bytes([
         h.msg_buf[index_off],
@@ -743,10 +780,17 @@ pub unsafe fn next_applied(h: &mut Http, sys: &SyscallTable) -> Feedback {
         h.msg_buf[index_off + 7],
     ]);
     if let Some(pos) = h.indices.iter().position(|slot| slot.index == index) {
-        let id = h.indices[pos].id;
+        let slot = h.indices[pos];
         h.indices[pos] = IndexSlot::empty();
+        if slot.term != term {
+            // Another term's entry took the position: this proposal did
+            // not commit, and the client resubmits.
+            h.proposal_rejections = h.proposal_rejections.saturating_add(1);
+            finish(h, sys, slot.id, 503, b"proposal superseded");
+            return Feedback::Handled;
+        }
         h.committed = h.committed.saturating_add(1);
-        finish(h, sys, id, 200, b"committed");
+        finish(h, sys, slot.id, 200, b"committed");
     } else {
         h.applies_unmatched = h.applies_unmatched.saturating_add(1);
     }

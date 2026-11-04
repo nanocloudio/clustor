@@ -360,6 +360,13 @@ path = "tests/timing_cluster_e2e.rs"
 name = "session_directory_e2e"
 path = "tests/session_directory_e2e.rs"
 
+# The published multi-voter stack (`clustor-directory-group`) through its
+# admin pair: learner admission, joint-consensus voter replacement and
+# leader transfer over four members.
+[[test]]
+name = "directory_group_e2e"
+path = "tests/directory_group_e2e.rs"
+
 # Site loss against a real multi-site group (5 voters / 3 sites, and
 # 3 voters / 2 sites at min_sites 2).
 [[test]]
@@ -481,6 +488,13 @@ path = "tests/raft_meta.rs"
 [[test]]
 name = "name_fence"
 path = "tests/name_fence.rs"
+
+# Host-side unit coverage for the state-directory param durability's
+# `wal_dir` and consensus's `meta_dir` share (`modules/common/store_dir.rs`):
+# what construction accepts and refuses. No prereqs, always runs.
+[[test]]
+name = "store_dir"
+path = "tests/store_dir.rs"
 
 # Deterministic, seeded end-to-end Raft fault matrix. Mounts the whole
 # consensus composite (raft, replicator, commit, apply) and durability

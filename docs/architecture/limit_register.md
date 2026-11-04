@@ -43,7 +43,8 @@ absent so that "absent here is a bug" stays a checkable claim:
   `CHECK_REQ_MAX` from the arm check's layout carrying `ARM_AUTH_MAX` of
   auth (which mirrors Fluxor's identity contract, so a check Fluxor may
   send is never cut),
-  `SNAP_PTR_CANDIDATES` from `SNAP_PTR_SLOTS`, `FWD_FRAME_MAX` (one
+  `SNAP_PTR_CANDIDATES` from `SNAP_PTR_SLOTS`, `WAL_PATH_MAX`,
+  `SNAP_PATH_MAX` and `META_PATH_MAX` from `STORE_DIR_MAX`, `FWD_FRAME_MAX` (one
   routed install frame the replicator holds) from `XFER_CHUNK_BODY`, and `EXPORT_TAIL_RECORDS`
   and `COMP_STEP_BUCKETS` from histogram bucket counts.
 - **Striping and resolution factors.** `DEDUP_SHARDS` picks which of 16
@@ -81,6 +82,14 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Commit-latency timestamp ring | `COMMIT_TS_RING` | modules/app/consensus/raft.rs | 64 | Capacity, observability only: append→commit timestamps for the commit-latency histogram. A wrap before commit drops that sample; an equality check keeps a wrapped slot from being attributed to the wrong entry. |
 | Leader ReadIndex probes in flight | `MAX_INFLIGHT_PROBES` | modules/app/consensus/raft.rs | 32 | Local and follower-forwarded reads share the table. A full probe table answers unconfirmed (a forwarded read gets a refusing `MSG_READ_INDEX_RESP`), and the read is rejected to the caller for retry. |
 | Follower reads forwarded to the leader | `MAX_INFLIGHT_PROBES` | modules/app/consensus/raft.rs | 32 | A full forward table refuses the read at once, retryably; an outstanding forward is refused at its 1500 ms deadline or on any term/leader change. |
+| Admin ops forwarded to the leader | `ADMIN_FWD_SLOTS` | modules/app/consensus/raft.rs | 4 | Capacity: leader-only admin ops (membership, transfer) a follower forwarded and has not heard back about. A full table answers the next one `ADMIN_STATUS_NOT_LEADER` at once (retryable); an ask unanswered past `ADMIN_FWD_DEADLINE_MS` is answered the same. |
+| Forwarded admin op deadline | `ADMIN_FWD_DEADLINE_MS` | modules/app/consensus/raft.rs | — | Semantic; typed value 2000 (`u64`, ms). Every op that travels this way is idempotent at the leader, so the retry a NOT_LEADER invites is safe even when the lost answer was an OK. |
+| Admin answers waiting for their port | `OWED_ANSWERS` | modules/app/operations/admin.rs | 16 | Backpressure, lossless: admin answers (`responses` / `admin_answers`) the port had no room for, oldest first. While full, the admin component takes no further command or apply acknowledgement, so no command loses its outcome. |
+| Follower writes forwarded to the leader | `FWD_WINDOW` | modules/app/consensus/raft.rs | 16 | Backpressure, lossless: response-owed writes a follower has forwarded and not yet answered, per group, as a sliding window over its forward sequence. A full window leaves the next proposal on its channel. The leader keeps a record of the same width per origin replica (`FwdSeen`), so every forward a follower can still ask about is in it; widening one without the other lets a query outrun the record. |
+| Forward status re-ask period | `FWD_QUERY_MS` | modules/app/consensus/raft.rs | — | Pacing; typed value 250 (`u64`, ms): how often an unanswered forward is asked after, at the leader it was sent to. The answer rides a best-effort rpc write; this is what recovers a lost one without proposing the write again. |
+| Forwarded write deadline | `FWD_DEADLINE_MS` | modules/app/consensus/raft.rs | — | Semantic; typed value 4000 (`u64`, ms): past it, a forward no node that led its term could answer for is refused `CLIENT_REJECT_OUTCOME_UNKNOWN` (it may still commit). Below the proposers' own reclaim windows (the directory's 10 s `PENDING_TTL_MS`, the gateway's 30 s `CORR_TTL_MS`), so the proposer hears an outcome before it gives up. |
+| No-leader write hold | `NO_LEADER_HOLD_MS` | modules/app/consensus/raft.rs | — | Semantic; typed value 8000 (`u64`, ms), or two election timeouts if longer. A response-owed write on a node with no leader waits on its channel this long — through a boot-time formation or a split-vote election — and is proposed if a leader appears; past it, it is refused NOT_LEADER. Below the directory's 10 s `PENDING_TTL_MS`, so the proposer hears the refusal. |
+| Terms a forward record speaks for | `LED_TERMS` | modules/app/consensus/raft.rs | 4 | Capacity: the terms this node led since boot whose forwards it can still answer "never appended" for. A query about an older term is answered unknown, which the asker turns into OUTCOME_UNKNOWN at its deadline — conservative, never a false "not appended". |
 | Pending linearizable reads at apply | `PENDING_READ_SLOTS` | modules/app/consensus/apply.rs | 16 | A full queue evicts the oldest read with an explicit client reject, so the submitter fails closed. |
 | Pending committed-entry bodies at apply | `PENDING_ENTRY_SLOTS` | modules/app/consensus/apply.rs | 64 | Capacity/backpressure: sized above the 48-entry uncommitted window so committed bodies are not evicted before apply. Changing either side requires a joint review. |
 | Coalesced proposals per WAL entry | `MAX_BATCH_PROPOSALS` | modules/app/consensus/raft.rs | 256 | Shape/pacing: caps correlation records in one proposal batch; remaining proposals wait for another step. The byte cap normally binds first. |
@@ -90,9 +99,12 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Catch-up resend window | `CATCHUP_WINDOW` | modules/app/consensus/replicator.rs | — | Pacing; typed value 8 entries. What a NACK re-ships to a lagging peer in one round: enough to keep its stream pipelined while the leader appends hundreds a second (one entry per round trip never caught up), bounded so a NACK never re-ships the whole tail. Past it the peer NACKs again and is fed the next window. |
 | Configuration entries above the base | `CFG_LOG` | modules/common/wire.rs | 16 | Shape: Raft takes one membership change at a time, so all but the newest one or two are committed; when the list is full the oldest is folded into the configuration base. Nothing is refused. |
 | Shard-ownership override map | `SHARD_MAP_MAX_ENTRIES` | modules/common/wire.rs | 256 | Wire contract: the producer never emits a larger map, because a consumer that dropped the tail would resolve those shards to their baseline owner while other nodes used the override — split ownership. Quantum's `edge_routing_core::MAX_SHARD_OVERRIDES` is sized to match. |
-| ReadIndex seam queue | `PROBE_QUEUE_SLOTS` | modules/app/consensus/seam.rs | 8 | A full Raft reply queue currently drops the confirmation silently. This is a correctness-sensitive lossy boundary and should become retained backpressure or an explicit reject. |
+| ReadIndex seam queue | `PROBE_QUEUE_SLOTS` | modules/app/consensus/seam.rs | 8 | Pacing, lossless: the E7 request and E8 reply queues between apply and Raft. Apply takes a read off its channel only when its probe fits E7 and a pending slot is free, so a full queue is backpressure to the reader, never a read served at a submission-time horizon. A reply that finds E8 full waits in Raft's reply backlog and moves in at the next step. |
+| ReadIndex replies Raft may owe apply | `PROBE_REPLIES_OWED_MAX` | modules/app/consensus/raft.rs | — | Typed value `2 * MAX_INFLIGHT_PROBES` (64): local probe slots plus forwarded reads plus queued and backlogged replies. Raft takes no further read off E7 while this many are owed, which is what keeps the reply backlog (this size) from ever overflowing: every read it took gets its confirmation or refusal, none is dropped into the 5 s timeout. |
 | Client correlation ids in flight | `CORR_RING` | modules/app/gateway/codec.rs | 64 | Lossy capacity: correlation ids held between proposal submission and commit. Overflow evicts the oldest entry; that client's response is then dropped and counted. Fail-open by design — a dropped response never becomes a misrouted one. |
 | Assigned-index → connection map | `IDX_RING` | modules/app/gateway/codec.rs | 64 | Lossy capacity: `wal_index → conn_id` for committed proposals, same eviction and drop-not-misroute contract as `CORR_RING`. |
+| Recently applied positions at the codec | `APPLIED_RING` | modules/app/gateway/codec.rs | 64 | Capacity: `(partition, index, term)` of the last committed responses, so an assignment that arrives after its entry applied (a forwarded write answered by a later status query) is answered at once — committed, or superseded (NOT_LEADER). One older than the whole ring is answered OUTCOME_UNKNOWN rather than left to the TTL. |
+| Codec answers waiting for the surface | `OWED_REPLIES` | modules/app/gateway/codec.rs | 16 | Backpressure: refusals and immediate answers the codec resolved off the assignment port. A full queue stops the codec reading that port, so nothing it resolved is dropped. |
 | Admin commands awaiting their applied record | `CMD_RING` | modules/app/operations/admin.rs | 16 | Lossy capacity: in-memory predecessors for admin ops in flight through replication. The supported op set is double-apply-safe by construction (FREEZE→FREEZE, etc.), so a lost predecessor at worst re-applies an idempotent op. |
 | Concurrent partition migrations | `MAX_ACTIVE` | modules/app/control_plane/migration.rs | 1 | Semantic: one slot is the enforceable form of MIG-SERIAL. Concurrent migrations across disjoint groups need a per-group lock first — a control-plane design step, not a larger array here. |
 | Conflict-repair truncation hold | `TRUNCATE_HOLD_TIMEOUTS` | modules/app/consensus/raft.rs | — | Semantic; typed value 3 (election timeouts). While held, the node NACKs every AppendEntries, refuses candidacy and suspends the no-op. A WAL that never answers — latched failure, unopenable segment, only one direction of the pair wired — would otherwise take the node out of replication permanently, so the request is abandoned at this bound. Wide enough that ordinary fsync latency and a re-sent request never reach it. |
@@ -128,9 +140,7 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Replay's incarnation-reappearance window | `SEEN_INCARNATIONS` | modules/app/durability/wal_seal.rs | 16 | Lossy detection capacity: replay remembers the last 16 incarnations it walked past to catch one reappearing in a later segment (a nonce-domain conflict). Older ones are forgotten; the allocator's never-reuse rule, not this window, is the guarantee. |
 | Raft metadata copies | `META_SLOTS` | modules/app/consensus/raft.rs | 2 | Two alternating metadata records provide recoverable publication; this is redundancy policy, not user capacity. |
 | Snapshot pointer copies | `SNAP_PTR_SLOTS` | modules/app/durability/snapshot.rs | 2 | Two alternating pointer records provide recoverable publication; this is redundancy policy, not user capacity. |
-| Raft metadata path staging | `META_PATH_MAX` | modules/app/consensus/raft.rs | 32 | Bounds internally generated per-partition metadata paths; builders and partition-id formatting must remain within it. |
-| WAL path staging | `WAL_PATH_MAX` | modules/app/durability/wal.rs | 48 | Bounds internally generated segment/index paths; builders must not silently truncate a generated name. |
-| Snapshot path staging | `SNAP_PATH_MAX` | modules/app/durability/snapshot.rs | 64 | Bounds internally generated snapshot/pointer paths; builders must not silently truncate a generated name. |
+| State directory named by a param | `STORE_DIR_MAX` | modules/common/store_dir.rs | 128 | Shape: the longest `wal_dir` (durability) or `meta_dir` (consensus), once trailing `/` are dropped. A longer value — like one with a `..` component, a NUL, `/` alone, or any value beside `root_path = 1` — fails the module's construction rather than placing state elsewhere. Every path a module builds is this directory plus its own name, so the path staging buffers derive from it: `WAL_PATH_MAX` and `SNAP_PATH_MAX` are `STORE_DIR_MAX + 32` (the longest name, `p<NNNN>_snap_<NNNNNNNN>.bin` with a pointer's slot digit, is 24 bytes), `META_PATH_MAX` is `STORE_DIR_MAX + 16` (`/p<NNNN>/meta<slot>`, 12); a builder writes the whole path or none of it, never a truncated name. The longest path, 152 bytes, sits inside the platform fs contract's 255. |
 | Concurrent peer + client connections | `MAX_CONNS` | modules/app/peer_router/mod.rs | 16384 | A full connection table drops the accept; overflow clients never complete a handshake. This is the FIRST ceiling every client connection meets, so it must stay at or above the broker-side per-protocol tables it fronts (quantum's `protocol` MAX_CONNS / KCONNS / ACONNS) — a smaller value here silently caps the broker whatever those tables allow. Sized for a 7-node cluster's peer links plus a 10k-client broker. A `Conn` is 72 B and holds no payload buffer, so per-connection BYTES live in the protocol modules — but the table is 1152 KiB of module state at this size, paid whether or not a client ever connects, which makes it the peer_router's dominant fixed cost. Hard ceiling 65536: the slot index is the app-facing `wire::ConnId` (u16). |
 | Transport conn-id reverse index | `CONN_ID_SPACE` | modules/app/peer_router/mod.rs | 65536 | Envelope, not a reachable ceiling: transport conn ids are u16, so `slot_by_conn` is sized to the whole id space and every per-frame conn-id lookup is O(1) rather than a walk of the table. It is a FLAT 128 KiB of module state independent of `MAX_CONNS` — raising `MAX_CONNS` does not move it, and lowering `MAX_CONNS` does not recover it. |
 | Routed peer/client frame | `ROUTE_FRAME_MAX` | modules/app/peer_router/mod.rs | 4096 | Oversized frames are dropped and counted. All gateway/peer copies must share this bound; undersizing any hop wedges replication or times out clients. |
@@ -271,10 +281,6 @@ Failure to reschedule deferred work is a correctness defect.
 
 ## Known risk and maintenance contract
 
-- The ReadIndex probe table correctly returns unconfirmed when its 32 slots
-  fill, but the eight-slot reply seam can silently drop a confirmation. Make
-  this path lossless or explicitly rejected before treating strict reads as
-  complete under saturation.
 - The 2048-byte WAL body binds before the facade's nominal 4096-byte command.
   Either narrow the advertised facade contract or introduce deterministic
   chunking above consensus.
@@ -336,8 +342,19 @@ MAX_UNCOMMITTED_INFLIGHT | modules/app/consensus/raft.rs | 48
 MAX_WAL_UNACKED | modules/app/consensus/raft.rs | 256
 MAX_PENDING_WAL_REQS | modules/app/consensus/replicator.rs | 16
 PROBE_QUEUE_SLOTS | modules/app/consensus/seam.rs | 8
+PROBE_REPLIES_OWED_MAX | modules/app/consensus/raft.rs | 2 * MAX_INFLIGHT_PROBES
+ADMIN_FWD_SLOTS | modules/app/consensus/raft.rs | 4
+ADMIN_FWD_DEADLINE_MS | modules/app/consensus/raft.rs | 2_000
+OWED_ANSWERS | modules/app/operations/admin.rs | 16
+FWD_WINDOW | modules/app/consensus/raft.rs | 16
+FWD_QUERY_MS | modules/app/consensus/raft.rs | 250
+FWD_DEADLINE_MS | modules/app/consensus/raft.rs | 4_000
+LED_TERMS | modules/app/consensus/raft.rs | 4
+NO_LEADER_HOLD_MS | modules/app/consensus/raft.rs | 8_000
 CORR_RING | modules/app/gateway/codec.rs | 64
 IDX_RING | modules/app/gateway/codec.rs | 64
+APPLIED_RING | modules/app/gateway/codec.rs | 64
+OWED_REPLIES | modules/app/gateway/codec.rs | 16
 CMD_RING | modules/app/operations/admin.rs | 16
 MAX_ACTIVE | modules/app/control_plane/migration.rs | 1
 TRUNCATE_HOLD_TIMEOUTS | modules/app/consensus/raft.rs | 3
@@ -369,9 +386,7 @@ TERM_BOUNDARIES | modules/app/durability/wal.rs | 32
 SEGMENT_STARTS | modules/app/durability/wal.rs | 64
 META_SLOTS | modules/app/consensus/raft.rs | 2
 SNAP_PTR_SLOTS | modules/app/durability/snapshot.rs | 2
-META_PATH_MAX | modules/app/consensus/raft.rs | 32
-WAL_PATH_MAX | modules/app/durability/wal.rs | 48
-SNAP_PATH_MAX | modules/app/durability/snapshot.rs | 64
+STORE_DIR_MAX | modules/common/store_dir.rs | 128
 MAX_CONNS | modules/app/peer_router/mod.rs | 16384
 CONN_ID_SPACE | modules/app/peer_router/mod.rs | 65536
 ROUTE_FRAME_MAX | modules/app/peer_router/mod.rs | 4096
@@ -508,6 +523,9 @@ RG_MAX_CMD | modules/common/region_registry.rs | -
 OP_MAX_CMD | modules/common/operation_registry.rs | -
 AT_MAX_CMD | modules/common/attachment_registry.rs | -
 RS_MAX_CMD | modules/common/reservation_registry.rs | -
+META_PATH_MAX | modules/app/consensus/raft.rs | -
+WAL_PATH_MAX | modules/app/durability/wal.rs | -
+SNAP_PATH_MAX | modules/app/durability/snapshot.rs | -
 
 # Status codes. The convention keys on the NAME, and a reply status that
 # reports exhaustion reads as a capacity — these are values on the wire,

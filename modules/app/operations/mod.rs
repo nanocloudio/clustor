@@ -247,6 +247,8 @@ pub unsafe extern "C" fn module_new(
         // Index 11: `migration_cmd`, declared last in the manifest so
         // no existing output index shifted.
         s.admin.out_migration = dev_channel_port(sys, 1, 11);
+        // Index 12: `admin_answers`, appended after it.
+        s.admin.out_answers = dev_channel_port(sys, 1, 12);
         #[cfg(feature = "http")]
         {
             s.http.in_proposal_assigned = dev_channel_port(sys, 0, 5);
@@ -456,7 +458,7 @@ unsafe fn route_admin(
 ) -> bool {
     let authorized = rbac::evaluate(&mut s.rbac, sys, origin, &env[..len]);
     if authorized {
-        admin::on_command(&mut s.admin, sys, now, &env[..len]);
+        admin::on_command(&mut s.admin, sys, now, &env[..len], false);
     }
     telemetry::on_legacy_envelope(&mut s.telemetry);
     authorized

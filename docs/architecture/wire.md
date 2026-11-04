@@ -99,6 +99,9 @@ catalog covers the major families rather than every id.
 | 0x0A | `MSG_TIMEOUT_NOW` | `[caller_term:u64 LE]` — leader-transfer promotion |
 | 0x0B / 0x0C | `MSG_READ_INDEX_PROBE` / `_RESP` | probe `[probe_id:u64][term:u64]`; response adds `[replica:u8]` |
 | 0x0D / 0x0E | `MSG_READ_PROBE_REQ` / `_REPLY` | internal apply ↔ raft read-confirmation seam |
+| 0x1D | `MSG_PROPOSAL_FORWARD_TAGGED` | follower → leader response-owed write `[origin:u8][fwd_id:u64][term:u64][body]` (17 B header); an empty body is a status query for `fwd_id`. Only the leader of `term` appends it, at most once |
+| 0x1E | `MSG_PROPOSAL_ASSIGNED_REMOTE` | leader → origin forward answer `[fwd_id:u64][partition_id:u16][wal_index:u64][term:u64][status:u8]` (27 B): `0x00` appended at `(wal_index, term)`, `0xFF` unknown (the answering node did not lead that term since it booted), else a `CLIENT_REJECT_*` refusal — never appended |
+| 0x28 / 0x34 | `MSG_ADMIN_FORWARD` / `_RESP` | follower → leader leader-only admin op `[origin:u8][command_id:u32][term:u64][op_code][op_body]` (13 B header); the answer `[command_id:u32][status:u8]` is the op's `ADMIN_STATUS_*` on the leader (`NOT_LEADER` from a node that does not lead `term`) |
 | 0x1F | `MSG_READ_INDEX_REQ` | follower → leader read-index request `[read_id:u64][term:u64][origin:u8]` (17 B) |
 | 0x26 | `MSG_READ_INDEX_RESP` | leader → origin `[read_id:u64][term:u64][read_index:u64][granted:u8]` (25 B); `granted = 0` refuses |
 
@@ -140,6 +143,7 @@ under its own ids; there is no `high_rtt` field.
 | 0x11 | `MSG_CLIENT_RESPONSE` | commit ack; internal v2 `[partition_id:u16][term:u64][index:u64]` |
 | 0x12 / 0x13 | `MSG_ADMIN_COMMAND` / `_RESPONSE` | response's first byte is an `ADMIN_STATUS_*` code |
 | 0x14 | `MSG_PROPOSAL_ASSIGNED` | `[correlation_id:u64][partition_id:u16][wal_index:u64][term:u64]` (26 B) — binds a tagged proposal to its log index. The term is what makes the index name one entry: an index alone can be overwritten by conflict repair, so a proposer tracking acks matches on both |
+| 0x27 | `MSG_PROPOSAL_REFUSED` | `[correlation_id:u64][status:u8][leader_id:u8]` (10 B) on `proposal_assigned` — consensus refused a tagged proposal (`CLIENT_REJECT_*` status, see [errors.md](errors.md)); `leader_id` `0xFF` for none |
 | 0x15 | `MSG_CLIENT_REJECT` | structured rejection, 11 B — see [errors.md](errors.md) |
 | 0x16 | `MSG_CLIENT_READ_REQUEST` | linearizable read: `[read_id:u64 LE][body]` after the gateway's conn_id prefix |
 | 0x17 | `MSG_CLIENT_REJECT_INTERNAL` | throttle → codec rejection, 18 B — see [errors.md](errors.md) |

@@ -23,8 +23,13 @@
 # itself as its only peer, so the includer wires the platform's socket
 # surface to `net_in` / `net_out` (`linux_net.net_out → <as>.net_in`,
 # `<as>.net_out → linux_net.net_in`) and the group elects itself. The WAL
-# lives in the runtime's state directory (`FLUXOR_STATE_DIR`), as every
-# Clustor graph's does. A multi-voter directory is Clustor's own graphs
+# (segments and snapshots) lives in `wal_dir` and the election metadata
+# in `meta_dir`; by default `wal` and `raft` in the runtime's state
+# directory (`FLUXOR_STATE_DIR`), as every Clustor graph's does. A graph
+# whose state must outlive it — a workload on a volume lent at an
+# absolute path — names directories on that volume for BOTH: a log kept
+# without the term and vote it was written under lets a restarted
+# replica vote twice in one term. A multi-voter directory is Clustor's own graphs
 # (`configs/session-directory-3node.yaml`); this stack is the shape a
 # graph that needs a directory beside its own modules takes.
 #
@@ -53,6 +58,20 @@ params:
     max: 65535
     example: 18790
     description: The peer router's TCP port (the group's own replication listener)
+  wal_dir:
+    type: string
+    default: wal
+    description: >-
+      The directory the WAL's segments and snapshots live in (absolute, or
+      relative to the working directory); up to 128 bytes, no `..`
+      component. Its last component is created at first open; its parents
+      must exist.
+  meta_dir:
+    type: string
+    default: raft
+    description: >-
+      The directory the election metadata (term, vote) lives in, as
+      `wal_dir`. Keep it on the same storage as `wal_dir`.
   smoke:
     type: integer
     default: 0
@@ -83,6 +102,7 @@ modules:
       voter_count: 1
       heartbeat_interval_ms: 150
       peer_count: 1
+      meta_dir: ${param:meta_dir}
   - name: session_directory
     params:
       replica_id: ${param:self_id}
@@ -92,6 +112,7 @@ modules:
       self_id: ${param:self_id}
       voter_count: 1
       partition_id: 0
+      wal_dir: ${param:wal_dir}
   - name: control_plane
   - name: admission
   - name: operations

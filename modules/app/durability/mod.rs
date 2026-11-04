@@ -110,12 +110,19 @@ mod step_accounting;
 mod fs_step;
 #[path = "../../common/sealed_record.rs"]
 mod sealed;
+// The `wal_dir` param: one validated directory for segments and
+// snapshots, read by both `wal` and `snapshot`.
+#[path = "../../common/store_dir.rs"]
+mod store_dir;
 
 mod keys;
 #[cfg(not(feature = "volatile"))]
 mod ledger;
 mod snapshot;
 mod wal;
+
+/// `wal_dir`'s default: `wal/` in the working directory.
+const WAL_DIR_DEFAULT: &[u8] = b"wal";
 
 /// Composite step return for a step that did cold synchronous disk
 /// work (same contract as the kernel Burst outcome).
@@ -178,6 +185,22 @@ define_params! {
 
     9, root_path, u8, 0
         => |s, d, len| { s.root_path = p_u8(d, len, 0, 0); };
+
+    // The directory segments, the floor sidecar, the seal state and
+    // snapshots live in (`root_path = 0`): a path the FS provider
+    // resolves — absolute (a volume lent at an absolute path), or
+    // relative to the working directory. Up to 128 bytes, no `..`
+    // component; its last component is created at first open, its
+    // parents must exist. Empty: `wal`. A value construction refuses
+    // (too long, a `..`, a NUL, `/` alone, or any value beside
+    // `root_path = 1`) fails the module rather than writing elsewhere.
+    18, wal_dir, str, 0
+        => |s, d, len| {
+            // SAFETY: the params TLV names `len` bytes at `d` (none when
+            // `len` is 0, the default pass).
+            let raw = if len == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(d, len) } };
+            s.wal_dir.set(raw, WAL_DIR_DEFAULT);
+        };
 
     // 1 = skip boot replay (start fresh).
     10, skip_replay, u8, 0
@@ -291,6 +314,8 @@ struct ModuleState {
     /// stays shared rather than duplicated per slot.
     root_path: u8,
     name_fence: u8,
+    /// The `wal_dir` param, fanned into every slot's `wal` and `snapshot`.
+    wal_dir: store_dir::StoreDir,
 
     /// The hosted groups.
     slots: [DurSlot; K_MAX],
@@ -398,6 +423,7 @@ pub unsafe extern "C" fn module_new(
         }
         s.root_path = 0;
         s.name_fence = 0;
+        s.wal_dir = store_dir::StoreDir::named(WAL_DIR_DEFAULT);
         // EVERY slot, not just the hosted ones: `init` runs before the
         // params that say how many groups this instance hosts, and an
         // uninitialised slot is all-zeroes — which reads as channel
@@ -461,10 +487,17 @@ pub unsafe extern "C" fn module_new(
         if !params.is_null() && params_len >= 4 {
             parse_tlv(s, params, params_len);
         }
+        // `wal_dir` is validated here, once: a value that would place the
+        // log somewhere other than what it names refuses the module.
+        if s.wal_dir.refused() || (s.wal_dir.explicit() && s.root_path != 0) {
+            let m = b"[wal] wal_dir refused (1..=128 bytes, no `..`, not with root_path=1)";
+            dev_log(sys, 1, m.as_ptr(), m.len());
+            return -22;
+        }
         // Slots 1..K-1 mirror slot 0's channel handles — every hosted
         // group shares this instance's ports. They differ only in
         // identity: `partition_id = base + i`, which is what puts each
-        // group's WAL under its own `wal/pNNNN/` and its snapshots under
+        // group's WAL under its own `<wal_dir>/pNNNN_*` names and its snapshots under
         // their own names.
         let base_partition = s.slots[0].partition_id;
         let (self_id, voter_count) = (s.slots[0].self_id, s.slots[0].voter_count);
@@ -764,9 +797,11 @@ fn fan_slot_identity(s: &mut ModuleState, i: usize) {
     s.slots[i].wal.partition_id = s.slots[i].partition_id;
     s.slots[i].wal.self_id = s.slots[i].self_id;
     s.slots[i].wal.root_path = s.root_path;
+    s.slots[i].wal.dir = s.wal_dir;
     s.slots[i].wal.name_fence = s.name_fence;
     s.slots[i].snapshot.partition_id = s.slots[i].partition_id;
     s.slots[i].snapshot.root_path = s.root_path;
+    s.slots[i].snapshot.dir = s.wal_dir;
     s.slots[i].snapshot.name_fence = s.name_fence;
     // Clamped as raft clamps its own, so equal params name equal sets.
     s.slots[i].voter_count = s.slots[i].voter_count.clamp(1, types::MAX_NODES as u8);

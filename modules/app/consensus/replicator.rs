@@ -1029,13 +1029,27 @@ unsafe fn maybe_promote(s: &mut Repl, sys: &SyscallTable, peer: u8) {
     }
     let lag = s.last_emitted_index.saturating_sub(s.peers[i].match_index);
     if lag <= VOTING_LAG_THRESHOLD {
-        // Promote only when the peer is also in current_voters (not
-        // just joint). During joint-consensus, the joint set may
-        // include not-yet-current voters; we wait for the C_new
-        // commit to install them into `current_voters` before flipping
-        // their voting flag.
-        if (s.current_voters & (1u8 << peer)) != 0 {
+        // A voter of either configuration counts. In `C_old,new` every
+        // decision needs a majority of BOTH sets, and the new set's
+        // members are exactly what makes up its majority: holding a new
+        // voter's match back until `C_new` committed would leave
+        // `C_new` itself waiting on that majority — which, when an old
+        // voter has failed (the replacement this transition exists
+        // for), only the new voter can complete. The leader's
+        // ADD_VOTER gate already refused a learner that was not caught
+        // up. A learner (in neither set) never counts.
+        let bit = 1u8 << peer;
+        let in_joint = s.joint_active && (s.joint_voters & bit) != 0;
+        if (s.current_voters & bit) != 0 || in_joint {
             s.peers[i].voting = true;
+            // Its match so far was withheld while it did not count;
+            // hand it to commit now, or a quiet log would never report
+            // it again.
+            let m = s.peers[i].match_index;
+            if m > s.match_out[i] {
+                s.match_out[i] = m;
+            }
+            s.match_dirty = true;
             dev_log(sys, 3, b"[repl] promoted".as_ptr(), 15);
         }
     }

@@ -218,20 +218,75 @@ pub const MSG_REQUEST_VOTE_RESP: u8 = 0x04;
 /// plumbed back and are NOT forwarded.
 pub const MSG_PROPOSAL_FORWARD: u8 = 0x0F;
 
-/// A RESPONSE-OWED proposal relayed by a follower (QoS 1+, `acks>=1`).
-/// Payload is `[origin:u8][correlation_id:u64 LE][body]`. The origin is
-/// carried explicitly because the leader must send the resulting
-/// `MSG_PROPOSAL_ASSIGNED` back to the ring that holds the waiting
-/// inflight slot — its own ring is the wrong one.
+/// A RESPONSE-OWED proposal a follower forwards to the leader of its
+/// current term (every tagged proposal: gateway writes, the directory's,
+/// QoS 1+, `acks>=1`). Payload is
+/// `[origin:u8][fwd_id:u64 LE][term:u64 LE][body]`: `origin` is the
+/// forwarding replica, `fwd_id` its handle on this forward (the waiting
+/// correlation stays on the origin), `term` the term whose leader is
+/// asked — a node that does not lead that term refuses it, so a forward
+/// can be appended by that one leader or by none. An EMPTY body is a
+/// status query for `fwd_id`: the leader of `term`, deposed or not,
+/// answers from its record of that term's forwards.
 pub const MSG_PROPOSAL_FORWARD_TAGGED: u8 = 0x1D;
-/// The leader's answer to `MSG_PROPOSAL_FORWARD_TAGGED`, addressed to
-/// the ORIGIN node: `[correlation_id:u64 LE][partition_id:u16 LE]
-/// [wal_index:u64 LE]`, the same shape as `MSG_PROPOSAL_ASSIGNED`,
-/// which the origin re-emits locally to its proposer.
+/// The answer to `MSG_PROPOSAL_FORWARD_TAGGED` (forward or query),
+/// addressed to the origin: `[fwd_id:u64 LE][partition_id:u16 LE]
+/// [wal_index:u64 LE][term:u64 LE][status:u8]` (`FORWARD_ANSWER_LEN`).
+/// `status` is `FWD_STATUS_ACCEPTED` (appended at `(wal_index, term)`;
+/// the origin re-emits it to its proposer as `MSG_PROPOSAL_ASSIGNED`),
+/// `FWD_STATUS_UNKNOWN` (the answering node cannot say — it did not lead
+/// that term since it booted), or a `CLIENT_REJECT_*` refusal: never
+/// appended, and never will be.
 pub const MSG_PROPOSAL_ASSIGNED_REMOTE: u8 = 0x1E;
-/// `[origin:u8][correlation_id:u64 LE]` prefix on a forwarded tagged
+/// `[origin:u8][fwd_id:u64 LE][term:u64 LE]` prefix on a forwarded tagged
 /// proposal.
-pub const FORWARD_TAGGED_HDR: usize = 9;
+pub const FORWARD_TAGGED_HDR: usize = 17;
+/// `MSG_PROPOSAL_ASSIGNED_REMOTE` payload size.
+pub const FORWARD_ANSWER_LEN: usize = 27;
+/// Forward answer: appended at the answer's `(wal_index, term)`.
+pub const FWD_STATUS_ACCEPTED: u8 = 0x00;
+/// Forward answer: this node cannot say whether it appended the forward.
+pub const FWD_STATUS_UNKNOWN: u8 = 0xFF;
+
+/// Encode a forwarded tagged proposal's header.
+#[inline]
+pub fn encode_forward_tagged_hdr(dst: &mut [u8], origin: u8, fwd_id: u64, term: u64) {
+    Writer::new(dst).u8(origin).u64(fwd_id).u64(term);
+}
+
+/// Decode a forwarded tagged proposal's header —
+/// `(origin, fwd_id, term)`; the body follows at `FORWARD_TAGGED_HDR`.
+#[inline]
+pub fn decode_forward_tagged_hdr(buf: &[u8]) -> Option<(u8, u64, u64)> {
+    let mut r = Reader::new(buf, FORWARD_TAGGED_HDR)?;
+    Some((r.u8(), r.u64(), r.u64()))
+}
+
+/// Encode a forward answer (`MSG_PROPOSAL_ASSIGNED_REMOTE`).
+#[inline]
+pub fn encode_forward_answer(
+    dst: &mut [u8],
+    fwd_id: u64,
+    partition_id: u16,
+    wal_index: u64,
+    term: u64,
+    status: u8,
+) {
+    Writer::new(dst)
+        .u64(fwd_id)
+        .u16(partition_id)
+        .u64(wal_index)
+        .u64(term)
+        .u8(status);
+}
+
+/// Decode a forward answer — `(fwd_id, partition_id, wal_index, term,
+/// status)`.
+#[inline]
+pub fn decode_forward_answer(buf: &[u8]) -> Option<(u64, u16, u64, u64, u8)> {
+    let mut r = Reader::new(buf, FORWARD_ANSWER_LEN)?;
+    Some((r.u64(), r.u16(), r.u64(), r.u64(), r.u8()))
+}
 pub const MSG_PRE_VOTE: u8 = 0x05;
 pub const MSG_PRE_VOTE_RESP: u8 = 0x06; // reuse slot: high bit unused
 pub const MSG_HEARTBEAT: u8 = 0x07;
@@ -272,6 +327,20 @@ pub const MSG_READ_INDEX_REQ: u8 = 0x1F;
 /// read retryably. A grant is honoured only while the follower is
 /// still in `term` under the same leader.
 pub const MSG_READ_INDEX_RESP: u8 = 0x26;
+/// A leader-only admin op (`TRANSFER_LEADER`, `ADD_VOTER`,
+/// `REMOVE_VOTER`, `ADD_LEARNER`, `REMOVE_LEARNER`) a follower's
+/// `admin_proposals` received, forwarded to the leader of its term:
+/// `[origin:u8][command_id:u32 LE][term:u64 LE][op_code:u8][op_body]`.
+/// The leader runs it exactly as a local one and answers
+/// `MSG_ADMIN_FORWARD_RESP`; a node that does not lead `term` answers
+/// `ADMIN_STATUS_NOT_LEADER` and runs nothing.
+pub const MSG_ADMIN_FORWARD: u8 = 0x28;
+/// The answer to `MSG_ADMIN_FORWARD`, to the origin:
+/// `[command_id:u32 LE][status:u8]` — the `ADMIN_STATUS_*` the op
+/// returned on the leader, which the origin reports on `admin_applied`.
+pub const MSG_ADMIN_FORWARD_RESP: u8 = 0x34;
+/// `MSG_ADMIN_FORWARD` header before the op code.
+pub const ADMIN_FORWARD_HDR: usize = 13;
 pub const READ_INDEX_REQ_LEN: usize = 17;
 pub const READ_INDEX_RESP_LEN: usize = 25;
 
@@ -975,6 +1044,12 @@ pub const CLIENT_REJECT_READ_UNSUPPORTED: u8 = 0x05;
 /// consumed downstream — truncating and proposing a prefix would
 /// commit a corrupted entry while acking the client's full write.
 pub const CLIENT_REJECT_TOO_LARGE: u8 = 0x06;
+/// A write forwarded from a follower whose leader went silent before
+/// saying whether it appended it: it may yet commit, or never. Only
+/// the forwarding path answers this, and only when no node that led
+/// the forward's term could say before its deadline — every other
+/// refusal means "not appended" and is safe to retry.
+pub const CLIENT_REJECT_OUTCOME_UNKNOWN: u8 = 0x07;
 
 /// Inner reject body, independent of envelope variant: 10 bytes
 /// `[status:u8][reserved:u8=0][retry_after_ms:u16 LE][entry_credits:i16 LE][byte_credits:i32 LE]`.
@@ -3527,6 +3602,35 @@ pub fn encode_keyed_proposal(dst: &mut [u8], shard_id: u32, rest: &[u8]) -> i32 
 pub fn decode_keyed_proposal(buf: &[u8]) -> Option<(u32, usize)> {
     let shard_id = Reader::new(buf, KEYED_PROPOSAL_HDR)?.u32();
     Some((shard_id, KEYED_PROPOSAL_HDR))
+}
+
+/// A tagged proposal consensus refused, on the same port as
+/// `MSG_PROPOSAL_ASSIGNED`: `[correlation_id:u64 LE][status:u8]
+/// [leader_id:u8]` (`PROPOSAL_REFUSED_LEN`). `status` is a
+/// `CLIENT_REJECT_*` code — `NOT_LEADER` (no leader known, or the node
+/// asked no longer led the term), `THROTTLED` (leader backpressure),
+/// `FALLBACK` (frozen / strict fallback), `TOO_LARGE`: never appended;
+/// `OUTCOME_UNKNOWN`: see that code. `leader_id` is the leader this node
+/// believes in, `0xFF` for none.
+pub const MSG_PROPOSAL_REFUSED: u8 = 0x27;
+/// `MSG_PROPOSAL_REFUSED` payload size.
+pub const PROPOSAL_REFUSED_LEN: usize = 10;
+
+/// Encode a `MSG_PROPOSAL_REFUSED` payload.
+#[inline]
+pub fn encode_proposal_refused(dst: &mut [u8], correlation_id: u64, status: u8, leader_id: u8) {
+    Writer::new(dst)
+        .u64(correlation_id)
+        .u8(status)
+        .u8(leader_id);
+}
+
+/// Decode a `MSG_PROPOSAL_REFUSED` payload — `(correlation_id, status,
+/// leader_id)`.
+#[inline]
+pub fn decode_proposal_refused(buf: &[u8]) -> Option<(u64, u8, u8)> {
+    let mut r = Reader::new(buf, PROPOSAL_REFUSED_LEN)?;
+    Some((r.u64(), r.u8(), r.u8()))
 }
 
 /// MSG_PROPOSAL_ASSIGNED payload size (26 bytes): `[correlation_id:u64]

@@ -213,12 +213,11 @@ unsafe fn release_pending(slot: &mut PendingEntry, sys: &SyscallTable) {
 ///   0 = AWAITING_PROBE: probe issued to raft, waiting for reply.
 ///   1 = ARMED: probe confirmed, `required_commit` set, waiting on
 ///       `apply_index` to catch up.
-///   2 = LEGACY: probe queue full at submission — submission-time
-///       `commit_horizon` was used directly. Behaves like phase 1 but
-///       never times out waiting for a probe.
+///
+/// Every read waits on a probe: a read is not taken off its channel
+/// until its probe can be queued.
 const READ_PHASE_AWAITING_PROBE: u8 = 0;
 const READ_PHASE_ARMED: u8 = 1;
-const READ_PHASE_LEGACY: u8 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -236,7 +235,7 @@ impl PendingRead {
             correlation_id: 0,
             required_commit: 0,
             submitted_ms: 0,
-            phase: READ_PHASE_LEGACY,
+            phase: READ_PHASE_AWAITING_PROBE,
         }
     }
 
@@ -257,8 +256,8 @@ pub struct Apply {
 
     // ── Seams (consumed by raft at the top of the next dispatch) ──
     /// E7: strict-ReadIndex probe requests → raft (was
-    /// `read_probe_request`). Full queue = degrade-to-LEGACY at the
-    /// submission site, exactly the full-channel fallback.
+    /// `read_probe_request`). A full queue holds further reads on their
+    /// input channel (backpressure); no read skips its probe.
     pub probe_out: [u64; PROBE_QUEUE_SLOTS],
     pub probe_out_count: u8,
     /// E9: committed admin/config bodies → raft.
@@ -704,8 +703,7 @@ unsafe fn drain_log_entries(s: &mut Apply, sys: &SyscallTable, bodies: &mut Seam
 /// Snapshot install reset. Drop pending observer entries whose index is at
 /// or below the snapshot point and fast-forward our own apply_index /
 /// commit_horizon to it. Read queue is left intact — strict ReadIndex probe
-/// replies (or the legacy commit-horizon path) will arm them against the new
-/// horizon.
+/// replies will arm them against the new horizon.
 ///
 /// # Safety
 /// Caller must supply a valid `&SyscallTable` per the module ABI —
@@ -1227,6 +1225,15 @@ unsafe fn drain_read_submissions(s: &mut Apply, sys: &SyscallTable, now: u64) {
         return;
     }
     for _ in 0..8 {
+        // Backpressure, not loss: a read is taken off the channel only
+        // when its probe can be queued for raft and a pending slot can
+        // hold it. Otherwise it stays queued upstream until raft (which
+        // admits a probe only while it can owe its reply) catches up.
+        if (s.probe_out_count as usize) >= PROBE_QUEUE_SLOTS
+            || !s.pending_reads.iter().any(PendingRead::is_empty)
+        {
+            break;
+        }
         let Some((msg_type, plen)) = wire_channels::next_msg(sys, s.in_reads, &mut s.msg_buf)
         else {
             break;
@@ -1256,14 +1263,12 @@ unsafe fn drain_read_submissions(s: &mut Apply, sys: &SyscallTable, now: u64) {
         // moment the read was submitted, so a partitioned former leader
         // can't serve a stale answer.
         //
-        // The probe seam (E7) is always wired in-module; a full probe
-        // queue degrades to the legacy submission-time commit horizon
-        // for this read — the same fallback the full channel produced.
+        // The probe seam (E7) is always wired in-module and was checked
+        // for room above, so every read waits on a probe: none is served
+        // at a submission-time commit horizon a follower or a deposed
+        // leader could hold stale.
         if issue_read_probe(s, sys, corr_id) {
             enqueue_read(s, sys, corr_id, 0, now, READ_PHASE_AWAITING_PROBE);
-        } else {
-            // Probe queue full → degrade to legacy for this read.
-            enqueue_read(s, sys, corr_id, s.commit_horizon, now, READ_PHASE_LEGACY);
         }
     }
 }
@@ -1323,6 +1328,13 @@ unsafe fn drain_read_probe_replies(
         }
     }
     *reply_count = 0;
+}
+
+/// The highest index apply has applied (handed to raft each step, which
+/// judges a membership change only once apply has caught up with the
+/// configuration entries in the log).
+pub fn applied_index(s: &Apply) -> Index {
+    s.apply_index
 }
 
 unsafe fn enqueue_read(
