@@ -365,6 +365,20 @@ pull the kernel-scope step-time histogram over the monitor
 syscall; without it, bare-metal EL0 enforcement denies the call
 and the step histogram is silently empty.
 
+`monitor` is a node privilege, and a workload may hold no module
+permission but `observe`. A tenant graph therefore runs
+`operations_tenant` (`modules/app/operations_tenant/`): the same
+body (`operations/composite.rs`, each type's `mod.rs` naming its
+`KERNEL_STEPS`), the same ports, params, variants and metrics, and a
+manifest equal to `operations`' less `permissions`
+(`tests/operations_tenant.rs` holds them equal). Its telemetry never
+asks for the kernel's step histograms: its export carries the global
+histogram's records empty and no per-module ones, while the
+per-component step histograms are in place. The `clustor-directory`
+and `clustor-directory-group` stacks run this type, so a graph that
+includes them may run as a workload; a node that wants the kernel's
+step histograms beside an included directory runs Fluxor's `monitor`.
+
 ### Standalone modules
 
 These are not part of any composite. `session_directory` joins

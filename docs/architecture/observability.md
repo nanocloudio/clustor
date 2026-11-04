@@ -57,7 +57,7 @@ registers.
 | `clustor.raft.commit_latency_ms` | `consensus` (`raft.rs`) | leader append to commit, via a per-index timestamp ring |
 | `clustor.flow.apply_batch_latency_ms` | `consensus` (`apply.rs`) | per commit-apply pass that delivers at least one entry |
 | `clustor.snapshot.transfer_seconds` | `durability` (`snapshot.rs`) | first install chunk to `done` |
-| kernel scheduler step time | `operations` (`telemetry.rs`) | scraped over the monitor ABI |
+| kernel scheduler step time | `operations` (`telemetry.rs`) | scraped over the monitor ABI (not by `operations_tenant`, which holds no `monitor`) |
 
 ### Step-time histograms
 

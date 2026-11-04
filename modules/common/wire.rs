@@ -455,8 +455,9 @@ pub const MSG_CLIENT_REJECT: u8 = 0x15;
 /// `CLIENT_REJECT_READ_UNSUPPORTED`.
 pub const MSG_CLIENT_READ_REQUEST: u8 = 0x16;
 /// Internal rejection envelope used between the gateway's throttle
-/// reject path and its response egress. Carries the correlation_id assigned
-/// by gateway so the codec can map it back to a conn_id.
+/// reject path and its response egress, and on `consensus.applied` for a
+/// linearizable read consensus refuses. Carries the correlation_id
+/// assigned by gateway so the codec can map it back to a conn_id.
 /// Payload (18 bytes):
 /// `[correlation_id:u64 LE][status:u8][reserved:u8][retry_after_ms:u16 LE][entry_credits:i16 LE][byte_credits:i32 LE]`
 pub const MSG_CLIENT_REJECT_INTERNAL: u8 = 0x17;

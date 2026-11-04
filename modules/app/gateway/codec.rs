@@ -147,12 +147,12 @@ struct IdxEntry {
 
 #[repr(C)]
 pub struct Codec {
-    pub in_applied: i32,   // in: MSG_CLIENT_RESPONSE / READ_RESPONSE from consensus
+    pub in_applied: i32, // in: MSG_CLIENT_RESPONSE / READ_RESPONSE / read refusals from consensus
     pub in_placement: i32, // in: PlacementUpdate
     pub in_proposal_assigned: i32, // in: consensus.proposal_assigned
     pub in_leader_state: i32, // in: consensus.leader_state (MSG_LEADER_HINT)
     pub in_client_requests: i32, // in: pre-demuxed `[conn_id][body]` client traffic
-    pub out_reads: i32,    // out: tagged read submissions to consensus.read
+    pub out_reads: i32,  // out: tagged read submissions to consensus.read
 
     // Config / params
     pub self_id: u8,
@@ -630,24 +630,35 @@ pub unsafe fn on_request(
             let mut framed = [0u8; 2048];
             framed[0..8].copy_from_slice(&corr_id.to_le_bytes());
             framed[8..total].copy_from_slice(&body[..body_len]);
-            if !wire_channels::writable(sys, c.out_reads) {
-                return Route::Done;
-            }
             // Write FIRST, record on success. Recording before the
             // write strands a correlation entry whenever the reads
             // channel refuses the frame: the request is consumed, the
             // table slot lingers until TTL/overflow, and the client
-            // waits on a reply that can never arrive.
-            let wrote = wire_channels::channel_write_msg(
-                sys,
-                c.out_reads,
-                wire::MSG_CLIENT_READ_REQUEST,
-                &framed[..total],
-            );
-            if wrote > 0 {
-                put_corr(c, corr_id, conn_id, origin, dev_millis(sys));
-                c.requests_parsed += 1;
+            // waits on a reply that can never arrive. A frame the
+            // channel cannot take is refused retryably rather than
+            // dropped: the request is already consumed, so silence
+            // would hang the client just the same.
+            let wrote = wire_channels::writable(sys, c.out_reads)
+                && wire_channels::channel_write_msg(
+                    sys,
+                    c.out_reads,
+                    wire::MSG_CLIENT_READ_REQUEST,
+                    &framed[..total],
+                ) > 0;
+            if !wrote {
+                c.reads_rejected += 1;
+                return Route::Respond(build_reject_wire(
+                    origin,
+                    conn_id,
+                    wire::CLIENT_REJECT_THROTTLED,
+                    0,
+                    0,
+                    0,
+                    0,
+                ));
             }
+            put_corr(c, corr_id, conn_id, origin, dev_millis(sys));
+            c.requests_parsed += 1;
             Route::Done
         }
         // Default: treat as a write proposal.
@@ -834,6 +845,18 @@ pub unsafe fn next_applied(c: &mut Codec, sys: &SyscallTable) -> Option<Outbound
             };
             out.buf[..2].copy_from_slice(&conn_id.to_le_bytes());
             Some(out)
+        }
+        wire::MSG_CLIENT_REJECT_INTERNAL => {
+            // A read consensus refused: no leader known, the leader's
+            // confirm round failed or timed out, or the read outlived
+            // its deadline. Every read is answered or refused, so the
+            // refusal reaches the client like any other — dropping it
+            // here leaves the client waiting on a reply that never
+            // comes.
+            let mut env = [0u8; wire::CLIENT_REJECT_INTERNAL_LEN];
+            let n = pl.min(env.len());
+            env[..n].copy_from_slice(&c.msg_buf[..n]);
+            on_reject_internal(c, &env[..n]).or_else(next_applied_skip)
         }
         _ => {
             // Unknown response shape — drop.

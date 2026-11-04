@@ -142,6 +142,12 @@ pub struct Telemetry {
     /// export tick and appended to the export so a single `/metrics` read
     /// attributes time across modules.
     step_buckets: [u32; STEP_HIST_BUCKETS],
+    /// Scrape the kernel's step-time histograms (`STEP_HISTOGRAM_QUERY`,
+    /// which takes the `monitor` permission). The node's `operations` sets
+    /// it; `operations_tenant`, which holds no permission, clears it, and
+    /// its export then carries the global histogram's records empty and no
+    /// per-module ones.
+    pub kernel_steps: bool,
 }
 
 pub unsafe fn init(t: &mut Telemetry, sys: &SyscallTable) {
@@ -163,6 +169,7 @@ pub unsafe fn init(t: &mut Telemetry, sys: &SyscallTable) {
         *slot = MetricEntry::empty();
     }
     t.step_buckets = [0u32; STEP_HIST_BUCKETS];
+    t.kernel_steps = true;
 }
 
 /// True on exactly the steps the export tick emitted — the dispatch
@@ -446,7 +453,9 @@ unsafe fn build_export(t: &mut Telemetry, sys: &SyscallTable) -> usize {
     //    typed samples (metric_id = COMP_STEP_BASE + i under the component's
     //    source id — fluxor-modules.md §8 rule 8); those ride the ordinary
     //    slot table exported in section 1.
-    for m in 0..STEP_MODULES {
+    //    Without the kernel scrape (`kernel_steps` clear) there are none.
+    let scraped = if t.kernel_steps { STEP_MODULES } else { 0 };
+    for m in 0..scraped {
         let mut sb = [0u32; STEP_HIST_BUCKETS];
         let rc = (sys.provider_call)(
             m as i32,
@@ -571,15 +580,17 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
         // Scrape the kernel scheduler step-timing histogram. Best-effort: a
         // negative return (opcode unsupported on this target) leaves the
         // last sample in place.
-        let mut sb = [0u32; STEP_HIST_BUCKETS];
-        let rc = (sys.provider_call)(
-            -1,
-            STEP_HISTOGRAM_QUERY,
-            sb.as_mut_ptr() as *mut u8,
-            STEP_HIST_BUCKETS * 4,
-        );
-        if rc >= 0 {
-            t.step_buckets = sb;
+        if t.kernel_steps {
+            let mut sb = [0u32; STEP_HIST_BUCKETS];
+            let rc = (sys.provider_call)(
+                -1,
+                STEP_HISTOGRAM_QUERY,
+                sb.as_mut_ptr() as *mut u8,
+                STEP_HIST_BUCKETS * 4,
+            );
+            if rc >= 0 {
+                t.step_buckets = sb;
+            }
         }
 
         // Readyz: 1 byte (ready flag)

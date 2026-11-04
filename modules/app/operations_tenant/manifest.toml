@@ -1,0 +1,201 @@
+version = "0.1.0"
+timer_class = "wall_clock"
+type = "Transformer"
+entry = "mod.rs"
+hardware_targets = ["bcm2712", "linux"]
+
+# operations_tenant — `operations` for a tenant graph: the same body
+# (modules/app/operations/composite.rs), ports, params, variants and
+# metrics, without the node's privilege. A workload may hold no module
+# permission but `observe`, so this type declares none and its
+# telemetry does not scrape the kernel's step-time histograms (the
+# `monitor` syscall `operations` holds the permission for): its
+# /metrics export carries the global step histogram's records empty and
+# no per-module ones. The per-component step histograms, the module's
+# own, are in place. The clustor-directory stacks run this type.
+#
+# Everything below is `operations`' manifest, less `permissions`; keep
+# the two in step (tests/operations_tenant.rs holds them equal). See
+# modules/app/operations/manifest.toml for the ports' and variants'
+# descriptions.
+
+[[variant]]
+name = "headless"
+# Marker feature: the headless surface is the base component set; the
+# marker satisfies the variant-is-a-feature-set rule without gating
+# any code of its own.
+features = ["headless"]
+omit_ports = ["proposal_assigned", "applied", "proposal_rejected", "request_in", "proposal", "response_out"]
+
+[[variant]]
+name = "diag"
+features = ["http"]
+default = true
+
+# ── inputs ───────────────────────────────────────────────────
+
+[[ports]]
+name = "admin_req"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "identity"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_applied"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "admin_requests"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "ingest"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposal_assigned"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "applied"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposal_rejected"
+direction = "input"
+content_type = "OctetStream"
+
+[[ports]]
+name = "request_in"
+direction = "input"
+content_type = "ExchangeRequest"
+buffer_size = 16384
+# One exchange record: the contract's `RECORD_MAX`, which the reader's
+# frame buffer matches exactly. Requests from the `http` server's
+# application routes; answers leave on `response_out`.
+max_record = 8192
+rate_class_max = "transaction"
+
+# ── outputs ──────────────────────────────────────────────────
+
+[[ports]]
+name = "responses"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + `[conn_id][status]` (2).
+max_record = 5
+rate_class_max = "transaction"
+
+[[ports]]
+name = "denied"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "audit_events"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "raft_commands"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + fixed admin command buffer (1024).
+max_record = 1027
+rate_class_max = "transaction"
+
+[[ports]]
+name = "raft_proposal"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+max_record = 1027
+rate_class_max = "transaction"
+
+[[ports]]
+name = "readyz"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "why"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "export"
+direction = "output"
+content_type = "OctetStream"
+
+[[ports]]
+name = "proposal"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope + correlation id + maximum HTTP proposal body.
+max_record = 1035
+rate_class_max = "transaction"
+
+[[ports]]
+name = "authorized"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 8192
+# Envelope (3) + the admin command envelope (1024).
+max_record = 1027
+rate_class_max = "transaction"
+# Optional tee of admission decisions that passed: the same
+# `MSG_ADMIN_COMMAND` `[conn_id][op_code][body]` bytes delivered to
+# the admin component, for consumers that observe or mirror the
+# authorized stream. Best-effort — dropped on backpressure, never
+# gating the in-module delivery. `denied` is its negative counterpart.
+
+[[ports]]
+name = "response_out"
+direction = "output"
+content_type = "ExchangeResponse"
+buffer_size = 16384
+# One exchange record. Every answer is a single response HEAD with its
+# body inline; the largest, a `/metrics` export, is bounded inside it.
+max_record = 8192
+rate_class_max = "transaction"
+
+[observability]
+# The /propose bridge's request + proposal-correlation health, plus
+# the aggregator's own drop/eviction accounting (self-metrics under the
+# telemetry component id inside the export it serves). Every name here
+# has an emit site in http.rs / telemetry.rs — the list claims exactly
+# what the module ships.
+metrics = ["requests", "requests_404", "correlations_inflight", "indices_inflight", "inflight_high_water", "proposal_timeouts", "commit_timeouts", "assignments_unmatched", "assignments_no_slot", "applies_unmatched", "rejections", "queue_unavailable", "committed", "responses_dropped", "admin_dropped"]
+
+# Appended LAST deliberately: port indices follow declaration order, so
+# inserting anywhere earlier would renumber every output after it.
+[[ports]]
+name = "migration_cmd"
+direction = "output"
+content_type = "OctetStream"
+
+# out[12]: answers to the commands that arrived on `admin_requests` —
+# `MSG_ADMIN_RESPONSE [conn_id:u16 LE][status]`, the conn_id the command
+# carried — so a graph driving admin through that pre-authorized input
+# hears the outcome itself. Unwired, they leave on `responses` as every
+# answer did. Commands under conn_id 0xFFFF (peer_router's learner asks)
+# are answered nowhere. Appended last, like `migration_cmd`.
+[[ports]]
+name = "admin_answers"
+direction = "output"
+content_type = "OctetStream"
+buffer_size = 4096
+max_record = 5
+rate_class_max = "transaction"

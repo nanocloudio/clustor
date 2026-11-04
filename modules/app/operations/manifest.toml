@@ -33,6 +33,12 @@ hardware_targets = ["bcm2712", "linux"]
 # Without it, bare-metal EL0 capability enforcement denies the call
 # (`[cap] module called 0x0c55 without permissions = ["monitor"]`) and the
 # step histogram is silently empty. Mirrors foundation/observe's grant.
+#
+# `monitor` is a node privilege, which a workload may not hold: a tenant
+# graph (and the clustor-directory stacks) runs `operations_tenant`, this
+# module's body without the kernel scrape and without the permission.
+# Its manifest is this one less `permissions`; keep the two in step
+# (tests/operations_tenant.rs holds them equal).
 permissions = ["monitor"]
 
 [[variant]]

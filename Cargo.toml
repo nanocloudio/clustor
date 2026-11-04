@@ -471,6 +471,15 @@ path = "tests/gateway_namespaces.rs"
 name = "operations_exchange"
 path = "tests/operations_exchange.rs"
 
+# `operations_tenant`, the type a workload may run: its manifest is
+# `operations`' less the `monitor` permission, both types build the one
+# body, and its telemetry never asks the kernel for step-time histograms
+# (the node's type does). Mounts operations/telemetry.rs via `#[path]`
+# against a mock SyscallTable; the directory stacks run the tenant type.
+[[test]]
+name = "operations_tenant"
+path = "tests/operations_tenant.rs"
+
 # Host-side unit coverage for raft's write-then-adopt metadata
 # persistence discipline. Pulls `modules/app/consensus/raft.rs` in via
 # `#[path]` against a mock SyscallTable (in-memory FS with fault

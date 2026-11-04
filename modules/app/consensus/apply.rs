@@ -213,11 +213,14 @@ unsafe fn release_pending(slot: &mut PendingEntry, sys: &SyscallTable) {
 ///   0 = AWAITING_PROBE: probe issued to raft, waiting for reply.
 ///   1 = ARMED: probe confirmed, `required_commit` set, waiting on
 ///       `apply_index` to catch up.
+///   2 = REFUSED: the probe was refused but `applied` had no room for
+///       the refusal; it is re-offered every step until it lands.
 ///
 /// Every read waits on a probe: a read is not taken off its channel
 /// until its probe can be queued.
 const READ_PHASE_AWAITING_PROBE: u8 = 0;
 const READ_PHASE_ARMED: u8 = 1;
+const READ_PHASE_REFUSED: u8 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -1317,11 +1320,17 @@ unsafe fn drain_read_probe_replies(
         }
         let Some(i) = slot_idx else { continue };
         if !confirmed {
-            // Probe failed — reject with FALLBACK.
+            // Probe failed — reject with FALLBACK. The slot is freed
+            // only once the refusal is written: a refusal `applied` has
+            // no room for stays owed and is re-offered each step, never
+            // dropped with the client still waiting on it.
             let corr = s.pending_reads[i].correlation_id;
-            let _ = emit_read_reject(s, sys, corr, wire::CLIENT_REJECT_FALLBACK);
-            s.pending_reads[i] = PendingRead::empty();
-            s.reads_timed_out += 1;
+            if emit_read_reject(s, sys, corr, wire::CLIENT_REJECT_FALLBACK) {
+                s.pending_reads[i] = PendingRead::empty();
+                s.reads_timed_out += 1;
+            } else {
+                s.pending_reads[i].phase = READ_PHASE_REFUSED;
+            }
         } else {
             s.pending_reads[i].required_commit = confirmed_commit;
             s.pending_reads[i].phase = READ_PHASE_ARMED;
@@ -1357,12 +1366,13 @@ unsafe fn enqueue_read(
             return;
         }
     }
-    // Full — evict the oldest read (smallest submitted_ms) and REJECT
-    // it so the submitter can fail closed instead of leaking a stashed
-    // read that never resolves (a silent eviction would leave the
-    // router's fence slot AWAITING forever). Best-effort: if the reject
-    // channel is full the victim still vanishes, but the submitter's
-    // own stash deadline covers that residue.
+    // Full — unreachable while `drain_read_submissions` takes a read
+    // off its channel only when a slot is free. Should that admission
+    // ever break, evict the oldest read (smallest submitted_ms) and
+    // REJECT it so the submitter fails closed. Best-effort: nothing
+    // downstream answers a client whose read vanishes (the gateway's
+    // correlation TTL only reclaims the slot), so the admission above
+    // is what keeps every read answered or refused.
     let mut victim: usize = 0;
     let mut victim_ms = u64::MAX;
     for (i, slot) in s.pending_reads.iter().enumerate() {
@@ -1400,6 +1410,15 @@ unsafe fn drain_pending_reads(s: &mut Apply, sys: &SyscallTable, now: u64) {
     for i in 0..PENDING_READ_SLOTS {
         let slot = s.pending_reads[i];
         if slot.is_empty() {
+            continue;
+        }
+
+        // Refused, the refusal still owed: offer it again.
+        if slot.phase == READ_PHASE_REFUSED {
+            if emit_read_reject(s, sys, slot.correlation_id, wire::CLIENT_REJECT_FALLBACK) {
+                s.pending_reads[i] = PendingRead::empty();
+                s.reads_timed_out += 1;
+            }
             continue;
         }
 

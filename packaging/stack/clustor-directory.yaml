@@ -115,7 +115,10 @@ modules:
       wal_dir: ${param:wal_dir}
   - name: control_plane
   - name: admission
+  # The tenant type: `operations` less the node's `monitor` permission and
+  # its kernel step-time scrape, so a workload may include this stack.
   - name: operations
+    type: operations_tenant
 
 wiring:
   # peer_router → the group.

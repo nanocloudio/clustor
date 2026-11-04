@@ -100,7 +100,7 @@ prefix a replica would recover. Module source:
 
 | Path              | Contents |
 |-------------------|----------|
-| `modules/app/`    | `no_std` PIC modules: the seven substrate modules, `session_directory`, `directory_front`, `partition_router`, the `consensus_bench` / `nvme_bench` drivers, `example_consumer`, and `clustor_cli`. `fluxor modules build` packs each into a `.fmod`, plus one per declared variant (`durability` has a `volatile` variant, `operations` a `headless` one). |
+| `modules/app/`    | `no_std` PIC modules: the seven substrate modules, `session_directory`, `directory_front`, `partition_router`, the `consensus_bench` / `nvme_bench` drivers, `example_consumer`, and `clustor_cli`. `fluxor modules build` packs each into a `.fmod`, plus one per declared variant (`durability` has a `volatile` variant, `operations` a `headless` one). `operations_tenant` is `operations` built for a tenant graph: no `monitor` permission, no kernel step-time scrape. |
 | `modules/common/` | Shared types, wire constants, the WAL frame contract, the consumer facade, and the HTTP admin mapping. Pulled into each app module via `#[path]`. |
 | `crates/`         | `clustor-common`, the publishable cargo crate re-exporting the pure `no_std` subset of `modules/common/` for host consumers. |
 | `packaging/`      | Distribution packaging; `packaging/applet/clustor/` holds the CLI applet's graph and workload manifest. |
