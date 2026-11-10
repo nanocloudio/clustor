@@ -269,21 +269,21 @@ impl MemoryEntry {
 }
 
 // FS opcodes (from abi::dev_fs)
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_WRITE: u32 = 0x0906;
-const FS_FSYNC: u32 = 0x0905;
-const FS_CLOSE: u32 = 0x0903;
-const FS_STAT: u32 = 0x0904;
+const FS_OPEN: u32 = super::abi::registry::fs::OPEN;
+const FS_READ: u32 = super::abi::registry::fs::READ;
+const FS_SEEK: u32 = super::abi::registry::fs::SEEK;
+const FS_WRITE: u32 = super::abi::registry::fs::WRITE;
+const FS_FSYNC: u32 = super::abi::registry::fs::FSYNC;
+const FS_CLOSE: u32 = super::abi::registry::fs::CLOSE;
+const FS_STAT: u32 = super::abi::registry::fs::STAT;
 /// Write-side opener. `FS_OPEN` is read-only-if-exists per the FS
 /// contract (see `target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs`),
 /// so a fresh WAL with no segment file on disk silently degrades to
 /// in-memory; segment creation needs the write tier.
-const FS_OPEN_CREATE: u32 = 0x0909;
+const FS_OPEN_CREATE: u32 = super::abi::registry::fs::OPEN_CREATE;
 /// Remove a file by path (`modules/sdk/contracts/storage/fs.rs::UNLINK`).
 /// Gated on the provider's `caps::UNLINK` bit — see `fs_unlink_supported`.
-const FS_UNLINK: u32 = 0x090A;
+const FS_UNLINK: u32 = super::abi::registry::fs::UNLINK;
 /// Directory create (single-level, EEXIST-idempotent on the linux
 /// provider; bare-metal FAT32 answers a clean ENOSYS). Used once per
 /// boot to self-heal a missing `wal/` parent in dir-mode layouts.
@@ -293,26 +293,26 @@ const FS_UNLINK: u32 = 0x090A;
 /// after an open has already hard-failed, and the retried open — not
 /// the mkdir's return — decides the outcome. A caps probe would cost
 /// the same round-trip it saves.
-const FS_MKDIR: u32 = 0x090B;
-const FS_PREALLOCATE: u32 = 0x090E;
+const FS_MKDIR: u32 = super::abi::registry::fs::MKDIR;
+const FS_PREALLOCATE: u32 = super::abi::registry::fs::PREALLOCATE;
 /// Async durable-write tier (`fs.rs::{WRITE_ASYNC, FSYNC_SUBMIT,
 /// FSYNC_POLL}` + `caps::FSYNC_ASYNC`). Used only when the FS provider
 /// advertises `FS_CAP_FSYNC_ASYNC`; otherwise the WAL keeps the
 /// synchronous FS_WRITE + FS_FSYNC path unchanged.
-const FS_WRITE_ASYNC: u32 = 0x090F;
-const FS_FSYNC_SUBMIT: u32 = 0x0910;
-const FS_FSYNC_POLL: u32 = 0x0911;
+const FS_WRITE_ASYNC: u32 = super::abi::registry::fs::WRITE_ASYNC;
+const FS_FSYNC_SUBMIT: u32 = super::abi::registry::fs::FSYNC_SUBMIT;
+const FS_FSYNC_POLL: u32 = super::abi::registry::fs::FSYNC_POLL;
 const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
 /// Durable publication of a parent-directory entry
 /// (`modules/sdk/contracts/storage/fs.rs::{FSYNC_NAME, caps::FSYNC_NAME}`).
 /// `FS_FSYNC` covers a segment's bytes through its descriptor; it does
 /// NOT make the name that finds the segment survive a power cut. Both
 /// fences are required before a segment file counts as durable.
-const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_FSYNC_NAME: u32 = super::abi::registry::fs::FSYNC_NAME;
 const FS_CAP_FSYNC_NAME: u32 = 1 << 11;
 /// FS capability-discovery opcode + the `UNLINK` bit
 /// (`modules/sdk/contracts/storage/fs.rs::{CAPS, caps::UNLINK}`).
-const FS_CAPS: u32 = 0x09FF;
+const FS_CAPS: u32 = super::abi::registry::fs::CAPS;
 const FS_CAP_UNLINK: u32 = 1 << 5;
 /// FS ENOSYS: the provider implements no such opcode. Distinct from an
 /// allocation or device failure, which must never be reinterpreted as

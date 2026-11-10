@@ -360,8 +360,8 @@ const MSG_FLOW_TOKEN_VERDICT: u8 = 0xC3;
 /// [boot_incarnation:16][auth_len:u16 LE][auth]`, the auth a VIP emission
 /// token; answered `[addr:16][generation:u32 LE][sha256(auth):32]
 /// [verdict:u8]`.
-const MSG_ARM_AUTH_CHECK: u8 = 0x7A;
-const MSG_ARM_AUTH_VERDICT: u8 = 0x7B;
+const MSG_ARM_AUTH_CHECK: u8 = abi::registry::msg::identity::MSG_ARM_AUTH_CHECK;
+const MSG_ARM_AUTH_VERDICT: u8 = abi::registry::msg::identity::ARM_AUTH_VERDICT;
 /// The largest auth an arm check carries (Fluxor's `ARM_AUTH_MAX`).
 const ARM_AUTH_MAX: usize = 160;
 /// The largest check either provider sends: an arm check carrying

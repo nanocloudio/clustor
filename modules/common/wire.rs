@@ -1495,7 +1495,7 @@ pub const XFER_CHUNK_BODY: usize = 2048;
 /// `verification_result != PEER_RESULT_OK` clears any previously
 /// bound identity for the connection: the peer offered no usable
 /// credential, or one that failed a check the profile required.
-pub const MSG_PEER_IDENTITY: u8 = 0x5A;
+pub const MSG_PEER_IDENTITY: u8 = 0xC8;
 
 /// `MSG_PEER_IDENTITY` fixed payload size; fingerprint and principal
 /// follow.

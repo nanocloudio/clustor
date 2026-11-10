@@ -43,9 +43,12 @@ hardware_targets = ["bcm2712", "linux"]
 
 permissions = []
 
+# Only the disk variant writes through the FS contract; the volatile build
+# compiles the ledger out and never calls it.
 [[resources]]
 requires_contract = "fs"
 access = "write"
+variants = ["disk"]
 
 [[variant]]
 name = "volatile"

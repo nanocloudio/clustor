@@ -360,30 +360,30 @@ impl FwdSeen {
 }
 
 // FS opcodes
-const FS_OPEN: u32 = 0x0900;
+const FS_OPEN: u32 = super::abi::registry::fs::OPEN;
 /// Write-side opener: creates the file if absent (FS_OPEN is read-only-
 /// if-exists). Required for the root-level metadata file on bare-metal
 /// FAT32, which has no mkdir for the default `raft/meta` parent.
-const FS_OPEN_CREATE: u32 = 0x0909;
+const FS_OPEN_CREATE: u32 = super::abi::registry::fs::OPEN_CREATE;
 /// FS E_AGAIN: provider present but still initialising (fat32 reading the BPB
 /// on a pi5 cold boot). `load_metadata` must retry rather than treat this as
 /// "no metadata" — otherwise a recovering node restarts fresh.
-const FS_READ: u32 = 0x0901;
-const FS_WRITE: u32 = 0x0906;
-const FS_FSYNC: u32 = 0x0905;
-const FS_CLOSE: u32 = 0x0903;
-const FS_SEEK: u32 = 0x0902;
+const FS_READ: u32 = super::abi::registry::fs::READ;
+const FS_WRITE: u32 = super::abi::registry::fs::WRITE;
+const FS_FSYNC: u32 = super::abi::registry::fs::FSYNC;
+const FS_CLOSE: u32 = super::abi::registry::fs::CLOSE;
+const FS_SEEK: u32 = super::abi::registry::fs::SEEK;
 /// Directory create (single-level, EEXIST-idempotent on the linux
 /// provider; bare-metal FAT32 answers ENOSYS). Used once per boot to
 /// self-heal a missing `raft/` parent in dir-mode persistence.
-const FS_MKDIR: u32 = 0x090B;
+const FS_MKDIR: u32 = super::abi::registry::fs::MKDIR;
 /// Durable publication of a parent-directory entry
 /// (`modules/sdk/contracts/storage/fs.rs::{FSYNC_NAME, caps::FSYNC_NAME}`).
 /// `FS_FSYNC` makes a slot's bytes durable through its descriptor; the
 /// name that lets the next boot open the slot at all is a separate
 /// fence, and it is the one that matters on first creation.
-const FS_FSYNC_NAME: u32 = 0x0912;
-const FS_CAPS: u32 = 0x09FF;
+const FS_FSYNC_NAME: u32 = super::abi::registry::fs::FSYNC_NAME;
+const FS_CAPS: u32 = super::abi::registry::fs::CAPS;
 const FS_CAP_FSYNC_NAME: u32 = 1 << 11;
 
 /// `name_fence` postures — 0 = auto (fence where the provider

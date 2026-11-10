@@ -71,31 +71,31 @@ mod wire_channels;
 use log_fmt::{log_field, log_field_i32};
 
 // dev_fs opcodes (mirror `abi::dev_fs`; see modules/app/wal/mod.rs).
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_CLOSE: u32 = 0x0903;
-const FS_FSYNC: u32 = 0x0905;
-const FS_WRITE: u32 = 0x0906;
-const FS_OPEN_CREATE: u32 = 0x0909;
+const FS_OPEN: u32 = abi::registry::fs::OPEN;
+const FS_READ: u32 = abi::registry::fs::READ;
+const FS_SEEK: u32 = abi::registry::fs::SEEK;
+const FS_CLOSE: u32 = abi::registry::fs::CLOSE;
+const FS_FSYNC: u32 = abi::registry::fs::FSYNC;
+const FS_WRITE: u32 = abi::registry::fs::WRITE;
+const FS_OPEN_CREATE: u32 = abi::registry::fs::OPEN_CREATE;
 /// Async durable-write tier (`fs.rs::{WRITE_ASYNC, FSYNC_SUBMIT,
 /// FSYNC_POLL}`). `FS_WRITE_ASYNC` takes the same args as `FS_WRITE` and
 /// returns bytes accepted; a short count is backpressure, not an error.
 /// `FS_FSYNC_SUBMIT` fills an 8-byte out buffer with a u64 LE ticket and
 /// returns 0; `FS_FSYNC_POLL` takes that ticket and returns 0 = durable,
 /// 1 = in flight, negative errno = a fenced write failed.
-const FS_WRITE_ASYNC: u32 = 0x090F;
-const FS_FSYNC_SUBMIT: u32 = 0x0910;
-const FS_FSYNC_POLL: u32 = 0x0911;
+const FS_WRITE_ASYNC: u32 = abi::registry::fs::WRITE_ASYNC;
+const FS_FSYNC_SUBMIT: u32 = abi::registry::fs::FSYNC_SUBMIT;
+const FS_FSYNC_POLL: u32 = abi::registry::fs::FSYNC_POLL;
 /// Capability discovery + the bit that gates the tier above. A provider
 /// that does not advertise it (the linux host FS) cannot serve `io_mode = 1`.
-const FS_CAPS: u32 = 0x09FF;
+const FS_CAPS: u32 = abi::registry::fs::CAPS;
 const FS_CAP_FSYNC_ASYNC: u32 = 1 << 10;
 /// Durable publication of the bench file's name (`fs.rs::FSYNC_NAME`,
 /// `caps::FSYNC_NAME`). `FS_FSYNC` covers the file's bytes, not the entry
 /// that finds it: the power-cycle `verify_only` run reads the file by
 /// name, so a run that created it fences the name before writing.
-const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_FSYNC_NAME: u32 = abi::registry::fs::FSYNC_NAME;
 const FS_CAP_FSYNC_NAME: u32 = 1 << 11;
 
 /// `io_mode` selectors. `IO_MODE_SYNC` is the latency tier: queue-depth-1

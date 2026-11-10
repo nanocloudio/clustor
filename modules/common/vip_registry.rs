@@ -1302,10 +1302,10 @@ impl<const N: usize, const O: usize> VipRegistry<N, O> {
     }
 
     /// An address provider's check before it arms under `arm_authority`,
-    /// as Fluxor's `ip` asks it on `auth_req` (`MSG_ARM_AUTH_CHECK` 0x7A:
+    /// as Fluxor's `ip` asks it on `auth_req` (`MSG_ARM_AUTH_CHECK`:
     /// `[addr:16][generation:u32 LE][boot_incarnation:16][auth_len:u16 LE]
     /// [auth]`, the auth a VIP emission token), answered as
-    /// `ARM_AUTH_VERDICT` (0x7B) wants it: `[addr][generation]
+    /// `ARM_AUTH_VERDICT` wants it: `[addr][generation]
     /// [sha256(auth):32][verdict]` — 0 for a token that verifies, names the
     /// asking boot, and covers the address being armed; otherwise `0x80 |`
     /// the refusal. The provider does not parse the token, so this is the

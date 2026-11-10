@@ -128,7 +128,7 @@ direction = "input"
 content_type = "OctetStream"
 
 # Token checks: a continuity provider's MSG_TOKEN_CHECK (0xC2) and an
-# address provider's MSG_ARM_AUTH_CHECK (0x7A), Fluxor's `auth_req`.
+# address provider's MSG_ARM_AUTH_CHECK, Fluxor's `auth_req`.
 # Each is held behind a barrier entry (magic "CK") and answered on
 # `replies` once this replica has applied it, so the verdict reflects
 # every command committed before the check. Checks hold slots of their
@@ -152,7 +152,7 @@ content_type = "OctetStream"
 # or operation REPLAY is followed by one reply per live record. Also on
 # this port: MSG_DIR_OUT_OF_SCOPE (0xA0), a request this directory's tier
 # refuses before proposing it, sent at once; and a token check's verdict
-# (MSG_TOKEN_VERDICT 0xC3, ARM_AUTH_VERDICT 0x7B), sent once the check's
+# (MSG_TOKEN_VERDICT 0xC3, ARM_AUTH_VERDICT), sent once the check's
 # barrier has applied.
 [[ports]]
 name = "replies"

@@ -23,7 +23,7 @@ pub const EMIT_INTERVAL_MS_DEFAULT: u64 = 1000;
 /// (`abi::internal::monitor::STEP_HISTOGRAM_QUERY`); `handle = -1` reads the
 /// global histogram into 8 × u32 bucket counts. Defined locally so the
 /// producer path doesn't depend on the unstable internal-ABI module path.
-const STEP_HISTOGRAM_QUERY: u32 = 0x0C55;
+const STEP_HISTOGRAM_QUERY: u32 = super::abi::registry::monitor::STEP_HISTOGRAM_QUERY;
 const STEP_HIST_BUCKETS: usize = 8;
 
 /// Size of the per-(module, metric_id) latest-value table. 320 slots cover

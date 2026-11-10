@@ -30,8 +30,8 @@ pub const E_INPROGRESS: i32 = -36;
 /// started has already happened and its decision was dropped.
 pub const E_NOENT: i32 = -2;
 
-pub const OP_READ: u32 = 0x0901;
-pub const OP_FSYNC: u32 = 0x0905;
+pub const OP_READ: u32 = crate::abi::registry::fs::READ;
+pub const OP_FSYNC: u32 = crate::abi::registry::fs::FSYNC;
 
 /// `provider_call`'s shape.
 pub type Call = unsafe extern "C" fn(i32, u32, *mut u8, usize) -> i32;

@@ -24,30 +24,30 @@ use super::store_dir::{StoreDir, STORE_DIR_MAX};
 use super::{fs_step, sealed};
 use fs_step::{later, Io};
 
-const FS_OPEN: u32 = 0x0900;
-const FS_READ: u32 = 0x0901;
-const FS_SEEK: u32 = 0x0902;
-const FS_WRITE: u32 = 0x0906;
-const FS_FSYNC: u32 = 0x0905;
-const FS_CLOSE: u32 = 0x0903;
+const FS_OPEN: u32 = crate::abi::registry::fs::OPEN;
+const FS_READ: u32 = crate::abi::registry::fs::READ;
+const FS_SEEK: u32 = crate::abi::registry::fs::SEEK;
+const FS_WRITE: u32 = crate::abi::registry::fs::WRITE;
+const FS_FSYNC: u32 = crate::abi::registry::fs::FSYNC;
+const FS_CLOSE: u32 = crate::abi::registry::fs::CLOSE;
 /// Write-side opener. `FS_OPEN` is read-only-if-exists per the FS
 /// contract (see `target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs`);
 /// snapshot manifests are created from scratch, so persistence needs
 /// the write tier.
-const FS_OPEN_CREATE: u32 = 0x0909;
+const FS_OPEN_CREATE: u32 = crate::abi::registry::fs::OPEN_CREATE;
 /// Remove a file by path (`modules/sdk/contracts/storage/fs.rs::UNLINK`).
 /// Used to retire the previous snapshot file once a newer one is durable;
 /// gated on the provider's `caps::UNLINK` bit (see `fs_unlink_supported`).
-const FS_UNLINK: u32 = 0x090A;
+const FS_UNLINK: u32 = crate::abi::registry::fs::UNLINK;
 /// FS capability-discovery opcode + the `UNLINK` bit
 /// (`modules/sdk/contracts/storage/fs.rs::{CAPS, caps::UNLINK}`).
-const FS_CAPS: u32 = 0x09FF;
+const FS_CAPS: u32 = crate::abi::registry::fs::CAPS;
 const FS_CAP_UNLINK: u32 = 1 << 5;
 /// Durable publication of a parent-directory entry
 /// (`modules/sdk/contracts/storage/fs.rs::{FSYNC_NAME, caps::FSYNC_NAME}`).
 /// A snapshot artefact and its pointer slots are recovery roots: their
 /// bytes being durable is worthless if the name that finds them is not.
-const FS_FSYNC_NAME: u32 = 0x0912;
+const FS_FSYNC_NAME: u32 = crate::abi::registry::fs::FSYNC_NAME;
 const FS_CAP_FSYNC_NAME: u32 = 1 << 11;
 
 /// `name_fence` postures — see `durability/mod.rs` param 15.

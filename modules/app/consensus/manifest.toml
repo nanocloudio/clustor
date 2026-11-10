@@ -42,12 +42,14 @@ capabilities = ["replication.state_machine"]
 # exist, and a value it refuses fails construction. Keep it on the same
 # storage as durability's `wal_dir`).
 # Persist failures are counted (meta_write_errors) and withhold vote
-# grants and election starts. The `persist_meta: 0` posture disables
-# metadata persistence deliberately (volatile graphs); the declaration
-# stays for the default posture.
+# grants and election starts. The `persist_meta: none` posture disables
+# metadata persistence deliberately (volatile graphs) and never calls the
+# FS contract, so the claim holds under `persist_meta: fs` (the default)
+# only.
 [[resources]]
 requires_contract = "fs"
 access = "write"
+when = { persist_meta = "fs" }
 
 # ── inputs ───────────────────────────────────────────────────
 
