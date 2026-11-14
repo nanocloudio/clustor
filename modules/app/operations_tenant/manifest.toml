@@ -14,7 +14,7 @@ hardware_targets = ["bcm2712", "linux"]
 # no per-module ones. The per-component step histograms, the module's
 # own, are in place. The clustor-directory stacks run this type.
 #
-# Everything below is `operations`' manifest, less `permissions`; keep
+# Everything below is `operations`' manifest, less `grants`; keep
 # the two in step (tests/operations_tenant.rs holds them equal). See
 # modules/app/operations/manifest.toml for the ports' and variants'
 # descriptions.

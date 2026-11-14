@@ -1345,7 +1345,7 @@ pub fn init(s: &mut Raft) {
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 pub unsafe fn arm(s: &mut Raft, sys: &SyscallTable) {
     // `voter_count` is operator-supplied; clamp both ends. Above
     // MAX_NODES the initial-voter loop and every later `quorum_index`
@@ -1519,7 +1519,7 @@ pub unsafe fn on_peer_term(s: &mut Raft, sys: &SyscallTable, term: Term) {
 ///
 /// Caller must hold exclusive component borrows and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 pub unsafe fn step(
     s: &mut Raft,
     sys: &SyscallTable,
@@ -1705,7 +1705,7 @@ pub unsafe fn step(
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 /// The change latch moves only on a confirmed write. This is emitted
 /// ONLY when `(leader_id, term)` differs from the last one latched, so a
 /// hint recorded as sent but never written is never re-offered — every
@@ -1743,7 +1743,7 @@ unsafe fn emit_leader_hint(s: &mut Raft, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 /// Drain forwarded proposals from their own inbox. Leader-only work —
 /// the handlers refuse on a follower — bounded by one inbox depth per
 /// step, matching what a follower relays per step.
@@ -1849,7 +1849,7 @@ unsafe fn process_rpc(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn handle_read_index_probe(s: &mut Raft, sys: &SyscallTable, plen: u16) {
     let pl = plen as usize;
     let (probe_id, term) = match wire::decode_read_index_probe(&s.msg_buf[..pl]) {
@@ -1886,7 +1886,7 @@ unsafe fn handle_read_index_probe(s: &mut Raft, sys: &SyscallTable, plen: u16) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn handle_read_index_probe_resp(s: &mut Raft, sys: &SyscallTable, plen: u16) {
     if s.role != ROLE_LEADER {
         return;
@@ -2016,7 +2016,7 @@ unsafe fn handle_read_index_resp(s: &mut Raft, sys: &SyscallTable, plen: u16) {
 ///
 /// Caller must hold exclusive borrows and supply a valid
 /// `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 unsafe fn drain_read_probes(
     s: &mut Raft,
     sys: &SyscallTable,
@@ -2058,7 +2058,7 @@ unsafe fn drain_read_probes(
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn start_probe(s: &mut Raft, sys: &SyscallTable, correlation_id: u64, now: u64) {
     if s.role == ROLE_LEADER {
         open_probe(s, sys, ORIGIN_LOCAL, correlation_id, now);
@@ -2274,7 +2274,7 @@ unsafe fn broadcast_probe(s: &mut Raft, sys: &SyscallTable, i: usize) -> bool {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn expire_probes(s: &mut Raft, sys: &SyscallTable, now: u64) {
     for i in 0..MAX_INFLIGHT_PROBES {
         let slot = s.probes[i];
@@ -2384,7 +2384,7 @@ unsafe fn emit_read_probe_reply(
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 /// React to a leader-transfer TimeoutNow: bump term immediately and
 /// start an election. Drop stale requests where the sender's term is
 /// behind ours.
@@ -2428,7 +2428,7 @@ unsafe fn handle_timeout_now(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn drain_snapshot_installed(s: &mut Raft, sys: &SyscallTable) {
     if s.in_snapshot_installed < 0 {
         return;
@@ -2544,7 +2544,7 @@ unsafe fn emit_apply_reset(s: &mut Raft, _sys: &SyscallTable, term: u64, index: 
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_wal_compact_before(s: &mut Raft, sys: &SyscallTable, before_index: u64) {
     if s.out_wal_compact < 0 {
         return;
@@ -2818,7 +2818,7 @@ unsafe fn truncate_log_after(s: &mut Raft, sys: &SyscallTable, keep_through: Ind
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 unsafe fn drain_commit_in(s: &mut Raft, sys: &SyscallTable) {
     if !s.commit_in.dirty {
         return;
@@ -3019,7 +3019,7 @@ unsafe fn drain_wal_flushed(s: &mut Raft, sys: &SyscallTable) {
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn drain_wal_replay_complete(s: &mut Raft, sys: &SyscallTable) {
     if s.in_wal_replay_complete < 0 {
         return;
@@ -3071,7 +3071,7 @@ unsafe fn drain_wal_replay_complete(s: &mut Raft, sys: &SyscallTable) {
 ///
 /// Caller must hold exclusive borrows and supply a valid
 /// `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 unsafe fn drain_admin_committed(s: &mut Raft, sys: &SyscallTable, admin_in: &mut SeamRing<4096>) {
     for _ in 0..4 {
         // An unannounced result blocks the drain. The ring holds the
@@ -3110,7 +3110,7 @@ unsafe fn drain_admin_committed(s: &mut Raft, sys: &SyscallTable, admin_in: &mut
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn apply_config_change(s: &mut Raft, sys: &SyscallTable, plen: usize) {
     let (op_code, voters_off, voter_count) = match wire::decode_config_change(&s.msg_buf[..plen]) {
         Some(v) => v,
@@ -3311,7 +3311,7 @@ unsafe fn deliver_quorum_config(s: &mut Raft, sys: &SyscallTable) -> bool {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn drain_admin(s: &mut Raft, sys: &SyscallTable, _now: u64) {
     if s.in_admin < 0 {
         return;
@@ -3498,7 +3498,7 @@ fn handle_admin_forward_resp(s: &mut Raft, plen: u16) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn apply_admin_op(s: &mut Raft, op_code: u8, buf_ptr: *const u8, plen: usize) -> u8 {
     // Safety: drain_admin owns the buffer for this iteration; this view
     // is read-only.
@@ -3677,7 +3677,7 @@ unsafe fn apply_admin_op(s: &mut Raft, op_code: u8, buf_ptr: *const u8, plen: us
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_admin_applied(s: &mut Raft, sys: &SyscallTable, command_id: u32, status: u8) {
     if s.out_admin_applied < 0 {
         return;
@@ -3721,7 +3721,7 @@ unsafe fn flush_admin_applied(s: &mut Raft, sys: &SyscallTable) -> bool {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_timeout_now_if_pending(s: &mut Raft, sys: &SyscallTable) {
     if s.pending_transfer_to == 0 {
         return;
@@ -3788,7 +3788,7 @@ fn replay_hold(s: &Raft) -> bool {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, plen: u16) {
     // Slice to the declared payload before decoding. `msg_buf` is a
     // long-lived scratch buffer: handing the decoder the whole array
@@ -3939,7 +3939,7 @@ unsafe fn handle_vote_request(s: &mut Raft, sys: &SyscallTable, msg_type: u8, pl
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn handle_vote_response(s: &mut Raft, sys: &SyscallTable, msg_type: u8, plen: u16) {
     if s.role != ROLE_CANDIDATE {
         return;
@@ -4019,7 +4019,7 @@ fn set_majority(
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn handle_append_entries(s: &mut Raft, sys: &SyscallTable, plen: u16, now: u64) {
     let pl = plen as usize;
     if pl < wire::AE_HDR_LEN {
@@ -4320,7 +4320,7 @@ unsafe fn note_unverified(s: &mut Raft, sys: &SyscallTable, index: Index) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 /// Publish this node's quorum-durable horizon so `flow` can release
 /// acknowledgements here, whether or not this node is the leader.
 ///
@@ -4374,7 +4374,7 @@ unsafe fn advance_follower_commit(s: &mut Raft, sys: &SyscallTable, leader_commi
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn send_append_response(s: &mut Raft, sys: &SyscallTable, success: bool, busy: bool) {
     send_append_response_at(s, sys, success, busy, s.last_log_index);
 }
@@ -4518,7 +4518,7 @@ unsafe fn log_p(
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn step_follower(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // Relay client proposals to the leader before considering an
     // election: a follower never calls `drain_proposals`, so without
@@ -4552,7 +4552,7 @@ unsafe fn step_follower(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn step_candidate(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // No leader while campaigning: writes wait on their channel, and
     // are refused once the election has run long.
@@ -4588,7 +4588,7 @@ unsafe fn step_candidate(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn step_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // 0. Joint-consensus completeness: if a C_old,new entry has
     //    committed (apply_config_change set `pending_new_voters_set`),
@@ -4712,7 +4712,7 @@ unsafe fn step_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 /// Append a `CONFIG_CHANGE_OP_NEW` entry into the proposal batch,
 /// completing the joint-consensus transition that
 /// `apply_config_change` started. Called exclusively from
@@ -4850,7 +4850,7 @@ unsafe fn emit_pending_learners(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 /// Relay a follower's queued fire-and-forget client proposals (the
 /// untagged channels, `in_proposals` and `in_proposals_partitioned`) to
 /// the leader. Nothing here owes a response; response-owed writes go
@@ -5626,7 +5626,7 @@ unsafe fn drain_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn append_to_batch(
     s: &mut Raft,
     sys: &SyscallTable,
@@ -5761,7 +5761,7 @@ unsafe fn append_noop(s: &mut Raft, sys: &SyscallTable) {
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
     if s.proposal_batch_count == 0 {
         return;
@@ -5886,7 +5886,7 @@ unsafe fn flush_proposal_batch(s: &mut Raft, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
     let count = s.proposal_batch_count as usize;
     let assigned_index = s.last_log_index;
@@ -5953,7 +5953,7 @@ unsafe fn emit_proposal_assignments(s: &mut Raft, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn send_heartbeat(s: &mut Raft, sys: &SyscallTable) {
     // Heartbeats are AppendEntries with an empty body (entry_index = 0).
     // They double as log-matching probes: a follower whose tail
@@ -6209,7 +6209,7 @@ const MJ_CHECK: u8 = 5;
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
     s.meta_fs_step = true;
     let root = s.meta_root_path != 0;
@@ -6812,7 +6812,7 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
 ///
 /// Caller must hold an exclusive `&mut Raft` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn persist_meta_record(
     s: &mut Raft,
     sys: &SyscallTable,
@@ -7150,7 +7150,7 @@ unsafe fn send_vote_response(s: &mut Raft, sys: &SyscallTable, candidate: u8, gr
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn become_follower(s: &mut Raft, sys: &SyscallTable, term: Term) {
     become_follower_mem(s, term);
     // Liveness exception to write-then-adopt: refusing to observe a
@@ -7207,7 +7207,7 @@ fn step_down_same_term(s: &mut Raft) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
     // Unreachable while `start_election` holds — candidacy cannot begin
     // during replay — and checked anyway, because this is the step that
@@ -7280,7 +7280,7 @@ unsafe fn become_leader(s: &mut Raft, sys: &SyscallTable, now: u64) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn start_election(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: bool) {
     // No candidacy on a tip this node has already agreed to discard:
     // the vote request would advertise a log the WAL is in the middle
@@ -7435,7 +7435,7 @@ unsafe fn begin_candidacy(s: &mut Raft, sys: &SyscallTable, now: u64, pre_vote: 
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn reset_election_deadline(s: &mut Raft, now: u64) {
     // Fold self_id AND partition_id into the seed. Two independent
     // correlations have to be broken:
@@ -7484,7 +7484,7 @@ pub fn on_fallback(s: &mut Raft, msg: &[u8], plen: u16) {
 /// Caller must hold an exclusive `&mut Raft` (or shared
 /// `&Raft` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_metrics(s: &mut Raft, sys: &SyscallTable, now: u64) {
     if s.out_metrics < 0 {
         return;

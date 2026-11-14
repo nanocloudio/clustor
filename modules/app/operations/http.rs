@@ -73,8 +73,8 @@
 //! body.
 
 use super::abi::contracts::exchange::{
-    abort, parse_request, response_body_at, seal_response, status, write_abort, write_credit,
-    Collector, ExchangeId, Record, Refuse, METHOD_POST, RECORD_MAX,
+    abort, parse_request, response_body_at, seal_response, write_abort, write_credit, Collector,
+    ExchangeId, Record, Refuse, METHOD_POST, RECORD_MAX,
 };
 use super::abi::SyscallTable;
 use super::ExchangeOutbox;

@@ -138,7 +138,7 @@ pub fn init(s: &mut Commit) {
 /// # Safety
 ///
 /// Caller must supply a valid `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 pub unsafe fn arm(_s: &mut Commit, sys: &SyscallTable) {
     super::dev_log(sys, 3, b"[commit] init".as_ptr(), 13);
 }
@@ -206,7 +206,7 @@ pub fn on_voter_set(s: &mut Commit, current: u8, joint: u8, joint_active: bool) 
 ///
 /// Caller must hold an exclusive `&mut Commit` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 pub unsafe fn step(s: &mut Commit, sys: &SyscallTable) {
     let mut changed = false;
 
@@ -366,7 +366,7 @@ unsafe fn emit_metrics(s: &mut Commit, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Commit` (or shared
 /// `&Commit` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 pub fn apply_durability_proof(s: &mut Commit, term: u64, index: u64) {
     if index <= s.durable_index {
         return;
@@ -446,7 +446,7 @@ pub fn on_cache_state(s: &mut Commit, msg: &[u8], plen: u16) {
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Commit` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 unsafe fn advance_commit(s: &mut Commit) {
     // Compute quorum match index. During joint mode the effective commit
     // index is the minimum of the two medians, so an entry must be

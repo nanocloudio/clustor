@@ -392,7 +392,7 @@ pub fn init(s: &mut Apply) {
 /// # Safety
 ///
 /// Caller must supply a valid `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 pub unsafe fn arm(_s: &mut Apply, sys: &SyscallTable) {
     dev_log(sys, 3, b"[apply] init".as_ptr(), 12);
 }
@@ -418,7 +418,7 @@ pub struct Horizons {
 ///
 /// Caller must hold exclusive component borrows and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 pub unsafe fn step(
     s: &mut Apply,
     sys: &SyscallTable,
@@ -502,7 +502,7 @@ pub unsafe fn step(
 ///
 /// Caller must hold an exclusive `&mut Apply` and supply a valid
 /// `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 pub unsafe fn on_commit_horizon(s: &mut Apply, sys: &SyscallTable, term: Term, index: Index) {
     // Dedup horizon advances per-shard (legacy behaviour preserved).
     let shard = (index as usize) % DEDUP_SHARDS;
@@ -663,7 +663,7 @@ unsafe fn emit_sample(
 ///
 /// Caller must hold exclusive borrows and supply a valid
 /// `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 unsafe fn drain_log_entries(s: &mut Apply, sys: &SyscallTable, bodies: &mut SeamRing<8192>) {
     for _ in 0..16 {
         // Preserve the oldest not-yet-applied entries when the local join
@@ -741,7 +741,7 @@ unsafe fn pipeline_reset(s: &mut Apply, sys: &SyscallTable, term: Term, index: I
 /// Caller must hold an exclusive `&mut Apply` (or shared
 /// `&Apply` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn store_pending(
     s: &mut Apply,
     sys: &SyscallTable,
@@ -855,7 +855,7 @@ const STALL_LOG_INTERVAL_MS: u64 = 1_000;
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Apply` and supply a valid
-/// `&SyscallTable` per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `&SyscallTable` per the module ABI in `fluxor_abi`.
 unsafe fn note_delivery_stall(s: &mut Apply, sys: &SyscallTable) {
     s.delivery_stalls = s.delivery_stalls.saturating_add(1);
     let now = dev_millis(sys);
@@ -878,7 +878,7 @@ unsafe fn note_delivery_stall(s: &mut Apply, sys: &SyscallTable) {
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Apply` and supply a valid
-/// `&SyscallTable` per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `&SyscallTable` per the module ABI in `fluxor_abi`.
 unsafe fn drain_pending_entries(s: &mut Apply, sys: &SyscallTable) {
     loop {
         // No pre-poll of `out_applied` here. `emit_committed_entry`
@@ -939,7 +939,7 @@ unsafe fn drain_pending_entries(s: &mut Apply, sys: &SyscallTable) {
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Apply` and supply a valid
-/// `&SyscallTable` per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `&SyscallTable` per the module ABI in `fluxor_abi`.
 unsafe fn request_missing_entry(s: &mut Apply, sys: &SyscallTable, index: Index) {
     if s.out_entry_request < 0 || index == 0 {
         return;
@@ -980,7 +980,7 @@ unsafe fn request_missing_entry(s: &mut Apply, sys: &SyscallTable, index: Index)
 /// # Safety
 ///
 /// Caller must hold an exclusive `&mut Apply` and supply a valid
-/// `&SyscallTable` per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `&SyscallTable` per the module ABI in `fluxor_abi`.
 pub unsafe fn on_entry_reply(s: &mut Apply, sys: &SyscallTable, msg: &[u8], plen: u16) {
     // Stage the frame in this component's scratch (the demux buffer is
     // shared), mirroring the truncating channel-read contract.
@@ -1067,7 +1067,7 @@ pub unsafe fn on_entry_reply(s: &mut Apply, sys: &SyscallTable, msg: &[u8], plen
 ///
 /// Caller must hold an exclusive `&mut Apply` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_committed_entry(s: &mut Apply, sys: &SyscallTable, slot_idx: usize) -> bool {
     // Small fields only — the body stays in its slot rather than being
     // copied through a PENDING_BODY_CAP-sized stack temporary on every
@@ -1194,7 +1194,7 @@ unsafe fn emit_committed_entry(s: &mut Apply, sys: &SyscallTable, slot_idx: usiz
 /// Caller must hold an exclusive `&mut Apply` (or shared
 /// `&Apply` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn drain_read_permits(s: &mut Apply, sys: &SyscallTable, now: u64) {
     // The read gate emits MSG_READ_PERMIT every step the CP cache is
     // Fresh or Cached, with payload `[cache_state:u8]`. We track the
@@ -1222,7 +1222,7 @@ unsafe fn drain_read_permits(s: &mut Apply, sys: &SyscallTable, now: u64) {
 /// Caller must hold an exclusive `&mut Apply` (or shared
 /// `&Apply` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn drain_read_submissions(s: &mut Apply, sys: &SyscallTable, now: u64) {
     if s.in_reads < 0 {
         return;
@@ -1297,7 +1297,7 @@ unsafe fn issue_read_probe(s: &mut Apply, _sys: &SyscallTable, correlation_id: u
 ///
 /// Caller must hold exclusive borrows and supply a valid
 /// `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 unsafe fn drain_read_probe_replies(
     s: &mut Apply,
     sys: &SyscallTable,
@@ -1399,7 +1399,7 @@ unsafe fn enqueue_read(
 /// Caller must hold an exclusive `&mut Apply` (or shared
 /// `&Apply` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn drain_pending_reads(s: &mut Apply, sys: &SyscallTable, now: u64) {
     if s.out_applied < 0 {
         return;
@@ -1460,7 +1460,7 @@ unsafe fn drain_pending_reads(s: &mut Apply, sys: &SyscallTable, now: u64) {
 /// Caller must hold an exclusive `&mut Apply` (or shared
 /// `&Apply` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_read_response(
     s: &mut Apply,
     sys: &SyscallTable,
@@ -1497,7 +1497,7 @@ unsafe fn emit_read_response(
 /// Caller must hold an exclusive `&mut Apply` (or shared
 /// `&Apply` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_read_reject(
     s: &mut Apply,
     sys: &SyscallTable,

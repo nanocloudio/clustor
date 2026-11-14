@@ -31,7 +31,7 @@ const FS_WRITE: u32 = crate::abi::registry::fs::WRITE;
 const FS_FSYNC: u32 = crate::abi::registry::fs::FSYNC;
 const FS_CLOSE: u32 = crate::abi::registry::fs::CLOSE;
 /// Write-side opener. `FS_OPEN` is read-only-if-exists per the FS
-/// contract (see `target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs`);
+/// contract (see `fluxor_abi::contracts::storage::fs`);
 /// snapshot manifests are created from scratch, so persistence needs
 /// the write tier.
 const FS_OPEN_CREATE: u32 = crate::abi::registry::fs::OPEN_CREATE;
@@ -145,16 +145,10 @@ const BOOT_DONE: u8 = 4;
 /// snapshot that is not on disk.
 const FS_E_NODEV: i32 = -19;
 const FS_E_NOSYS: i32 = -38;
-
-/// `module_step` return code for `StepOutcome::Burst` (kernel ABI:
-/// 0=Continue, 1=Done, 2=Burst, 3=Ready). Returned from a step that
-/// performed a synchronous disk op (snapshot persist, chunk ingest,
-/// boot restore): a cold first-touch FS_OPEN_CREATE/write on this NVMe
-/// runs tens to >100 ms and would trip the step guard. Burst discards
-/// the step's elapsed instead of checking it, then re-arms with the 8×
-/// budget. Work per step is bounded (≤4 triggers), so this is a
-/// headroom grant, not unbounded I/O.
-const STEP_BURST: i32 = 2;
+/// The kernel refusing the call outright: this module holds no `fs` grant.
+/// Distinct from ENODEV/ENOSYS, which say the device or the op is absent —
+/// a refusal says the module may not ask, and no retry will change that.
+const FS_E_ACCES: i32 = -13;
 
 /// Longest path this file builds: the `wal_dir` directory, its `/`, and
 /// the longest name placed in it (`p<NNNN>_snap_<NNNNNNNN>.bin`, 23
@@ -405,6 +399,11 @@ pub struct Snapshot {
     /// artefact; anything else must reach disk before the install is
     /// signalled.
     install_had_fs: bool,
+    /// `fs` refused this module, said once. A refusal is permanent — the
+    /// build's grant set does not carry `fs` — but it arrives as just
+    /// another negative fd, so every caller here treats it as a failure to
+    /// retry. Retrying is harmless; being silent about it is not.
+    fs_refused_logged: bool,
     /// Open write fd of a snapshot being streamed, or -1.
     wfd: i32,
     /// Bytes of body written so far through `snap_append`.
@@ -737,6 +736,7 @@ pub unsafe fn init(s: &mut Snapshot) {
     s.body_len = 0;
     s.install_had_fs = false;
     s.capture_had_fs = false;
+    s.fs_refused_logged = false;
     s.wfd = -1;
     s.wbody = 0;
     s.wterm = 0;
@@ -1665,7 +1665,7 @@ unsafe fn emit_sample(
 /// Caller must hold an exclusive `&mut Snapshot` (or shared
 /// `&Snapshot` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn ingest_install_chunk(s: &mut Snapshot, sys: &SyscallTable, plen: usize) {
     let (term, last_idx, last_term, offset, done, membership, hdr_len) =
         match wire::decode_install_snapshot(&s.msg_buf[..plen]) {
@@ -2372,7 +2372,7 @@ unsafe fn request_app_capture(
 /// Caller must hold an exclusive `&mut Snapshot` (or shared
 /// `&Snapshot` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 /// Re-broadcast the most recent snapshot as a manifest-only
 /// InstallSnapshot: peers learn the `(term, index)` and trust their own
 /// log/WAL for the rest. Body-carrying installs go out through
@@ -2574,7 +2574,7 @@ unsafe fn export_step(s: &mut Snapshot, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Snapshot` (or shared
 /// `&Snapshot` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_install_body(
     s: &mut Snapshot,
     sys: &SyscallTable,
@@ -2855,6 +2855,7 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable) -> Step {
                 }
                 if fd < 0 {
                     s.p_phase = P_IDLE;
+                    say_if_fs_refused(s, sys, fd);
                     // A device with no FS at all has no pointer to keep.
                     return if fd == FS_E_NODEV || fd == FS_E_NOSYS {
                         Step::Done
@@ -2969,6 +2970,7 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable) -> Step {
                 }
                 if fd < 0 {
                     s.p_phase = P_IDLE;
+                    say_if_fs_refused(s, sys, fd);
                     return if fd == FS_E_NODEV || fd == FS_E_NOSYS {
                         Step::Done
                     } else {
@@ -3925,6 +3927,28 @@ fn snap_header(
     hdr
 }
 
+/// Say so, once, when `fs` refuses this module.
+///
+/// A refused open is not a transient failure: the build's grant set does not
+/// carry `fs`, so every retry is refused the same way. It reaches a caller
+/// as a negative fd like any other error, which is how a mis-scoped claim
+/// once cost a whole afternoon — the snapshot writer demanded an install a
+/// hundred times, logged `[snap] open fail` at trace level each time, and
+/// never said that it was being refused rather than failing.
+///
+/// # Safety
+///
+/// Caller must hold an exclusive `&mut Snapshot` and supply a valid
+/// `&SyscallTable` per the module ABI in `fluxor_abi`.
+unsafe fn say_if_fs_refused(s: &mut Snapshot, sys: &SyscallTable, fd: i32) {
+    if fd != FS_E_ACCES || s.fs_refused_logged {
+        return;
+    }
+    s.fs_refused_logged = true;
+    let m = b"[snap] ERROR fs refused this module (EACCES): it holds no fs grant, so no retry can open a snapshot; check the build's grant set and its [[resources]] variants";
+    dev_log(sys, 1, m.as_ptr(), m.len());
+}
+
 /// Open a snapshot file and write a placeholder header, ready for
 /// `snap_append`. Returns `(started, had_fs)` with the same
 /// had_fs contract as the old `write_snapshot_durable`: false means no
@@ -3959,7 +3983,9 @@ unsafe fn snap_begin(
         // Genuinely no FS provider (in-memory graph): nothing to durably
         // install. ANY other error (EIO, ENOSPC, missing parent dir)
         // reports had_fs=true so the caller withholds its install signal
-        // and the source retries.
+        // and the source retries. A refusal lands here too — it is not a
+        // transient failure, so it is named rather than retried quietly.
+        say_if_fs_refused(s, sys, fd);
         return (false, fd != FS_E_NODEV && fd != FS_E_NOSYS);
     }
     if sealing(s) {

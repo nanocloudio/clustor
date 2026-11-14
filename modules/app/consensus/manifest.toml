@@ -20,7 +20,6 @@ hardware_targets = ["bcm2712", "linux"]
 # committed admin/config bodies, voter-set updates — are interior seams
 # drained by the module's dispatch table, not ports.
 
-permissions = []
 
 # Service role (fluxor capability_surface.md §Replication): consensus
 # owns the apply-pipeline surface — committed-entry stream,

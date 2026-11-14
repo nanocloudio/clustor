@@ -1,9 +1,15 @@
 [workspace]
-members = [".", "crates/clustor-common", "tools/clustor-bench"]
+members = ["crates/clustor-common", "tools/clustor-bench"]
 # Bare `cargo test`/`build` in the root dir covers the whole
 # workspace (the root manifest is package+workspace, which would
 # otherwise scope commands to the root package alone).
 default-members = [".", "crates/clustor-common", "tools/clustor-bench"]
+# The Fluxor SDK crates `fluxor sync` stages under target/fluxor/ are path
+# dev-dependencies inside this directory; cargo would otherwise adopt them as
+# members and lint them under this workspace's policy. `members` leaves out
+# `.` (the root package is a member as the workspace root) because a member
+# path covers everything beneath it and would override this exclusion.
+exclude = ["target"]
 
 [workspace.package]
 # Shared by every publishable crate via `version.workspace = true`.
@@ -133,6 +139,11 @@ bench = false
 [dependencies]
 
 [dev-dependencies]
+# Fluxor's module SDK as `fluxor sync` stages it under target/fluxor/: the
+# host tests mount module sources, which import these crates.
+fluxor-abi = { path = "target/fluxor/fluxor-abi" }
+fluxor-sdk = { path = "target/fluxor/fluxor-sdk" }
+fluxor-rt = { path = "target/fluxor/fluxor-rt" }
 tempfile = "3.23.0"
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 # Used by the cluster harness (`tests/support/cluster.rs`) to put

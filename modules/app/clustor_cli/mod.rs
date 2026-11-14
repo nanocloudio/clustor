@@ -20,23 +20,18 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other clustor modules and the \
+              host tests"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
+use fluxor_rt::*;
 
 // The repo's single CRC32C owner — identical source to the WAL's.
 #[path = "../../common/collections.rs"]
@@ -50,7 +45,6 @@ use wal_frame::{FRAME_HDR, MAX_ENTRY_LEN};
 
 const PORT_INPUT: u8 = 0;
 const PORT_OUTPUT: u8 = 1;
-const STEP_DONE: i32 = 1;
 
 /// Binary staging cap for decoded `crc`/`wal-scan`/`wal-frame` input. Input
 /// past this is reported as oversize, never as invalid hex.
@@ -367,11 +361,7 @@ fn cmd_wal_scan(s: &mut State, a: usize, b: usize) -> (usize, i32) {
     (q, 0)
 }
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<State>() as u32
-}
+fluxor_rt::module_facts! { state: State }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -409,18 +399,18 @@ pub extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     unsafe {
         if state.is_null() {
-            return STEP_DONE;
+            return StepReturn::Done;
         }
         let s = &mut *(state as *mut State);
         if s.syscalls.is_null() {
-            return STEP_DONE;
+            return StepReturn::Done;
         }
         let sys = &*s.syscalls;
         if s.done != 0 {
-            return STEP_DONE;
+            return StepReturn::Done;
         }
         if s.exit_chan < 0 {
             s.exit_chan = dev_channel_port(sys, PORT_OUTPUT, 1);
@@ -437,7 +427,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         if an <= 0 {
             s.waited += 1;
             if s.waited < ARGV_WAIT {
-                return 0; // keep waiting for argv
+                return StepReturn::Continue; // keep waiting for argv
             }
         }
         let alen = if an > 0 { an as usize } else { 0 };
@@ -497,8 +487,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let _ = (sys.channel_write)(s.exit_chan, c.as_ptr(), c.len());
         }
         s.done = 1;
-        STEP_DONE
+        StepReturn::Done
     }
 }
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/wasm_entry.rs");
+fluxor_rt::wasm_entry!();

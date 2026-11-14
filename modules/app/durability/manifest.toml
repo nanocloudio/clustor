@@ -41,14 +41,48 @@ hardware_targets = ["bcm2712", "linux"]
 # intake (raft backpressures) rather than degrading — in-memory
 # operation is only ever the volatile variant's declared mode.
 
-permissions = []
+# Sealing (`aead`, the WAL and snapshot seal state) calls the key vault.
+# Two things decide whether this build makes that call, and the grant names
+# both, because the grant set is what a node enforces: a module holding a
+# grant that reaches the kernel cannot be placed as a tenant at all.
+#
+#   variants — only the disk build seals; the volatile build compiles the
+#     ledger out and never opens the vault.
+#   when     — sealing is chosen per instance by `aead`, and is inert at 0
+#     (its default). An instance that selects no suite never opens the
+#     vault, so it does not need the key to it.
+#
+# Declared unconditionally, every disk instance asked for the vault whether
+# or not it sealed, and any graph running one as a tenant was refused.
+grants = [{ name = "key_vault", variants = ["disk"], when = { aead = [1, 2] } }]
 
-# Only the disk variant writes through the FS contract; the volatile build
-# compiles the ledger out and never calls it.
+# Both builds write through the FS contract. The volatile variant compiles
+# out the WAL LEDGER — segments and raft meta never touch disk, which is the
+# whole of its in-memory contract — but the snapshot component stages its
+# images through `fs` whichever variant is built, and a restarted volatile
+# follower is rebuilt by snapshot install.
+#
+# Not scoped, therefore. Scoped to `disk` it read as true of the ledger and
+# was harmless only while nothing honoured it: once a build's grant set
+# followed its variants, the volatile build lost `fs`, its snapshot open was
+# refused EACCES, and `snap_begin` read that as "FS present, open failed"
+# (EACCES is neither ENODEV nor ENOSYS) and retried for ever. The leader
+# demanded a snapshot 112 times and logged 112 `[snap] open fail`, so a
+# restarted follower was never rebuilt.
+# Optional, not required: where no provider answers `fs` — a bcm2712 node
+# has none, and the memory configs run there — `snap_begin` reads ENODEV or
+# ENOSYS as "no FS at all, nothing to durably install" and carries on. That
+# is a fallback the module really implements, which is what `optional` means;
+# a required claim would refuse those graphs outright.
+#
+# Optional still CLAIMS the contract, so the build holds the `fs` grant
+# wherever a provider does answer. That is the distinction this needs and
+# `variants` could not express: the call is made by every build, and merely
+# not answered everywhere.
 [[resources]]
 requires_contract = "fs"
 access = "write"
-variants = ["disk"]
+optional = true
 
 [[variant]]
 name = "volatile"

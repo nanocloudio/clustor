@@ -25,6 +25,7 @@ use super::abi::SyscallTable;
 use super::collections::Crc32c;
 use super::types::{Index, Term};
 use super::wal_frame;
+use fluxor_rt::StepReturn;
 
 use super::{fs_step, sealed};
 #[path = "wal_seal.rs"]
@@ -32,7 +33,7 @@ pub mod wal_seal;
 use super::store_dir::{StoreDir, STORE_DIR_MAX};
 use super::{
     dev_input_flow_budget, dev_log, dev_micros, dev_millis, dev_report_step_effect, fmt_u32_raw,
-    step_effect, wire, wire_channels, POLL_IN, POLL_OUT,
+    step_effect, wire, wire_channels,
 };
 use fs_step::{later, Io};
 
@@ -188,7 +189,7 @@ struct SegmentStart {
 ///
 /// `Wal` is by far the largest component in the durability composite,
 /// so it is what decides whether a constrained target fits. The kernel
-/// allocates module state from `module_state_size()`, not from BSS, so
+/// allocates module state from `MODULE_STATE_BYTES`, not from BSS, so
 /// nothing in the linker output flags a regression here — an extra ring
 /// or a widened `MemoryEntry` costs half a megabyte of RAM per replica,
 /// silently. These bounds sit a little above the actual sizes (disk
@@ -277,7 +278,7 @@ const FS_FSYNC: u32 = super::abi::registry::fs::FSYNC;
 const FS_CLOSE: u32 = super::abi::registry::fs::CLOSE;
 const FS_STAT: u32 = super::abi::registry::fs::STAT;
 /// Write-side opener. `FS_OPEN` is read-only-if-exists per the FS
-/// contract (see `target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs`),
+/// contract (see `fluxor_abi::contracts::storage::fs`),
 /// so a fresh WAL with no segment file on disk silently degrades to
 /// in-memory; segment creation needs the write tier.
 const FS_OPEN_CREATE: u32 = super::abi::registry::fs::OPEN_CREATE;
@@ -425,12 +426,6 @@ const WAL_PATH_MAX: usize = STORE_DIR_MAX + 32;
 // Module phases
 const PHASE_REPLAY: u8 = 0;
 const PHASE_NORMAL: u8 = 1;
-
-/// `module_step` return code for `StepOutcome::Burst` (kernel ABI:
-/// 0=Continue, 1=Done, 2=Burst, 3=Ready). Replay returns this from any
-/// step that performed an `FS_OPEN` so the scheduler forgives the
-/// one-time cold directory-scan penalty (see `step_replay`).
-const STEP_BURST: i32 = 2;
 
 /// How many consecutive missing segments the replay scanner
 /// tolerates before declaring "no more segments". Replay walks
@@ -1408,7 +1403,7 @@ pub fn arm(s: &mut Wal) {
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI.
 #[inline(always)]
-pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
+pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> StepReturn {
     s.dbg_steps = s.dbg_steps.wrapping_add(1);
 
     // A sealed WAL reads nothing and writes nothing until its allocator
@@ -1436,7 +1431,11 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
         let worked = continue_retirement(s, sys);
         flush_truncate_ack(s, sys);
         emit_metrics(s, sys);
-        return if worked { STEP_BURST } else { 0 };
+        return if worked {
+            StepReturn::Burst
+        } else {
+            StepReturn::Continue
+        };
     }
 
     // FS-readiness gate. While the segment isn't open, (re)try the open
@@ -1451,14 +1450,14 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
         ensure_segment_open(s, sys);
         if s.fd < 0 && !s.no_fs {
             emit_metrics(s, sys);
-            return 0;
+            return StepReturn::Continue;
         }
         if s.fixed_segment_active {
             // Physical segment reservation is bounded boot/rotation work,
             // but intentionally much larger than a steady-state step.
             // Burst classifies that one-time elapsed interval correctly;
             // no entry has been consumed yet.
-            return STEP_BURST;
+            return StepReturn::Burst;
         }
     }
 
@@ -1468,7 +1467,7 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     // transient background phase as a 400+ ms queue.
     if s.fixed_segment_active && dev_millis(sys) < s.preallocate_ready_at_ms {
         emit_metrics(s, sys);
-        return 0;
+        return StepReturn::Continue;
     }
 
     // Hand consensus the exact on-disk high-water reconstructed by
@@ -1571,9 +1570,9 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
     // directory fence per file), well above a steady-state step even at
     // the paced budget. Burst classifies that interval correctly.
     if retired {
-        STEP_BURST
+        StepReturn::Burst
     } else {
-        0
+        StepReturn::Continue
     }
 }
 
@@ -1587,7 +1586,7 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> i32 {
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per `fluxor_abi`.
 unsafe fn maybe_emit_replay_complete(s: &mut Wal, sys: &SyscallTable) {
     if !s.replay_complete_pending {
         return;
@@ -1665,7 +1664,7 @@ fn memory_slot(index: u64) -> usize {
 /// Caller must hold an exclusive `&mut Wal` (or shared
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 /// An entry the log has taken at `index`, its `[term][index][body]` at
 /// `msg_buf[from..from + len]`: a config entry moves the configuration.
 fn note_config(s: &mut Wal, index: u64, from: usize, len: usize) {
@@ -1837,7 +1836,7 @@ fn segment_for(s: &Wal, index: u64) -> u32 {
 /// Caller must hold an exclusive `&mut Wal` (or shared
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn lookup_entry_loc(s: &Wal, index: u64) -> Option<EntryLoc> {
     if index == 0 || index > s.entry_ring_max_index {
         return None;
@@ -1858,7 +1857,7 @@ unsafe fn lookup_entry_loc(s: &Wal, index: u64) -> Option<EntryLoc> {
 /// Caller must hold an exclusive `&mut Wal` (or shared
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn drain_entry_requests(s: &mut Wal, sys: &SyscallTable) {
     // A read-back still reading its frame is resumed first, and no other
     // request is taken until it has answered: its descriptor and buffer
@@ -1896,7 +1895,7 @@ unsafe fn drain_entry_requests(s: &mut Wal, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Wal` (or shared
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 /// Serve one WAL entry read-back on `reply_chan`.
 ///
 /// `allow_scan` gates the bounded forward segment scan for an index that
@@ -2949,7 +2948,7 @@ unsafe fn deliver_scan_reply_sealed(s: &mut Wal, sys: &SyscallTable) {
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 unsafe fn begin_entry_scan(s: &mut Wal, sys: &SyscallTable, request_id: u32, wal_index: u64) {
     // The located-but-undelivered reply matches: just refresh the id.
     if s.scan_found {
@@ -3072,7 +3071,7 @@ unsafe fn fail_entry_scan(s: &mut Wal, sys: &SyscallTable) {
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
     if s.scan_found {
         deliver_scan(s, sys);
@@ -3298,7 +3297,7 @@ unsafe fn deliver_scan(s: &mut Wal, sys: &SyscallTable) {
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a valid
 /// `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 #[inline(never)]
 unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
     if !s.scan_found {
@@ -3408,7 +3407,7 @@ unsafe fn deliver_scan_reply(s: &mut Wal, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Wal` (or shared
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) -> bool {
     // An ack the output channel could not take is retried before
     // anything else: the requester holds its old tip until it arrives,
@@ -3548,7 +3547,7 @@ unsafe fn drain_compact_before(s: &mut Wal, sys: &SyscallTable) -> bool {
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a
 /// `&SyscallTable` whose function pointers reach live kernel routines per
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 unsafe fn truncate_after(
     s: &mut Wal,
     sys: &SyscallTable,
@@ -4519,7 +4518,7 @@ unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> Step 
 /// Caller must hold an exclusive `&mut Wal` (or shared
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn compact_before(s: &mut Wal, sys: &SyscallTable, before_index: u64) {
     if before_index == 0 {
         return;
@@ -4964,8 +4963,8 @@ unsafe fn publish_name(s: &mut Wal, sys: &SyscallTable, path: &mut [u8], plen: u
 /// Caller must hold an exclusive `&mut Wal` (or shared
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
-unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
+/// routines per the module ABI in `fluxor_abi`.
+unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> StepReturn {
     // Try to open the current replay segment.
     //
     // Replay walks forward from `replay_seg = 1` probing for
@@ -5005,7 +5004,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             // FS provider still initialising (fat32 reading the BPB on a pi5
             // cold boot), or the directory not cached yet. Do NOT count this
             // as a missing segment. Wait and retry the same seq next step.
-            return 0;
+            return StepReturn::Continue;
         }
         if fd < 0 {
             // Missing segment — count it and either advance or
@@ -5020,7 +5019,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
                 // Burst discards this step's elapsed instead of checking it,
                 // and re-arms the next step with the 8× budget. Replay is
                 // bounded, so this is headroom, not unbounded work.
-                return STEP_BURST;
+                return StepReturn::Burst;
             }
             // Bound reached: replay is done. Finding no segments here
             // is NOT proof the filesystem is unavailable — a fresh
@@ -5041,7 +5040,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             s.phase = PHASE_NORMAL;
             // Burst (forgive any cold-scan this open paid); harmlessly
             // re-steps once into PHASE_NORMAL, which returns Continue.
-            return STEP_BURST;
+            return StepReturn::Burst;
         }
         s.replay_fd = fd;
         s.replay_sized = false;
@@ -5056,7 +5055,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         let mut stat_buf = [0u8; 8];
         let stat_rc = (sys.provider_call)(s.replay_fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
         if later(stat_rc) {
-            return 0; // the same descriptor is sized next step
+            return StepReturn::Continue; // the same descriptor is sized next step
         }
         let size = if stat_rc < 0 {
             0
@@ -5072,7 +5071,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             s.phase = PHASE_NORMAL;
             settle_after_replay(s);
             // Burst (forgive any cold-scan this open paid).
-            return STEP_BURST;
+            return StepReturn::Burst;
         }
 
         // Real segment data found — reset the gap counter and
@@ -5086,7 +5085,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
 
         if wal_seal::enabled(s) && !wal_seal::on_replay_segment(s, sys) {
             close_replay_fd(s, sys);
-            return 0;
+            return StepReturn::Continue;
         }
 
         if s.replay_tainted {
@@ -5097,7 +5096,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             // never read, acked, or recorded.
             close_replay_fd(s, sys);
             s.replay_seg = s.replay_seg.saturating_add(1);
-            return STEP_BURST;
+            return StepReturn::Burst;
         }
 
         s.replay_sized = true;
@@ -5108,7 +5107,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         // The FS_OPEN above may have paid the cold directory-scan penalty
         // (tens of ms). Forgive it via Burst and read frames on subsequent
         // warm steps rather than falling through here.
-        return STEP_BURST;
+        return StepReturn::Burst;
     }
 
     if wal_seal::enabled(s) {
@@ -5128,14 +5127,14 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         // before consuming the frame rather than replaying past an ack
         // the channel could not take.
         if s.out_flushed >= 0 && !wire_channels::writable(sys, s.out_flushed) {
-            return 0;
+            return StepReturn::Continue;
         }
         frames += 1;
         let remaining = s.replay_file_size.saturating_sub(s.replay_pos);
         if s.replay_got == 0 && remaining < FRAME_HDR {
             // Not enough data for a frame header — segment done
             end_replay_segment(s, sys, false);
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Read the 8-byte header (length + CRC32C)
@@ -5150,14 +5149,14 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             );
             s.replay_got = got as u32;
             match io {
-                Io::Later => return 0,
+                Io::Later => return StepReturn::Continue,
                 Io::Done => {}
                 Io::End | Io::Fail(_) => {
                     // Short read despite `remaining >= FRAME_HDR`: a device
                     // fault, not a clean end. Taint so no later segment is
                     // acked over it.
                     end_replay_segment(s, sys, true);
-                    return 0;
+                    return StepReturn::Continue;
                 }
             }
         }
@@ -5174,7 +5173,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             // does not taint. A nonzero-but-impossible length is a torn
             // header, which does.
             end_replay_segment(s, sys, entry_len32 != 0);
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Read entry data
@@ -5188,11 +5187,11 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         );
         s.replay_got = FRAME_HDR + got as u32;
         match io {
-            Io::Later => return 0,
+            Io::Later => return StepReturn::Continue,
             Io::Done => {}
             Io::End | Io::Fail(_) => {
                 end_replay_segment(s, sys, true);
-                return 0;
+                return StepReturn::Continue;
             }
         }
         let entry_payload_offset = s.replay_pos + FRAME_HDR;
@@ -5212,7 +5211,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
             s.checksum_failures = s.checksum_failures.saturating_add(1);
             dev_log(sys, 3, b"[wal] replay CRC FAIL".as_ptr(), 21);
             end_replay_segment(s, sys, true);
-            return 0;
+            return StepReturn::Continue;
         }
 
         // Parse: first 16 bytes are term(8) + index(8)
@@ -5226,7 +5225,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
                 s.continuity_errors = s.continuity_errors.saturating_add(1);
                 dev_log(sys, 1, b"[wal] replay gap".as_ptr(), 16);
                 end_replay_segment(s, sys, true);
-                return 0;
+                return StepReturn::Continue;
             }
 
             if index > s.current_index {
@@ -5262,7 +5261,7 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> i32 {
         }
     }
 
-    0
+    StepReturn::Continue
 }
 
 /// Close the replay descriptor (a read-only one: nothing it carried is
@@ -5298,18 +5297,18 @@ unsafe fn end_replay_segment(s: &mut Wal, sys: &SyscallTable, torn: bool) {
 ///
 /// # Safety
 /// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
-unsafe fn read_replay_floor(s: &mut Wal, sys: &SyscallTable) -> i32 {
+unsafe fn read_replay_floor(s: &mut Wal, sys: &SyscallTable) -> StepReturn {
     if s.floor_rd_fd < 0 {
         let mut path = [0u8; WAL_PATH_MAX];
         let plen = encode_floor_path(s.partition_id, s.root_path != 0, &s.dir, &mut path);
         let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
         if later(fd) {
-            return 0; // provider initialising — retry
+            return StepReturn::Continue; // provider initialising — retry
         }
         if fd < 0 {
             s.replay_floor_checked = true;
             // The open may have paid the cold directory-scan penalty.
-            return STEP_BURST;
+            return StepReturn::Burst;
         }
         s.floor_rd_fd = fd;
         s.floor_rd_got = 0;
@@ -5326,7 +5325,7 @@ unsafe fn read_replay_floor(s: &mut Wal, sys: &SyscallTable) -> i32 {
     );
     s.floor_rd_got = got as u8;
     if io == Io::Later {
-        return 0;
+        return StepReturn::Continue;
     }
     (sys.provider_call)(s.floor_rd_fd, FS_CLOSE, core::ptr::null_mut(), 0);
     s.floor_rd_fd = -1;
@@ -5349,7 +5348,7 @@ unsafe fn read_replay_floor(s: &mut Wal, sys: &SyscallTable) -> i32 {
         s.replay_start_persisted = start;
     }
     s.replay_floor_checked = true;
-    STEP_BURST
+    StepReturn::Burst
 }
 
 /// # Safety
@@ -5357,7 +5356,7 @@ unsafe fn read_replay_floor(s: &mut Wal, sys: &SyscallTable) -> i32 {
 /// Caller must hold an exclusive `&mut Wal` (or shared
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn build_segment_path(s: &mut Wal, seq: u32) {
     let n = encode_segment_path(
         s.partition_id,
@@ -6276,7 +6275,7 @@ unsafe fn flush_batch_pipelined(s: &mut Wal, sys: &SyscallTable) {
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per `fluxor_abi`.
 unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
     // Probe the FS provider's async durable-write capability once, before the
     // first write is issued, so `fs_async` reflects the backend. Until the
@@ -6460,7 +6459,7 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
 ///
 /// Caller must hold an exclusive `&mut Wal` and supply a
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per `fluxor_abi`.
 unsafe fn ensure_segment_open(s: &mut Wal, sys: &SyscallTable) {
     if s.fd >= 0 {
         return;
@@ -6994,7 +6993,7 @@ unsafe fn close_segment(s: &mut Wal, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Wal` (or shared
 /// `&Wal` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_metrics(s: &mut Wal, sys: &SyscallTable) {
     let now = dev_millis(sys);
     if now.wrapping_sub(s.last_metrics_ms) < METRICS_INTERVAL_MS {

@@ -70,24 +70,18 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other clustor modules and the \
+              host tests"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/collections.rs"]
 mod collections;
@@ -124,11 +118,7 @@ mod wal;
 /// `wal_dir`'s default: `wal/` in the working directory.
 const WAL_DIR_DEFAULT: &[u8] = b"wal";
 
-/// Composite step return for a step that did cold synchronous disk
-/// work (same contract as the kernel Burst outcome).
-const STEP_BURST: i32 = 2;
-
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     1, encoding, u8, 0
@@ -364,17 +354,7 @@ struct ModuleState {
 /// anything at all.
 const ARENA_BYTES: u32 = 256 * 1024;
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_arena_size"]
-pub extern "C" fn module_arena_size() -> u32 {
-    ARENA_BYTES
-}
-
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState, arena: ARENA_BYTES }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -396,9 +376,9 @@ pub unsafe extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
+    // SAFETY: per the module ABI (`fluxor_abi`),
     // the kernel passes a valid, exclusively-borrowed `state` of
-    // at least `module_state_size()` bytes, and a `syscalls`
+    // at least `MODULE_STATE_BYTES` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
     // The dereferences and syscall invocations below rely on
     // those guarantees.
@@ -831,10 +811,10 @@ fn fan_slot_identity(s: &mut ModuleState, i: usize) {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
+    // SAFETY: per the module ABI (`fluxor_abi`),
     // the kernel passes a valid, exclusively-borrowed `state` of
-    // at least `module_state_size()` bytes, and a `syscalls`
+    // at least `MODULE_STATE_BYTES` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
     // The dereferences and syscall invocations below rely on
     // those guarantees.
@@ -865,7 +845,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // own steps. `wal_rc` / `cold_fs` accumulate across groups —
         // one group's cold FS touch is a Burst for the whole engine,
         // which is the honest answer: the step really did that work.
-        let mut wal_rc = 0i32;
+        let mut wal_rc = StepReturn::Continue;
         let mut cold_fs = false;
         for i in 0..s.active_slots as usize {
             let t0 = dev_micros(sys);
@@ -904,7 +884,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             let slot_wal_rc = if restored {
                 wal::step(&mut s.slots[i].wal, sys)
             } else {
-                STEP_BURST
+                StepReturn::Burst
             };
             s.comp_step[1].record(dev_micros(sys).wrapping_sub(t0));
 
@@ -1017,8 +997,8 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                 );
             }
 
-            if slot_wal_rc == STEP_BURST {
-                wal_rc = STEP_BURST;
+            if slot_wal_rc == StepReturn::Burst {
+                wal_rc = StepReturn::Burst;
             }
         }
 
@@ -1061,8 +1041,14 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        if wal_rc == STEP_BURST || cold_fs {
-            STEP_BURST
+        // A step that did synchronous disk work (WAL replay's FS_OPEN, a
+        // snapshot persist, chunk ingest, boot restore) answers Burst: a cold
+        // first-touch open or write on NVMe runs tens to >100 ms and would trip
+        // the step guard, and Burst discards the step's elapsed instead of
+        // checking it. Work per step is bounded, so this is headroom, not
+        // unbounded I/O.
+        if wal_rc == StepReturn::Burst || cold_fs {
+            StepReturn::Burst
         } else {
             wal_rc
         }

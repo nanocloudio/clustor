@@ -36,6 +36,20 @@ pub fn take_matches(s: &mut Repl, out: &mut [Index; MAX_NODES]) -> bool {
     true
 }
 
+/// Drain the learner-progress seam: the per-replica match indices of
+/// peers that receive the log but do not vote. Same contract as
+/// [`take_matches`], but this array is for raft's promotion gate ONLY —
+/// it must never reach `commit::on_match`, where a learner would count
+/// toward quorum.
+pub fn take_learner_matches(s: &mut Repl, out: &mut [Index; MAX_NODES]) -> bool {
+    if !s.learner_match_dirty {
+        return false;
+    }
+    s.learner_match_dirty = false;
+    *out = s.learner_match_out;
+    true
+}
+
 const METRICS_INTERVAL_MS: u64 = 1000;
 
 /// Outstanding WAL read-back request slot. Bounded so a slow WAL
@@ -185,6 +199,12 @@ pub struct Repl {
     /// `commit::on_match`.
     match_out: [Index; MAX_NODES],
     match_dirty: bool,
+    /// Learner progress: the match indices E2 withholds from commit
+    /// because the peer does not vote. Drained by
+    /// [`take_learner_matches`] into raft's promotion gate, which has no
+    /// other view of how far a learner has caught up.
+    learner_match_out: [Index; MAX_NODES],
+    learner_match_dirty: bool,
 
     /// E11 seam (the leader-state hint raft already publishes on
     /// `leader_state`, delivered in-module): AppendEntries is a
@@ -310,6 +330,8 @@ pub fn init(s: &mut Repl) {
     s.out_cross_durability_ack = -1;
     s.match_out = [0; MAX_NODES];
     s.match_dirty = false;
+    s.learner_match_out = [0; MAX_NODES];
+    s.learner_match_dirty = false;
     s.is_leader = false;
     s.self_id = 0;
     s.peer_count = 0;
@@ -353,7 +375,7 @@ pub fn init(s: &mut Repl) {
 /// # Safety
 ///
 /// Caller must supply a valid `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 pub unsafe fn arm(s: &mut Repl, sys: &SyscallTable) {
     // Activate peer slots. Initial set: 0..peer_count exclusive
     // of self. Every initial peer is voting; non-voting state is
@@ -399,7 +421,7 @@ pub fn on_leader_state(s: &mut Repl, is_leader: bool, term: Term, commit: Index)
 ///
 /// Caller must hold exclusive component borrows and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel routines
-/// per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// per the module ABI in `fluxor_abi`.
 pub unsafe fn step(s: &mut Repl, ae: &mut SeamRing<8192>, sys: &SyscallTable) {
     // 1. Process inbound entries from raft → fan out to peers
     replicate_entries(s, sys, ae);
@@ -517,7 +539,7 @@ unsafe fn replicate_entries(s: &mut Repl, sys: &SyscallTable, ae: &mut SeamRing<
 /// Caller must hold an exclusive `&mut Repl` (or shared
 /// `&Repl` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
     if s.in_ack < 0 {
         return;
@@ -649,6 +671,15 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
                                 s.match_out[r] = index;
                             }
                             s.match_dirty = true;
+                        } else if !was_voting && index > prev_match {
+                            // A learner's progress never reaches commit,
+                            // but raft's ADD_VOTER gate must see it: the
+                            // gate judges "caught up" from this alone.
+                            let r = replica as usize;
+                            if index > s.learner_match_out[r] {
+                                s.learner_match_out[r] = index;
+                            }
+                            s.learner_match_dirty = true;
                         }
                         // Auto-promote: a non-voting peer that's caught
                         // up to within `VOTING_LAG_THRESHOLD` of the
@@ -748,7 +779,7 @@ unsafe fn process_acks(s: &mut Repl, sys: &SyscallTable) {
 ///
 /// Caller must hold an exclusive `&mut Repl` and supply a
 /// `&SyscallTable` whose function pointers reach live kernel routines per
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 unsafe fn drive_catchup(s: &mut Repl, sys: &SyscallTable) {
     // TTL sweep: free request slots whose round-trip evidently died
     // (request or reply dropped on a full channel) so the renudge below
@@ -952,7 +983,7 @@ unsafe fn issue_wal_request(s: &mut Repl, sys: &SyscallTable, peer: u8, wal_inde
 /// # Safety
 ///
 /// Caller must supply a valid `&SyscallTable` per the module ABI in
-/// `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// `fluxor_abi`.
 pub unsafe fn on_voter_set(
     s: &mut Repl,
     sys: &SyscallTable,
@@ -1015,7 +1046,7 @@ pub unsafe fn on_voter_set(
 ///
 /// Caller must hold an exclusive `&mut Repl` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn maybe_promote(s: &mut Repl, sys: &SyscallTable, peer: u8) {
     let i = peer as usize;
     if i >= MAX_NODES {
@@ -1060,7 +1091,7 @@ unsafe fn maybe_promote(s: &mut Repl, sys: &SyscallTable, peer: u8) {
 /// Caller must hold an exclusive `&mut Repl` (or shared
 /// `&Repl` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn request_snapshot_install(s: &mut Repl, sys: &SyscallTable, target: u8) {
     // Remember who needs the install so the chunk forward below can be
     // routed to that peer instead of broadcast to the whole cluster.
@@ -1102,7 +1133,7 @@ unsafe fn request_snapshot_install(s: &mut Repl, sys: &SyscallTable, target: u8)
 ///
 /// Caller must hold an exclusive `&mut Repl` and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u16) {
     // Stage the frame in this component's scratch (the demux buffer is
     // shared), mirroring the truncating channel-read contract.
@@ -1226,7 +1257,7 @@ pub unsafe fn on_wal_reply(s: &mut Repl, sys: &SyscallTable, msg: &[u8], plen: u
 /// Caller must hold an exclusive `&mut Repl` (or shared
 /// `&Repl` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn forward_snapshots(s: &mut Repl, sys: &SyscallTable) {
     if s.in_snapshot_rx < 0 {
         return;
@@ -1325,7 +1356,7 @@ unsafe fn forward_snapshots(s: &mut Repl, sys: &SyscallTable) {
 /// Caller must hold an exclusive `&mut Repl` (or shared
 /// `&Repl` where the signature uses one) and supply a valid
 /// `&SyscallTable` whose function pointers reach live kernel
-/// routines per the module ABI in `target/fluxor/fluxor-abi/sdk/abi.rs`.
+/// routines per the module ABI in `fluxor_abi`.
 unsafe fn emit_metrics(s: &mut Repl, sys: &SyscallTable) {
     if s.out_metrics < 0 {
         return;

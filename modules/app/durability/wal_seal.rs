@@ -95,11 +95,12 @@ use super::sealed as sr;
 use super::{
     dev_log, end_replay_segment, fence_wal_dir, note_config, note_ledger_ack, publish_name,
     record_entry_loc, wal_frame, wire, wire_channels, write_part, Step, Wal, FS_CLOSE, FS_FSYNC,
-    FS_MKDIR, FS_OPEN, FS_OPEN_CREATE, FS_WRITE, STEP_BURST, WAL_PATH_MAX,
+    FS_MKDIR, FS_OPEN, FS_OPEN_CREATE, FS_WRITE, WAL_PATH_MAX,
 };
 use crate::abi::contracts::key_vault as kv;
 use crate::abi::SyscallTable;
 use crate::store_dir::{StoreDir, STORE_DIR_MAX};
+use fluxor_rt::StepReturn;
 
 /// Incarnations reserved per allocator write.
 pub const INCARNATION_STRIDE: u64 = 64;
@@ -1081,16 +1082,16 @@ fn add_mark(r: &mut Record, epoch: u32, segment: u32) -> bool {
 /// # Safety
 /// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
 #[inline(never)]
-pub unsafe fn boot_step(s: &mut Wal, sys: &SyscallTable) -> Option<i32> {
+pub unsafe fn boot_step(s: &mut Wal, sys: &SyscallTable) -> Option<StepReturn> {
     match s.seal.phase {
         PHASE_READY => {
             drive(s, sys);
             None
         }
-        PHASE_FAULT => Some(0),
+        PHASE_FAULT => Some(StepReturn::Continue),
         _ => {
             load(s, sys);
-            Some(STEP_BURST)
+            Some(StepReturn::Burst)
         }
     }
 }
@@ -1630,9 +1631,9 @@ fn note_nonce(s: &mut Wal, inc: &[u8; sr::INCARNATION_LEN], seq: u64) -> bool {
 
 /// End replay of the open segment. `torn` marks the walk tainted so no
 /// later segment is acknowledged over the hole.
-unsafe fn end_segment(s: &mut Wal, sys: &SyscallTable, torn: bool) -> i32 {
+unsafe fn end_segment(s: &mut Wal, sys: &SyscallTable, torn: bool) -> StepReturn {
     end_replay_segment(s, sys, torn);
-    0
+    StepReturn::Continue
 }
 
 /// Replay up to `max_frames` sealed frames of the open segment. The
@@ -1645,11 +1646,11 @@ unsafe fn end_segment(s: &mut Wal, sys: &SyscallTable, torn: bool) -> i32 {
 /// # Safety
 /// Exclusive `&mut Wal`; `sys` must reach live kernel routines.
 #[inline(never)]
-pub unsafe fn replay_frames(s: &mut Wal, sys: &SyscallTable, max_frames: usize) -> i32 {
+pub unsafe fn replay_frames(s: &mut Wal, sys: &SyscallTable, max_frames: usize) -> StepReturn {
     let mut frames = 0usize;
     while frames < max_frames {
         if s.out_flushed >= 0 && !wire_channels::writable(sys, s.out_flushed) {
-            return 0;
+            return StepReturn::Continue;
         }
         frames += 1;
         let frame_start = s.replay_pos;
@@ -1669,7 +1670,7 @@ pub unsafe fn replay_frames(s: &mut Wal, sys: &SyscallTable, max_frames: usize) 
             );
             s.replay_got = got as u32;
             match io {
-                Io::Later => return 0,
+                Io::Later => return StepReturn::Continue,
                 Io::Done => {}
                 Io::End | Io::Fail(_) => return end_segment(s, sys, true),
             }
@@ -1696,7 +1697,7 @@ pub unsafe fn replay_frames(s: &mut Wal, sys: &SyscallTable, max_frames: usize) 
         );
         s.replay_got = (sr::WAL_PREFIX_LEN + got) as u32;
         match io {
-            Io::Later => return 0,
+            Io::Later => return StepReturn::Continue,
             Io::Done => {}
             Io::End | Io::Fail(_) => return end_segment(s, sys, true),
         }
@@ -1779,7 +1780,7 @@ pub unsafe fn replay_frames(s: &mut Wal, sys: &SyscallTable, max_frames: usize) 
             }
         }
     }
-    0
+    StepReturn::Continue
 }
 
 // ── Retirement ──────────────────────────────────────────────────────────

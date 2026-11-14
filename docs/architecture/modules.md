@@ -360,17 +360,17 @@ compiles the `http` component out and omits its ports entirely;
 readiness and metrics still publish on `readyz`, `why` and
 `export`, so a deployment that must not expose HTTP selects the
 variant rather than trusting a config flag.
-`operations` declares the `monitor` capability so `telemetry` can
-pull the kernel-scope step-time histogram over the monitor
-syscall; without it, bare-metal EL0 enforcement denies the call
-and the step histogram is silently empty.
+`operations` holds the `monitor` grant so `telemetry` can pull
+the kernel-scope step-time histogram over the monitor contract;
+without it the kernel refuses the call and the step histogram is
+empty.
 
-`monitor` is a node privilege, and a workload may hold no module
-permission but `observe`. A tenant graph therefore runs
+`monitor` is a node privilege, which a workload may not hold. A
+tenant graph therefore runs
 `operations_tenant` (`modules/app/operations_tenant/`): the same
 body (`operations/composite.rs`, each type's `mod.rs` naming its
 `KERNEL_STEPS`), the same ports, params, variants and metrics, and a
-manifest equal to `operations`' less `permissions`
+manifest equal to `operations`' less `grants`
 (`tests/operations_tenant.rs` holds them equal). Its telemetry never
 asks for the kernel's step histograms: its export carries the global
 histogram's records empty and no per-module ones, while the

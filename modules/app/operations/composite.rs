@@ -8,17 +8,10 @@
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/http_admin.rs"]
 mod http_admin;
@@ -42,12 +35,7 @@ mod telemetry;
 #[path = "../operations/http.rs"]
 mod http;
 
-/// Step-return code classifying this step as bursty work for the
-/// scheduler (same contract as wal's STEP_BURST): set when the http
-/// component advanced a request, reply or stream slice.
-const STEP_BURST: i32 = 2;
-
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     1, admin_svid_prefix, blob, 0
@@ -125,11 +113,7 @@ struct ModuleState {
     comp_step_last_ms: u64,
 }
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -151,9 +135,9 @@ pub unsafe extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
+    // SAFETY: per the module ABI (`fluxor_abi`),
     // the kernel passes a valid, exclusively-borrowed `state` of
-    // at least `module_state_size()` bytes, and a `syscalls`
+    // at least `MODULE_STATE_BYTES` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
     // The dereferences and syscall invocations below rely on
     // those guarantees.
@@ -227,10 +211,10 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
+    // SAFETY: per the module ABI (`fluxor_abi`),
     // the kernel passes a valid, exclusively-borrowed `state` of
-    // at least `module_state_size()` bytes, and a `syscalls`
+    // at least `MODULE_STATE_BYTES` bytes, and a `syscalls`
     // table whose function pointers reach live kernel routines.
     // The dereferences and syscall invocations below rely on
     // those guarantees.
@@ -381,10 +365,10 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
 
         #[cfg(feature = "http")]
         if http::take_worked(&mut s.http) {
-            return STEP_BURST;
+            return StepReturn::Burst;
         }
 
-        0
+        StepReturn::Continue
     }
 }
 

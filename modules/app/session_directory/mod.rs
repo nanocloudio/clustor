@@ -110,25 +110,18 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    unused_imports,
     dead_code,
-    unreachable_patterns,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; defensive `_ =>` arms are intentional"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other clustor modules and the \
+              host tests"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 use abi::contracts::net::session_ctrl;
 #[path = "../../common/attachment_registry.rs"]
@@ -154,8 +147,7 @@ mod reservation_registry;
 mod session_registry;
 /// The SDK's SHA-256: the digest the VIP registry derives emission-token
 /// capabilities with (and the custody-context digest for bound keys).
-#[path = "../../../target/fluxor/fluxor-abi/sdk/crypto/sha256.rs"]
-mod sha256;
+use fluxor_sdk::crypto::sha256;
 #[path = "../../common/slot_index.rs"]
 mod slot_index;
 #[path = "../../common/transport_registry.rs"]
@@ -193,8 +185,8 @@ use operation_registry::{
 };
 use region_registry::{
     RegionRegistry, RgExportCursor, RgInstaller, RgReply, RG_INVALIDATE_LEN, RG_MAX_CMD,
-    RG_OP_INVALIDATE, RG_OWNERS_PI5, RG_OWNERS_RP2350, RG_OWNERS_SERVER, RG_PROFILE_PI5,
-    RG_PROFILE_RP2350, RG_PROFILE_SERVER, RG_REPLY_LEN, RG_SNAP_MAX_UNIT,
+    RG_OP_INVALIDATE, RG_PROFILE_PI5, RG_PROFILE_RP2350, RG_PROFILE_SERVER, RG_REPLY_LEN,
+    RG_SNAP_MAX_UNIT,
 };
 use replica_facade::{CommitOrderError, CommittedSubscriber, TAGGED_PROPOSAL_HDR};
 use reservation_registry::{
@@ -211,9 +203,8 @@ use transport_registry::{
 };
 use vip_registry::{
     build_seed, SeedPacer, SeedStep, VbExportCursor, VbInstaller, VipRegistry, VipReply,
-    VB_MAX_CMD, VB_OP_ACTIVATE, VB_OP_SEED, VB_OWNERS_PI5, VB_OWNERS_RP2350, VB_OWNERS_SERVER,
-    VB_PROFILE_PI5, VB_PROFILE_RP2350, VB_PROFILE_SERVER, VB_REPLY_LEN, VB_SEED, VB_SNAP_MAX_UNIT,
-    VB_ST_CONFLICT, VB_ST_OK, VB_ST_UNAUTHORIZED, VB_TOKEN_LEN,
+    VB_MAX_CMD, VB_OP_ACTIVATE, VB_OP_SEED, VB_PROFILE_PI5, VB_PROFILE_RP2350, VB_PROFILE_SERVER,
+    VB_REPLY_LEN, VB_SEED, VB_SNAP_MAX_UNIT, VB_ST_CONFLICT, VB_ST_OK, VB_ST_UNAUTHORIZED,
 };
 
 // ── Profile (variant-selected arenas) ───────────────────────────────
@@ -228,10 +219,10 @@ mod profile {
     pub const DEADLINES: usize = SR_DEADLINES_SERVER;
     pub const FLOWS: usize = TR_PROFILE_SERVER;
     pub const BINDINGS: usize = VB_PROFILE_SERVER;
-    pub const OWNERS: usize = VB_OWNERS_SERVER;
+    pub const OWNERS: usize = vip_registry::VB_OWNERS_SERVER;
     pub const OPERATIONS: usize = FO_PROFILE_SERVER;
     pub const SERVICES: usize = RG_PROFILE_SERVER;
-    pub const REGIONS: usize = RG_OWNERS_SERVER;
+    pub const REGIONS: usize = region_registry::RG_OWNERS_SERVER;
     pub const RECORDS: usize = OP_PROFILE_SERVER;
     pub const ATTACHMENTS: usize = AT_PROFILE_SERVER;
     pub const PRODUCERS: usize = AT_SERVICES_SERVER;
@@ -245,10 +236,10 @@ mod profile {
     pub const DEADLINES: usize = SR_DEADLINES_PI5;
     pub const FLOWS: usize = TR_PROFILE_PI5;
     pub const BINDINGS: usize = VB_PROFILE_PI5;
-    pub const OWNERS: usize = VB_OWNERS_PI5;
+    pub const OWNERS: usize = vip_registry::VB_OWNERS_PI5;
     pub const OPERATIONS: usize = FO_PROFILE_PI5;
     pub const SERVICES: usize = RG_PROFILE_PI5;
-    pub const REGIONS: usize = RG_OWNERS_PI5;
+    pub const REGIONS: usize = region_registry::RG_OWNERS_PI5;
     pub const RECORDS: usize = OP_PROFILE_PI5;
     pub const ATTACHMENTS: usize = AT_PROFILE_PI5;
     pub const PRODUCERS: usize = AT_SERVICES_PI5;
@@ -262,10 +253,10 @@ mod profile {
     pub const DEADLINES: usize = SR_DEADLINES_RP2350;
     pub const FLOWS: usize = TR_PROFILE_RP2350;
     pub const BINDINGS: usize = VB_PROFILE_RP2350;
-    pub const OWNERS: usize = VB_OWNERS_RP2350;
+    pub const OWNERS: usize = vip_registry::VB_OWNERS_RP2350;
     pub const OPERATIONS: usize = FO_PROFILE_RP2350;
     pub const SERVICES: usize = RG_PROFILE_RP2350;
-    pub const REGIONS: usize = RG_OWNERS_RP2350;
+    pub const REGIONS: usize = region_registry::RG_OWNERS_RP2350;
     pub const RECORDS: usize = OP_PROFILE_RP2350;
     pub const ATTACHMENTS: usize = AT_PROFILE_RP2350;
     pub const PRODUCERS: usize = AT_SERVICES_RP2350;
@@ -800,9 +791,8 @@ mod params_def {
     use super::p_u32;
     use super::p_u8;
     use super::ModuleState;
-    use super::SCHEMA_MAX;
 
-    define_params! {
+    fluxor_rt::define_params! {
         ModuleState;
 
         1, replica_id, u8, 0
@@ -1195,11 +1185,7 @@ unsafe fn mon_reply(s: &mut ModuleState, reply: &SessionReply) {
 
 // ── Module interface ────────────────────────────────────────────────
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -1222,7 +1208,7 @@ pub unsafe extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     // SAFETY: per the module ABI, the kernel passes a valid,
-    // exclusively-borrowed `state` of at least `module_state_size()`
+    // exclusively-borrowed `state` of at least `MODULE_STATE_BYTES`
     // bytes and a live syscall table.
     unsafe {
         if syscalls.is_null() || state.is_null() {
@@ -2145,7 +2131,7 @@ fn export_stage(s: &mut ModuleState) {
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // SAFETY: per the module ABI, `state` is valid and exclusively
     // borrowed; the syscall table is live.
     unsafe {
@@ -2852,6 +2838,6 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
             }
         }
 
-        0
+        StepReturn::Continue
     }
 }

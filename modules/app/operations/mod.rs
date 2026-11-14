@@ -66,9 +66,10 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other clustor modules and the \
+              host tests"
 )]
 
 /// The kernel step-time scrape (`STEP_HISTOGRAM_QUERY`, under `monitor`):

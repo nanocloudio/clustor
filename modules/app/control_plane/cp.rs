@@ -9,7 +9,6 @@
 //! optional — graphs without tenancy leave them unwired.
 
 use super::abi::SyscallTable;
-use super::dev_millis;
 use super::{wire, wire_channels};
 
 const REFRESH_FRESH_MS: u64 = 5000;

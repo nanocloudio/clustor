@@ -40,24 +40,18 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other clustor modules and the \
+              host tests"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/fs_step.rs"]
 mod fs_step;
@@ -188,7 +182,7 @@ const OPEN_RETRY_MAX_DEFAULT: u32 = 60_000;
 /// instead of after the full E_AGAIN patience window.
 const OPEN_HARD_FAIL_RETRIES: u32 = 200;
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     // Bytes per FS_WRITE. Clamped to BLOCK_MAX.
@@ -352,11 +346,7 @@ struct ModuleState {
     log_buf: [u8; LOG_BUF_LEN],
 }
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -378,9 +368,9 @@ pub unsafe extern "C" fn module_new(
     state_size: usize,
     syscalls: *const c_void,
 ) -> i32 {
-    // SAFETY: per the module ABI (target/fluxor/fluxor-abi/sdk/abi.rs),
+    // SAFETY: per the module ABI (`fluxor_abi`),
     // the kernel passes a valid, exclusively-borrowed `state` of at least
-    // `module_state_size()` bytes and a live `syscalls` table.
+    // `MODULE_STATE_BYTES` bytes and a live `syscalls` table.
     unsafe {
         if syscalls.is_null() || state.is_null() {
             return -1;
@@ -840,21 +830,9 @@ fn kbps(bytes: u64, elapsed_us: u64) -> u32 {
     }
 }
 
-/// Self-driven module: the bench has no input port to wake it, so it must
-/// be stepped every tick regardless of channel activity. The bare-metal
-/// scheduler only steps an input-less module when it advertises deferred
-/// readiness (mirrors fluxor's `nvme_perf_probe`); without this, the pi5
-/// scheduler never calls `module_step` and the bench sits in PH_OPEN.
-/// (On linux every module is stepped, so this is a no-op there.)
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_deferred_ready"]
-pub extern "C" fn module_deferred_ready() -> u32 {
-    1
-}
-
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // SAFETY: see module_new — the kernel hands us a live state + syscalls.
     unsafe {
         let s = &mut *(state as *mut ModuleState);
@@ -888,7 +866,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // default and never gate it.)
         if s.steps == 1 {
             emit_metrics(s, sys);
-            return 3; // StepOutcome::Ready
+            return StepReturn::Ready; // StepOutcome::Ready
         }
 
         // Defer the first FS op past the log_net history-skip (~30 s TAIL
@@ -898,7 +876,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // emitting during the wait, so liveness stays observable.
         if (dev_millis(sys) as u32) < s.start_delay_ms {
             emit_metrics(s, sys);
-            return 0;
+            return StepReturn::Continue;
         }
 
         match s.phase {
@@ -961,7 +939,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                     if !probe_fs_caps(s, sys) {
                         // Asked again next step, on the same descriptor.
                         emit_metrics(s, sys);
-                        return 0;
+                        return StepReturn::Continue;
                     }
                     if !s.name_fenced {
                         if s.fs_caps & FS_CAP_FSYNC_NAME == 0 {
@@ -980,13 +958,13 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                             if later(rc) {
                                 // The same fence is asked again next step.
                                 emit_metrics(s, sys);
-                                return 0;
+                                return StepReturn::Continue;
                             }
                             if rc != 0 {
                                 s.io_errors = s.io_errors.saturating_add(1);
                                 bench_abort(s, sys, b"[nvbench] FAIL name fence rc=", rc);
                                 emit_metrics(s, sys);
-                                return 0;
+                                return StepReturn::Continue;
                             }
                             s.name_fenced = true;
                         }
@@ -1141,7 +1119,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         s.open_retries += 1;
                         if s.open_retries < s.open_retry_max {
                             emit_metrics(s, sys);
-                            return 0;
+                            return StepReturn::Continue;
                         }
                         // Fall through to fail on persistent E_AGAIN.
                     }
@@ -1165,7 +1143,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
                         // so the open's directory walk and the first read chunk
                         // don't share one step's deadline.
                         emit_metrics(s, sys);
-                        return 0;
+                        return StepReturn::Continue;
                     }
                 }
 
@@ -1247,7 +1225,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         // Emit metrics each second so /metrics carries live progress and
         // the final floor numbers.
         emit_metrics(s, sys);
-        0
+        StepReturn::Continue
     }
 }
 

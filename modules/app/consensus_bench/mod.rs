@@ -19,24 +19,18 @@
 
 #![cfg_attr(not(feature = "host-test"), no_std)]
 #![allow(
-    unused_imports,
     dead_code,
-    reason = "the fluxor SDK is include!'d wholesale and each module consumes only a subset; pending upstream allow attributes in target/fluxor/fluxor-abi/sdk/"
+    reason = "mounts shared cores from modules/common whole and uses a subset of \
+              each; their other items serve the other clustor modules and the \
+              host tests"
 )]
 
 use core::ffi::c_void;
 
-#[allow(
-    unused_imports,
-    dead_code,
-    reason = "see file-level allow: SDK surface is shared across modules"
-)]
-#[path = "../../../target/fluxor/fluxor-abi/sdk/abi.rs"]
-mod abi;
 use abi::SyscallTable;
+use fluxor_abi as abi;
 
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime.rs");
-include!("../../../target/fluxor/fluxor-abi/sdk/runtime/params.rs");
+use fluxor_rt::*;
 
 #[path = "../../common/log_fmt.rs"]
 mod log_fmt;
@@ -53,7 +47,7 @@ const PH_WARMUP: u8 = 0;
 const PH_INJECT: u8 = 1;
 const PH_DONE: u8 = 2;
 
-define_params! {
+fluxor_rt::define_params! {
     ModuleState;
 
     // Total proposals to inject before idling.
@@ -108,11 +102,7 @@ struct ModuleState {
     log_buf: [u8; 96],
 }
 
-#[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
-#[link_section = ".text.module_state_size"]
-pub extern "C" fn module_state_size() -> u32 {
-    core::mem::size_of::<ModuleState>() as u32
-}
+fluxor_rt::module_facts! { state: ModuleState }
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -135,7 +125,7 @@ pub unsafe extern "C" fn module_new(
     syscalls: *const c_void,
 ) -> i32 {
     // SAFETY: the kernel hands us a live, exclusively-borrowed state of
-    // at least module_state_size() bytes and a live syscall table.
+    // at least `MODULE_STATE_BYTES` bytes and a live syscall table.
     unsafe {
         if syscalls.is_null() || state.is_null() {
             return -1;
@@ -185,7 +175,7 @@ pub unsafe extern "C" fn module_new(
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_step"]
-pub extern "C" fn module_step(state: *mut u8) -> i32 {
+pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
     // SAFETY: see module_new.
     unsafe {
         let s = &mut *(state as *mut ModuleState);
@@ -270,7 +260,7 @@ pub extern "C" fn module_step(state: *mut u8) -> i32 {
         }
 
         emit_metrics(s, sys, now);
-        0
+        StepReturn::Continue
     }
 }
 

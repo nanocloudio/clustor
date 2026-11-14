@@ -1,5 +1,5 @@
 //! The caller's half of the non-blocking `fs` contract
-//! (`target/fluxor/fluxor-abi/sdk/contracts/storage/fs.rs`).
+//! (`fluxor_abi::contracts::storage::fs`).
 //!
 //! No fs call waits on the device. A call answers a result, `EAGAIN`
 //! ("nothing moved, ask again later, with any arguments") or, for the
