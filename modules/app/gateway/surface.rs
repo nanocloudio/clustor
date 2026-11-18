@@ -40,6 +40,11 @@ pub enum Inbound {
     },
 }
 
+/// Largest record this surface writes on `responses` and
+/// `client_responses`, envelope included: the module's `max_record` on
+/// both ports.
+pub const RESPONSE_RECORD_MAX: usize = 256;
+
 #[repr(C)]
 pub struct Surface {
     pub in_requests: i32,   // in: cleartext MSG_CLIENT_FRAME from peer_router
@@ -66,7 +71,7 @@ pub struct Surface {
     retry_len: u16,
     /// The port the retained frame is owed to.
     retry_port: i32,
-    retry_frame: [u8; 256],
+    retry_frame: [u8; RESPONSE_RECORD_MAX],
     /// Responses dropped because the retry slot was still occupied
     /// when another send arrived (bounded stash, counted loss).
     responses_dropped: u32,
@@ -356,8 +361,8 @@ pub unsafe fn send_response(
     let inner_len = payload.len() - 2;
     let body_len = 2 + wire::ENVELOPE_HDR + inner_len;
     let total = wire::ENVELOPE_HDR + body_len;
-    let mut frame = [0u8; 256];
-    if total > 256 {
+    let mut frame = [0u8; RESPONSE_RECORD_MAX];
+    if total > RESPONSE_RECORD_MAX {
         return false;
     }
     let h = wire::ENVELOPE_HDR;

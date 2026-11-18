@@ -104,6 +104,9 @@ buffer_size = 16384
 # application routes; answers leave on `response_out`.
 max_record = 8192
 rate_class_max = "transaction"
+# The requests are HTTP: methods for verbs, header fields for meta.
+[ports.facts]
+binding = ["http"]
 
 # ── outputs ──────────────────────────────────────────────────
 

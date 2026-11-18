@@ -24,6 +24,7 @@ use super::store_dir::{StoreDir, STORE_DIR_MAX};
 use super::{fs_step, sealed};
 use fs_step::{later, Io};
 
+use crate::abi::contracts::storage::fs::seek;
 const FS_OPEN: u32 = crate::abi::registry::fs::OPEN;
 const FS_READ: u32 = crate::abi::registry::fs::READ;
 const FS_SEEK: u32 = crate::abi::registry::fs::SEEK;
@@ -2114,7 +2115,14 @@ unsafe fn restore_begin(s: &mut Snapshot, term: Term, index: Index, total: u64, 
 /// Close the restore's file and key.
 unsafe fn restore_close(s: &mut Snapshot, sys: &SyscallTable) {
     if s.rs_fd >= 0 {
-        (sys.provider_call)(s.rs_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.rs_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.rs_fd = -1;
     }
     s.rs_seeked = false;
@@ -2418,7 +2426,14 @@ unsafe fn export_staged(s: &mut Snapshot, sys: &SyscallTable, term: Term, index:
 /// `sys` must reach live kernel routines per the module ABI.
 unsafe fn export_end(s: &mut Snapshot, sys: &SyscallTable) {
     if s.ex_fd >= 0 {
-        (sys.provider_call)(s.ex_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.ex_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.ex_fd = -1;
     }
     if s.ex_reader.key >= 0 {
@@ -2781,7 +2796,14 @@ unsafe fn build_snap_pointer_path(s: &mut Snapshot) -> usize {
 /// `sys` must reach live kernel routines per the module ABI.
 unsafe fn p_close(s: &mut Snapshot, sys: &SyscallTable) {
     if s.p_fd >= 0 {
-        (sys.provider_call)(s.p_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.p_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.p_fd = -1;
     }
 }
@@ -2849,7 +2871,14 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable) -> Step {
                     continue;
                 }
                 let plen = build_snap_ptr_slot_path(s, s.p_mslot);
-                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    s.path_buf.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(fd) {
                     return Step::Later;
                 }
@@ -2873,8 +2902,15 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable) -> Step {
                 // created a moment ago reads 0, one written by a previous
                 // boot reads SNAP_PTR_SIZE and keeps whatever record it holds.
                 if !s.p_seeked {
-                    let seek = 0i32.to_le_bytes();
-                    let rc = (sys.provider_call)(s.p_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                    let mut pos = seek::encode(0);
+                    let rc = (sys.provider_call)(
+                        s.p_fd,
+                        FS_SEEK,
+                        pos.as_mut_ptr(),
+                        seek::ARG_LEN,
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     if later(rc) {
                         return Step::Later;
                     }
@@ -2910,8 +2946,15 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable) -> Step {
             }
             P_MAT_NEUTRAL => {
                 if !s.p_seeked {
-                    let seek = 0i32.to_le_bytes();
-                    let rc = (sys.provider_call)(s.p_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                    let mut pos = seek::encode(0);
+                    let rc = (sys.provider_call)(
+                        s.p_fd,
+                        FS_SEEK,
+                        pos.as_mut_ptr(),
+                        seek::ARG_LEN,
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     if later(rc) {
                         return Step::Later;
                     }
@@ -2938,7 +2981,14 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable) -> Step {
                 }
             }
             P_MAT_FSYNC => {
-                let rc = (sys.provider_call)(s.p_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.p_fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return Step::Later;
                 }
@@ -2964,7 +3014,14 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable) -> Step {
                 // adopted, so no publish below ever mutates the directory.
                 let slot = 1 - (s.snap_ptr_slot & 1);
                 let plen = build_snap_ptr_slot_path(s, slot);
-                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    s.path_buf.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(fd) {
                     return Step::Later;
                 }
@@ -3004,7 +3061,14 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable) -> Step {
                 }
             }
             P_FSYNC => {
-                let rc = (sys.provider_call)(s.p_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.p_fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return Step::Later;
                 }
@@ -3022,8 +3086,15 @@ unsafe fn persist_snap_pointer(s: &mut Snapshot, sys: &SyscallTable) -> Step {
                 // accepted — a short or mis-encoded write is caught here; the
                 // fsync above is what carries them to media.
                 if !s.p_seeked {
-                    let seek = 0i32.to_le_bytes();
-                    let rc = (sys.provider_call)(s.p_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                    let mut pos = seek::encode(0);
+                    let rc = (sys.provider_call)(
+                        s.p_fd,
+                        FS_SEEK,
+                        pos.as_mut_ptr(),
+                        seek::ARG_LEN,
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     if later(rc) {
                         return Step::Later;
                     }
@@ -3094,7 +3165,14 @@ unsafe fn collect_snap_ptr_candidates(s: &mut Snapshot, sys: &SyscallTable) -> b
             } else {
                 build_snap_ptr_slot_path(s, s.bp_slot)
             };
-            let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+            let fd = (sys.provider_call)(
+                -1,
+                FS_OPEN,
+                s.path_buf.as_mut_ptr(),
+                plen,
+                core::ptr::null_mut(),
+                0,
+            );
             if later(fd) {
                 return true;
             }
@@ -3117,7 +3195,14 @@ unsafe fn collect_snap_ptr_candidates(s: &mut Snapshot, sys: &SyscallTable) -> b
         if io == Io::Later {
             return true;
         }
-        (sys.provider_call)(s.bp_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.bp_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.bp_fd = -1;
         let slot = s.bp_slot;
         s.bp_slot += 1;
@@ -3289,7 +3374,14 @@ pub unsafe fn boot_restore(s: &mut Snapshot, sys: &SyscallTable) -> bool {
 /// `sys` must reach live kernel routines per the module ABI.
 unsafe fn bl_close(s: &mut Snapshot, sys: &SyscallTable) {
     if s.bl_fd >= 0 {
-        (sys.provider_call)(s.bl_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.bl_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.bl_fd = -1;
     }
     if s.bl_reader.key >= 0 {
@@ -3326,7 +3418,14 @@ unsafe fn boot_load_step(s: &mut Snapshot, sys: &SyscallTable) {
         match s.bl_phase {
             BL_OPEN => {
                 let plen = build_snapshot_path(s, s.boot_ptr_index);
-                let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN,
+                    s.path_buf.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(fd) {
                     return;
                 }
@@ -3464,8 +3563,15 @@ unsafe fn boot_load_step(s: &mut Snapshot, sys: &SyscallTable) {
             }
             BL_SEALED => {
                 if !s.bl_seeked {
-                    let start = (SNAP_HDR_LEN as i32).to_le_bytes();
-                    let rc = (sys.provider_call)(s.bl_fd, FS_SEEK, start.as_ptr() as *mut u8, 4);
+                    let mut start = seek::encode(SNAP_HDR_LEN as u64);
+                    let rc = (sys.provider_call)(
+                        s.bl_fd,
+                        FS_SEEK,
+                        start.as_mut_ptr(),
+                        seek::ARG_LEN,
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     if later(rc) {
                         return;
                     }
@@ -3674,11 +3780,11 @@ unsafe fn ensure_fs_caps(s: &mut Snapshot, sys: &SyscallTable) -> bool {
         return true;
     }
     let mut caps = [0u8; 4];
-    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4, core::ptr::null_mut(), 0);
     if later(rc) {
         return false;
     }
-    let bits = if rc == 4 { u32::from_le_bytes(caps) } else { 0 };
+    let bits = if rc == 0 { u32::from_le_bytes(caps) } else { 0 };
     s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
     s.name_fence_probe = if bits & FS_CAP_FSYNC_NAME != 0 {
         NAME_FENCE_PRESENT
@@ -3711,7 +3817,14 @@ unsafe fn publish_name(s: &mut Snapshot, sys: &SyscallTable, plen: usize) -> Ste
         s.name_unfenced = s.name_unfenced.saturating_add(1);
         return Step::Done;
     }
-    let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, s.path_buf.as_mut_ptr(), plen);
+    let rc = (sys.provider_call)(
+        -1,
+        FS_FSYNC_NAME,
+        s.path_buf.as_mut_ptr(),
+        plen,
+        core::ptr::null_mut(),
+        0,
+    );
     if later(rc) {
         return Step::Later;
     }
@@ -3782,7 +3895,14 @@ unsafe fn unlink_step(s: &mut Snapshot, sys: &SyscallTable) {
                     s.ul_phase = UL_IDLE;
                     continue;
                 }
-                let rc = (sys.provider_call)(-1, FS_UNLINK, s.path_buf.as_mut_ptr(), plen);
+                let rc = (sys.provider_call)(
+                    -1,
+                    FS_UNLINK,
+                    s.path_buf.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if rc == FS_E_INPROGRESS {
                     s.ul_taken = true;
                 }
@@ -3846,7 +3966,14 @@ unsafe fn snap_open_body(
         if plen == 0 {
             return Io::Fail(-1);
         }
-        let opened = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), plen);
+        let opened = (sys.provider_call)(
+            -1,
+            FS_OPEN,
+            s.path_buf.as_mut_ptr(),
+            plen,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(opened) {
             return Io::Later;
         }
@@ -3857,13 +3984,27 @@ unsafe fn snap_open_body(
         *seeked = false;
     }
     if !*seeked {
-        let off = (SNAP_HDR_LEN as i32).to_le_bytes();
-        let rc = (sys.provider_call)(*fd, FS_SEEK, off.as_ptr() as *mut u8, 4);
+        let mut off = seek::encode(SNAP_HDR_LEN as u64);
+        let rc = (sys.provider_call)(
+            *fd,
+            FS_SEEK,
+            off.as_mut_ptr(),
+            seek::ARG_LEN,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(rc) {
             return Io::Later;
         }
         if rc < 0 {
-            (sys.provider_call)(*fd, FS_CLOSE, core::ptr::null_mut(), 0);
+            (sys.provider_call)(
+                *fd,
+                FS_CLOSE,
+                core::ptr::null_mut(),
+                0,
+                core::ptr::null_mut(),
+                0,
+            );
             *fd = -1;
             return Io::Fail(rc);
         }
@@ -3978,7 +4119,14 @@ unsafe fn snap_begin(
     if plen == 0 {
         return (false, false);
     }
-    let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
+    let fd = (sys.provider_call)(
+        -1,
+        FS_OPEN_CREATE,
+        s.path_buf.as_mut_ptr(),
+        plen,
+        core::ptr::null_mut(),
+        0,
+    );
     if !later(fd) && fd < 0 {
         // Genuinely no FS provider (in-memory graph): nothing to durably
         // install. ANY other error (EIO, ENOSPC, missing parent dir)
@@ -4003,7 +4151,14 @@ unsafe fn snap_begin(
         };
         if s.wkey < 0 {
             if fd >= 0 {
-                (sys.provider_call)(fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                (sys.provider_call)(
+                    fd,
+                    FS_CLOSE,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
             }
             s.seal_failures = s.seal_failures.saturating_add(1);
             dev_log(sys, 2, b"[snap] seal key unavailable".as_ptr(), 27);
@@ -4166,7 +4321,14 @@ unsafe fn drain_append(s: &mut Snapshot, sys: &SyscallTable) -> Step {
 /// `&SyscallTable` per the module ABI.
 unsafe fn snap_abort(s: &mut Snapshot, sys: &SyscallTable) {
     if s.wfd >= 0 {
-        (sys.provider_call)(s.wfd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.wfd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.wfd = -1;
     }
     s.wbody = 0;
@@ -4185,7 +4347,14 @@ unsafe fn snap_abort(s: &mut Snapshot, sys: &SyscallTable) {
     s.wq_moved = 0;
     s.p_phase = P_IDLE;
     if s.p_fd >= 0 {
-        (sys.provider_call)(s.p_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.p_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.p_fd = -1;
     }
 }
@@ -4246,8 +4415,15 @@ unsafe fn w_seek(s: &mut Snapshot, sys: &SyscallTable, at: u32) -> Step {
     if s.w_seeked {
         return Step::Done;
     }
-    let arg = (at as i32).to_le_bytes();
-    let rc = (sys.provider_call)(s.wfd, FS_SEEK, arg.as_ptr() as *mut u8, 4);
+    let mut arg = seek::encode(u64::from(at));
+    let rc = (sys.provider_call)(
+        s.wfd,
+        FS_SEEK,
+        arg.as_mut_ptr(),
+        seek::ARG_LEN,
+        core::ptr::null_mut(),
+        0,
+    );
     if later(rc) {
         return Step::Later;
     }
@@ -4270,7 +4446,14 @@ unsafe fn drive_writer(s: &mut Snapshot, sys: &SyscallTable) {
         match s.w_phase {
             W_OPEN => {
                 let plen = build_snapshot_path(s, s.windex);
-                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, s.path_buf.as_mut_ptr(), plen);
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    s.path_buf.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(fd) {
                     return;
                 }
@@ -4459,7 +4642,14 @@ unsafe fn drive_writer(s: &mut Snapshot, sys: &SyscallTable) {
             W_FIN_FSYNC => {
                 // Durability is fenced BEFORE the close: CLOSE never waits
                 // and reports no write-back failure.
-                let rc = (sys.provider_call)(s.wfd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.wfd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return;
                 }
@@ -4467,7 +4657,14 @@ unsafe fn drive_writer(s: &mut Snapshot, sys: &SyscallTable) {
                     fail_writer(s, sys);
                     return;
                 }
-                (sys.provider_call)(s.wfd, FS_CLOSE, core::ptr::null_mut(), 0);
+                (sys.provider_call)(
+                    s.wfd,
+                    FS_CLOSE,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 s.wfd = -1;
                 s.w_phase = W_FIN_NAME;
             }

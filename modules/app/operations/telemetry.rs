@@ -462,6 +462,8 @@ unsafe fn build_export(t: &mut Telemetry, sys: &SyscallTable) -> usize {
             STEP_HISTOGRAM_QUERY,
             sb.as_mut_ptr() as *mut u8,
             STEP_HIST_BUCKETS * 4,
+            core::ptr::null_mut(),
+            0,
         );
         if rc < 0 {
             continue;
@@ -587,6 +589,8 @@ pub unsafe fn step(t: &mut Telemetry, sys: &SyscallTable, now: u64) {
                 STEP_HISTOGRAM_QUERY,
                 sb.as_mut_ptr() as *mut u8,
                 STEP_HIST_BUCKETS * 4,
+                core::ptr::null_mut(),
+                0,
             );
             if rc >= 0 {
                 t.step_buckets = sb;

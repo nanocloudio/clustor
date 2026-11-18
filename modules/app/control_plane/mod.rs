@@ -658,7 +658,13 @@ unsafe fn drain_migration_commands(s: &mut ModuleState, sys: &SyscallTable, now:
     }
 }
 
-fluxor_rt::module_facts! { state: ModuleState }
+// `committed_entries` is read an envelope at a time whatever its size
+// (`wire_channels::channel_read_msg` drains one that does not fit), so
+// it takes any record a channel carries.
+fluxor_rt::module_facts! {
+    state: ModuleState,
+    records: [in 1 COMMITTED_ENTRIES_ACCEPTS_RECORD = abi::CHANNEL_BUFFER_SIZE],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

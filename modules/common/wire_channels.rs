@@ -166,13 +166,12 @@ pub unsafe fn next_msg(
 /// payload.len()`) on success, or `<= 0` when the frame did not fit (the
 /// channel is full) or is oversize — in which case NOTHING was written.
 ///
-/// Why one write, not two: fluxor FIFO channels are byte rings whose
-/// `channel_write` is **all-or-nothing** (`kernel::ringbuf::write` returns
-/// 0 if the frame doesn't fit — "partial writes corrupt byte-stream
-/// framing"). Writing the header and payload as two separate
-/// `channel_write` calls therefore tears a frame whenever the ring has
-/// room for the header but not the payload: the header commits, the
-/// payload write returns 0, and every subsequent frame on the channel is
+/// Why one write, not two: a `channel_write` is one record, whole or not
+/// at all (`EAGAIN` when it does not fit now). Writing the header and
+/// payload as two separate `channel_write` calls therefore tears a frame
+/// whenever the ring has room for the header but not the payload: the
+/// header commits, the payload write is refused, and every subsequent
+/// frame on the channel is
 /// misaligned (the reader takes the next frame's bytes as this one's
 /// payload). At saturation a downstream that frees ~one frame per step
 /// keeps the ring in exactly that danger zone, so the tear is the common
@@ -287,7 +286,7 @@ pub unsafe fn channel_read_msg(
     }
 
     let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), plen);
-    if (n2 as usize) < plen {
+    if n2 < 0 || (n2 as usize) < plen {
         return (0, 0);
     }
 
@@ -360,7 +359,7 @@ pub unsafe fn channel_read_partitioned(
     }
 
     let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), plen);
-    if (n2 as usize) < plen {
+    if n2 < 0 || (n2 as usize) < plen {
         return (0, 0, 0);
     }
 
@@ -434,7 +433,7 @@ pub unsafe fn channel_read_routed(
     }
 
     let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), plen);
-    if (n2 as usize) < plen {
+    if n2 < 0 || (n2 as usize) < plen {
         return (0, 0, 0);
     }
 
@@ -512,7 +511,7 @@ pub unsafe fn channel_read_routed_partitioned(
     }
 
     let n2 = (sys.channel_read)(chan, buf.as_mut_ptr(), plen);
-    if (n2 as usize) < plen {
+    if n2 < 0 || (n2 as usize) < plen {
         return (0, 0, 0, 0);
     }
 

@@ -64,6 +64,7 @@ mod wire;
 mod wire_channels;
 use log_fmt::{log_field, log_field_i32};
 
+use abi::contracts::storage::fs::seek;
 // dev_fs opcodes (mirror `abi::dev_fs`; see modules/app/wal/mod.rs).
 const FS_OPEN: u32 = abi::registry::fs::OPEN;
 const FS_READ: u32 = abi::registry::fs::READ;
@@ -503,7 +504,14 @@ unsafe fn fsync_timed(s: &mut ModuleState, sys: &SyscallTable) -> Option<i32> {
         s.fs_pending = true;
         s.fs_t0 = dev_micros(sys);
     }
-    let rc = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
+    let rc = (sys.provider_call)(
+        s.fd,
+        FS_FSYNC,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     if later(rc) {
         return None;
     }
@@ -632,12 +640,12 @@ unsafe fn bench_abort(s: &mut ModuleState, sys: &SyscallTable, what: &[u8], rc: 
 /// `sys` must be live.
 unsafe fn probe_fs_caps(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     let mut caps = [0u8; 4];
-    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4, core::ptr::null_mut(), 0);
     if later(rc) {
         // The volume is still attaching: never latched as "absent".
         return false;
     }
-    s.fs_caps = if rc == 4 { u32::from_le_bytes(caps) } else { 0 };
+    s.fs_caps = if rc == 0 { u32::from_le_bytes(caps) } else { 0 };
     s.fs_async = u16::from(s.fs_caps & FS_CAP_FSYNC_ASYNC != 0);
     true
 }
@@ -659,7 +667,14 @@ unsafe fn probe_fs_caps(s: &mut ModuleState, sys: &SyscallTable) -> bool {
 unsafe fn fence_submit(s: &mut ModuleState, sys: &SyscallTable) -> bool {
     let mut tb = [0u8; 8];
     let t0 = dev_micros(sys);
-    let rc = (sys.provider_call)(s.fd, FS_FSYNC_SUBMIT, tb.as_mut_ptr(), 8);
+    let rc = (sys.provider_call)(
+        s.fd,
+        FS_FSYNC_SUBMIT,
+        tb.as_mut_ptr(),
+        8,
+        core::ptr::null_mut(),
+        0,
+    );
     if later(rc) {
         s.fence_again = s.fence_again.saturating_add(1);
         return false;
@@ -706,7 +721,14 @@ unsafe fn step_seq_async(s: &mut ModuleState, sys: &SyscallTable, step_t0: u64) 
     while s.fence_count > 0 {
         let head = s.fence_head as usize % FENCE_RING_MAX;
         let mut tb = s.fence_tickets[head].to_le_bytes();
-        let rc = (sys.provider_call)(s.fd, FS_FSYNC_POLL, tb.as_mut_ptr(), 8);
+        let rc = (sys.provider_call)(
+            s.fd,
+            FS_FSYNC_POLL,
+            tb.as_mut_ptr(),
+            8,
+            core::ptr::null_mut(),
+            0,
+        );
         if rc == 1 || later(rc) {
             break;
         } // oldest still in flight; nothing newer can be done
@@ -742,7 +764,14 @@ unsafe fn step_seq_async(s: &mut ModuleState, sys: &SyscallTable, step_t0: u64) 
         // so the on-disk pattern stays one contiguous copy per block.
         let off = s.part as usize;
         let rem = bs - off;
-        let w = (sys.provider_call)(s.fd, FS_WRITE_ASYNC, s.data_buf.as_mut_ptr().add(off), rem);
+        let w = (sys.provider_call)(
+            s.fd,
+            FS_WRITE_ASYNC,
+            core::ptr::null_mut(),
+            0,
+            s.data_buf.as_mut_ptr().add(off),
+            rem,
+        );
         if later(w) || w == 0 {
             s.write_again = s.write_again.saturating_add(1);
             break;
@@ -903,6 +932,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                         FS_OPEN_CREATE,
                         path.as_ptr() as *mut u8,
                         path.len(),
+                        core::ptr::null_mut(),
+                        0,
                     );
                     s.last_open_rc = s.fd;
                 }
@@ -954,6 +985,8 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                                 FS_FSYNC_NAME,
                                 path.as_ptr() as *mut u8,
                                 path.len(),
+                                core::ptr::null_mut(),
+                                0,
                             );
                             if later(rc) {
                                 // The same fence is asked again next step.
@@ -1041,8 +1074,15 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                         s.rand_seeked = false;
                     }
                     if !s.rand_seeked {
-                        let arg = s.rand_off.to_le_bytes();
-                        let src = (sys.provider_call)(s.fd, FS_SEEK, arg.as_ptr() as *mut u8, 4);
+                        let mut arg = seek::encode(u64::from(s.rand_off));
+                        let src = (sys.provider_call)(
+                            s.fd,
+                            FS_SEEK,
+                            arg.as_mut_ptr(),
+                            seek::ARG_LEN,
+                            core::ptr::null_mut(),
+                            0,
+                        );
                         if later(src) {
                             break; // the same block's seek is asked again
                         }
@@ -1103,7 +1143,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                 // real verify failure — that IS the durability signal.
                 if s.dbg & DBG_VERIFY_OPEN == 0 {
                     if s.fd >= 0 {
-                        (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                        (sys.provider_call)(
+                            s.fd,
+                            FS_CLOSE,
+                            core::ptr::null_mut(),
+                            0,
+                            core::ptr::null_mut(),
+                            0,
+                        );
                         s.fd = -1;
                     }
                     let path: &[u8] = if s.root_path != 0 {
@@ -1111,8 +1158,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     } else {
                         PATH_WAL
                     };
-                    let rfd =
-                        (sys.provider_call)(-1, FS_OPEN, path.as_ptr() as *mut u8, path.len());
+                    let rfd = (sys.provider_call)(
+                        -1,
+                        FS_OPEN,
+                        path.as_ptr() as *mut u8,
+                        path.len(),
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     s.last_open_rc = rfd;
                     if later(rfd) {
                         // Provider not ready — retry next step (don't arm).
@@ -1151,7 +1204,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                     let mut read_sectors = 0u32;
                     let mut bad = false;
                     while s.verify_off < total && read_sectors < VERIFY_SECTORS_PER_STEP {
-                        let n = (sys.provider_call)(s.fd, FS_READ, s.vbuf.as_mut_ptr(), 512);
+                        let n = (sys.provider_call)(
+                            s.fd,
+                            FS_READ,
+                            core::ptr::null_mut(),
+                            0,
+                            s.vbuf.as_mut_ptr(),
+                            512,
+                        );
                         if later(n) {
                             // Not cached yet: the read resumes at the same
                             // offset next step. Never a verify failure.
@@ -1184,7 +1244,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
                         read_sectors += 1;
                     }
                     if bad || s.verify_off >= total {
-                        (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                        (sys.provider_call)(
+                            s.fd,
+                            FS_CLOSE,
+                            core::ptr::null_mut(),
+                            0,
+                            core::ptr::null_mut(),
+                            0,
+                        );
                         s.fd = -1;
                         let mut p = 0usize;
                         if !bad {
@@ -1208,7 +1275,14 @@ pub extern "C" fn module_step(state: *mut u8) -> StepReturn {
             }
             PH_REPORT => {
                 if s.fd >= 0 {
-                    (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                    (sys.provider_call)(
+                        s.fd,
+                        FS_CLOSE,
+                        core::ptr::null_mut(),
+                        0,
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     s.fd = -1;
                 }
                 let mut p = 0usize;

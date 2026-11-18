@@ -42,19 +42,19 @@ hardware_targets = ["bcm2712", "linux"]
 # operation is only ever the volatile variant's declared mode.
 
 # Sealing (`aead`, the WAL and snapshot seal state) calls the key vault.
-# Two things decide whether this build makes that call, and the grant names
-# both, because the grant set is what a node enforces: a module holding a
-# grant that reaches the kernel cannot be placed as a tenant at all.
+# Two things decide whether this build makes that call, and the claim names
+# both:
 #
 #   variants — only the disk build seals; the volatile build compiles the
 #     ledger out and never opens the vault.
 #   when     — sealing is chosen per instance by `aead`, and is inert at 0
 #     (its default). An instance that selects no suite never opens the
-#     vault, so it does not need the key to it.
-#
-# Declared unconditionally, every disk instance asked for the vault whether
-# or not it sealed, and any graph running one as a tenant was refused.
-grants = [{ name = "key_vault", variants = ["disk"], when = { aead = [1, 2] } }]
+#     vault, so it does not claim it.
+[[resources]]
+requires_contract = "key_vault"
+access = "write"
+variants = ["disk"]
+when = { aead = ["1", "2"] }
 
 # Both builds write through the FS contract. The volatile variant compiles
 # out the WAL LEDGER — segments and raft meta never touch disk, which is the
@@ -269,7 +269,7 @@ bounds_us = [250, 500, 1000, 2000, 4000, 6000, 8000, 10000, 15000, 20000,
 
 [[observability.instrument.dimension]]
 key    = "fluxor.slot"
-domain = "numeric"
+kind   = "numeric"
 max    = 64
 
 [[observability.instrument]]
@@ -281,7 +281,7 @@ bounds_us = [250000, 500000, 1000000, 2000000, 4000000, 8000000, 16000000,
 
 [[observability.instrument.dimension]]
 key    = "fluxor.slot"
-domain = "numeric"
+kind   = "numeric"
 max    = 64
 
 # Runtime group activation (MSG_SLOT_ACTIVATE), the durability half of a

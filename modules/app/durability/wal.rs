@@ -270,6 +270,7 @@ impl MemoryEntry {
 }
 
 // FS opcodes (from abi::dev_fs)
+use super::abi::contracts::storage::fs::{seek, stat, Stat};
 const FS_OPEN: u32 = super::abi::registry::fs::OPEN;
 const FS_READ: u32 = super::abi::registry::fs::READ;
 const FS_SEEK: u32 = super::abi::registry::fs::SEEK;
@@ -323,6 +324,12 @@ const FS_E_NOSYS: i32 = -38;
 /// (`FS_OPEN`) answers this for a name that does not exist, which is how
 /// an absent segment is told apart from a provider that is refusing.
 const FS_E_NOENT: i32 = -2;
+
+/// The size a `STAT` answer reports, saturated to the segment cursor's
+/// width; 0 for a record that does not decode.
+fn stat_size(rec: &[u8]) -> u32 {
+    Stat::decode(rec).map_or(0, |st| u32::try_from(st.size).unwrap_or(u32::MAX))
+}
 
 /// `name_fence` postures. `AUTO` publishes names through
 /// `FS_FSYNC_NAME` when the provider advertises `caps::FSYNC_NAME` and
@@ -1522,7 +1529,7 @@ pub unsafe fn step(s: &mut Wal, sys: &SyscallTable) -> StepReturn {
     // period; an unclassed legacy graph retains one-record-per-step
     // behaviour. Atomic records may overshoot the byte grant by at most
     // one validated max_record.
-    let grant = dev_input_flow_budget(sys, s.in_entries, 0) as u64;
+    let grant = dev_input_flow_budget(sys, 0) as u64;
     s.input_budget_bytes = grant.min(u32::MAX as u64) as u32;
     let mut consumed = 0u64;
     let mut records = 0usize;
@@ -2173,7 +2180,14 @@ unsafe fn begin_serve(
 /// `sys` must reach live kernel routines per the module ABI.
 unsafe fn end_serve(s: &mut Wal, sys: &SyscallTable) {
     if s.sv_own && s.sv_fd >= 0 {
-        (sys.provider_call)(s.sv_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.sv_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
     s.sv_fd = -1;
     s.sv_own = false;
@@ -2228,7 +2242,14 @@ unsafe fn continue_serve(s: &mut Wal, sys: &SyscallTable) {
             s.sv_own = false;
         } else {
             if s.serve_fd >= 0 {
-                (sys.provider_call)(s.serve_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                (sys.provider_call)(
+                    s.serve_fd,
+                    FS_CLOSE,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 s.serve_fd = -1;
             }
             let mut path = [0u8; WAL_PATH_MAX];
@@ -2239,7 +2260,14 @@ unsafe fn continue_serve(s: &mut Wal, sys: &SyscallTable) {
                 &s.dir,
                 &mut path,
             );
-            let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+            let fd = (sys.provider_call)(
+                -1,
+                FS_OPEN,
+                path.as_mut_ptr(),
+                plen,
+                core::ptr::null_mut(),
+                0,
+            );
             if later(fd) {
                 return; // the open is asked again next step
             }
@@ -2277,8 +2305,15 @@ unsafe fn continue_serve(s: &mut Wal, sys: &SyscallTable) {
     }
     if s.sv_phase == SV_SEEK {
         let off = loc.payload_offset.saturating_sub(lead);
-        let seek_arg = (off as i32).to_le_bytes();
-        let rc = (sys.provider_call)(s.sv_fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, 4);
+        let mut seek_arg = seek::encode(u64::from(off));
+        let rc = (sys.provider_call)(
+            s.sv_fd,
+            FS_SEEK,
+            seek_arg.as_mut_ptr(),
+            seek::ARG_LEN,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(rc) {
             return;
         }
@@ -2315,7 +2350,14 @@ unsafe fn continue_serve(s: &mut Wal, sys: &SyscallTable) {
         return;
     }
     if s.sv_own && s.sv_fd >= 0 {
-        (sys.provider_call)(s.sv_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.sv_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.sv_fd = -1;
         s.sv_own = false;
     }
@@ -2686,7 +2728,14 @@ unsafe fn serve_sealed(
 /// `sys` must reach live kernel routines per the module ABI.
 unsafe fn scan_next_segment(s: &mut Wal, sys: &SyscallTable) {
     if s.scan_fd >= 0 {
-        (sys.provider_call)(s.scan_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.scan_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
     s.scan_fd = -1;
     s.scan_sized = false;
@@ -2711,8 +2760,15 @@ unsafe fn scan_sealed_records(s: &mut Wal, sys: &SyscallTable) {
                 scan_next_segment(s, sys);
                 return;
             }
-            let seek = (s.scan_pos as i32).to_le_bytes();
-            let rc = (sys.provider_call)(s.scan_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+            let mut pos = seek::encode(u64::from(s.scan_pos));
+            let rc = (sys.provider_call)(
+                s.scan_fd,
+                FS_SEEK,
+                pos.as_mut_ptr(),
+                seek::ARG_LEN,
+                core::ptr::null_mut(),
+                0,
+            );
             if later(rc) {
                 return;
             }
@@ -2842,8 +2898,15 @@ unsafe fn read_located(s: &mut Wal, sys: &SyscallTable, at: u32, want: usize) ->
         return Io::Fail(-1);
     }
     if !s.dlv_seeked {
-        let seek = (at as i32).to_le_bytes();
-        let rc = (sys.provider_call)(s.scan_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+        let mut pos = seek::encode(u64::from(at));
+        let rc = (sys.provider_call)(
+            s.scan_fd,
+            FS_SEEK,
+            pos.as_mut_ptr(),
+            seek::ARG_LEN,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(rc) {
             return Io::Later;
         }
@@ -3002,7 +3065,14 @@ unsafe fn begin_entry_scan(s: &mut Wal, sys: &SyscallTable, request_id: u32, wal
 /// `&SyscallTable` per the module ABI.
 unsafe fn reset_scan_cursor(s: &mut Wal, sys: &SyscallTable) {
     if s.scan_fd >= 0 {
-        (sys.provider_call)(s.scan_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.scan_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.scan_fd = -1;
     }
     s.scan_sized = false;
@@ -3099,7 +3169,14 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
             &s.dir,
             &mut path,
         );
-        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+        let fd = (sys.provider_call)(
+            -1,
+            FS_OPEN,
+            path.as_mut_ptr(),
+            plen,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(fd) {
             return;
         } // provider initialising, or the directory not cached — retry
@@ -3118,16 +3195,19 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
         s.scan_got = 0;
     }
     if !s.scan_sized {
-        let mut stat_buf = [0u8; 8];
-        let stat_rc = (sys.provider_call)(s.scan_fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
+        let mut stat_buf = [0u8; stat::LEN];
+        let stat_rc = (sys.provider_call)(
+            s.scan_fd,
+            FS_STAT,
+            stat_buf.as_mut_ptr(),
+            stat::LEN,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(stat_rc) {
             return;
         }
-        let size = if stat_rc < 0 {
-            0
-        } else {
-            u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
-        };
+        let size = if stat_rc < 0 { 0 } else { stat_size(&stat_buf) };
         if size == 0 {
             scan_next_segment(s, sys);
             return;
@@ -3161,8 +3241,15 @@ unsafe fn step_entry_scan(s: &mut Wal, sys: &SyscallTable) {
                 scan_next_segment(s, sys);
                 return;
             }
-            let seek_arg = (s.scan_pos as i32).to_le_bytes();
-            let rc = (sys.provider_call)(s.scan_fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, 4);
+            let mut seek_arg = seek::encode(u64::from(s.scan_pos));
+            let rc = (sys.provider_call)(
+                s.scan_fd,
+                FS_SEEK,
+                seek_arg.as_mut_ptr(),
+                seek::ARG_LEN,
+                core::ptr::null_mut(),
+                0,
+            );
             if later(rc) {
                 return;
             }
@@ -3894,8 +3981,15 @@ unsafe fn truncate_current_segment(s: &mut Wal, sys: &SyscallTable, new_cursor: 
         return Step::Fail;
     }
     if s.tc_phase == TC_SEEK {
-        let seek = (new_cursor as i32).to_le_bytes();
-        let rc = (sys.provider_call)(s.fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+        let mut pos = seek::encode(u64::from(new_cursor));
+        let rc = (sys.provider_call)(
+            s.fd,
+            FS_SEEK,
+            pos.as_mut_ptr(),
+            seek::ARG_LEN,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(rc) {
             return Step::Later;
         }
@@ -4029,7 +4123,14 @@ unsafe fn begin_cross_segment_truncate(
     // The live segment is quiescent (every batch fenced, no ticket
     // outstanding), so nothing its close would drop is owed durability.
     if s.fd >= 0 {
-        (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.fd = -1;
     }
     let old_seq = s.segment_seq;
@@ -4077,7 +4178,14 @@ unsafe fn begin_cross_segment_truncate(
 /// `sys` must reach live kernel routines per the module ABI.
 unsafe fn refuse_retire_prep(s: &mut Wal, sys: &SyscallTable, what: &[u8]) {
     if s.retire_fd >= 0 {
-        (sys.provider_call)(s.retire_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.retire_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.retire_fd = -1;
     }
     s.retire_active = false;
@@ -4109,7 +4217,14 @@ unsafe fn continue_retire_prep(s: &mut Wal, sys: &SyscallTable) -> Step {
                     &s.dir,
                     &mut path,
                 );
-                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    path.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(fd) {
                     return Step::Later;
                 }
@@ -4121,22 +4236,32 @@ unsafe fn continue_retire_prep(s: &mut Wal, sys: &SyscallTable) -> Step {
                 s.retire_prep = PREP_STAT;
             }
             PREP_STAT => {
-                let mut stat_buf = [0u8; 8];
-                let rc = (sys.provider_call)(s.retire_fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
+                let mut stat_buf = [0u8; stat::LEN];
+                let rc = (sys.provider_call)(
+                    s.retire_fd,
+                    FS_STAT,
+                    stat_buf.as_mut_ptr(),
+                    stat::LEN,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return Step::Later;
                 }
-                let size = if rc < 0 {
-                    0
-                } else {
-                    u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
-                };
+                let size = if rc < 0 { 0 } else { stat_size(&stat_buf) };
                 s.retire_high_water = size.max(s.retire_cursor);
                 s.retire_prep = PREP_SEEK;
             }
             PREP_SEEK => {
-                let seek = (s.retire_cursor as i32).to_le_bytes();
-                let rc = (sys.provider_call)(s.retire_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                let mut pos = seek::encode(u64::from(s.retire_cursor));
+                let rc = (sys.provider_call)(
+                    s.retire_fd,
+                    FS_SEEK,
+                    pos.as_mut_ptr(),
+                    seek::ARG_LEN,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return Step::Later;
                 }
@@ -4169,7 +4294,14 @@ unsafe fn continue_retire_prep(s: &mut Wal, sys: &SyscallTable) -> Step {
                 }
             }
             PREP_FSYNC => {
-                let rc = (sys.provider_call)(s.retire_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.retire_fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return Step::Later;
                 }
@@ -4246,7 +4378,14 @@ unsafe fn continue_retirement(s: &mut Wal, sys: &SyscallTable) -> bool {
                 // Nothing retired: hand the pre-truncation state back
                 // untouched and refuse.
                 if s.retire_fd >= 0 {
-                    (sys.provider_call)(s.retire_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                    (sys.provider_call)(
+                        s.retire_fd,
+                        FS_CLOSE,
+                        core::ptr::null_mut(),
+                        0,
+                        core::ptr::null_mut(),
+                        0,
+                    );
                     s.retire_fd = -1;
                 }
                 s.retire_active = false;
@@ -4309,7 +4448,14 @@ unsafe fn drop_serve_fd(s: &mut Wal, sys: &SyscallTable, seq: u32) {
         end_serve(s, sys);
     }
     if s.serve_fd >= 0 && s.serve_seg == seq {
-        (sys.provider_call)(s.serve_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.serve_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.serve_fd = -1;
     }
 }
@@ -4329,7 +4475,14 @@ fn rm_reset(s: &mut Wal) {
 /// `sys` must reach live kernel routines per the module ABI.
 unsafe fn rm_close(s: &mut Wal, sys: &SyscallTable) {
     if s.rm_fd >= 0 {
-        (sys.provider_call)(s.rm_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.rm_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.rm_fd = -1;
     }
 }
@@ -4385,7 +4538,14 @@ unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> Step 
     loop {
         match s.rm_phase {
             RM_UNLINK => {
-                let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
+                let rc = (sys.provider_call)(
+                    -1,
+                    FS_UNLINK,
+                    path.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if rc == FS_E_INPROGRESS {
                     s.rm_taken = true;
                 }
@@ -4421,12 +4581,26 @@ unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> Step 
                 // Retirement answers a durability question, and a dying
                 // provider must not be able to report every segment
                 // retired.
-                let probe = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+                let probe = (sys.provider_call)(
+                    -1,
+                    FS_OPEN,
+                    path.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(probe) {
                     return Step::Later;
                 }
                 if probe >= 0 {
-                    (sys.provider_call)(probe, FS_CLOSE, core::ptr::null_mut(), 0);
+                    (sys.provider_call)(
+                        probe,
+                        FS_CLOSE,
+                        core::ptr::null_mut(),
+                        0,
+                        core::ptr::null_mut(),
+                        0,
+                    );
                 } else if probe == FS_E_NOENT && !s.rm_unlinked {
                     rm_reset(s);
                     return Step::Done;
@@ -4434,7 +4608,14 @@ unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> Step 
                 s.rm_phase = RM_CREATE;
             }
             RM_CREATE => {
-                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    path.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(fd) {
                     return Step::Later;
                 }
@@ -4445,8 +4626,15 @@ unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> Step 
                 s.rm_phase = RM_SEEK;
             }
             RM_SEEK => {
-                let seek = 0i32.to_le_bytes();
-                let rc = (sys.provider_call)(s.rm_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                let mut pos = seek::encode(0);
+                let rc = (sys.provider_call)(
+                    s.rm_fd,
+                    FS_SEEK,
+                    pos.as_mut_ptr(),
+                    seek::ARG_LEN,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return Step::Later;
                 }
@@ -4477,7 +4665,14 @@ unsafe fn invalidate_segment(s: &mut Wal, sys: &SyscallTable, seq: u32) -> Step 
             RM_FSYNC => {
                 // The terminator's durability is fenced BEFORE the close:
                 // CLOSE never waits and reports no write-back failure.
-                let rc = (sys.provider_call)(s.rm_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.rm_fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return Step::Later;
                 }
@@ -4786,7 +4981,14 @@ unsafe fn continue_compaction(s: &mut Wal, sys: &SyscallTable) -> bool {
                 if !s.cp_taken {
                     drop_serve_fd(s, sys, s.oldest_segment_seq);
                 }
-                let rc = (sys.provider_call)(-1, FS_UNLINK, path.as_mut_ptr(), plen);
+                let rc = (sys.provider_call)(
+                    -1,
+                    FS_UNLINK,
+                    path.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if rc == FS_E_INPROGRESS {
                     s.cp_taken = true;
                 }
@@ -4855,11 +5057,11 @@ unsafe fn ensure_fs_caps(s: &mut Wal, sys: &SyscallTable) -> bool {
         return true;
     }
     let mut caps = [0u8; 4];
-    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4, core::ptr::null_mut(), 0);
     if later(rc) {
         return false;
     }
-    let bits = if rc == 4 { u32::from_le_bytes(caps) } else { 0 };
+    let bits = if rc == 0 { u32::from_le_bytes(caps) } else { 0 };
     s.fs_unlink_probe = if bits & FS_CAP_UNLINK != 0 { 1 } else { 2 };
     s.fs_async = bits & FS_CAP_FSYNC_ASYNC != 0;
     s.name_fence_probe = if bits & FS_CAP_FSYNC_NAME != 0 {
@@ -4932,7 +5134,14 @@ unsafe fn publish_name(s: &mut Wal, sys: &SyscallTable, path: &mut [u8], plen: u
         s.name_unfenced = s.name_unfenced.saturating_add(1);
         return Step::Done;
     }
-    let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, path.as_mut_ptr(), plen);
+    let rc = (sys.provider_call)(
+        -1,
+        FS_FSYNC_NAME,
+        path.as_mut_ptr(),
+        plen,
+        core::ptr::null_mut(),
+        0,
+    );
     if later(rc) {
         return Step::Later;
     }
@@ -4999,7 +5208,14 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> StepReturn {
             return read_replay_floor(s, sys);
         }
         build_segment_path(s, s.replay_seg);
-        let fd = (sys.provider_call)(-1, FS_OPEN, s.path_buf.as_mut_ptr(), s.path_len as usize);
+        let fd = (sys.provider_call)(
+            -1,
+            FS_OPEN,
+            s.path_buf.as_mut_ptr(),
+            s.path_len as usize,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(fd) {
             // FS provider still initialising (fat32 reading the BPB on a pi5
             // cold boot), or the directory not cached yet. Do NOT count this
@@ -5051,17 +5267,19 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> StepReturn {
         // Check file size — an empty segment is the tombstone an
         // in-flight rotation may leave behind. Treat it the same
         // way we treat a final miss: terminate replay here.
-        // FS_STAT writes [size:u32 LE][mtime:u32 LE] into the supplied buffer.
-        let mut stat_buf = [0u8; 8];
-        let stat_rc = (sys.provider_call)(s.replay_fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
+        let mut stat_buf = [0u8; stat::LEN];
+        let stat_rc = (sys.provider_call)(
+            s.replay_fd,
+            FS_STAT,
+            stat_buf.as_mut_ptr(),
+            stat::LEN,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(stat_rc) {
             return StepReturn::Continue; // the same descriptor is sized next step
         }
-        let size = if stat_rc < 0 {
-            0
-        } else {
-            u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]])
-        };
+        let size = if stat_rc < 0 { 0 } else { stat_size(&stat_buf) };
         if size == 0 {
             close_replay_fd(s, sys);
             // Freeze the durable high-water reconstructed by replay.
@@ -5271,7 +5489,14 @@ unsafe fn step_replay(s: &mut Wal, sys: &SyscallTable) -> StepReturn {
 /// `sys` must reach live kernel routines per the module ABI.
 unsafe fn close_replay_fd(s: &mut Wal, sys: &SyscallTable) {
     if s.replay_fd >= 0 {
-        (sys.provider_call)(s.replay_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.replay_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
     s.replay_fd = -1;
     s.replay_sized = false;
@@ -5301,7 +5526,14 @@ unsafe fn read_replay_floor(s: &mut Wal, sys: &SyscallTable) -> StepReturn {
     if s.floor_rd_fd < 0 {
         let mut path = [0u8; WAL_PATH_MAX];
         let plen = encode_floor_path(s.partition_id, s.root_path != 0, &s.dir, &mut path);
-        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+        let fd = (sys.provider_call)(
+            -1,
+            FS_OPEN,
+            path.as_mut_ptr(),
+            plen,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(fd) {
             return StepReturn::Continue; // provider initialising — retry
         }
@@ -5327,7 +5559,14 @@ unsafe fn read_replay_floor(s: &mut Wal, sys: &SyscallTable) -> StepReturn {
     if io == Io::Later {
         return StepReturn::Continue;
     }
-    (sys.provider_call)(s.floor_rd_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    (sys.provider_call)(
+        s.floor_rd_fd,
+        FS_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     s.floor_rd_fd = -1;
     let n = if matches!(io, Io::Fail(_)) { 0 } else { got };
     let val = s.floor_rd_buf;
@@ -5559,7 +5798,14 @@ unsafe fn persist_replay_start(s: &mut Wal, sys: &SyscallTable, seg: u32) {
 /// `sys` must reach live kernel routines per the module ABI.
 unsafe fn sidecar_reset(s: &mut Wal, sys: &SyscallTable) {
     if s.sc_fd >= 0 {
-        (sys.provider_call)(s.sc_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.sc_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.sc_fd = -1;
     }
     s.sc_phase = SC_IDLE;
@@ -5595,7 +5841,14 @@ unsafe fn sidecar_step(s: &mut Wal, sys: &SyscallTable) {
     loop {
         match s.sc_phase {
             SC_OPEN => {
-                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    path.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(fd) {
                     return;
                 }
@@ -5631,7 +5884,14 @@ unsafe fn sidecar_step(s: &mut Wal, sys: &SyscallTable) {
             }
             SC_FSYNC => {
                 // Fenced before the close: CLOSE reports no write-back.
-                let rc = (sys.provider_call)(s.sc_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.sc_fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return;
                 }
@@ -5639,7 +5899,14 @@ unsafe fn sidecar_step(s: &mut Wal, sys: &SyscallTable) {
                     sidecar_refused(s, sys);
                     return;
                 }
-                (sys.provider_call)(s.sc_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                (sys.provider_call)(
+                    s.sc_fd,
+                    FS_CLOSE,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 s.sc_fd = -1;
                 s.sc_phase = SC_NAME;
             }
@@ -6177,7 +6444,14 @@ unsafe fn flush_batch_pipelined(s: &mut Wal, sys: &SyscallTable) {
     while s.fence_ring_count > 0 {
         let (ticket, max_index, max_term) = s.fence_ring[s.fence_ring_head as usize];
         let mut tb = ticket.to_le_bytes();
-        let rc = (sys.provider_call)(s.fd, FS_FSYNC_POLL, tb.as_mut_ptr(), 8);
+        let rc = (sys.provider_call)(
+            s.fd,
+            FS_FSYNC_POLL,
+            tb.as_mut_ptr(),
+            8,
+            core::ptr::null_mut(),
+            0,
+        );
         if rc == 1 || later(rc) {
             break; // oldest fence still in flight; nothing newer can be acked
         }
@@ -6237,7 +6511,14 @@ unsafe fn flush_batch_pipelined(s: &mut Wal, sys: &SyscallTable) {
 
     // Open the durability fence covering everything written so far.
     let mut tb = [0u8; 8];
-    let rc = (sys.provider_call)(s.fd, FS_FSYNC_SUBMIT, tb.as_mut_ptr(), 8);
+    let rc = (sys.provider_call)(
+        s.fd,
+        FS_FSYNC_SUBMIT,
+        tb.as_mut_ptr(),
+        8,
+        core::ptr::null_mut(),
+        0,
+    );
     if later(rc) {
         // No fence slot free (or nothing could be opened without waiting):
         // no fence exists. The batch's bytes are already written
@@ -6310,7 +6591,14 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
         // write was submitted earlier; here we only observe completion.
         if s.fence_pending {
             let mut tb = s.fence_ticket.to_le_bytes();
-            let rc = (sys.provider_call)(s.fd, FS_FSYNC_POLL, tb.as_mut_ptr(), 8);
+            let rc = (sys.provider_call)(
+                s.fd,
+                FS_FSYNC_POLL,
+                tb.as_mut_ptr(),
+                8,
+                core::ptr::null_mut(),
+                0,
+            );
             if rc == 1 || later(rc) {
                 // Still pending — the batch is not yet durable this step.
                 return;
@@ -6370,7 +6658,14 @@ unsafe fn flush_batch(s: &mut Wal, sys: &SyscallTable) {
                 // Open a non-blocking fence and hand off; the ack is emitted
                 // on a later step once the poll (above) reports durable.
                 let mut tb = [0u8; 8];
-                let rc = (sys.provider_call)(s.fd, FS_FSYNC_SUBMIT, tb.as_mut_ptr(), 8);
+                let rc = (sys.provider_call)(
+                    s.fd,
+                    FS_FSYNC_SUBMIT,
+                    tb.as_mut_ptr(),
+                    8,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if rc == 0 {
                     s.fence_ticket = u64::from_le_bytes(tb);
                     s.fence_pending = true;
@@ -6535,7 +6830,14 @@ enum OpenOutcome {
 /// `sys` must reach live kernel routines per the module ABI.
 unsafe fn refuse_open(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
     if s.open_fd >= 0 {
-        (sys.provider_call)(s.open_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.open_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.open_fd = -1;
     }
     s.open_phase = OPEN_IDLE;
@@ -6568,6 +6870,8 @@ unsafe fn open_segment_attempt(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
                     FS_OPEN_CREATE,
                     s.path_buf.as_mut_ptr(),
                     s.path_len as usize,
+                    core::ptr::null_mut(),
+                    0,
                 );
                 s.open_rc = fd;
                 if later(fd) {
@@ -6600,7 +6904,14 @@ unsafe fn open_segment_attempt(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
             OPEN_MKDIR => {
                 let mut dir = [0u8; STORE_DIR_MAX];
                 let dlen = s.dir.put(&mut dir).unwrap_or(0);
-                let rc = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dlen);
+                let rc = (sys.provider_call)(
+                    -1,
+                    FS_MKDIR,
+                    dir.as_mut_ptr(),
+                    dlen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return OpenOutcome::Settling;
                 }
@@ -6620,8 +6931,14 @@ unsafe fn open_segment_attempt(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
                 // offset zero.
                 let capacity = s.segment_limit.saturating_add(4);
                 let cap = capacity.to_le_bytes();
-                let prc =
-                    (sys.provider_call)(s.open_fd, FS_PREALLOCATE, cap.as_ptr() as *mut u8, 4);
+                let prc = (sys.provider_call)(
+                    s.open_fd,
+                    FS_PREALLOCATE,
+                    cap.as_ptr() as *mut u8,
+                    4,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(prc) {
                     // Provider still initialising, or the reservation is
                     // taken and undecided: the same request is asked again
@@ -6689,8 +7006,15 @@ unsafe fn open_segment_attempt(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
                 }
             }
             OPEN_REWIND => {
-                let seek = 0i32.to_le_bytes();
-                let sr = (sys.provider_call)(s.open_fd, FS_SEEK, seek.as_ptr() as *mut u8, 4);
+                let mut pos = seek::encode(0);
+                let sr = (sys.provider_call)(
+                    s.open_fd,
+                    FS_SEEK,
+                    pos.as_mut_ptr(),
+                    seek::ARG_LEN,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(sr) {
                     return OpenOutcome::Settling;
                 }
@@ -6702,7 +7026,14 @@ unsafe fn open_segment_attempt(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
                 s.open_phase = OPEN_FSYNC;
             }
             OPEN_FSYNC => {
-                let fr = (sys.provider_call)(s.open_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let fr = (sys.provider_call)(
+                    s.open_fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(fr) {
                     return OpenOutcome::Settling;
                 }
@@ -6767,14 +7098,20 @@ unsafe fn open_segment_attempt(s: &mut Wal, sys: &SyscallTable) -> OpenOutcome {
                 // trailing terminator until fresh writes overwrite past it,
                 // else replay reads our fresh frames and continues straight
                 // into the stale ones.
-                let mut stat_buf = [0u8; 8];
-                let rc = (sys.provider_call)(s.open_fd, FS_STAT, stat_buf.as_mut_ptr(), 8);
+                let mut stat_buf = [0u8; stat::LEN];
+                let rc = (sys.provider_call)(
+                    s.open_fd,
+                    FS_STAT,
+                    stat_buf.as_mut_ptr(),
+                    stat::LEN,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return OpenOutcome::Settling;
                 }
                 if rc >= 0 {
-                    let size =
-                        u32::from_le_bytes([stat_buf[0], stat_buf[1], stat_buf[2], stat_buf[3]]);
+                    let size = stat_size(&stat_buf);
                     if size > s.seg_high_water {
                         s.seg_high_water = size;
                     }
@@ -6890,8 +7227,15 @@ unsafe fn write_staged(s: &mut Wal, sys: &SyscallTable, op: u32) -> Step {
     let batch_start = s.cursor.saturating_sub(logical_len as u32);
     let mut moved = (s.flush_moved as usize).min(staged_len);
     if moved < staged_len {
-        let seek_arg = (batch_start.wrapping_add(moved as u32) as i32).to_le_bytes();
-        let seek_rc = (sys.provider_call)(s.fd, FS_SEEK, seek_arg.as_ptr() as *mut u8, 4);
+        let mut seek_arg = seek::encode(u64::from(batch_start.wrapping_add(moved as u32)));
+        let seek_rc = (sys.provider_call)(
+            s.fd,
+            FS_SEEK,
+            seek_arg.as_mut_ptr(),
+            seek::ARG_LEN,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(seek_rc) {
             return Step::Later;
         }
@@ -6955,7 +7299,14 @@ unsafe fn sync_fd(s: &mut Wal, sys: &SyscallTable) -> Step {
     if !s.sync_pending {
         s.sync_start_us = dev_micros(sys);
     }
-    let rc = (sys.provider_call)(s.fd, FS_FSYNC, core::ptr::null_mut(), 0);
+    let rc = (sys.provider_call)(
+        s.fd,
+        FS_FSYNC,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     if later(rc) {
         s.sync_pending = true;
         return Step::Later;
@@ -6980,7 +7331,14 @@ unsafe fn close_segment(s: &mut Wal, sys: &SyscallTable) {
     if s.fd >= 0 {
         // CLOSE never waits and reports no write-back: everything this
         // descriptor carried that durability rests on was fenced first.
-        (sys.provider_call)(s.fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.fd = -1;
     }
     s.sync_pending = false;

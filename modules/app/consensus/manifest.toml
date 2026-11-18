@@ -317,8 +317,9 @@ content_type = "NetProto"
 # response, never a media stream, whatever NetProto defaults to.
 rate_class_default = "transaction"
 buffer_size = 8192
-# Envelope (3) + term/index (16) + proposal body (2048).
-max_record = 2067
+# Envelope (3) + partition/term/index (18) + entry body (2048), as the
+# module states it (`COMMITTED_ENTRIES_MAX_RECORD`).
+max_record = 2069
 rate_class_max = "transaction"
 
 [[ports]]
@@ -435,7 +436,7 @@ bounds_us = [500, 1000, 2000, 4000, 6000, 8000, 10000, 15000, 20000, 30000,
 
 [[observability.instrument.dimension]]
 key    = "fluxor.slot"
-domain = "numeric"
+kind   = "numeric"
 max    = 64
 
 [[observability.instrument]]
@@ -446,5 +447,5 @@ bounds_us = [250, 500, 1000, 2000, 4000, 6000, 8000, 10000, 15000, 20000,
 
 [[observability.instrument.dimension]]
 key    = "fluxor.slot"
-domain = "numeric"
+kind   = "numeric"
 max    = 64

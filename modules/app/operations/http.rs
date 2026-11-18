@@ -50,8 +50,8 @@
 //!
 //! Requests are collected whole by the contract's `Collector`, sized
 //! to what this surface serves: up to [`REQ_SLOTS`] exchanges at once,
-//! a target of [`MAX_EXT_TARGET`] bytes, a header block of
-//! [`MAX_EXT_HEADERS`] and a body of [`MAX_EXT_BODY`]. A body the
+//! a target of [`MAX_EXT_TARGET`] bytes, meta of [`MAX_EXT_META`]
+//! and a body of [`MAX_EXT_BODY`]. A body the
 //! server has whole rides inline in the HEAD; one announced with MORE
 //! is granted the rest of the body bound at once, and the request is
 //! handled when its last BODY record lands. Statuses this surface
@@ -63,7 +63,7 @@
 //! | 403 | rbac refused an `/admin/<op>` command |
 //! | 404 | no route for the method and target |
 //! | 408 | a request body announced with MORE did not finish within [`REQ_BODY_TIMEOUT_MS`] |
-//! | 413 | target, headers or body past the bounds above |
+//! | 413 | target, meta or body past the bounds above |
 //! | 503 | every request slot busy, the propose queue unavailable, a proposal rejected or timed out |
 //!
 //! A requester ABORT ends its exchange here too: a request being
@@ -73,9 +73,10 @@
 //! body.
 
 use super::abi::contracts::exchange::{
-    abort, parse_request, response_body_at, seal_response, write_abort, write_credit, Collector,
-    ExchangeId, Record, Refuse, METHOD_POST, RECORD_MAX,
+    abort, meta_field_len, parse_request, response_body_at, seal_response_head, write_abort,
+    write_credit, Collector, ExchangeId, Record, Refuse, META_CONTENT_TYPE, RECORD_MAX,
 };
+use super::abi::contracts::exchange_http as eh;
 use super::abi::SyscallTable;
 use super::ExchangeOutbox;
 use super::{dev_log, dev_millis, dev_report_step_effect, step_effect};
@@ -102,9 +103,36 @@ const HTTP_INFLIGHT: usize = 64;
 /// Content type stamped on every answer this component produces.
 const CT_TEXT: &[u8] = b"text/plain";
 
+/// Bytes of [`CT_META`].
+const CT_META_LEN: usize = meta_field_len(META_CONTENT_TYPE.len(), CT_TEXT.len());
+
+/// The meta every answer carries: its one `content-type` field,
+/// `[key_len u8][key][val_len u16 LE][val]`.
+const CT_META: [u8; CT_META_LEN] = content_type_meta();
+
+const fn content_type_meta() -> [u8; CT_META_LEN] {
+    let mut m = [0u8; CT_META_LEN];
+    let k = META_CONTENT_TYPE.len();
+    m[0] = k as u8;
+    let mut i = 0;
+    while i < k {
+        m[1 + i] = META_CONTENT_TYPE[i];
+        i += 1;
+    }
+    let v = (CT_TEXT.len() as u16).to_le_bytes();
+    m[1 + k] = v[0];
+    m[2 + k] = v[1];
+    let mut j = 0;
+    while j < CT_TEXT.len() {
+        m[3 + k + j] = CT_TEXT[j];
+        j += 1;
+    }
+    m
+}
+
 /// Largest answer body one record carries: the record bound less the
 /// response HEAD in front of the body.
-const RESP_BODY_MAX: usize = RECORD_MAX - response_body_at(CT_TEXT.len());
+const RESP_BODY_MAX: usize = RECORD_MAX - response_body_at(CT_META_LEN);
 
 // The whole `/metrics` cache answers in one record.
 const _: () = assert!(METRICS_CACHE <= RESP_BODY_MAX);
@@ -114,16 +142,16 @@ pub const REQ_SLOTS: usize = 4;
 /// Largest request target (path and query) this surface takes. Every
 /// route is far shorter; the bound is room for a client's query.
 pub const MAX_EXT_TARGET: usize = 256;
-/// Largest forwarded header block this surface takes. Collected and
-/// read past, so it bounds what a client may send rather than what
-/// any route reads.
-pub const MAX_EXT_HEADERS: usize = 2048;
+/// Largest request meta this surface takes (the forwarded header
+/// fields). Collected and read past, so it bounds what a client may
+/// send rather than what any route reads.
+pub const MAX_EXT_META: usize = 2048;
 /// Largest request body: the 1 KiB admin envelope bound, which is also
 /// the `/propose` body bound.
 pub const MAX_EXT_BODY: usize = 1024;
 
 /// The request collector this surface answers from.
-type Requests = Collector<REQ_SLOTS, MAX_EXT_TARGET, MAX_EXT_HEADERS, MAX_EXT_BODY>;
+type Requests = Collector<eh::Http, REQ_SLOTS, MAX_EXT_TARGET, MAX_EXT_META, MAX_EXT_BODY>;
 
 /// How long a request body announced with MORE may stay unfinished.
 /// The server aborts a stalled exchange on its own deadline; this
@@ -400,11 +428,15 @@ unsafe fn emit_response(
         h.responses_dropped = h.responses_dropped.saturating_add(1);
         return false;
     }
-    let at = response_body_at(CT_TEXT.len());
+    let Some(head) = eh::head(id, status, &CT_META, &[]) else {
+        h.responses_dropped = h.responses_dropped.saturating_add(1);
+        return false;
+    };
+    let at = response_body_at(CT_META_LEN);
     if body_len > 0 {
         core::ptr::copy_nonoverlapping(body_ptr, h.resp_frame.as_mut_ptr().add(at), body_len);
     }
-    let Some(len) = seal_response(&id, status, CT_TEXT, body_len, &mut h.resp_frame) else {
+    let Some(len) = seal_response_head::<eh::Http>(&head, body_len, &mut h.resp_frame) else {
         h.responses_dropped = h.responses_dropped.saturating_add(1);
         return false;
     };
@@ -487,7 +519,7 @@ pub unsafe fn next_external_request(
     // A requester ABORT ends the exchange wherever it is held: the
     // collector frees a request it is collecting, and a deferred
     // answer is never written.
-    if let Some(Record::Abort { id, .. }) = parse_request(&h.req_frame[..n]) {
+    if let Ok(Record::Abort { id, .. }) = parse_request::<eh::Http>(&h.req_frame[..n]) {
         forget_exchange(h, id);
     }
 
@@ -502,7 +534,7 @@ pub unsafe fn next_external_request(
             };
             // The collector's bounds are this struct's, so both fit.
             req.id = r.id;
-            req.method = r.method;
+            req.method = r.verb;
             req.path_len = r.target.len() as u16;
             req.body_len = r.body.len() as u16;
             req.path[..r.target.len()].copy_from_slice(r.target);
@@ -530,7 +562,7 @@ pub unsafe fn next_external_request(
                         Refuse::TooLarge => b"request too large",
                         Refuse::Unexpected => b"bad request",
                     };
-                    finish(h, sys, id, why.status(), body);
+                    finish(h, sys, id, eh::canonical_status(why.outcome()), body);
                 }
                 // A record naming no exchange this surface holds — a
                 // stray body, one past its exchange's end — or one that
@@ -911,7 +943,7 @@ pub unsafe fn on_request(
 ) -> ReqOut {
     // POST /propose — synchronous write bridge. The response is
     // deferred until apply acknowledges the assigned WAL index.
-    if method == METHOD_POST && path == b"/propose" {
+    if method == eh::method::POST && path == b"/propose" {
         if !emit_http_proposal(h, sys, id, body) {
             h.queue_unavailable = h.queue_unavailable.saturating_add(1);
             finish(h, sys, id, 503, b"propose queue unavailable");
@@ -928,7 +960,7 @@ pub unsafe fn on_request(
     // the admin component, not that the op succeeded: its real status
     // answers on the module's `responses` port, which HTTP does not
     // surface.
-    if method == METHOD_POST && path.starts_with(b"/admin/") {
+    if method == eh::method::POST && path.starts_with(b"/admin/") {
         let op_name = &path[b"/admin/".len()..];
         let out = match http_admin::admin_op_code(op_name) {
             Some(op_code) => {

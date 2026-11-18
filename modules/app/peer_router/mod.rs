@@ -240,10 +240,12 @@ fluxor_rt::define_params! {
     // 1: relay each client connection's peer (`MSG_PEER` from the
     // transport) on `cleartext` as `MSG_CLIENT_PEER` under the client id,
     // ahead of its first frame — for a consumer that names a connection
-    // by its client — its mirrored output horizon (`MSG_HORIZON`) as
-    // `MSG_CLIENT_HORIZON`, and a takeover's resume point (`MSG_RESUMED`)
-    // as `MSG_CLIENT_RESUMED`; and relay `MSG_CLIENT_DELIVERED` from
-    // `client_resp` to the transport as `CMD_DELIVERED`. 0 (default):
+    // by its client — its mirrored output horizon
+    // (`MSG_CURSOR_HORIZON`) as `MSG_CLIENT_HORIZON`, and a takeover's
+    // resume point (`MSG_CURSOR_RESUMED`) as `MSG_CLIENT_RESUMED`; and
+    // relay `MSG_CLIENT_DELIVERED` from `client_resp` to the transport as
+    // `CMD_CURSOR_DELIVERED`. The listener asks for the `stream_cursor`
+    // sideband (`net_proto::flag::CURSORS`) to carry them. 0 (default):
     // nothing but frames and closes.
     29, forward_peer, u8, 0
         => |s, d, len| { s.forward_peer = p_u8(d, len, 0, 0); };
@@ -293,20 +295,20 @@ unsafe fn configure_peer(s: &mut ModuleState, idx: usize, d: *const u8, len: usi
 // net_proto stream contract — Fluxor's contract
 // (`fluxor_abi::contracts::net::net_proto`) is authoritative: every event/command payload leads with
 // `conn_id: u16 LE`. Local aliases keep the short names used below.
-use abi::contracts::net::net_proto;
+use abi::contracts::net::{net_proto, stream_cursor};
 const NMSG_ACCEPT: u8 = net_proto::MSG_ACCEPTED;
 const NMSG_DATA: u8 = net_proto::MSG_DATA;
 const NMSG_CLOSED: u8 = net_proto::MSG_CLOSED;
 const NMSG_PEER: u8 = net_proto::MSG_PEER;
-const NMSG_HORIZON: u8 = net_proto::MSG_HORIZON;
-const NMSG_RESUMED: u8 = net_proto::MSG_RESUMED;
+const NMSG_HORIZON: u8 = stream_cursor::MSG_CURSOR_HORIZON;
+const NMSG_RESUMED: u8 = stream_cursor::MSG_CURSOR_RESUMED;
 const NMSG_BOUND: u8 = net_proto::MSG_BOUND;
 const NMSG_CONNOK: u8 = net_proto::MSG_CONNECTED;
 
 const NCMD_BIND: u8 = net_proto::CMD_BIND;
 const NCMD_SEND: u8 = net_proto::CMD_SEND;
 const NCMD_CLOSE: u8 = net_proto::CMD_CLOSE;
-const NCMD_DELIVERED: u8 = net_proto::CMD_DELIVERED;
+const NCMD_DELIVERED: u8 = stream_cursor::CMD_CURSOR_DELIVERED;
 const NCMD_CONNECT_TO: u8 = net_proto::CMD_CONNECT_TO;
 const NSOCK_STREAM: u8 = net_proto::SOCK_TYPE_STREAM;
 
@@ -556,10 +558,9 @@ struct ModuleState {
 
     // State
     bound: bool,
-    /// Set once we've warned about a `MSG_ACCEPTED` that carried no
-    /// listener port (`payload_len < 4`). The contract stamps the
-    /// accepting port on every accept, so a frame without one is
-    /// malformed and is dropped: claiming it on a shared provider would
+    /// Set once we've warned about a `MSG_ACCEPTED` that is not the
+    /// contract's exact record. Its listener port cannot be trusted, so
+    /// the frame is dropped: claiming it on a shared provider would
     /// pull another anchor's connection in here as a bogus client
     /// proposal. Warn once, not per-accept.
     short_accept_warned: bool,
@@ -598,7 +599,7 @@ struct ModuleState {
     /// response frame, so the hot path never re-zeroes an 8 KiB stack
     /// buffer per iteration.
     resp_stash_len: u16,
-    /// The retained payload's command: `CMD_SEND`, or `CMD_DELIVERED`
+    /// The retained payload's command: `CMD_SEND`, or `CMD_CURSOR_DELIVERED`
     /// for a relayed `MSG_CLIENT_DELIVERED`.
     resp_stash_cmd: u8,
     /// Frames dropped on this module's routing paths (oversize inbound
@@ -652,7 +653,13 @@ struct ModuleState {
     buf: [u8; BUF_SIZE],
 }
 
-fluxor_rt::module_facts! { state: ModuleState }
+// `client_resp` is read an envelope at a time whatever its size
+// (`wire_channels::channel_read_msg` drains one that does not fit), so
+// it takes any record a channel carries.
+fluxor_rt::module_facts! {
+    state: ModuleState,
+    records: [in 3 CLIENT_RESP_ACCEPTS_RECORD = abi::CHANNEL_BUFFER_SIZE],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]
@@ -1385,14 +1392,20 @@ unsafe fn try_bind(s: &mut ModuleState, sys: &SyscallTable) {
         return;
     }
 
-    // CMD_BIND payload: [port: u16 LE] (no sock_type — linux_net expects just port)
-    let pb = s.listen_port.to_le_bytes();
+    // Relaying a client's cursors (`forward_peer`) asks the transport for
+    // the `stream_cursor` sideband on every connection the listener takes.
+    let flags = if s.forward_peer != 0 {
+        net_proto::flag::CURSORS
+    } else {
+        0
+    };
+    let pb = net_proto::bind(s.listen_port, flags);
     net_write_frame(
         sys,
         s.net_out,
         NCMD_BIND,
         pb.as_ptr(),
-        2,
+        pb.len(),
         s.buf.as_mut_ptr(),
         BUF_SIZE,
     );
@@ -1466,10 +1479,13 @@ unsafe fn connect_peers(s: &mut ModuleState, sys: &SyscallTable, now: u64) {
         let mut payload = [0u8; net_proto::CONNECT_TO_MAX];
         let n = net_proto::write_connect_to(
             &mut payload,
-            NSOCK_STREAM,
-            peer.port,
-            &target,
-            Some(dev_requester_tag(sys)),
+            &net_proto::ConnectTo {
+                sock_type: NSOCK_STREAM,
+                flags: 0,
+                port: peer.port,
+                target,
+                requester_tag: dev_requester_tag(sys),
+            },
         );
         if n == 0 {
             continue;
@@ -1507,14 +1523,13 @@ unsafe fn close_conn(s: &mut ModuleState, sys: &SyscallTable, conn_id: u16) {
     if !wire_channels::writable(sys, out) {
         return;
     }
-    // CMD_CLOSE payload: [conn_id:u16 LE]
-    let payload = conn_id.to_le_bytes();
+    let payload = net_proto::close(conn_id, false);
     net_write_frame(
         sys,
         out,
         NCMD_CLOSE,
         payload.as_ptr(),
-        2,
+        payload.len(),
         s.buf.as_mut_ptr(),
         BUF_SIZE,
     );
@@ -1525,13 +1540,13 @@ unsafe fn write_close(sys: &SyscallTable, scratch: &mut [u8], chan: i32, conn_id
     if !wire_channels::writable(sys, chan) {
         return false;
     }
-    let payload = conn_id.to_le_bytes();
+    let payload = net_proto::close(conn_id, false);
     net_write_frame(
         sys,
         chan,
         NCMD_CLOSE,
         payload.as_ptr(),
-        2,
+        payload.len(),
         scratch.as_mut_ptr(),
         scratch.len(),
     ) != 0
@@ -1659,8 +1674,6 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
 
             match event {
                 NMSG_ACCEPT => {
-                    // payload: [conn_id: u16 LE][local_port: u16 LE]
-                    //
                     // We share `net_in` (linux_net / ip `net_out`) with the
                     // other anchors on this node — wave's `http` module binds
                     // the diagnostic port on the same provider. The provider
@@ -1671,31 +1684,23 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                     // this filter peer_router would alloc a slot for a
                     // diagnostic HTTP connection and forward its raw HTTP
                     // bytes to the gateway as a bogus client proposal.
-                    if payload_len < 4 {
-                        // No port to filter on. Claiming it would take whatever
-                        // the provider accepted, on any listener, as a client of
-                        // this router. Warn once and drop it.
+                    let payload = &s.buf[NET_FRAME_HDR..NET_FRAME_HDR + payload_len];
+                    let Some((local_port, generation)) = net_proto::accepted_parts(payload)
+                        .map(|a| (a.local_port, a.opening.generation))
+                    else {
+                        // Not a record the contract defines. Claiming it would
+                        // take whatever the provider accepted, on any listener,
+                        // as a client of this router. Warn once and drop it.
                         if !s.short_accept_warned {
                             s.short_accept_warned = true;
-                            let m = b"[pr] MSG_ACCEPTED without a listener port; dropped";
+                            let m = b"[pr] malformed MSG_ACCEPTED; dropped";
                             dev_log(sys, 2, m.as_ptr(), m.len());
                         }
                         continue;
-                    }
-                    let local_port =
-                        u16::from_le_bytes([s.buf[NET_FRAME_HDR + 2], s.buf[NET_FRAME_HDR + 3]]);
+                    };
                     if local_port == s.listen_port {
                         reap_conn_id(s, sys, conn_id);
                         if let Some(slot) = alloc_conn(s) {
-                            // `[conn_id][local_port][generation]`
-                            let generation = if payload_len >= 6 {
-                                u16::from_le_bytes([
-                                    s.buf[NET_FRAME_HDR + 4],
-                                    s.buf[NET_FRAME_HDR + 5],
-                                ])
-                            } else {
-                                0
-                            };
                             register_conn(s, slot, conn_id, generation, false);
                             adopt_awaiting_identity(s, sys, slot, now);
                         }
@@ -1729,7 +1734,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                     // `[conn_id][bytes_through:u64]`: how much of a client
                     // connection's output the transport's standby holds,
                     // under its client id, in order with its frames.
-                    if s.forward_peer == 0 || payload_len < net_proto::HORIZON_LEN {
+                    if s.forward_peer == 0 || payload_len != stream_cursor::HORIZON_LEN {
                         continue;
                     }
                     let slot = find_conn(s, conn_id);
@@ -1740,9 +1745,9 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                     {
                         continue;
                     }
-                    let mut rec = [0u8; net_proto::HORIZON_LEN];
+                    let mut rec = [0u8; stream_cursor::HORIZON_LEN];
                     rec.copy_from_slice(
-                        &s.buf[NET_FRAME_HDR..NET_FRAME_HDR + net_proto::HORIZON_LEN],
+                        &s.buf[NET_FRAME_HDR..NET_FRAME_HDR + stream_cursor::HORIZON_LEN],
                     );
                     rec[..2].copy_from_slice(&(slot as u16).to_le_bytes());
                     if !deliver_client_frame(s, sys, wire::MSG_CLIENT_HORIZON, &rec, now) {
@@ -1755,7 +1760,7 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                     // a client connection's predecessor stood when a
                     // takeover resumed it here, under its client id, ahead
                     // of its frames.
-                    if s.forward_peer == 0 || payload_len < net_proto::RESUMED_LEN {
+                    if s.forward_peer == 0 || payload_len != stream_cursor::RESUMED_LEN {
                         continue;
                     }
                     let slot = find_conn(s, conn_id);
@@ -1766,9 +1771,9 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                     {
                         continue;
                     }
-                    let mut rec = [0u8; net_proto::RESUMED_LEN];
+                    let mut rec = [0u8; stream_cursor::RESUMED_LEN];
                     rec.copy_from_slice(
-                        &s.buf[NET_FRAME_HDR..NET_FRAME_HDR + net_proto::RESUMED_LEN],
+                        &s.buf[NET_FRAME_HDR..NET_FRAME_HDR + stream_cursor::RESUMED_LEN],
                     );
                     rec[..2].copy_from_slice(&(slot as u16).to_le_bytes());
                     if !deliver_client_frame(s, sys, wire::MSG_CLIENT_RESUMED, &rec, now) {
@@ -1782,17 +1787,15 @@ unsafe fn process_net_events(s: &mut ModuleState, sys: &SyscallTable, now: u64) 
                     // `[conn_id u16][tag u16][generation u16]`, read through
                     // the contract's accessors rather than at fixed offsets.
                     let payload = &s.buf[NET_FRAME_HDR..NET_FRAME_HDR + payload_len];
-                    let (_, tag) = if payload_len >= net_proto::CONN_ID_LEN {
-                        net_proto::connected_parts(payload)
-                    } else {
-                        (0, net_proto::REQUESTER_TAG_NONE)
+                    let Some(c) = net_proto::connected_parts(payload) else {
+                        continue;
                     };
-                    let generation =
-                        net_proto::session_generation(payload, net_proto::CONNECTED_FIXED);
+                    let tag = c.requester_tag;
+                    let generation = c.opening.generation;
                     let mine =
                         tag == dev_requester_tag(sys) || tag == net_proto::REQUESTER_TAG_NONE;
                     dev_log(sys, 2, b"[pr] dial-ok".as_ptr(), 11);
-                    if payload_len >= 2 && mine {
+                    if mine {
                         reap_conn_id(s, sys, conn_id);
                         if let Some(slot) = alloc_conn(s) {
                             register_conn(s, slot, conn_id, generation, true);
@@ -2733,7 +2736,7 @@ unsafe fn route_client_responses(s: &mut ModuleState, sys: &SyscallTable) {
         // never counts a delivery consumed ahead of the response written
         // for it.
         if msg_type == wire::MSG_CLIENT_DELIVERED {
-            let n = net_proto::DELIVERED_LEN;
+            let n = stream_cursor::DELIVERED_LEN;
             if len != n {
                 continue;
             }

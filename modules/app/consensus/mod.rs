@@ -194,7 +194,8 @@ fluxor_rt::define_params! {
     23, meta_dir, str, 0
         => |s, d, len| {
             // SAFETY: the params TLV names `len` bytes at `d` (none when
-            // `len` is 0, the default pass).
+            // `len` is 0, an empty value). An absent param runs no
+            // handler: `raft::init` holds the default.
             let raw = if len == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(d, len) } };
             s.slots[0].raft.meta_dir.set(raw, b"raft");
         };
@@ -418,7 +419,18 @@ struct ModuleState {
 /// applied entries free space.
 const ARENA_BYTES: u32 = 256 * 1024;
 
-fluxor_rt::module_facts! { state: ModuleState, arena: ARENA_BYTES }
+// `committed_entries` carries one `MSG_COMMITTED_ENTRY` per entry: the
+// envelope, the partition/term/index head and an entry body. `applied`
+// carries the acks and refusals, each well inside 64 bytes.
+fluxor_rt::module_facts! {
+    state: ModuleState,
+    arena: ARENA_BYTES,
+    records: [
+        out 12 COMMITTED_ENTRIES_MAX_RECORD =
+            wire::ENVELOPE_HDR + wire::COMMITTED_ENTRY_HDR + wal_frame::MAX_ENTRY_BODY,
+        out 13 APPLIED_MAX_RECORD = 64,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

@@ -187,7 +187,8 @@ fluxor_rt::define_params! {
     18, wal_dir, str, 0
         => |s, d, len| {
             // SAFETY: the params TLV names `len` bytes at `d` (none when
-            // `len` is 0, the default pass).
+            // `len` is 0, an empty value). An absent param runs no
+            // handler: `module_new` holds the default.
             let raw = if len == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(d, len) } };
             s.wal_dir.set(raw, WAL_DIR_DEFAULT);
         };
