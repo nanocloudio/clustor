@@ -34,7 +34,7 @@ pub const OP_READ: u32 = crate::abi::registry::fs::READ;
 pub const OP_FSYNC: u32 = crate::abi::registry::fs::FSYNC;
 
 /// `provider_call`'s shape.
-pub type Call = unsafe extern "C" fn(i32, u32, *mut u8, usize) -> i32;
+pub type Call = unsafe extern "C" fn(i32, u32, *mut u8, usize, *mut u8, usize) -> i32;
 
 /// True when `rc` is not an answer yet: the caller keeps its request and
 /// asks again on a later step. Never a failure, an end of data, or an
@@ -69,7 +69,7 @@ pub enum Io {
 pub unsafe fn read_into(call: Call, fd: i32, buf: *mut u8, len: usize, done: &mut usize) -> Io {
     while *done < len {
         let want = len - *done;
-        let rc = call(fd, OP_READ, buf.add(*done), want);
+        let rc = call(fd, OP_READ, core::ptr::null_mut(), 0, buf.add(*done), want);
         if later(rc) {
             return Io::Later;
         }
@@ -104,7 +104,14 @@ pub unsafe fn write_from(
 ) -> Io {
     while *done < len {
         let want = len - *done;
-        let rc = call(fd, op, buf.add(*done) as *mut u8, want);
+        let rc = call(
+            fd,
+            op,
+            core::ptr::null_mut(),
+            0,
+            buf.add(*done) as *mut u8,
+            want,
+        );
         if later(rc) || rc == 0 {
             return Io::Later;
         }
@@ -125,7 +132,7 @@ pub unsafe fn write_from(
 /// `arg` must be valid for `len` bytes as the opcode requires.
 #[inline]
 pub unsafe fn ask(call: Call, handle: i32, op: u32, arg: *mut u8, len: usize) -> Option<i32> {
-    let rc = call(handle, op, arg, len);
+    let rc = call(handle, op, arg, len, core::ptr::null_mut(), 0);
     if later(rc) {
         None
     } else {

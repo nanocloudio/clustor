@@ -482,6 +482,9 @@ pub fn master_label(
 
 // ── KEY_VAULT client ────────────────────────────────────────────────────
 
+/// `EINVAL`: a request this client will not put on the wire.
+const E_INVAL: i32 = -22;
+
 /// Open epoch `epoch`'s persisted master (`KDF_KEY`), generating it when
 /// `create`. Returns the handle or a negative errno (`-ENOENT` when
 /// absent and not created).
@@ -489,25 +492,28 @@ pub fn master_label(
 /// # Safety
 /// `sys` must reach live kernel routines per the module ABI.
 pub unsafe fn open_master(sys: &SyscallTable, label: &[u8], create: bool) -> i32 {
-    if label.is_empty() || label.len() > MASTER_LABEL_CAP {
-        return -22;
+    if label.len() > MASTER_LABEL_CAP {
+        return E_INVAL;
     }
-    let mut arg = [0u8; 8 + MASTER_LABEL_CAP + 12];
-    put(&mut arg, 0, &kv::suite::KDF_KEY.to_le_bytes());
-    put(
+    let mut arg = [0u8; kv::open::HEADER + MASTER_LABEL_CAP];
+    let Some(n) = kv::open::encode(
         &mut arg,
-        2,
-        &(kv::usage::DERIVE | kv::usage::PERSIST).to_le_bytes(),
-    );
-    arg[7] = label.len() as u8;
-    put(&mut arg, 8, label);
-    let n = 8 + label.len() + 12;
+        &kv::open::Request {
+            suite: kv::suite::KDF_KEY,
+            usage: kv::usage::DERIVE | kv::usage::PERSIST,
+            flags: 0,
+            label,
+        },
+    ) else {
+        return E_INVAL;
+    };
     let op = if create {
         kv::OPEN_OR_GENERATE
     } else {
         kv::OPEN
     };
-    (sys.provider_call)(-1, op, arg.as_mut_ptr(), n)
+    // A KDF master has no public half: nothing comes back in `data`.
+    (sys.provider_call)(-1, op, arg.as_mut_ptr(), n, core::ptr::null_mut(), 0)
 }
 
 /// Whether the vault will give `handle` back after a restart. A master
@@ -517,9 +523,17 @@ pub unsafe fn open_master(sys: &SyscallTable, label: &[u8], create: bool) -> i32
 /// # Safety
 /// `sys` must reach live kernel routines per the module ABI.
 pub unsafe fn persisted(sys: &SyscallTable, handle: i32) -> bool {
-    let mut d = [0u8; 8];
-    let rc = (sys.provider_call)(handle, kv::DESCRIBE, d.as_mut_ptr(), d.len());
-    rc >= 8 && d[7] != 0
+    let mut d = [0u8; kv::describe::ARG_LEN];
+    let rc = (sys.provider_call)(
+        handle,
+        kv::DESCRIBE,
+        d.as_mut_ptr(),
+        d.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    rc == kv::describe::ARG_LEN as i32
+        && kv::describe::parse(&d).is_some_and(|k| k.persisted != kv::persisted::NO)
 }
 
 /// Destroy the persisted master filed under `label`.
@@ -527,13 +541,21 @@ pub unsafe fn persisted(sys: &SyscallTable, handle: i32) -> bool {
 /// # Safety
 /// `sys` must reach live kernel routines per the module ABI.
 pub unsafe fn destroy_label(sys: &SyscallTable, label: &[u8]) -> i32 {
-    if label.is_empty() || label.len() > MASTER_LABEL_CAP {
-        return -22;
+    if label.len() > MASTER_LABEL_CAP {
+        return E_INVAL;
     }
     let mut arg = [0u8; 1 + MASTER_LABEL_CAP];
-    arg[0] = label.len() as u8;
-    put(&mut arg, 1, label);
-    (sys.provider_call)(-1, kv::DESTROY_BY_LABEL, arg.as_mut_ptr(), 1 + label.len())
+    let Some(n) = kv::destroy_by_label::encode(&mut arg, label) else {
+        return E_INVAL;
+    };
+    (sys.provider_call)(
+        -1,
+        kv::DESTROY_BY_LABEL,
+        arg.as_mut_ptr(),
+        n,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// `DERIVE` a purpose key from `master`: a fresh handle the caller owns
@@ -549,25 +571,31 @@ pub unsafe fn derive(
     label: &[u8],
     context: &[u8],
 ) -> i32 {
-    use kv::derive as d;
     const LABEL_CAP: usize = 32;
     const CONTEXT_CAP: usize = 64;
     if label.len() > LABEL_CAP || context.len() > CONTEXT_CAP {
-        return -22;
+        return E_INVAL;
     }
-    let mut arg = [0u8; d::LABEL + LABEL_CAP + CONTEXT_CAP];
-    put(&mut arg, d::TARGET_SUITE, &suite.to_le_bytes());
-    put(&mut arg, d::TARGET_USAGE, &usage.to_le_bytes());
-    arg[d::LABEL_LEN] = label.len() as u8;
-    put(
+    let mut arg = [0u8; kv::derive::LABEL + LABEL_CAP + CONTEXT_CAP];
+    let Some(n) = kv::derive::encode(
         &mut arg,
-        d::CONTEXT_LEN,
-        &(context.len() as u16).to_le_bytes(),
-    );
-    let at = put(&mut arg, d::LABEL, label);
-    put(&mut arg, at, context);
-    let n = d::LABEL + label.len() + context.len();
-    (sys.provider_call)(master, kv::DERIVE, arg.as_mut_ptr(), n)
+        &kv::derive::Request {
+            suite,
+            usage,
+            label,
+            context,
+        },
+    ) else {
+        return E_INVAL;
+    };
+    (sys.provider_call)(
+        master,
+        kv::DERIVE,
+        arg.as_mut_ptr(),
+        n,
+        core::ptr::null_mut(),
+        0,
+    )
 }
 
 /// Destroy a derived handle.
@@ -576,7 +604,14 @@ pub unsafe fn derive(
 /// `sys` must reach live kernel routines per the module ABI.
 pub unsafe fn destroy(sys: &SyscallTable, handle: i32) {
     if handle >= 0 {
-        (sys.provider_call)(handle, kv::DESTROY, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            handle,
+            kv::DESTROY,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
     }
 }
 
@@ -602,6 +637,9 @@ pub struct AeadBuf {
 /// Seal (`seal`) or open `len` bytes at `data` in place under `key`,
 /// the 16-byte tag at `tag`.
 ///
+/// One unit per call: the unit is the call's `data`, and the tag travels
+/// in `arg` (written by a seal, checked by an open).
+///
 /// # Safety
 /// `sys` must reach live kernel routines; `data` must be valid for `len`
 /// bytes and `tag` for 16, neither aliasing `aad` or `nonce`.
@@ -613,52 +651,73 @@ pub unsafe fn aead(
     aad: &[u8],
     buf: AeadBuf,
 ) -> Aead {
-    let AeadBuf { data, len, tag } = buf;
     use kv::units as u;
-    let mut arg = [0u8; u::HEADER_LEN + u::ENTRY_LEN];
-    put(&mut arg, u::COUNT, &1u16.to_le_bytes());
-    let e = u::HEADER_LEN;
-    put(&mut arg, e + u::NONCE, nonce);
-    put(&mut arg, e + u::AAD_LEN, &(aad.len() as u16).to_le_bytes());
-    put(
-        &mut arg,
-        e + u::AAD_PTR,
-        &(aad.as_ptr() as u64).to_le_bytes(),
-    );
-    put(&mut arg, e + u::DATA_PTR, &(data as u64).to_le_bytes());
-    put(&mut arg, e + u::DATA_LEN, &(len as u32).to_le_bytes());
-    put(&mut arg, e + u::TAG_PTR, &(tag as u64).to_le_bytes());
+    let AeadBuf { data, len, tag } = buf;
+    if len > u::MAX_UNIT {
+        return Aead::Refused(E_INVAL);
+    }
+    let mut t = [0u8; u::TAG_LEN];
+    if !seal {
+        core::ptr::copy_nonoverlapping(tag, t.as_mut_ptr(), u::TAG_LEN);
+    }
+    let mut arg = [0u8; u::MAX_ARG];
+    let Some(n) = u::encode(&mut arg, nonce, &t, aad) else {
+        return Aead::Refused(E_INVAL);
+    };
     let op = if seal {
         kv::AEAD_SEAL_UNITS
     } else {
         kv::AEAD_OPEN_UNITS
     };
-    let rc = (sys.provider_call)(key, op, arg.as_mut_ptr(), arg.len());
-    if rc < 0 {
-        Aead::Refused(rc)
-    } else if rc == 0 && arg[e + u::STATUS] == 0 {
+    let rc = (sys.provider_call)(key, op, arg.as_mut_ptr(), n, data, len);
+    if rc == 0 {
+        if seal {
+            let Some(sealed) = u::tag(&arg) else {
+                return Aead::Refused(E_INVAL);
+            };
+            core::ptr::copy_nonoverlapping(sealed.as_ptr(), tag, u::TAG_LEN);
+        }
         Aead::Ok
-    } else {
+    } else if !seal && rc == E_INVAL {
+        // The request was checked well-formed above, so an open's `EINVAL`
+        // is the tag not verifying.
         Aead::AuthFailed
+    } else {
+        Aead::Refused(rc)
     }
 }
 
+/// Longest message `hmac` / `hmac_verify` take.
+const HMAC_MSG_CAP: usize = 256;
+/// An HMAC-SHA256 tag.
+const HMAC_LEN: usize = 32;
+
 /// HMAC-SHA256 of `msg` under the HMAC handle `key` (`SIGN`, raw mode).
+/// The message is signed in place in a scratch span, the tag written over
+/// its head.
 ///
 /// # Safety
 /// `sys` must reach live kernel routines per the module ABI.
 pub unsafe fn hmac(sys: &SyscallTable, key: i32, msg: &[u8], out: &mut [u8; 32]) -> bool {
-    const MSG_CAP: usize = 256;
-    if msg.len() > MSG_CAP {
+    if msg.len() > HMAC_MSG_CAP {
         return false;
     }
-    let mut arg = [0u8; 6 + MSG_CAP + 12];
-    arg[0] = kv::sign_mode::RAW;
-    put(&mut arg, 2, &(msg.len() as u32).to_le_bytes());
-    let t = put(&mut arg, 6, msg);
-    put(&mut arg, t, &(out.as_mut_ptr() as u64).to_le_bytes());
-    put(&mut arg, t + 8, &32u16.to_le_bytes());
-    (sys.provider_call)(key, kv::SIGN, arg.as_mut_ptr(), t + 12) >= 0
+    let mut span = [0u8; HMAC_MSG_CAP];
+    span[..msg.len()].copy_from_slice(msg);
+    let mut arg = kv::sign::encode(kv::sign_mode::RAW, msg.len() as u32);
+    let rc = (sys.provider_call)(
+        key,
+        kv::SIGN,
+        arg.as_mut_ptr(),
+        arg.len(),
+        span.as_mut_ptr(),
+        span.len(),
+    );
+    if rc != HMAC_LEN as i32 {
+        return false;
+    }
+    out.copy_from_slice(&span[..HMAC_LEN]);
+    true
 }
 
 /// Check an HMAC-SHA256 tag inside the vault (`VERIFY` against the
@@ -667,26 +726,40 @@ pub unsafe fn hmac(sys: &SyscallTable, key: i32, msg: &[u8], out: &mut [u8; 32])
 /// # Safety
 /// `sys` must reach live kernel routines per the module ABI.
 pub unsafe fn hmac_verify(sys: &SyscallTable, key: i32, msg: &[u8], tag: &[u8; 32]) -> bool {
-    const MSG_CAP: usize = 256;
-    if msg.len() > MSG_CAP {
+    if msg.len() > HMAC_MSG_CAP {
         return false;
     }
-    let mut arg = [0u8; 8 + MSG_CAP + 32];
-    put(&mut arg, 0, &(msg.len() as u16).to_le_bytes());
-    put(&mut arg, 2, &32u16.to_le_bytes());
-    let at = put(&mut arg, 8, msg);
-    put(&mut arg, at, tag);
-    (sys.provider_call)(key, kv::VERIFY, arg.as_mut_ptr(), at + 32) == 1
+    let mut span = [0u8; HMAC_MSG_CAP + HMAC_LEN];
+    span[..msg.len()].copy_from_slice(msg);
+    span[msg.len()..msg.len() + HMAC_LEN].copy_from_slice(tag);
+    let mut arg = kv::verify::encode(msg.len() as u32, HMAC_LEN as u16, 0);
+    (sys.provider_call)(
+        key,
+        kv::VERIFY,
+        arg.as_mut_ptr(),
+        arg.len(),
+        span.as_mut_ptr(),
+        msg.len() + HMAC_LEN,
+    ) == 1
 }
 
-/// Whether the vault can hold keys of `vault_suite`.
+/// Whether the vault can hold keys of `vault_suite`: `DESCRIBE_SUITE` at
+/// that cursor answers the suite's own record.
 ///
 /// # Safety
 /// `sys` must reach live kernel routines per the module ABI.
 pub unsafe fn suite_offered(sys: &SyscallTable, vault_suite: u16) -> bool {
-    let mut q = [0u8; 14];
-    put(&mut q, 0, &vault_suite.to_le_bytes());
-    (sys.provider_call)(-1, kv::SUITE_QUERY, q.as_mut_ptr(), q.len()) >= 0
+    let mut q = kv::describe_suite::encode_cursor(vault_suite);
+    let rc = (sys.provider_call)(
+        -1,
+        kv::DESCRIBE_SUITE,
+        q.as_mut_ptr(),
+        q.len(),
+        core::ptr::null_mut(),
+        0,
+    );
+    rc == kv::describe_suite::LEN as i32
+        && kv::describe_suite::parse(&q).is_some_and(|r| r.suite == vault_suite)
 }
 
 /// Fill `out` from the platform CSPRNG.
@@ -697,6 +770,8 @@ pub unsafe fn random_fill(sys: &SyscallTable, out: &mut [u8]) -> bool {
     (sys.provider_call)(
         -1,
         crate::abi::kernel_abi::RANDOM_FILL,
+        core::ptr::null_mut(),
+        0,
         out.as_mut_ptr(),
         out.len(),
     ) == 0

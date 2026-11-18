@@ -38,6 +38,9 @@ content_type = "NetProto"
 # Transaction-class edges: one record per committed entry or
 # response, never a media stream, whatever NetProto defaults to.
 rate_class_default = "transaction"
+# Read an envelope at a time whatever its size: any record a channel
+# carries (`abi::CHANNEL_BUFFER_SIZE`; the module states it too).
+accepts_record = 8192
 
 [[ports]]
 name = "placement"
@@ -102,6 +105,9 @@ content_type = "NetProto"
 # Transaction-class edges: one record per committed entry or
 # response, never a media stream, whatever NetProto defaults to.
 rate_class_default = "transaction"
+# One response envelope as `surface::send_response` builds it
+# (`surface::RESPONSE_RECORD_MAX`; the module states it too).
+max_record = 256
 
 [[ports]]
 name = "admin_req"
@@ -151,6 +157,9 @@ direction = "output"
 # `responses`.
 content_type = "NetProto"
 rate_class_default = "transaction"
+# One response envelope as `surface::send_response` builds it
+# (`surface::RESPONSE_RECORD_MAX`; the module states it too).
+max_record = 256
 
 [observability]
 # Admission counters from the throttle component. Surface/codec

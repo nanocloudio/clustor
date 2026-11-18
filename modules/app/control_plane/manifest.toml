@@ -38,6 +38,9 @@ content_type = "NetProto"
 # Transaction-class edges: one record per committed entry or
 # response, never a media stream, whatever NetProto defaults to.
 rate_class_default = "transaction"
+# Read an envelope at a time whatever its size: any record a channel
+# carries (`abi::CHANNEL_BUFFER_SIZE`; the module states it too).
+accepts_record = 8192
 
 # Raft leader hints. Only the leader ACCEPTS migration commands; every
 # node still adopts the committed records, which is how the fence

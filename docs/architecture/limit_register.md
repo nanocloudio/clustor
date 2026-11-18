@@ -122,7 +122,7 @@ scope. Their bounds are measurement apparatus, not deployment envelope.
 | Admin envelope staging | `ENV_BUF` | modules/app/operations/admin.rs | 1024 | Shape: every envelope staging buffer in the admin component, matching the 1 KiB channel-message scratch. The longest command it can carry is `CMD_MAX = ENV_BUF - 12`, because the replicated form prepends `ADMIN_MAGIC` (8) and `command_id` (4) inside the same buffer. |
 | HTTP request body accepted | `MAX_EXT_BODY` | modules/app/operations/http.rs | 1024 | The exchange `Collector`'s body bound: a larger body, inline or across BODY records, is answered 413, never truncated. Wire-side body/connection bounds are wave's (`max_body_kib`, per-target slot tables). |
 | HTTP request target accepted | `MAX_EXT_TARGET` | modules/app/operations/http.rs | 256 | Path and query. A longer target is answered 413 by the collector; every route this surface serves is far shorter. |
-| HTTP forwarded header block | `MAX_EXT_HEADERS` | modules/app/operations/http.rs | 2048 | The header block the server forwards is collected and read past; a larger block is answered 413. |
+| HTTP forwarded request meta | `MAX_EXT_META` | modules/app/operations/http.rs | 2048 | The exchange meta the server forwards is collected and read past; larger meta is answered 413. |
 | Exchanges collected at once | `REQ_SLOTS` | modules/app/operations/http.rs | 4 | Capacity: a slot is held from a request HEAD until the request is whole and handed over — at once for an inline body, at the last BODY record otherwise. A HEAD arriving with none free is answered 503 rather than held unanswered, and a body that never finishes ages out at `REQ_BODY_TIMEOUT_MS` with 408. |
 | Concurrent HTTP `/propose` requests | `HTTP_INFLIGHT` | modules/app/operations/http.rs | 64 | Slot exhaustion answers 503 "propose queue unavailable". |
 | Admin op body via HTTP | `ADMIN_BODY_MAX` | modules/common/http_admin.rs | 1021 | Capacity: the 1 KiB `admin_env` staging buffer less the 3-byte envelope header (`conn_id:u16 LE` + `op_code`). An oversize admin POST is answered 503 before any work is staged, and counted in `admin_dropped`. |
@@ -373,7 +373,7 @@ APP_CAPTURE_TIMEOUT_TICKS | modules/app/durability/snapshot.rs | 2000
 ENV_BUF | modules/app/operations/admin.rs | 1024
 MAX_EXT_BODY | modules/app/operations/http.rs | 1024
 MAX_EXT_TARGET | modules/app/operations/http.rs | 256
-MAX_EXT_HEADERS | modules/app/operations/http.rs | 2048
+MAX_EXT_META | modules/app/operations/http.rs | 2048
 HTTP_INFLIGHT | modules/app/operations/http.rs | 64
 ADMIN_BODY_MAX | modules/common/http_admin.rs | 1021
 VOLATILE_RETENTION_SLOTS | modules/app/durability/wal.rs | 256

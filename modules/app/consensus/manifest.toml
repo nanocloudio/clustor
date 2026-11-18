@@ -317,8 +317,9 @@ content_type = "NetProto"
 # response, never a media stream, whatever NetProto defaults to.
 rate_class_default = "transaction"
 buffer_size = 8192
-# Envelope (3) + term/index (16) + proposal body (2048).
-max_record = 2067
+# Envelope (3) + partition/term/index (18) + entry body (2048), as the
+# module states it (`COMMITTED_ENTRIES_MAX_RECORD`).
+max_record = 2069
 rate_class_max = "transaction"
 
 [[ports]]

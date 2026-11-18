@@ -359,6 +359,7 @@ impl FwdSeen {
     }
 }
 
+use super::abi::contracts::storage::fs::seek;
 // FS opcodes
 const FS_OPEN: u32 = super::abi::registry::fs::OPEN;
 /// Write-side opener: creates the file if absent (FS_OPEN is read-only-
@@ -5007,6 +5008,8 @@ unsafe fn forward_tagged_proposals(s: &mut Raft, sys: &SyscallTable, now: u64) {
         let ok = (sys.provider_call)(
             -1,
             super::abi::kernel_abi::RANDOM_FILL,
+            core::ptr::null_mut(),
+            0,
             r.as_mut_ptr(),
             r.len(),
         ) == 0;
@@ -6226,7 +6229,14 @@ unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
         let slot = s.ml_slot;
         if s.ml_fd < 0 {
             let (mut path, plen) = build_meta_slot_path(s.partition_id, root, &s.meta_dir, slot);
-            let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+            let fd = (sys.provider_call)(
+                -1,
+                FS_OPEN,
+                path.as_mut_ptr(),
+                plen,
+                core::ptr::null_mut(),
+                0,
+            );
             if later(fd) {
                 return true;
             }
@@ -6249,7 +6259,14 @@ unsafe fn load_metadata(s: &mut Raft, sys: &SyscallTable) -> bool {
         if io == Io::Later {
             return true;
         }
-        (sys.provider_call)(s.ml_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.ml_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.ml_fd = -1;
         s.ml_slot += 1;
         if io != Io::Done {
@@ -6358,7 +6375,14 @@ enum FlatLoad {
 unsafe fn load_flat_metadata(s: &mut Raft, sys: &SyscallTable, root: bool) -> FlatLoad {
     if s.ml_fd < 0 {
         let (mut path, plen) = build_meta_path_ex(s.partition_id, root, &s.meta_dir);
-        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+        let fd = (sys.provider_call)(
+            -1,
+            FS_OPEN,
+            path.as_mut_ptr(),
+            plen,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(fd) {
             return FlatLoad::Retry;
         }
@@ -6380,7 +6404,14 @@ unsafe fn load_flat_metadata(s: &mut Raft, sys: &SyscallTable, root: bool) -> Fl
     if io == Io::Later {
         return FlatLoad::Retry;
     }
-    (sys.provider_call)(s.ml_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    (sys.provider_call)(
+        s.ml_fd,
+        FS_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     s.ml_fd = -1;
     // A failed read is not a record: every negative answer other than
     // "not yet" leaves nothing to interpret.
@@ -6433,7 +6464,14 @@ unsafe fn load_flat_metadata(s: &mut Raft, sys: &SyscallTable, root: bool) -> Fl
 unsafe fn mark_meta_failure(s: &mut Raft, sys: &SyscallTable, slot: u8) -> PersistOutcome {
     let idx = (slot & 1) as usize;
     if s.meta_fds[idx] >= 0 {
-        (sys.provider_call)(s.meta_fds[idx], FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.meta_fds[idx],
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.meta_fds[idx] = -1;
     }
     s.meta_slots_materialized = false;
@@ -6463,11 +6501,11 @@ unsafe fn probe_name_fence(s: &mut Raft, sys: &SyscallTable) -> bool {
         return true;
     }
     let mut caps = [0u8; 4];
-    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4);
+    let rc = (sys.provider_call)(-1, FS_CAPS, caps.as_mut_ptr(), 4, core::ptr::null_mut(), 0);
     if later(rc) {
         return false;
     }
-    let bits = if rc == 4 { u32::from_le_bytes(caps) } else { 0 };
+    let bits = if rc == 0 { u32::from_le_bytes(caps) } else { 0 };
     s.name_fence_probe = if bits & FS_CAP_FSYNC_NAME != 0 {
         NAME_FENCE_PRESENT
     } else {
@@ -6536,7 +6574,14 @@ unsafe fn publish_meta_name(
         s.name_unfenced = s.name_unfenced.saturating_add(1);
         return PersistOutcome::Persisted;
     }
-    let rc = (sys.provider_call)(-1, FS_FSYNC_NAME, path.as_mut_ptr(), plen);
+    let rc = (sys.provider_call)(
+        -1,
+        FS_FSYNC_NAME,
+        path.as_mut_ptr(),
+        plen,
+        core::ptr::null_mut(),
+        0,
+    );
     if later(rc) {
         return PersistOutcome::Transient;
     }
@@ -6621,7 +6666,14 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
                 };
             }
             MZ_OPEN => {
-                let opened = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+                let opened = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    path.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(opened) {
                     return PersistOutcome::Transient; // provider initialising
                 }
@@ -6642,7 +6694,14 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
             MZ_MKDIR_ROOT => {
                 let mut root = [0u8; STORE_DIR_MAX];
                 let rlen = s.meta_dir.put(&mut root).unwrap_or(0);
-                let rc = (sys.provider_call)(-1, FS_MKDIR, root.as_mut_ptr(), rlen);
+                let rc = (sys.provider_call)(
+                    -1,
+                    FS_MKDIR,
+                    root.as_mut_ptr(),
+                    rlen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return PersistOutcome::Transient;
                 }
@@ -6662,7 +6721,14 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
                 // "raft/p<NNNN>" — the parent of the per-partition meta file.
                 let (mut dir, dlen) = build_meta_path(s.partition_id, &s.meta_dir);
                 // Strip the trailing "/meta" (5 bytes) to get the directory.
-                let rc = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dlen - 5);
+                let rc = (sys.provider_call)(
+                    -1,
+                    FS_MKDIR,
+                    dir.as_mut_ptr(),
+                    dlen - 5,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return PersistOutcome::Transient;
                 }
@@ -6677,8 +6743,15 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
                 // is the test: a file this node created a moment ago reads
                 // 0, one written by a previous boot reads META_SLOT_SIZE and
                 // keeps whatever record it holds.
-                let zero = 0i32.to_le_bytes();
-                let rc = (sys.provider_call)(s.meta_fds[idx], FS_SEEK, zero.as_ptr() as *mut u8, 4);
+                let mut zero = seek::encode(0);
+                let rc = (sys.provider_call)(
+                    s.meta_fds[idx],
+                    FS_SEEK,
+                    zero.as_mut_ptr(),
+                    seek::ARG_LEN,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return PersistOutcome::Transient;
                 }
@@ -6705,8 +6778,15 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
                 }
             }
             MZ_REWIND => {
-                let zero = 0i32.to_le_bytes();
-                let rc = (sys.provider_call)(s.meta_fds[idx], FS_SEEK, zero.as_ptr() as *mut u8, 4);
+                let mut zero = seek::encode(0);
+                let rc = (sys.provider_call)(
+                    s.meta_fds[idx],
+                    FS_SEEK,
+                    zero.as_mut_ptr(),
+                    seek::ARG_LEN,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return PersistOutcome::Transient;
                 }
@@ -6735,7 +6815,14 @@ unsafe fn materialize_meta_slots(s: &mut Raft, sys: &SyscallTable) -> PersistOut
                 }
             }
             MZ_FSYNC => {
-                let rc = (sys.provider_call)(s.meta_fds[idx], FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.meta_fds[idx],
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return PersistOutcome::Transient;
                 }
@@ -6933,8 +7020,15 @@ unsafe fn continue_persist(s: &mut Raft, sys: &SyscallTable) -> PersistOutcome {
         match s.mj_phase {
             MJ_SEEK | MJ_REWIND => {
                 // Seek to start (overwrite, then read back).
-                let zero = 0i32.to_le_bytes();
-                let rc = (sys.provider_call)(fd, FS_SEEK, zero.as_ptr() as *mut u8, 4);
+                let mut zero = seek::encode(0);
+                let rc = (sys.provider_call)(
+                    fd,
+                    FS_SEEK,
+                    zero.as_mut_ptr(),
+                    seek::ARG_LEN,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return PersistOutcome::Transient;
                 }
@@ -6965,7 +7059,14 @@ unsafe fn continue_persist(s: &mut Raft, sys: &SyscallTable) -> PersistOutcome {
                 }
             }
             MJ_FSYNC => {
-                let rc = (sys.provider_call)(fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     // Taken, not decided: the byte-identical fsync is asked
                     // again next step, and nothing writes the slot meanwhile.

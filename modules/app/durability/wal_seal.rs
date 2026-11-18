@@ -722,7 +722,14 @@ unsafe fn read_slot(s: &mut Wal, sys: &SyscallTable, slot: u8) -> Option<SlotRea
     if s.seal.rd_fd < 0 {
         let mut path = [0u8; WAL_PATH_MAX];
         let plen = state_path(s.partition_id, s.root_path != 0, &s.dir, slot, &mut path);
-        let fd = (sys.provider_call)(-1, FS_OPEN, path.as_mut_ptr(), plen);
+        let fd = (sys.provider_call)(
+            -1,
+            FS_OPEN,
+            path.as_mut_ptr(),
+            plen,
+            core::ptr::null_mut(),
+            0,
+        );
         if later(fd) {
             return None;
         }
@@ -744,7 +751,14 @@ unsafe fn read_slot(s: &mut Wal, sys: &SyscallTable, slot: u8) -> Option<SlotRea
     if io == Io::Later {
         return None;
     }
-    (sys.provider_call)(s.seal.rd_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+    (sys.provider_call)(
+        s.seal.rd_fd,
+        FS_CLOSE,
+        core::ptr::null_mut(),
+        0,
+        core::ptr::null_mut(),
+        0,
+    );
     s.seal.rd_fd = -1;
     if io != Io::Done {
         return Some(SlotRead::Err(SlotErr::Bad));
@@ -850,7 +864,14 @@ pub unsafe fn drive(s: &mut Wal, sys: &SyscallTable) {
 /// Close the state write's descriptor and idle the machine.
 unsafe fn sw_reset(s: &mut Wal, sys: &SyscallTable) {
     if s.seal.sw_fd >= 0 {
-        (sys.provider_call)(s.seal.sw_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+        (sys.provider_call)(
+            s.seal.sw_fd,
+            FS_CLOSE,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+            0,
+        );
         s.seal.sw_fd = -1;
     }
     s.seal.sw_phase = SW_IDLE;
@@ -883,7 +904,14 @@ unsafe fn drive_state_write(s: &mut Wal, sys: &SyscallTable) -> Step {
     loop {
         match s.seal.sw_phase {
             SW_OPEN => {
-                let fd = (sys.provider_call)(-1, FS_OPEN_CREATE, path.as_mut_ptr(), plen);
+                let fd = (sys.provider_call)(
+                    -1,
+                    FS_OPEN_CREATE,
+                    path.as_mut_ptr(),
+                    plen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(fd) {
                     return Step::Later;
                 }
@@ -905,7 +933,14 @@ unsafe fn drive_state_write(s: &mut Wal, sys: &SyscallTable) -> Step {
             SW_MKDIR => {
                 let mut dir = [0u8; STORE_DIR_MAX];
                 let dlen = s.dir.put(&mut dir).unwrap_or(0);
-                let rc = (sys.provider_call)(-1, FS_MKDIR, dir.as_mut_ptr(), dlen);
+                let rc = (sys.provider_call)(
+                    -1,
+                    FS_MKDIR,
+                    dir.as_mut_ptr(),
+                    dlen,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return Step::Later;
                 }
@@ -935,14 +970,28 @@ unsafe fn drive_state_write(s: &mut Wal, sys: &SyscallTable) -> Step {
             }
             SW_FSYNC => {
                 // Fenced before the close: CLOSE reports no write-back.
-                let rc = (sys.provider_call)(s.seal.sw_fd, FS_FSYNC, core::ptr::null_mut(), 0);
+                let rc = (sys.provider_call)(
+                    s.seal.sw_fd,
+                    FS_FSYNC,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 if later(rc) {
                     return Step::Later;
                 }
                 if rc != 0 {
                     return sw_refused(s, sys);
                 }
-                (sys.provider_call)(s.seal.sw_fd, FS_CLOSE, core::ptr::null_mut(), 0);
+                (sys.provider_call)(
+                    s.seal.sw_fd,
+                    FS_CLOSE,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                );
                 s.seal.sw_fd = -1;
                 s.seal.sw_phase = SW_NAME;
             }

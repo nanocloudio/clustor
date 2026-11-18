@@ -116,7 +116,18 @@ struct ModuleState {
     comp_step_last_ms: u64,
 }
 
-fluxor_rt::module_facts! { state: ModuleState }
+// `applied` is read an envelope at a time whatever its size
+// (`wire_channels::channel_read_msg` drains one that does not fit), so
+// it takes any record a channel carries; the two response ports carry
+// what `surface::send_response` builds.
+fluxor_rt::module_facts! {
+    state: ModuleState,
+    records: [
+        in 2 APPLIED_ACCEPTS_RECORD = abi::CHANNEL_BUFFER_SIZE,
+        out 1 RESPONSES_MAX_RECORD = surface::RESPONSE_RECORD_MAX,
+        out 7 CLIENT_RESPONSES_MAX_RECORD = surface::RESPONSE_RECORD_MAX,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

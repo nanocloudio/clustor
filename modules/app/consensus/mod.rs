@@ -418,7 +418,18 @@ struct ModuleState {
 /// applied entries free space.
 const ARENA_BYTES: u32 = 256 * 1024;
 
-fluxor_rt::module_facts! { state: ModuleState, arena: ARENA_BYTES }
+// `committed_entries` carries one `MSG_COMMITTED_ENTRY` per entry: the
+// envelope, the partition/term/index head and an entry body. `applied`
+// carries the acks and refusals, each well inside 64 bytes.
+fluxor_rt::module_facts! {
+    state: ModuleState,
+    arena: ARENA_BYTES,
+    records: [
+        out 12 COMMITTED_ENTRIES_MAX_RECORD =
+            wire::ENVELOPE_HDR + wire::COMMITTED_ENTRY_HDR + wal_frame::MAX_ENTRY_BODY,
+        out 13 APPLIED_MAX_RECORD = 64,
+    ],
+}
 
 #[cfg_attr(not(feature = "host-test"), unsafe(no_mangle))]
 #[link_section = ".text.module_init"]

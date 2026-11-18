@@ -1908,7 +1908,7 @@ pub const MSG_CONN_CLOSED: u8 = 0xEB;
 pub const MSG_CLIENT_PEER: u8 = 0xED;
 /// A client connection's mirrored output horizon, on the `cleartext`
 /// chain in order with its frames: `[conn_id:u16 LE][bytes_through:u64
-/// LE]` — the transport's `MSG_HORIZON` (how many of the bytes written to
+/// LE]` — the transport's `MSG_CURSOR_HORIZON` (how many of the bytes written to
 /// the connection its standby holds), relabelled with the router's client
 /// id. Emitted only under `peer_router`'s `forward_peer: 1`; never for a
 /// replica link.
@@ -1916,7 +1916,7 @@ pub const MSG_CLIENT_HORIZON: u8 = 0xEE;
 /// A client connection's deliveries are consumed, on the `client_resp`
 /// lane in order with its responses: `[conn_id:u16 LE][consumer_cursor:
 /// u64 LE][in_bytes:u64 LE]` — relayed unchanged to the transport as its
-/// `CMD_DELIVERED`, under the transport's conn id. `in_bytes` is how many
+/// `CMD_CURSOR_DELIVERED`, under the transport's conn id. `in_bytes` is how many
 /// of the connection's clear bytes, from its start, the consumer has
 /// consumed (it may fall inside a record), so nothing still in flight is
 /// acknowledged with them; the cursor is the consumer's own position
@@ -1930,7 +1930,7 @@ pub const MSG_CLIENT_DELIVERED: u8 = 0xEF;
 /// on the `cleartext` chain after its [`MSG_CLIENT_PEER`] and ahead of
 /// its first [`MSG_CLIENT_FRAME`] or [`MSG_CLIENT_HORIZON`]:
 /// `[conn_id:u16 LE][consumer_cursor:u64 LE][in_bytes:u64 LE][out_bytes:
-/// u64 LE]` — the transport's `MSG_RESUMED`, relabelled with the router's
+/// u64 LE]` — the transport's `MSG_CURSOR_RESUMED`, relabelled with the router's
 /// client id. `consumer_cursor` and `in_bytes` are the last ones the
 /// predecessor's [`MSG_CLIENT_DELIVERED`] carried (both 0 if none), and
 /// redelivery starts at exactly byte `in_bytes`, which this consumer's
