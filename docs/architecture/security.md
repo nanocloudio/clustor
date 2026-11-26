@@ -121,12 +121,12 @@ either way.
 | Snapshot body | v1 `FXSC` chunks of 4096 plaintext bytes, the last flagged final; the file header and CRC trailer stay in the clear | `DERIVE(master, "clustor/snapshot", cluster ‖ partition ‖ generation ‖ epoch)`, 128-bit random generation per snapshot |
 | Allocator state | `<wal_dir>/p<NNNN>_seal0`/`_seal1` A/B records: epoch, suite, reserved incarnation counter, live-epoch marks, HMAC-SHA256 | `DERIVE(master, "clustor/wal-state", cluster ‖ partition ‖ replica)` |
 
-Keys live in the Fluxor KEY_VAULT; no key byte enters the module. Each
+Keys live in the `key_vault` the graph composes; no key byte enters the module. Each
 group and replica has one persisted `KDF_KEY` master per key epoch,
 labelled `wal/p<partition>/r<replica>/e<epoch>` in the durability
 module's vault namespace — a vault label, not a path: it does not
-follow `wal_dir`, and the masters live wherever the node's vault
-keeps them. A master the vault would not give back after
+follow `wal_dir`, and the masters live wherever that vault keeps
+them (its block source). A master the vault would not give back after
 a restart is refused.
 
 **Nonces.** A frame's nonce is `"WAL0" ‖ frame sequence` under a key
@@ -168,7 +168,7 @@ snapshots, snapshot pointers and Raft metadata slots all on the
 decrypted device. Clustor writes its ordinary formats; only the
 `file.data` provider beneath them differs, and the lower image holds
 ciphertext alone. `crypt_block` holds its container's master key in the
-vault, so a runtime without vault persistence cannot unwrap across a
+vault, so a vault with no block source cannot unwrap across a
 restart what it wrote before one.
 
 The two postures answer different threats. Sealing authenticates every

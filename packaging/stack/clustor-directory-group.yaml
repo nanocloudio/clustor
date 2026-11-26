@@ -25,7 +25,9 @@
 # `trust` the authority's anchors — absolute paths, read at run time and
 # re-read when they change (Fluxor's `tls`), so an image carries no
 # credential. A member presenting replica N's principal is replica N; a
-# member that cannot is no peer.
+# member that cannot is no peer. Both `tls` hold `key` in the `key_vault`
+# the includer composes (`seal: none` suffices: `key` is read again at
+# every start).
 #
 # Membership and leadership. `admin_in` takes pre-authorized admin commands
 # — `MSG_ADMIN_COMMAND [conn_id:u16 LE][op_code:u8][op_body]`, the includer's

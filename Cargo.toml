@@ -556,8 +556,8 @@ name = "sealed_wal"
 path = "tests/sealed_wal.rs"
 
 # Sealing end to end: a single-node fluxor-linux cluster with `aead` set,
-# sealing through the real kernel KEY_VAULT (persisted under a per-test
-# FLUXOR_VAULT_DIR); commit, kill, replay, and ciphertext-only segments.
+# sealing through a `key_vault` module persisted in a per-test image;
+# commit, kill, replay, and ciphertext-only segments.
 # Same skip semantics as `cluster`.
 [[test]]
 name = "sealed_e2e"

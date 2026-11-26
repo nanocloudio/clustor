@@ -769,6 +769,11 @@ unsafe fn read_slot(s: &mut Wal, sys: &SyscallTable, slot: u8) -> Option<SlotRea
     };
     let w = who(s);
     let master = master_for(&mut s.seal, w, sys, r.epoch);
+    if master == sr::E_AGAIN {
+        // The vault is still loading its image: the slot is read again
+        // on a later step.
+        return None;
+    }
     if master < 0 {
         return Some(SlotRead::Err(SlotErr::Key));
     }
@@ -1218,6 +1223,9 @@ unsafe fn load(s: &mut Wal, sys: &SyscallTable) {
                     return;
                 }
                 let h = open_master(who(s), sys, r.epoch, false);
+                if h == sr::E_AGAIN {
+                    return;
+                }
                 if h < 0 {
                     fail(s, sys, fault::KEY, b"[wal] seal: key epoch unavailable");
                     return;
@@ -1240,7 +1248,11 @@ unsafe fn load(s: &mut Wal, sys: &SyscallTable) {
                 return;
             }
             None => {
+                // Asked again until the new master is durable in the vault.
                 let h = open_master(who(s), sys, 1, true);
+                if h == sr::E_AGAIN {
+                    return;
+                }
                 if h < 0 {
                     fail(s, sys, fault::VAULT, b"[wal] seal: master unavailable");
                     return;
@@ -1335,7 +1347,11 @@ pub fn request_rotation(s: &mut Wal) {
 unsafe fn rotate_epoch(s: &mut Wal, sys: &SyscallTable) -> Step {
     let next = s.seal.epoch.max(s.seal.max_epoch_seen).saturating_add(1);
     if s.seal.rot_h < 0 {
+        // Asked again until the new master is durable in the vault.
         let h = open_master(who(s), sys, next, true);
+        if h == sr::E_AGAIN {
+            return Step::Later;
+        }
         if h < 0 {
             return Step::Fail;
         }

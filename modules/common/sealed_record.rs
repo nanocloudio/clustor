@@ -485,9 +485,14 @@ pub fn master_label(
 /// `EINVAL`: a request this client will not put on the wire.
 const E_INVAL: i32 = -22;
 
+/// `EAGAIN`: the vault cannot answer a labelled open yet — its image is
+/// still loading, or a newly generated persisted key is not yet durable.
+/// The caller asks again on a later step.
+pub const E_AGAIN: i32 = -11;
+
 /// Open epoch `epoch`'s persisted master (`KDF_KEY`), generating it when
 /// `create`. Returns the handle or a negative errno (`-ENOENT` when
-/// absent and not created).
+/// absent and not created, [`E_AGAIN`] when the vault cannot answer yet).
 ///
 /// # Safety
 /// `sys` must reach live kernel routines per the module ABI.
